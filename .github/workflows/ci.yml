@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install core dependencies
+        run: npm ci
+      - name: Build and test core
+        run: npm test
+      - name: Install web dependencies
+        run: npm --prefix web ci
+      - name: Build web application
+        run: npm --prefix web run build

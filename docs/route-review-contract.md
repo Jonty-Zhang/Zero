@@ -1,0 +1,73 @@
+# Codex 分配与审核契约
+
+本文件是 Zero v1 的实现约束。Codex 负责语义选择与独立审核；Zero 负责能力校验、状态、测试及 DONE 判定。
+
+## 分配输入
+
+每个候选是经过 Adapter probe 的可执行绑定：
+
+```json
+{
+  "bindingId": "codex:gpt_primary",
+  "harness": "codex",
+  "model": "gpt_primary",
+  "reasoningEfforts": ["low", "medium", "high"],
+  "capabilities": ["code", "review", "json_events"],
+  "healthy": true
+}
+```
+
+提交任务可指定 `selection.harness`、`selection.model`、`selection.reasoningEffort` 的任意子集。合并顺序：任务 > 项目预设 > 全局预设 > Codex 分配。Zero 先过滤健康度和兼容性，再将任务 brief、验收条件、仓库摘要、已锁定字段与余下候选发送到独立只读 Codex 分配会话。
+
+分配器自身的 Codex 模型是启动配置，必须在应用设置中指定，或使用已通过 probe 的 Codex CLI 默认模型并记录其有效值；分配器不能在启动前为自己选模型。
+
+## 分配输出
+
+Codex 只输出一个 JSON 对象：
+
+```json
+{
+  "taskType": "debug",
+  "complexity": "medium",
+  "bindingId": "codex:gpt_primary",
+  "reasoningEffort": "high",
+  "reason": "失败堆栈明确，仓库有可运行测试，Codex 适合定位并验证。"
+}
+```
+
+Zero 检查 JSON 结构、候选 ID、已锁定字段、effort 是否受该 binding 支持，再将每个字段的来源（task/project/global/codex）与候选快照写入 route 决策记录。Codex 的非 JSON 响应或不存在的绑定不可转为默认模型。如果全部字段已手动锁定，Zero 仍用 Codex 做只读任务分析，但不能改变执行组合。
+
+## 审核输入与输出
+
+审核一定是新的 Codex 会话，不复用分配或执行上下文。输入包括原始任务、验收条件、base commit、完整 diff（含新增文件）、机器检查结果和执行摘要。Reviewer 的 sandbox 为只读；Zero 在审核前后比较 Git 状态，若发生任何写入则审核无效并记录故障。
+
+```json
+{
+  "verdict": "changes_requested",
+  "summary": "新增测试未覆盖空输入。",
+  "findings": [
+    {
+      "file": "src/parser.ts",
+      "line": 42,
+      "severity": "high",
+      "evidence": "空字符串进入该分支后抛出未处理异常。",
+      "requestedChange": "处理空输入并增加回归测试。"
+    }
+  ]
+}
+```
+
+合法 verdict 仅为 `pass`、`changes_requested`、`blocked`。审核输出必须通过 schema 校验；审核进程失败、结果缺失或非法时，Zero 记录审核故障，不能 DONE。`changes_requested` 生成返工 brief，加入检查失败证据，再交回执行 Harness。每次返工后重新测试和审核。
+
+## Reviewer 独立性与 DONE
+
+Reviewer 的 Harness 固定 `codex`。模型与思考强度可在 Zero 中手动配置；未配置时从已验证的 Codex 候选中选择，优先不同于执行模型。即使执行 Harness 也是 Codex 且模型相同，审核仍使用全新会话和只读权限，并在报告中标记此独立性限制。DONE 还必须满足检查通过、改动范围通过、结果提交到任务分支、报告归档。
+
+## 必测反例
+
+- 用户只锁定 `harness=zcode`，Codex 返回 `codex:gpt_primary`：拒绝。
+- 用户只锁定 `model=glm_primary`，Codex 返回不兼容 Harness：拒绝。
+- 用户锁定 `high`，该 binding 仅支持 `low|medium`：任务提交/路由即报配置错误。
+- Codex 输出不存在的 `bindingId`、不支持的 effort、格式错误或空理由：拒绝。
+- 测试失败但 Codex reviewer 输出 `pass`：仍进入返工或失败，不能 DONE。
+- Reviewer 输出 `pass` 但进程非零退出：不能 DONE。

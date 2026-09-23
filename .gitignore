@@ -1,0 +1,15 @@
+node_modules/
+web/node_modules/
+dist/
+web/dist/
+data/.zero/
+.zero-git-test-*/
+artifacts/
+reports/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+.env.*
+!.env.example
