@@ -19,7 +19,7 @@ import { GitWorktreeManager, type WorktreeInfo, type WorktreeReviewSnapshot } fr
 import { TaskStore } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
-import { HANDOFF_V1_MAX_BYTES } from "../domain/handoff.js";
+import { HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
 
 type ResumeStage = "route" | "execute" | "review";
 interface WorkerCheckpoint {
@@ -239,6 +239,9 @@ export class TaskWorker {
         const role = revision === 0 ? "implement" : "revise";
         const inputFingerprint = await this.#options.worktrees.fingerprint(worktree);
         const previousExecutionStage = this.#options.store.stages(taskId).filter(item => item.role === "implement" || item.role === "revise").at(-1);
+        const priorHandoffContext = previousExecutionStage
+          ? this.#handoffContextForInput(taskId, previousExecutionStage, baseCommit, inputFingerprint)
+          : undefined;
         const processStartId = randomUUID();
         const pendingStage = this.#options.store.createStage(taskId, {
           role,
@@ -263,14 +266,17 @@ export class TaskWorker {
         active.adapter = adapter;
         active.attempt = attempt;
         this.#assertNotCancelled(active);
+        const executionBrief = revision === 0 ? this.#initialExecutionBrief(task, revisionBrief) : revisionBrief;
         const runResult = await adapter.run({
           taskId,
           attemptId: attempt.id,
           role,
           cwd: worktree.path,
-          prompt: continuingExecution
-            ? `${revisionBrief}\n\nZero paused this attempt after a verified provider usage limit. Continue in this same worktree. Inspect the existing changes first, preserve correct work, and complete the task.`
-            : revisionBrief,
+          prompt: [
+            executionBrief,
+            ...(continuingExecution ? ["Zero paused this attempt after a verified provider usage limit. Continue in this same worktree. Inspect the existing changes first, preserve correct work, and complete the task."] : []),
+            ...(priorHandoffContext ? [priorHandoffContext] : []),
+          ].join("\n\n"),
           harness: route.harness,
           model: route.model,
           reasoningEffort: route.effectiveReasoningEffort ?? route.reasoningEffort,
@@ -539,6 +545,46 @@ export class TaskWorker {
     if (review) chunks.push(`Reviewer verdict: ${review.verdict}\n${review.summary}\n${review.findings.map(item => `- ${item.severity}${item.file ? ` ${item.file}${item.line ? `:${item.line}` : ""}` : ""}: ${item.evidence} Required change: ${item.requestedChange}`).join("\n")}`);
     if (task.acceptanceCriteria?.length) chunks.push(`Acceptance criteria:\n${task.acceptanceCriteria.map(item => `- ${item}`).join("\n")}`);
     return chunks.join("\n");
+  }
+
+  #initialExecutionBrief(task: TaskRecord, brief: string): string {
+    const criteria = boundedAcceptanceCriteria(task.acceptanceCriteria ?? [], task.id);
+    if (!criteria.length) return brief;
+    return `${brief}\n\nAcceptance criteria:\n${criteria.map(item => `- ${item}`).join("\n")}`;
+  }
+
+  #handoffContextForInput(taskId: string, sourceStage: StageRecord, baseCommit: string, inputFingerprint: string): string | undefined {
+    const attempts = this.#options.store.attempts(taskId);
+    const attemptById = new Map(attempts.map(attempt => [attempt.id, attempt]));
+    const stageHandoffs = this.#options.store.handoffs(taskId).filter(item => item.stageId === sourceStage.id);
+    const linkedAttemptIds = stageHandoffs.map(item => item.source.attemptId);
+    if (new Set(linkedAttemptIds).size !== linkedAttemptIds.length) {
+      return "Prior HandoffV1 data was excluded because multiple records claim the same source attempt. Use the primary task and acceptance criteria, inspect the current worktree, and rely on current Zero-observed Git and check results.";
+    }
+    const handoff = stageHandoffs
+      .sort((left, right) => (attemptById.get(left.source.attemptId)?.sequence ?? -1) - (attemptById.get(right.source.attemptId)?.sequence ?? -1)
+        || left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .at(-1);
+    if (!handoff) return undefined;
+    const attempt = attemptById.get(handoff.source.attemptId);
+    const valid = sourceStage.taskId === taskId
+      && ["implement", "revise"].includes(sourceStage.role)
+      && ["succeeded", "failed", "interrupted"].includes(sourceStage.status)
+      && sourceStage.outputFingerprint === inputFingerprint
+      && handoff.taskId === taskId
+      && handoff.workspace.state !== "unknown"
+      && handoff.workspace.baseCommit === baseCommit
+      && handoff.workspace.fingerprint === inputFingerprint
+      && handoff.source.processStartId === sourceStage.processStartId
+      && handoff.source.harness === sourceStage.harness
+      && handoff.source.model === sourceStage.model
+      && Boolean(attempt && attempt.taskId === taskId && attempt.stageId === sourceStage.id
+        && ["succeeded", "failed", "interrupted"].includes(attempt.status)
+        && attempt.harness === handoff.source.harness && attempt.model === handoff.source.model);
+    if (!valid) {
+      return "A prior HandoffV1 was excluded because its source stage, attempt, or worktree fingerprint does not match the current input. Use the primary task and acceptance criteria, inspect the current worktree, and rely on current Zero-observed Git and check results.";
+    }
+    return renderHandoffContext(handoff);
   }
 
   #assertLease(taskId: string, owner: string, lost: () => boolean): void {

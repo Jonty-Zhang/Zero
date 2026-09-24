@@ -19,9 +19,6 @@ export interface ZCodeProtocolModel {
   reasoningLevel?: string;
 }
 
-const START_PLAN_PROVIDER_IDS = new Set(['account:zai-start-plan', 'account:bigmodel-start-plan']);
-const START_PLAN_MODEL_ID = 'GLM-5.3-Flash';
-
 export interface ZCodeProtocolSessionRequest {
   cwd: string;
   workspaceKey: string;
@@ -141,7 +138,7 @@ export async function runZCodeProtocolSession(
       : undefined;
     sessionId = nonEmptyString(snapshotSession?.sessionId);
     if (!sessionId) throw new Error('ZCode session/create returned no sessionId');
-    assertStartPlanModelAvailable(created, request.model);
+    assertRequestedModelAvailable(created, request.model);
 
     // A missing or malformed state view is a hard block: legacy events alone do
     // not expose all v4 pending interactions or AskUserQuestion auto-resolution.
@@ -290,6 +287,7 @@ function validateRequest(request: ZCodeProtocolSessionRequest): void {
   if (!request.cwd || !isAbsolutePath(request.cwd)) throw new Error('ZCode protocol cwd must be absolute');
   if (!request.workspaceKey.trim()) throw new Error('ZCode protocol workspaceKey is required');
   if (!request.model.providerId.trim() || !request.model.modelId.trim()) throw new Error('ZCode protocol model must include providerId and modelId');
+  if (request.model.reasoningLevel !== undefined && !request.model.reasoningLevel.trim()) throw new Error('ZCode protocol reasoningLevel must not be empty');
   if (!request.prompt.trim()) throw new Error('ZCode protocol prompt must not be empty');
   if (request.timeoutMs !== undefined && (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0)) throw new Error('ZCode protocol timeoutMs must be positive');
   if (request.pollIntervalMs !== undefined && (!Number.isFinite(request.pollIntervalMs) || request.pollIntervalMs < 0)) throw new Error('ZCode protocol pollIntervalMs must be non-negative');
@@ -307,10 +305,7 @@ function assertNoPendingInteractions(value: unknown): void {
   }
 }
 
-function assertStartPlanModelAvailable(snapshot: Record<string, unknown>, model: ZCodeProtocolModel): void {
-  if (!START_PLAN_PROVIDER_IDS.has(model.providerId) || model.modelId !== START_PLAN_MODEL_ID) {
-    throw new Error('ZCode model request is outside the allowed Start Plan GLM-5.3-Flash providers');
-  }
+function assertRequestedModelAvailable(snapshot: Record<string, unknown>, model: ZCodeProtocolModel): void {
   const settings = snapshot.settings && typeof snapshot.settings === 'object' && !Array.isArray(snapshot.settings)
     ? asRecord(snapshot.settings)
     : undefined;
@@ -326,27 +321,26 @@ function assertStartPlanModelAvailable(snapshot: Record<string, unknown>, model:
     const ref = option.ref && typeof option.ref === 'object' && !Array.isArray(option.ref)
       ? asRecord(option.ref)
       : undefined;
-    if (!ref || !START_PLAN_PROVIDER_IDS.has(String(ref.providerId)) || ref.modelId !== START_PLAN_MODEL_ID) return [];
-    return [{ option, providerId: String(ref.providerId) }];
+    // Provider and model identity comes only from the protocol reference tuple.
+    // Labels, display names, and other catalog metadata are not identity.
+    if (!ref || ref.providerId !== model.providerId || ref.modelId !== model.modelId) return [];
+    return [option];
   });
   if (candidates.length !== 1) {
-    throw new Error('ZCode Start Plan model catalog entry is missing, duplicated, or ambiguous');
+    throw new Error('ZCode requested provider/model catalog entry is missing, duplicated, or ambiguous');
   }
   const candidate = candidates[0]!;
-  if (candidate.providerId !== model.providerId) {
-    throw new Error('ZCode requested Start Plan provider does not match the unique available catalog entry');
+  if (candidate.disabledReason !== undefined) {
+    throw new Error('ZCode requested provider/model catalog entry is disabled');
   }
-  if (candidate.option.disabledReason !== undefined) {
-    throw new Error('ZCode Start Plan model catalog entry is disabled');
-  }
-  if (model.reasoningLevel) {
-    const reasoning = candidate.option.reasoning && typeof candidate.option.reasoning === 'object' && !Array.isArray(candidate.option.reasoning)
-      ? asRecord(candidate.option.reasoning)
+  if (model.reasoningLevel !== undefined) {
+    const reasoning = candidate.reasoning && typeof candidate.reasoning === 'object' && !Array.isArray(candidate.reasoning)
+      ? asRecord(candidate.reasoning)
       : undefined;
     if (!Array.isArray(reasoning?.levels) || !reasoning.levels.some(level =>
       level && typeof level === 'object' && !Array.isArray(level) && asRecord(level).value === model.reasoningLevel
     )) {
-      throw new Error('ZCode reasoning level is not listed for the selected Start Plan model');
+      throw new Error('ZCode reasoning level is not listed for the selected provider/model');
     }
   }
 }

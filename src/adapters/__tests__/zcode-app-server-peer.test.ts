@@ -4,10 +4,12 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ZCodeAppServerPeer } from '../zcode-app-server-peer.js';
+import type { ZCodeAppServerDiagnosticEvent } from '../zcode-app-server-peer.js';
 
 const SERVER_SOURCE = String.raw`
 import readline from 'node:readline';
 const rl = readline.createInterface({ input: process.stdin });
+process.stderr.write('prompt=CANARY_STDERR token=CANARY_TOKEN config=CANARY_CONFIG profile=C:/private/profile proxy=http://private-proxy.invalid');
 let mode = 'normal';
 let keepAlive;
 const seenMethods = [];
@@ -79,10 +81,18 @@ rl.on('line', raw => {
     write({ id: 'runtime-pref-request', method: 'session/requestRuntimePreferences', params: {
       sessionId: 'session-one', scope: 'runtime-materialization',
     } });
-    respond(id, { session: { sessionId: 'session-one' } });
+    respond(id, mode === 'session-bad' ? { session: {} } : { session: { sessionId: 'session-one' } });
     return;
   }
   if (method === 'workspace/updateInteractionPreferences') {
+    if (mode === 'pref-error') {
+      write({ id, error: { code: 777, message: 'prompt=CANARY_PROMPT token=CANARY_TOKEN config=CANARY_CONFIG profile=C:/private/profile proxy=http://private-proxy.invalid' } });
+      return;
+    }
+    if (mode === 'pref-malformed') {
+      respond(id, {});
+      return;
+    }
     respond(id, {
       workspace: params.workspace,
       askUserQuestionAutoResolutionEnabled: mode === 'pref-bad',
@@ -91,6 +101,10 @@ rl.on('line', raw => {
     return;
   }
   if (method === 'v4/conversation/subscribe') {
+    if (mode === 'subscribe-malformed') {
+      respond(id, { ack: null });
+      return;
+    }
     if (params.topic !== 'conversation/session-one' || !params.connectionId || params.clientMode !== 'desktop-continuous') {
       respond(id, { ack: {} });
       return;
@@ -179,7 +193,7 @@ rl.on('close', () => {
 });
 `;
 
-async function withFakeServer<T>(run: (peer: ZCodeAppServerPeer, dirs: { root: string; worktree: string; dataBaseDir: string }) => Promise<T>): Promise<T> {
+async function withFakeServer<T>(run: (peer: ZCodeAppServerPeer, dirs: { root: string; worktree: string; dataBaseDir: string }) => Promise<T>, onDiagnostic?: (event: ZCodeAppServerDiagnosticEvent) => void): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), 'zero-zcode-peer-'));
   const worktree = join(root, 'task-worktree');
   const dataBaseDir = join(root, 'isolated-zcode-data');
@@ -194,6 +208,7 @@ async function withFakeServer<T>(run: (peer: ZCodeAppServerPeer, dirs: { root: s
     dataBaseDir,
     requestTimeoutMs: 1_000,
     initialFrameTimeoutMs: 150,
+    onDiagnostic,
   });
   try {
     return await run(peer, { root, worktree, dataBaseDir });
@@ -295,6 +310,72 @@ test('session creation requires confirmed auto-resolution disablement before sen
     const { methods } = await debugRequest(peer, 'test/methods', {}) as { methods: string[] };
     assert.equal(methods.includes('session/create'), false);
   });
+});
+
+test('diagnostics expose bounded safe lifecycle enums and omit RPC text and user supplied data', async () => {
+  const events: ZCodeAppServerDiagnosticEvent[] = [];
+  await withFakeServer(async peer => {
+    await createSession(peer);
+    assert.deepEqual(await peer.readPendingInteractions('session-one'), []);
+  }, event => events.push(event));
+
+  assert.ok(events.some(event => event.stage === 'launch' && event.outcome === 'acknowledged'));
+  assert.ok(events.some(event => event.stage === 'preference_ack' && event.outcome === 'acknowledged'));
+  assert.ok(events.some(event => event.stage === 'session_create_rpc' && event.outcome === 'acknowledged'));
+  assert.ok(events.some(event => event.stage === 'subscribe_ack' && event.outcome === 'acknowledged'));
+  assert.ok(events.some(event => event.stage === 'child_exit' && event.outcome === 'exited'));
+  for (const event of events) {
+    assert.deepEqual(Object.keys(event).sort(), event.code === undefined
+      ? ['elapsedMs', 'outcome', 'stage']
+      : ['code', 'elapsedMs', 'outcome', 'stage']);
+    assert.equal(Number.isInteger(event.elapsedMs), true);
+    assert.ok(Number(event.elapsedMs) >= 0 && Number(event.elapsedMs) <= 86_400_000);
+  }
+
+  const failedEvents: ZCodeAppServerDiagnosticEvent[] = [];
+  await withFakeServer(async peer => {
+    await debugRequest(peer, 'test/set-mode', { mode: 'pref-error' });
+    await assert.rejects(createSession(peer));
+  }, event => failedEvents.push(event));
+  assert.ok(failedEvents.some(event => event.stage === 'preference_ack' && event.outcome === 'failed' && event.code === 'rpc_failed'));
+  const malformedPreferenceEvents: ZCodeAppServerDiagnosticEvent[] = [];
+  await withFakeServer(async peer => {
+    await debugRequest(peer, 'test/set-mode', { mode: 'pref-malformed' });
+    await assert.rejects(createSession(peer), /preference ACK was malformed/);
+  }, event => malformedPreferenceEvents.push(event));
+  assert.ok(malformedPreferenceEvents.some(event => event.stage === 'preference_ack' && event.outcome === 'failed' && event.code === 'ack_invalid'));
+
+  const invalidSubscriptionEvents: ZCodeAppServerDiagnosticEvent[] = [];
+  await withFakeServer(async peer => {
+    await createSession(peer);
+    await debugRequest(peer, 'test/set-mode', { mode: 'subscribe-malformed' });
+    await assert.rejects(peer.readPendingInteractions('session-one'), /invalid initial snapshot ACK/);
+  }, event => invalidSubscriptionEvents.push(event));
+  assert.ok(invalidSubscriptionEvents.some(event => event.stage === 'subscribe_ack' && event.outcome === 'failed' && event.code === 'ack_invalid'));
+
+  const invalidSessionEvents: ZCodeAppServerDiagnosticEvent[] = [];
+  await withFakeServer(async peer => {
+    await debugRequest(peer, 'test/set-mode', { mode: 'session-bad' });
+    const result = await peer.request('session/create', {
+      workspace: { workspacePath: 'C:/zero/task-worktree', workspaceIdentity: 'C:/zero/task-worktree', workspaceKey: 'task-one' },
+      persistence: 'deferred',
+    });
+    assert.deepEqual(result, { session: {} });
+  }, event => invalidSessionEvents.push(event));
+  assert.ok(invalidSessionEvents.some(event => event.stage === 'session_create_rpc' && event.outcome === 'failed' && event.code === 'response_invalid'));
+
+  const timeoutEvents: ZCodeAppServerDiagnosticEvent[] = [];
+  await withFakeServer(async peer => {
+    await debugRequest(peer, 'test/set-mode', { mode: 'silent' });
+    await createSession(peer);
+    await assert.rejects(peer.readPendingInteractions('session-one'), /conversation snapshot timed out/);
+  }, event => timeoutEvents.push(event));
+  assert.ok(timeoutEvents.some(event => event.stage === 'initial_frame_timeout' && event.outcome === 'timeout' && event.code === 'initial_frame_timeout'));
+
+  const diagnosticText = JSON.stringify([...events, ...failedEvents, ...malformedPreferenceEvents, ...invalidSubscriptionEvents, ...invalidSessionEvents, ...timeoutEvents]);
+  for (const canary of ['CANARY_PROMPT', 'CANARY_STDERR', 'CANARY_TOKEN', 'CANARY_CONFIG', 'C:/private/profile', 'private-proxy.invalid']) {
+    assert.equal(diagnosticText.includes(canary), false);
+  }
 });
 
 test('existing-desktop mode forwards only profile location and proxy variables without overriding the data root', async () => {

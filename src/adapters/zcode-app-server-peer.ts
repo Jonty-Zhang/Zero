@@ -13,6 +13,40 @@ const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const DEFAULT_INITIAL_FRAME_TIMEOUT_MS = 10_000;
 const V4_WIRE_PROTOCOL_VERSION = 3;
 
+export type ZCodeAppServerDiagnosticStage =
+  | 'launch'
+  | 'preference_ack'
+  | 'session_create_rpc'
+  | 'subscribe_ack'
+  | 'initial_frame_timeout'
+  | 'child_exit';
+
+export type ZCodeAppServerDiagnosticOutcome =
+  | 'started'
+  | 'acknowledged'
+  | 'failed'
+  | 'timeout'
+  | 'exited';
+
+export type ZCodeAppServerDiagnosticCode =
+  | 'launch_failed'
+  | 'rpc_failed'
+  | 'ack_invalid'
+  | 'response_invalid'
+  | 'initial_frame_timeout'
+  | 'child_exit_unexpected'
+  | 'child_exit_during_close';
+
+/** Deliberately contains no app-server, process, profile, or task supplied data. */
+export interface ZCodeAppServerDiagnosticEvent {
+  readonly stage: ZCodeAppServerDiagnosticStage;
+  readonly outcome: ZCodeAppServerDiagnosticOutcome;
+  readonly code?: ZCodeAppServerDiagnosticCode;
+  readonly elapsedMs: number;
+}
+
+export type ZCodeAppServerDiagnosticSink = (event: ZCodeAppServerDiagnosticEvent) => void;
+
 export interface ZCodeAppServerPeerOptions {
   /** Absolute JavaScript CLI entry, invoked by the current Node executable. */
   entry: string;
@@ -27,6 +61,8 @@ export interface ZCodeAppServerPeerOptions {
   requestTimeoutMs?: number;
   initialFrameTimeoutMs?: number;
   signal?: AbortSignal;
+  /** Receives fixed, privacy-safe lifecycle events. Sink exceptions are ignored. */
+  onDiagnostic?: ZCodeAppServerDiagnosticSink;
 }
 
 interface PendingRequest {
@@ -81,12 +117,15 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
   private readonly initialFrameTimeoutMs: number;
   private readonly connectionId = randomUUID();
   private readonly abortSignal?: AbortSignal;
+  private readonly diagnosticSink?: ZCodeAppServerDiagnosticSink;
+  private readonly launchedAt = Date.now();
 
   private constructor(options: ZCodeAppServerPeerOptions, child: ChildProcessWithoutNullStreams) {
     this.child = child;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
     this.initialFrameTimeoutMs = options.initialFrameTimeoutMs ?? DEFAULT_INITIAL_FRAME_TIMEOUT_MS;
     this.abortSignal = options.signal;
+    this.diagnosticSink = options.onDiagnostic;
     child.stdout.on('data', this.onStdout);
     child.stderr.on('data', this.onStderr);
     child.stdin.on('error', this.onInputError);
@@ -100,42 +139,47 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
   }
 
   static async launch(options: ZCodeAppServerPeerOptions): Promise<ZCodeAppServerPeer> {
-    validateOptions(options);
-    await access(options.entry);
-    const taskStat = await stat(options.taskWorktree);
-    if (!taskStat.isDirectory()) throw new Error('ZCode taskWorktree must be an existing directory');
-    if (options.profileMode === 'isolated') {
-      await mkdir(options.zeroDataRoot!, { recursive: true });
-      await mkdir(options.dataBaseDir!, { recursive: true });
-      const [realRoot, realDataDir, realWorktree] = await Promise.all([
-        realpath(options.zeroDataRoot!),
-        realpath(options.dataBaseDir!),
-        realpath(options.taskWorktree),
-      ]);
-      if (!isPathInside(realRoot, realDataDir)) {
-        throw new Error('ZCode dataBaseDir resolves outside the Zero-owned data root');
-      }
-      if (realWorktree === realDataDir || isPathInside(realWorktree, realDataDir) || isPathInside(realDataDir, realWorktree)) {
-        throw new Error('ZCode app data directory resolves inside the task worktree');
-      }
-    }
-
-    const child = spawn(process.execPath, [options.entry, 'app-server'], {
-      cwd: options.taskWorktree,
-      env: childEnvironment(options.profileMode, options.dataBaseDir),
-      shell: false,
-      windowsHide: true,
-      stdio: 'pipe',
-      detached: process.platform !== 'win32',
-    });
-    const peer = new ZCodeAppServerPeer(options, child);
+    const startedAt = Date.now();
+    emitDiagnostic(options.onDiagnostic, 'launch', 'started', undefined, 0);
+    let peer: ZCodeAppServerPeer | undefined;
     try {
+      validateOptions(options);
+      await access(options.entry);
+      const taskStat = await stat(options.taskWorktree);
+      if (!taskStat.isDirectory()) throw new Error('ZCode taskWorktree must be an existing directory');
+      if (options.profileMode === 'isolated') {
+        await mkdir(options.zeroDataRoot!, { recursive: true });
+        await mkdir(options.dataBaseDir!, { recursive: true });
+        const [realRoot, realDataDir, realWorktree] = await Promise.all([
+          realpath(options.zeroDataRoot!),
+          realpath(options.dataBaseDir!),
+          realpath(options.taskWorktree),
+        ]);
+        if (!isPathInside(realRoot, realDataDir)) {
+          throw new Error('ZCode dataBaseDir resolves outside the Zero-owned data root');
+        }
+        if (realWorktree === realDataDir || isPathInside(realWorktree, realDataDir) || isPathInside(realDataDir, realWorktree)) {
+          throw new Error('ZCode app data directory resolves inside the task worktree');
+        }
+      }
+
+      const child = spawn(process.execPath, [options.entry, 'app-server'], {
+        cwd: options.taskWorktree,
+        env: childEnvironment(options.profileMode, options.dataBaseDir),
+        shell: false,
+        windowsHide: true,
+        stdio: 'pipe',
+        detached: process.platform !== 'win32',
+      });
+      peer = new ZCodeAppServerPeer(options, child);
       await peer.waitForSpawn();
+      peer.emitDiagnostic('launch', 'acknowledged', undefined, elapsedMs(startedAt));
+      return peer;
     } catch (error) {
-      await peer.close();
+      emitDiagnostic(options.onDiagnostic, 'launch', 'failed', 'launch_failed', elapsedMs(startedAt));
+      if (peer) await peer.close();
       throw error;
     }
-    return peer;
   }
 
   async request(method: string, params: Record<string, unknown>): Promise<unknown> {
@@ -154,11 +198,27 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
         throw new Error('ZCode session/create requires a local workspace identity for interaction safety gating');
       }
       const expectedWorkspace = { workspacePath, workspaceIdentity, workspaceKey };
-      const preference = asRecord(await this.requestRaw('workspace/updateInteractionPreferences', {
-        workspace: expectedWorkspace,
-        preferences: { askUserQuestionAutoResolutionEnabled: false },
-      }));
-      const acknowledgedWorkspace = asRecord(preference.workspace);
+      const preferenceStartedAt = Date.now();
+      this.emitDiagnostic('preference_ack', 'started', undefined, 0);
+      let preferenceResult: unknown;
+      try {
+        preferenceResult = await this.requestRaw('workspace/updateInteractionPreferences', {
+          workspace: expectedWorkspace,
+          preferences: { askUserQuestionAutoResolutionEnabled: false },
+        });
+      } catch (error) {
+        this.emitDiagnostic('preference_ack', 'failed', 'rpc_failed', elapsedMs(preferenceStartedAt));
+        throw error;
+      }
+      let preference: Record<string, unknown>;
+      let acknowledgedWorkspace: Record<string, unknown>;
+      try {
+        preference = asRecord(preferenceResult);
+        acknowledgedWorkspace = asRecord(preference.workspace);
+      } catch {
+        this.emitDiagnostic('preference_ack', 'failed', 'ack_invalid', elapsedMs(preferenceStartedAt));
+        throw new Error('ZCode interaction preference ACK was malformed');
+      }
       if (
         Object.keys(preference).length !== 3 ||
         preference.askUserQuestionAutoResolutionEnabled !== false ||
@@ -170,11 +230,23 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
         !Number.isSafeInteger(preference.snoozedInteractionCount) ||
         Number(preference.snoozedInteractionCount) < 0
       ) {
+        this.emitDiagnostic('preference_ack', 'failed', 'ack_invalid', elapsedMs(preferenceStartedAt));
         throw new Error('ZCode interaction auto-resolution disablement was not confirmed; session creation refused');
       }
-      const created = await this.requestRaw(method, params);
+      this.emitDiagnostic('preference_ack', 'acknowledged', undefined, elapsedMs(preferenceStartedAt));
+      const sessionStartedAt = Date.now();
+      this.emitDiagnostic('session_create_rpc', 'started', undefined, 0);
+      let created: unknown;
+      try {
+        created = await this.requestRaw(method, params);
+      } catch (error) {
+        this.emitDiagnostic('session_create_rpc', 'failed', 'rpc_failed', elapsedMs(sessionStartedAt));
+        throw error;
+      }
       const session = isRecord(created) && isRecord(created.session) ? created.session : undefined;
       const sessionId = nonEmptyString(session?.sessionId);
+      if (!sessionId) this.emitDiagnostic('session_create_rpc', 'failed', 'response_invalid', elapsedMs(sessionStartedAt));
+      else this.emitDiagnostic('session_create_rpc', 'acknowledged', undefined, elapsedMs(sessionStartedAt));
       if (sessionId) this.interactionGatedSessions.add(sessionId);
       return created;
     }
@@ -244,7 +316,15 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
       state.subscribePromise = this.subscribe(state);
     }
     await state.subscribePromise;
-    await withTimeout(state.initialized.promise, this.initialFrameTimeoutMs, 'ZCode v4 conversation snapshot timed out');
+    const frameWaitStartedAt = Date.now();
+    try {
+      await withTimeout(state.initialized.promise, this.initialFrameTimeoutMs, 'ZCode v4 conversation snapshot timed out');
+    } catch (error) {
+      if (error instanceof InitialFrameTimeoutError) {
+        this.emitDiagnostic('initial_frame_timeout', 'timeout', 'initial_frame_timeout', elapsedMs(frameWaitStartedAt));
+      }
+      throw error;
+    }
     if (state.error) throw state.error;
     if (!Array.isArray(state.pendingInteractions)) {
       throw new Error('ZCode v4 conversation snapshot has no pendingInteractions state');
@@ -266,20 +346,38 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
   }
 
   private async subscribe(state: SubscriptionState): Promise<void> {
-    const result = asRecord(await this.request('v4/conversation/subscribe', {
-      topic: state.topic,
-      connectionId: this.connectionId,
-      clientMode: 'desktop-continuous',
-    }));
-    const ack = asRecord(result.ack);
+    const startedAt = Date.now();
+    this.emitDiagnostic('subscribe_ack', 'started', undefined, 0);
+    let response: unknown;
+    try {
+      response = await this.request('v4/conversation/subscribe', {
+        topic: state.topic,
+        connectionId: this.connectionId,
+        clientMode: 'desktop-continuous',
+      });
+    } catch (error) {
+      this.emitDiagnostic('subscribe_ack', 'failed', 'rpc_failed', elapsedMs(startedAt));
+      throw error;
+    }
+    let ack: Record<string, unknown>;
+    try {
+      const result = asRecord(response);
+      ack = asRecord(result.ack);
+    } catch {
+      this.emitDiagnostic('subscribe_ack', 'failed', 'ack_invalid', elapsedMs(startedAt));
+      throw new Error('ZCode v4 conversation subscribe returned an invalid initial snapshot ACK');
+    }
     const subscriptionId = nonEmptyString(ack.subscriptionId);
     const logEpoch = nonEmptyString(ack.logEpoch);
     if (!subscriptionId || ack.mode !== 'snapshot' || !logEpoch) {
+      this.emitDiagnostic('subscribe_ack', 'failed', 'ack_invalid', elapsedMs(startedAt));
       throw new Error('ZCode v4 conversation subscribe returned an invalid initial snapshot ACK');
     }
     if (state.observedSubscriptionId && state.observedSubscriptionId !== subscriptionId) {
+      this.emitDiagnostic('subscribe_ack', 'failed', 'ack_invalid', elapsedMs(startedAt));
       throw new Error('ZCode v4 conversation frame subscriptionId did not match its ACK');
     }
+    this.emitDiagnostic('subscribe_ack', 'acknowledged', undefined, elapsedMs(startedAt));
     state.subscriptionId = subscriptionId;
     state.logEpoch = logEpoch;
     for (const queued of state.preAckFrames) this.applyConversationWire(state, queued.wire);
@@ -327,6 +425,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
 
   private readonly onChildClose = (code: number | null): void => {
     this.childClosed = true;
+    this.emitDiagnostic('child_exit', 'exited', this.closing ? 'child_exit_during_close' : 'child_exit_unexpected', elapsedMs(this.launchedAt));
     if (!this.closing && !this.terminalError) {
       this.fail(new Error(`ZCode app-server exited unexpectedly (${code ?? 'no exit code'})`));
     }
@@ -565,6 +664,10 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     void terminateChildTree(this.child).catch(() => undefined);
   }
 
+  private emitDiagnostic(stage: ZCodeAppServerDiagnosticStage, outcome: ZCodeAppServerDiagnosticOutcome, code: ZCodeAppServerDiagnosticCode | undefined, elapsed: number): void {
+    emitDiagnostic(this.diagnosticSink, stage, outcome, code, elapsed);
+  }
+
   private async waitForSpawn(): Promise<void> {
     if (this.child.pid) return;
     await new Promise<void>((resolveSpawn, rejectSpawn) => {
@@ -758,12 +861,37 @@ function deferred<T>(): Deferred<T> {
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   return new Promise<T>((resolvePromise, rejectPromise) => {
-    const timer = setTimeout(() => rejectPromise(new Error(message)), timeoutMs);
+    const timer = setTimeout(() => rejectPromise(new InitialFrameTimeoutError(message)), timeoutMs);
     promise.then(
       value => { clearTimeout(timer); resolvePromise(value); },
       error => { clearTimeout(timer); rejectPromise(error); },
     );
   });
+}
+
+class InitialFrameTimeoutError extends Error {}
+
+function elapsedMs(startedAt: number): number {
+  return Math.min(24 * 60 * 60 * 1_000, Math.max(0, Math.floor(Date.now() - startedAt)));
+}
+
+function emitDiagnostic(
+  sink: ZCodeAppServerDiagnosticSink | undefined,
+  stage: ZCodeAppServerDiagnosticStage,
+  outcome: ZCodeAppServerDiagnosticOutcome,
+  code: ZCodeAppServerDiagnosticCode | undefined,
+  elapsed: number,
+): void {
+  if (typeof sink !== 'function') return;
+  const event: ZCodeAppServerDiagnosticEvent = {
+    stage,
+    outcome,
+    ...(code === undefined ? {} : { code }),
+    elapsedMs: Math.min(24 * 60 * 60 * 1_000, Math.max(0, Math.floor(elapsed))),
+  };
+  try { sink(event); } catch {
+    // Diagnostics are observational and cannot change protocol behavior.
+  }
 }
 
 function waitForDrain(stream: NodeJS.WritableStream): Promise<void> {

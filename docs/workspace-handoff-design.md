@@ -45,7 +45,7 @@ Agent Orchestrator 的 [#3317 设计记录](https://github.com/Untrivial-ai/agen
 
 ## 当前 Zero 与差距
 
-当前 [TaskWorker](../src/orchestrator/worker.ts)已经让路由、执行、测试和返工围绕一个 task worktree 运行；返工保持已有文件。worker 为单次实现或返工写入阶段、关联尝试、工作树指纹和版本化交接，报告也收录这些记录。审核前先暂存任务输出，固定 Git tree、完整二进制 diff 与工作树指纹；审核后、提交前、提交后及标记 DONE 前逐次核对，防止晚到的写入混进已审核结果。[Reviewer](../src/orchestrator/reviewer.ts)在独立可信目录启动，从暂存 Git blob 构造有界的源码只读快照，包含未改动的调用方和 manifest；项目中的 `AGENTS.md` 与 `.codex` 在快照里改名为资料，避免自动加载。阶段间传递的执行提示仍是原始任务、失败检查摘要或 Review finding；worker 尚未消费交接单来规划下一执行阶段，也没有一个任务内 GLM → DeepSeek 这样的多个成功执行阶段。普通进程崩溃后工作树需要人工检查；额度暂停才有校验工作树指纹的恢复路径。
+当前 [TaskWorker](../src/orchestrator/worker.ts)已经让路由、执行、测试和返工围绕一个 task worktree 运行；返工保持已有文件。worker 为单次实现或返工写入阶段、关联尝试、工作树指纹和版本化交接，报告也收录这些记录。后续返工或额度恢复会核对紧邻前一执行阶段的交接来源、进程代号和当前工作树指纹，再以有界的不可信资料送入提示；不匹配时排除交接，不代替原任务和 Zero 实测事实。审核前先暂存任务输出，固定 Git tree、完整二进制 diff 与工作树指纹；审核后、提交前、提交后及标记 DONE 前逐次核对，防止晚到的写入混进已审核结果。[Reviewer](../src/orchestrator/reviewer.ts)在独立可信目录启动，从暂存 Git blob 构造有界的源码只读快照，包含未改动的调用方和 manifest；项目中的 `AGENTS.md` 与 `.codex` 在快照里改名为资料，避免自动加载。当前还没有一个任务内 GLM → DeepSeek 这样的多个成功执行阶段。普通进程崩溃后工作树需要人工检查；额度暂停才有校验工作树指纹的恢复路径。
 
 因此，现有一次路由到一次执行再审核的流程是多阶段引擎的最小路径，不能把它称为完整跨 Harness 接力。
 
@@ -74,7 +74,7 @@ SQLite 是任务、阶段、尝试和交接的权威状态；Zero 数据目录�
 ## 实施顺序和验收
 
 1. **验证接入事实。** 官方 0.16.9 源码表明 `sendText` 可按 `providerId/modelId` 选择模型；Zero 必须同时传 `modelExecution.selectionScope: execution`，使本轮选择不写入会话默认模型。仍需在隔离任务工作区验证本机协议调用、思考等级和退出/取消行为。不得移动或改写用户现有 ZCode 配置。
-2. **接通阶段与交接数据。** 可迁移的 stage/attempt/handoff 表、版本化 schema，以及单次实现/返工的 worker 阶段与交接记录已建立；下一步让 worker 将交接单作为后继阶段输入，并把路由、审核纳入阶段记录，再支持 GLM → DeepSeek 等多个执行阶段。
+2. **接通阶段与交接数据。** 可迁移的 stage/attempt/handoff 表、版本化 schema，以及单次实现/返工的 worker 阶段与交接记录已建立；下一执行尝试现在可读取来源与工作树状态均匹配的交接。下一步把路由、审核纳入阶段记录，并支持 GLM → DeepSeek 等多个成功执行阶段。
 3. **实现串行接力。** 统一工作区版本采集、进程停止确认、阶段输入构造、降级交接和额度等待后恢复；用不同 Harness 的真实任务验证文件与上下文接续。
 4. **加强审核。** 有界 Git index 源码快照和提交一致性门禁已实现并由 FakeCodex/本地 Git 测试覆盖；仍需以真实 Codex CLI 验证读取和审核结果，并扩展完整测试证据的按需访问。
 5. **项目级集成。** 多任务项目增加项目分支、依赖门禁、已完成任务的集成与冲突处理；并行子任务独立 worktree，不能直接共享一个写入目录。

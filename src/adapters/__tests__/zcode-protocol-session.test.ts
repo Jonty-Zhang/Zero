@@ -11,10 +11,12 @@ interface FakeOptions {
   catalog?: Array<Record<string, unknown>>;
 }
 
-const startPlanCatalogEntry = (providerId = 'account:zai-start-plan', extra: Record<string, unknown> = {}) => ({
-  ref: { providerId, modelId: 'GLM-5.3-Flash' },
+const catalogEntry = (providerId: string, modelId: string, extra: Record<string, unknown> = {}) => ({
+  ref: { providerId, modelId },
   ...extra,
 });
+const startPlanCatalogEntry = (providerId = 'account:zai-start-plan', extra: Record<string, unknown> = {}) =>
+  catalogEntry(providerId, 'GLM-5.3-Flash', extra);
 
 function fakePeer(options: FakeOptions = {}) {
   const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
@@ -65,7 +67,7 @@ const request = (suffix: string, overrides: Partial<Parameters<typeof runZCodePr
   ...overrides,
 });
 
-test('hybrid bridge pins explicit Start Plan provider/model and waits for the matching successful turn', async () => {
+test('protocol bridge pins the requested provider/model and waits for the matching successful turn', async () => {
   const fake = fakePeer({ eventsByPoll: [
     [{ seq: 1, type: 'turn.started', turnId: 'turn-current', payload: {
       inputId: '$command-id', foregroundExecutionId: 'exec-current',
@@ -119,7 +121,7 @@ test('sendText rejects non-accepted acknowledgements without polling', async () 
   }
 });
 
-test('catalog uniquely binds either Start Plan provider and validates reasoning options', async () => {
+test('catalog uniquely binds the requested provider/model and validates reasoning options', async () => {
   const bigModel = request('bigmodel-plan', {
     model: { providerId: 'account:bigmodel-start-plan', modelId: 'GLM-5.3-Flash', reasoningLevel: 'high' },
   });
@@ -143,12 +145,13 @@ test('catalog uniquely binds either Start Plan provider and validates reasoning 
   });
 });
 
-test('catalog missing, disabled, ambiguous, mismatched, or incomplete reasoning fails closed before sendText', async () => {
+test('catalog missing, disabled, duplicated, mismatched, or incomplete reasoning fails closed before sendText', async () => {
   const invalidCatalogs: Array<Array<Record<string, unknown>>> = [
     [],
     [startPlanCatalogEntry('account:zai-start-plan', { disabledReason: 'unavailable' })],
     [startPlanCatalogEntry(), startPlanCatalogEntry()],
     [startPlanCatalogEntry('account:bigmodel-start-plan')],
+    [startPlanCatalogEntry('account:zai-start-plan', { label: 'first' }), startPlanCatalogEntry('account:zai-start-plan', { label: 'second' })],
     [startPlanCatalogEntry('account:zai-start-plan', { reasoning: { levels: [{ value: 'low' }] } })],
   ];
   for (let index = 0; index < invalidCatalogs.length; index += 1) {
@@ -157,10 +160,38 @@ test('catalog missing, disabled, ambiguous, mismatched, or incomplete reasoning 
     const model = askedForReasoning
       ? { providerId: 'account:zai-start-plan', modelId: 'GLM-5.3-Flash', reasoningLevel: 'high' }
       : request(`catalog-invalid-${index}`).model;
-    await assert.rejects(runZCodeProtocolSession(fake.peer, request(`catalog-invalid-${index}`, { model })), /Start Plan|catalog entry|reasoning level/);
+    await assert.rejects(runZCodeProtocolSession(fake.peer, request(`catalog-invalid-${index}`, { model })), /provider\/model|catalog entry|reasoning level/);
     assert.ok(!fake.calls.some(call => call.method === 'v4/command'));
     assert.equal(fake.isClosed(), true);
   }
+});
+
+test('catalog validation accepts other exact provider/model tuples without inferring identity from labels', async () => {
+  const model = { providerId: 'account:deepseek', modelId: 'DeepSeek-V3.2' };
+  const fake = fakePeer({ catalog: [catalogEntry(model.providerId, model.modelId, { label: 'GLM-5.3-Flash' })] });
+  const requestPeer = fake.peer.request.bind(fake.peer);
+  fake.peer.request = async (method, params) => {
+    if (method === 'session/events') {
+      const result = await requestPeer(method, params) as { events: Array<Record<string, unknown>> };
+      const inputId = fake.calls.find(call => call.params.type === 'sendText')?.params.commandId;
+      return { events: [{ seq: 1, type: 'turn.completed', payload: {
+        inputId, resultType: 'success', response: 'ok',
+      } }, ...result.events] };
+    }
+    return requestPeer(method, params);
+  };
+  await runZCodeProtocolSession(fake.peer, request('generic-model', { model }));
+  const send = fake.calls.find(call => call.params.type === 'sendText');
+  assert.deepEqual((send?.params.payload as Record<string, unknown>).modelSelection, model);
+
+  const misleadingLabel = fakePeer({ catalog: [catalogEntry('account:glm-provider', 'GLM-5.3-Flash', {
+    label: 'DeepSeek-V3.2',
+  })] });
+  await assert.rejects(
+    runZCodeProtocolSession(misleadingLabel.peer, request('label-is-not-identity', { model })),
+    /provider\/model catalog entry is missing/,
+  );
+  assert.ok(!misleadingLabel.calls.some(call => call.params.type === 'sendText'));
 });
 
 test('sendText never interprets delivery from an ACK for a different commandId', async () => {
