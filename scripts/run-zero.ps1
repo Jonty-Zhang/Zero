@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory = $true)][string]$LogDir,
     [string]$CodexExe,
     [string]$DshEntry,
+    [string]$ZcodeEntry,
     [string]$ProxyUrl,
     [ValidateRange(1, 65535)][int]$Port = 4179
 )
@@ -31,6 +32,15 @@ if ($DshEntry) {
     }
     if (-not (Test-Path -LiteralPath $resolvedDshEntry -PathType Leaf)) { throw 'Configured DSH JavaScript CLI entry was not found.' }
     $env:ZERO_DSH_ENTRY = $resolvedDshEntry
+}
+if ($ZcodeEntry) {
+    if (-not [System.IO.Path]::IsPathRooted($ZcodeEntry)) { throw 'ZcodeEntry must be an absolute JavaScript CLI entry path.' }
+    $resolvedZcodeEntry = [System.IO.Path]::GetFullPath($ZcodeEntry)
+    if ([System.IO.Path]::GetExtension($resolvedZcodeEntry).ToLowerInvariant() -notin @('.js', '.mjs', '.cjs')) {
+        throw 'ZcodeEntry must point to a .js, .mjs, or .cjs file.'
+    }
+    if (-not (Test-Path -LiteralPath $resolvedZcodeEntry -PathType Leaf)) { throw 'Configured ZCode JavaScript CLI entry was not found.' }
+    $env:ZERO_ZCODE_ENTRY = $resolvedZcodeEntry
 }
 if ($ProxyUrl) {
     $proxyUri = $null

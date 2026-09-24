@@ -43,6 +43,7 @@ node .\dist\cli.js help
   -NodePath 'C:\Program Files\nodejs\node.exe' `
   -CodexExe 'C:\Users\zero-runner\AppData\Local\Programs\Codex\codex.exe' `
   -DshEntry '<absolute path to the DSH JavaScript CLI entry>' `
+  -ZcodeEntry '<absolute path to the ZCode JavaScript CLI entry>' `
   -ProxyUrl 'http://proxy.example:8080' `
   -DataDir 'C:\Users\zero-runner\AppData\Local\Zero' `
   -LogDir 'C:\Users\zero-runner\AppData\Local\Zero\logs' `
@@ -58,6 +59,7 @@ node .\dist\cli.js help
 | Node.js | 已验证的 Node.js 24+ 绝对路径 |
 | Codex CLI | 可选；用 `-CodexExe` 指定绝对 `codex.exe` 路径，启动器会设置 `ZERO_CODEX_EXE` |
 | DSH CLI | 可选；用 `-DshEntry` 指定绝对 `.js`、`.mjs` 或 `.cjs` CLI 入口，启动器会设置 `ZERO_DSH_ENTRY`。该路径会作为任务动作参数保存在 Task Scheduler 中；不要把凭据或其他秘密放进路径或参数。未指定时保留任务进程环境中已有的 `ZERO_DSH_ENTRY`。 |
+| ZCode CLI | 可选；用 `-ZcodeEntry` 指定绝对 `.js`、`.mjs` 或 `.cjs` CLI 入口，启动器会设置 `ZERO_ZCODE_ENTRY`。该路径同样保存在 Task Scheduler 动作参数中，不应包含凭据。 |
 | 网络代理 | 可选；`-ProxyUrl` 设置为 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`，仅接受不含凭据、路径、查询或片段的 HTTP(S)/SOCKS5 authority URL |
 | `ZERO_DATA_DIR` | `%LOCALAPPDATA%\Zero`，可用 `-DataDir` 覆盖 |
 | 日志目录 | `%LOCALAPPDATA%\Zero\logs`，可用 `-LogDir` 覆盖 |

@@ -205,6 +205,24 @@ test('ZCode uses documented data root and a profile with an exact selected model
     assert.equal(invocation.env.ZCODE_DATA_BASE_DIR, dataBaseDir);
     assert.equal(invocation.env.APPDATA, undefined);
     assert.equal(invocation.requestedModel, 'glm-5');
+    const result = invocation.parseOutput(JSON.stringify({ type: 'result', sessionId: 'sess-42', response: 'ZERO_ZCODE_NONCE' }), '');
+    assert.equal(result.finalText, 'ZERO_ZCODE_NONCE');
+    assert.equal(result.sessionId, 'sess-42');
+    assert.equal(result.actualModel, undefined);
+  } finally { await rm(dataBaseDir, { recursive: true, force: true }); }
+});
+
+test('ZCode starts an absolute JavaScript entry through Node without a shell', async () => {
+  const dataBaseDir = await mkdtemp(join(tmpdir(), 'zero-zcode-config-'));
+  const cliConfigDir = join(dataBaseDir, '.zcode', 'cli');
+  await mkdir(cliConfigDir, { recursive: true });
+  await writeFile(join(cliConfigDir, 'config.json'), JSON.stringify({ model: { main: 'zai/glm-5' } }));
+  const entry = join(dataBaseDir, 'zcode.cjs');
+  try {
+    const invocation = await new ZCodeAdapter({ zcodeEntry: entry }).prepare(context(), { ...zcodeBinding, configDir: dataBaseDir });
+    assert.equal(invocation.executable, process.execPath);
+    assert.equal(invocation.args[0], entry);
+    assert.equal(invocation.args[1], '--prompt');
   } finally { await rm(dataBaseDir, { recursive: true, force: true }); }
 });
 

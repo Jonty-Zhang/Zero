@@ -1,5 +1,5 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { ModelBinding, ModelConfig, ReasoningEffort } from '../adapters/types.js';
 
@@ -8,7 +8,7 @@ export interface LocalZeroConfig {
   bindings: ModelBinding[];
   allocator: { modelId: string | null; reasoningEffort: ReasoningEffort | null };
   reviewer: { modelId: string | null; reasoningEffort: ReasoningEffort | null };
-  verifications: Record<string, { verifiedAt: string; cliVersion: string; requestedModel: string; exitCode: 0; level: 'selector_only' | 'event_confirmed'; actualModel?: string; profile?: string; reasoningEfforts: ReasoningEffort[]; effortEvidence?: Record<string, { verifiedAt: string; cliVersion: string; exitCode: 0 }> }>;
+  verifications: Record<string, { verifiedAt: string; cliVersion: string; requestedModel: string; exitCode: 0; level: 'selector_only' | 'event_confirmed'; actualModel?: string; profile?: string; configDir?: string; mode?: string; reasoningEfforts: ReasoningEffort[]; effortEvidence?: Record<string, { verifiedAt: string; cliVersion: string; exitCode: 0 }> }>;
   /** Environment variable name -> secret reference; never returned by HTTP APIs. */
   secretRefs?: Record<string, string>;
 }
@@ -84,6 +84,27 @@ export class ConfigStore {
     await this.persist(config);
   }
 
+  async markZCodeVerified(modelId: string, expectedModel: ModelConfig, configDir: string, mode: string, evidence: Omit<LocalZeroConfig['verifications'][string], 'reasoningEfforts' | 'configDir' | 'mode'>): Promise<void> {
+    if (!isAbsoluteConfigDir(configDir)) throw new Error('ZCode config directory must be an absolute path');
+    if (!isSupportedZCodeMode(mode)) throw new Error('ZCode mode must be build or yolo');
+    if (!evidence.cliVersion.trim() || evidence.cliVersion === 'unknown') throw new Error('ZCode CLI version is required to pin a verified binding');
+    const config = await this.read();
+    const matches = config.models.filter(item => item.id === modelId);
+    if (matches.length !== 1) throw new Error(`Expected exactly one local model ID: ${modelId}`);
+    const model = matches[0]!;
+    if (model.provider !== expectedModel.provider || model.modelId !== expectedModel.modelId) {
+      throw new Error(`Local model ${modelId} changed during ZCode verification; run verification again`);
+    }
+    const key = `zcode:${model.id}`;
+    const binding: ModelBinding = {
+      harness: 'zcode', model, selector: 'isolated_config', configDir, mode, verified: true,
+      verificationSource: 'smoke_test', verifiedCliVersion: evidence.cliVersion, reasoningEfforts: [],
+    };
+    config.bindings = [...config.bindings.filter(item => !(item.harness === 'zcode' && item.model.id === model.id)), binding];
+    config.verifications[key] = { ...evidence, configDir, mode, reasoningEfforts: [] };
+    await this.persist(config);
+  }
+
   async markReasoningEffortVerified(harness: 'codex', modelId: string, effort: ReasoningEffort, cliVersion: string): Promise<void> {
     const config = await this.read();
     const model = config.models.find(item => item.id === modelId || item.modelId === modelId);
@@ -125,3 +146,9 @@ export class ConfigStore {
 function isSafeDshProfile(profile: string): boolean {
   return profile.toLowerCase() !== 'desktop' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(profile);
 }
+
+function isAbsoluteConfigDir(path: string): boolean {
+  return isAbsolute(path);
+}
+
+function isSupportedZCodeMode(mode: string): boolean { return mode === 'build' || mode === 'yolo'; }

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { startZeroServer, runBindingVerification, runDshBindingVerification } from './server/main.js';
+import { startZeroServer, runBindingVerification, runDshBindingVerification, runZCodeBindingVerification } from './server/main.js';
 
 const args = process.argv.slice(2);
 const command = args.shift() ?? 'help';
@@ -16,7 +16,7 @@ async function main() {
   }
   if (command === 'verify-binding') {
     const harness = args.shift(); const model = args.shift();
-    if (!model) throw new Error('Usage: zero verify-binding codex <model-id> [--effort high] | dsh <model-id> --profile <safe-profile>');
+    if (!model) throw new Error('Usage: zero verify-binding codex <model-id> [--effort high] | dsh <model-id> --profile <safe-profile> | zcode <model-id> --config-dir <absolute-path> --mode <build|yolo>');
     if (harness === 'codex') {
       const effort = option(args, '--effort') ?? 'high';
       if (args.length) throw new Error('Usage: zero verify-binding codex <model-id> [--effort high]');
@@ -29,7 +29,14 @@ async function main() {
       await runDshBindingVerification(model, profile);
       return;
     }
-    throw new Error('Usage: zero verify-binding codex <model-id> [--effort high] | dsh <model-id> --profile <safe-profile>');
+    if (harness === 'zcode') {
+      const configDir = requiredOption(args, '--config-dir');
+      const mode = requiredOption(args, '--mode');
+      if (args.length) throw new Error('Usage: zero verify-binding zcode <model-id> --config-dir <absolute-path> --mode <build|yolo>');
+      await runZCodeBindingVerification(model, configDir, mode);
+      return;
+    }
+    throw new Error('Usage: zero verify-binding codex <model-id> [--effort high] | dsh <model-id> --profile <safe-profile> | zcode <model-id> --config-dir <absolute-path> --mode <build|yolo>');
   }
   if (command === 'submit') {
     const repoPath = requiredOption(args, '--repo');
@@ -86,7 +93,7 @@ async function request(path: string, init?: RequestInit) {
   return text ? JSON.parse(text) as unknown : undefined;
 }
 function printHelp() {
-  process.stdout.write(`Zero task node\n\nCommands:\n  zero serve [--host 127.0.0.1] [--port 4179]\n  zero verify-binding codex <model-id> [--effort high]\n  zero verify-binding dsh <model-id> --profile <safe-profile>\n  zero submit --repo <path> --prompt <text> [--base <ref>] [--acceptance <text>] [--check <command>] [--max-revisions 2] [--harness <id>] [--model <id>] [--effort <level>]\n  zero status [task-id]\n  zero cancel <task-id>\n\nVerify runs a minimal headless model call; Codex effort levels are registered only after passing that exact effort. DSH bindings are pinned to the installed CLI version and never enable reasoning efforts.\nHarness, model and effort are independent optional task overrides.\nSet ZERO_URL to use a non-default local server URL.\n`);
+  process.stdout.write(`Zero task node\n\nCommands:\n  zero serve [--host 127.0.0.1] [--port 4179]\n  zero verify-binding codex <model-id> [--effort high]\n  zero verify-binding dsh <model-id> --profile <safe-profile>\n  zero verify-binding zcode <model-id> --config-dir <absolute-path> --mode <build|yolo>\n  zero submit --repo <path> --prompt <text> [--base <ref>] [--acceptance <text>] [--check <command>] [--max-revisions 2] [--harness <id>] [--model <id>] [--effort <level>]\n  zero status [task-id]\n  zero cancel <task-id>\n\nVerify runs a minimal headless model call. Codex effort levels are registered only after passing that exact effort. DSH and ZCode bindings are pinned to the installed CLI version and never enable reasoning efforts. ZCode requires a preconfigured isolated data directory and explicit build or yolo mode.\nHarness, model and effort are independent optional task overrides.\nSet ZERO_URL to use a non-default local server URL.\n`);
 }
 
 void main().catch(error => { console.error(`zero: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; });
