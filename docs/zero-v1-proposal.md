@@ -2,9 +2,11 @@
 
 核查日期：2026-09-24。本文区分已由项目官方仓库核实的能力与 Zero 的设计判断。上游功能、CLI 参数及许可证应在实施时锁定具体版本再复核。
 
+**接入路径更新：**用户现有 ZCode 桌面配置位于 ZCode 自己的 v2 数据根，并已配置 GLM 和 DeepSeek。早期设计的 Zero 独立 `.zcode/cli/config.json` 绑定仅是可选隔离 CLI 路径，不能代表这台电脑正在使用的桌面模型配置。当前优先研究 ZCode `app-server` 的会话级模型选择；[共享工作区与跨 Harness 接力设计](workspace-handoff-design.md)记录新的实施边界。Zero 不移动或改写现有 ZCode 配置/凭据。
+
 ## 结论
 
-Zero v1 做成**一个独立安装的应用**：后台服务负责无人值守执行，同一服务提供本地 Web 界面，CLI 提供脚本入口。核心使用 Node.js 24 + TypeScript、SQLite、Git worktree 和三个直接调用官方无头 CLI 的 Harness Adapter（Codex、DSH、ZCode）；界面采用 React 并作为静态资源随服务打包。**不直接 fork 七个参考仓库。** 其中 Hydra 是最接近需求的流程参考，CAO 提供清晰的多 CLI Provider/会话抽象；CAO 可在后续作为可插拔运行时接入，但不担任 Zero 的任务状态源。
+Zero v1 做成**一个独立安装的应用**：后台服务负责无人值守执行，同一服务提供本地 Web 界面，CLI 提供脚本入口。核心使用 Node.js 24 + TypeScript、SQLite、Git worktree 和 Codex、DSH、ZCode Harness Adapter；界面采用 React 并作为静态资源随服务打包。**不直接 fork 参考仓库。** 其中 Hydra 是最接近需求的流程参考，CAO 提供清晰的多 CLI Provider/会话抽象，Agent Orchestrator 提供已落地的同任务切换实例；这些项目可继续作为运行时与交接设计参考，但不担任 Zero 的任务状态源。
 
 这个判断针对当前 Windows 节点和 Zero 的交付标准：每项任务必须经过可追溯的路由、独立工作区、机器测试、Codex 独立审核、有限返工和持久归档。Zero 自己维护状态机，避免把某个 Agent 的自然语言“已完成”当成 DONE。按用户最新决定，**Codex 固定担任分配器和 Reviewer**；用户可在 Zero 中手动指定执行 Harness、模型和思考强度，未指定的字段由 Codex 在可用候选中选择。
 
@@ -19,10 +21,10 @@ Zero v1 做成**一个独立安装的应用**：后台服务负责无人值守�
 | [codex-orchestrator](https://github.com/zm2231/codex-orchestrator) | HTTP/SSE、SQLite、workflow DAG、Implementer→Reviewer→QA→返工、worktree。 | 仓库根目录未见许可证文件，README 未声明。 | 借鉴返工状态与 QA 门禁；不直接复用代码。 |
 | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | Cordis 插件架构；已检查 `@deepseek-ai/dsh@0.1.5-rc.2` 的 Windows CLI：headless 接受一次 positional task，stdout 输出最终回答，reasoning 写入 stderr；该版本不提供 `--json`。`--dump-config` 可打印组合 profile 配置。 | [MIT](https://github.com/deepseek-ai/deepseek-harness/blob/master/LICENSE) | 作为候选 Harness 接入。当前只探测隔离 `DSH_HOME` 下的 headless CLI，不暴露模型或思考强度 binding，直到 Zero 能验证有效 profile 配置与目标模型一致。 |
 | [Codex + DSH Delegation](https://github.com/LomoMao/delegate-to-deepseek-harness) | Codex Skill 与 wrapper；任务 brief、指定 cwd、独立验证和工作区范围检查。见 [Skill](https://github.com/LomoMao/delegate-to-deepseek-harness/blob/master/SKILL.md)。 | [MIT](https://github.com/LomoMao/delegate-to-deepseek-harness/blob/master/LICENSE) | 借鉴执行契约与验证器；不是调度系统。 |
-| [ZCode（Z.ai 官方）](https://github.com/zai-org/ZCode) | Agent CLI 支持 headless prompt、cwd、执行模式和 NDJSON。见 [参数源码](https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/cli/src/arguments.ts)。模型由 provider registry/default selection 读取，当前 headless 参数中未核实到 `--model` 或思考强度参数；官方 README 指明 CLI 配置默认在 `~/.zcode/cli/config.json`，数据根变量为 `ZCODE_DATA_BASE_DIR`。已从官方源码在本机隔离构建 v0.16.9，实测版本、帮助及无提示的 `build + stream-json` 参数组合；未作模型调用。 | [Apache-2.0](https://github.com/zai-org/ZCode/blob/main/LICENSE)；[NOTICE](https://github.com/zai-org/ZCode/blob/main/NOTICE.md) 限定第一方范围。 | 只在 Zero 单独的数据根下的 `.zcode/cli/config.json` 精确选择绑定模型且逐版本冒烟通过时启用；CLI 无法执行每任务指定思考强度，因此当前 adapter 不接受任何思考强度绑定。 |
+| [ZCode（Z.ai 官方）](https://github.com/zai-org/ZCode) | Agent CLI 支持 headless prompt、cwd、执行模式和 NDJSON，见[参数源码](https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/cli/src/arguments.ts)。本机官方源码隔离构建的 v0.16.9 已通过版本/帮助探测，尚未作模型调用。进一步只读源码审查发现 `app-server --stdio` 的 `session/create` 接受 `model: {providerId, modelId}` 和 `thoughtLevel`；模型选择写入该会话状态，不调用全局默认模型配置写入器。用户现有桌面配置已登记 GLM 与 DeepSeek。 | [Apache-2.0](https://github.com/zai-org/ZCode/blob/main/LICENSE)；[NOTICE](https://github.com/zai-org/ZCode/blob/main/NOTICE.md) 限定第一方范围。 | 优先用会话协议接入现有桌面提供方，不改写其配置/凭据；真实调用、取消、状态隔离和思考等级仍需在任务 worktree 中验证。早期独立 CLI 配置绑定保留为可选隔离模式，不用于推断用户桌面配置。 |
 | [Super Plumber](https://github.com/LUKAWI/super-plumber) | TypeScript 的任务依赖图、状态、checkpoint、交接报告；提供 CLI、MCP 与 Web UI，YAML/Git 为图数据来源。 | [MIT](https://github.com/LUKAWI/super-plumber/blob/main/LICENSE) | 可作为未来的可选任务规划/可视化模块；不代替 Zero 的 SQLite 执行状态、Harness 路由或额度恢复。详见[单独评估](super-plumber-assessment.md)。 |
 
-**底座判断：**若必须从现有代码库直接 fork，Hydra 的需求覆盖最高且许可证清楚；但 Zero v1 需要更小、更可证明的状态与能力边界。CAO 即使已有 model override、workflow journal 和 worktree，当前机器仍需要额外 Linux/WSL/tmux 环境，且 Zero 仍要实现自己的交付状态机。故选独立核心，参考并在将来允许接入 CAO 运行时。这个结论是基于上述事实的架构推断，不是对项目质量的排名。
+**底座判断：**若必须从现有代码库直接 fork，Hydra 的需求覆盖较高且许可证清楚；但 Zero v1 需要更小、更可证明的状态与能力边界。CAO 即使已有 model override、workflow journal 和 worktree，当前机器仍需要额外 Linux/WSL/tmux 环境，且 Zero 仍要实现自己的交付状态机。Agent Orchestrator 在 Windows 可运行并已支持 Codex/Claude 同任务切换，但其现成切换范围不包含用户当前重点使用的 ZCode，且直接采用会引入更广的桌面、PR/CI 产品结构。故保留 Zero 独立核心，吸收两者已验证的工作区和交接机制；如果其 ZCode 能力或运行边界发生变化，再按真实适配成本复核。这个结论是架构判断，不是对项目质量的排名。
 
 ## Zero v1 边界与交付语义
 
@@ -84,7 +86,7 @@ normalize(raw_output) -> RunResult
 
 - Codex：采用官方 [OpenAI Docs 的 `codex exec` 无交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)，用 JSONL 事件及显式模型与 sandbox 配置；review 阶段只读。
 - DSH：已核实 `@deepseek-ai/dsh@0.1.5-rc.2` 的 Windows headless CLI 形式为 `dsh --profile <name> <task...>`；headless 模板帮助展示 task 为位置参数，未发现 stdin 输入契约，也不支持 `--json`。stdout 是最终文本，reasoning 输出到 stderr，因此 Adapter 不把 stdout 当作 JSONL。实测 `--dump-config` 中 `agent-default-model` 为 `provider: deepseek-official`、`model: deepseek-flash`。Zero 将 `DSH_HOME` 固定到自己的数据目录；probe 和执行前均比对命名 profile 的有效 provider/model 与已验证绑定，并按 CLI 版本固定。`zero verify-binding dsh <model-id> --profile <name>` 会在隔离目录进行最小真实调用，成功后才登记绑定。DSH 不会因 CLI 可运行就被 Router 选中；当前本机尚未通过 DSH 真实模型调用，也没有可路由的 DSH 绑定。Windows npm 安装的 `.cmd` 启动器不能直接用于无 shell 子进程；可用 `ZERO_DSH_ENTRY` 指向绝对 JavaScript 入口，由 Node 启动。
-- ZCode：采用官方 `--prompt` 和 `--output-format stream-json`。本机从官方源码构建的 v0.16.9 在帮助中列出 `--prompt`、`--cwd`、`--mode`；`--output-format` 未显示在帮助，但源码注册了 `stream-json`，无提示的参数组合调用成功。adapter 将绑定的独立数据根传给官方 `ZCODE_DATA_BASE_DIR`，要求其中 `.zcode/cli/config.json` 的 `model.main` 与绑定的 provider/model 完全一致；版本/帮助探测也使用 Zero 自己的数据根。当前 CLI 参数没有 per-call 模型或思考强度 selector，因此手动指定思考强度会被拒绝，绑定若声明思考强度也不会进入候选。`--mode` 是权限模式，不代表思考强度。仅允许已验证的 `build` 或 `yolo` 执行模式，仍由外层工作区隔离约束权限。
+- ZCode：当前已发布的 headless adapter 使用 Zero 独立数据根和 `.zcode/cli/config.json`，属于可选隔离模式，不能直接接入用户在 ZCode 桌面界面配置的 GLM/DeepSeek。面向这台电脑的新接入方向是官方 `app-server --stdio` 协议：创建独立任务会话时传入准确的 `providerId/modelId`，工作目录指向任务 worktree，并按该会话选择模型。只读源码核对表明选择会写会话局部状态，不修改全局模型默认配置；仍需真实协议测试确认。`thoughtLevel` 有协议字段，但每个模型支持哪些等级仍需验证，未经验证不得显示为已生效的思考强度。不得复制、移动、修改用户现有 ZCode 配置或凭据。
 
 ## Harness 与 Model 解耦
 
@@ -103,8 +105,8 @@ bindings:
   - {harness: codex, model: gpt_primary, selector: cli_argument}
   - {harness: dsh, model: deepseek_primary, selector: profile, profile: headless-deepseek}
   - {harness: dsh, model: glm_primary, selector: profile, profile: headless-glm}
-  - {harness: zcode, model: glm_primary, selector: isolated_config}
-  - {harness: zcode, model: deepseek_primary, selector: isolated_config}
+  - {harness: zcode, model: glm_primary, selector: session_protocol}
+  - {harness: zcode, model: deepseek_primary, selector: session_protocol}
 ```
 
 `models` 记录模型能力、上下文上限、成本/配额元数据（若已核实）；`bindings` 才代表 Harness **实际可调用** 某模型。每个 binding 需要 `probe` 证明 CLI 版本、认证、模型选择和最小调用通过。无法确认 profile 选择的模型时将其置为 `unavailable`；若 CLI 在成功调用中不报告实际模型，报告以 `selector_only` 标明证据范围。若 DSH/ZCode 的配置只能修改全局状态，则先做运行级隔离或串行化，不允许并发任务互相改写默认模型。DSH 和 ZCode 当前的 per-run reasoning effort 不可验证，因此不展示为可选能力。配置快照及有效模型写入报告。
@@ -149,4 +151,4 @@ Codex 做语义判断，Zero 做约束验证和状态推进。质量、速度与
 
 ## 可推翻本方案的观察
 
-最关键的是**模型选择能否按任务被强制执行**：如果 ZCode/DSH 的当前发行版不能在隔离配置中稳定运行指定模型，那么对应 binding 必须停用，不能通过修改全局默认值伪装成双层路由。若目标节点改为稳定 Linux/WSL 环境，且 CAO 的 DSH/ZCode Provider 实测能提供可靠完成事件、隔离工作树和输出，重新评估将 CAO 作为 Zero 的运行时后端。当前没有对这些付费模型执行实机任务，质量排序保持待测。
+最关键的是**模型选择能否按任务被强制执行**：如果 ZCode 会话协议或 DSH profile 无法在本机稳定运行指定模型，对应 binding 必须停用，不能通过修改用户桌面全局默认值伪装成双层路由。若目标节点改为稳定 Linux/WSL 环境，且 CAO 的 DSH/ZCode Provider 实测能提供可靠完成事件、隔离工作树和输出，重新评估将 CAO 作为 Zero 的运行时后端。当前没有对这些付费模型执行实机任务，质量排序保持待测。

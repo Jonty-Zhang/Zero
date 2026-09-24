@@ -39,6 +39,7 @@ The UI lets you specify any subset of execution Harness, model and reasoning eff
 ## Architecture and references
 
 - [Zero v1 architecture, upstream comparison and licenses](docs/zero-v1-proposal.md)
+- [Shared worktree and cross-Harness handoff design](docs/workspace-handoff-design.md)
 - [Routing and review contract](docs/route-review-contract.md)
 - [Windows unattended deployment](docs/windows-deployment.md)
 - [Super Plumber integration assessment](docs/super-plumber-assessment.md)
