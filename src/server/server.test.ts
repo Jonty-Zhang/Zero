@@ -92,7 +92,7 @@ async function createFixture(hasLiveVerification = true): Promise<Fixture> {
   await mkdir(repoPath, { recursive: true });
   await execFileAsync('git', ['init', '--initial-branch=main'], { cwd: repoPath, windowsHide: true });
   await execFileAsync('git', ['config', 'user.name', 'Zero API Test'], { cwd: repoPath, windowsHide: true });
-  await execFileAsync('git', ['config', 'user.email', 'zero-api-test@example.invalid'], { cwd: repoPath, windowsHide: true });
+  await execFileAsync('git', ['config', 'user.email', 'zero-api-test@example.com'], { cwd: repoPath, windowsHide: true });
   await writeFile(join(repoPath, 'README.md'), '# API test repository\n', 'utf8');
   await execFileAsync('git', ['add', 'README.md'], { cwd: repoPath, windowsHide: true });
   await execFileAsync('git', ['commit', '-m', 'initial'], { cwd: repoPath, windowsHide: true });

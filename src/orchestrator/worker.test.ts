@@ -40,7 +40,7 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -107,7 +107,7 @@ test("worker cannot mark DONE when checks fail and revision budget is exhausted"
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -142,7 +142,7 @@ test("worker refuses DONE when Harness creates only an empty commit", async () =
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -153,7 +153,7 @@ test("worker refuses DONE when Harness creates only an empty commit", async () =
       id: "fake",
       async probe() { return { harness: "fake", available: true, models: ["model"], roles: ["implement"] }; },
       async run(request: RunRequest) {
-        await exec("git", ["-c", "user.name=Harness", "-c", "user.email=harness@example.invalid", "commit", "--allow-empty", "-m", "empty"], { cwd: request.cwd });
+        await exec("git", ["-c", "user.name=Harness", "-c", "user.email=harness@example.com", "commit", "--allow-empty", "-m", "empty"], { cwd: request.cwd });
         return { status: "completed", exitCode: 0, requestedModel: request.model, actualModel: request.model, durationMs: 1 };
       },
     };
@@ -178,7 +178,7 @@ test("worker cancels a running validation process and cannot mark DONE", async (
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -220,7 +220,7 @@ test("worker rechecks changed paths after test commands and rejects test-created
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -254,7 +254,7 @@ test("worker refuses to reuse an existing worktree after lease recovery", async 
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -291,7 +291,7 @@ test("quota pause survives service restart and resumes partial work without cons
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -362,7 +362,7 @@ test("quota resume fails closed when the archived stage fingerprint differs from
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -404,7 +404,7 @@ test("oversized handoff falls back to the task record and stays within 64 KiB", 
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -452,7 +452,7 @@ test("Codex allocation and review quota pauses resume at their exact stages", as
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -507,7 +507,7 @@ test("failed validation stage is handed off before a linked revision stage start
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });

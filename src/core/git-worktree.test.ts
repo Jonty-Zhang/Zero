@@ -16,7 +16,7 @@ test("worktree is isolated, diff includes untracked files, and commit records ou
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -29,7 +29,7 @@ test("worktree is isolated, diff includes untracked files, and commit records ou
     assert.match(diff, /new\.txt/);
     assert.match(diff, /\+new data/);
     await exec("git", ["add", "-A"], { cwd: info.path });
-    await exec("git", ["-c", "user.name=Harness", "-c", "user.email=harness@example.invalid", "commit", "-m", "harness internal commit"], { cwd: info.path });
+    await exec("git", ["-c", "user.name=Harness", "-c", "user.email=harness@example.com", "commit", "-m", "harness internal commit"], { cwd: info.path });
     assert.deepEqual((await manager.changedPaths(info)).sort(), ["new.txt", "seed.txt"]);
     const commit = await manager.commit(info, "task result");
     assert.ok(commit);
@@ -46,13 +46,13 @@ test("commit refuses a harness-created empty commit when base-to-HEAD has no cha
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
     const manager = new GitWorktreeManager(join(root, "worktrees"));
     const info = await manager.create("empty_task", repo, "main");
-    await exec("git", ["-c", "user.name=Harness", "-c", "user.email=harness@example.invalid", "commit", "--allow-empty", "-m", "empty"], { cwd: info.path });
+    await exec("git", ["-c", "user.name=Harness", "-c", "user.email=harness@example.com", "commit", "--allow-empty", "-m", "empty"], { cwd: info.path });
     assert.equal((await manager.diff(info)).trim(), "");
     assert.deepEqual(await manager.changedPaths(info), []);
     assert.equal(await manager.commit(info, "Zero result"), undefined);
@@ -67,7 +67,7 @@ test("worktree fingerprint detects same-length untracked binary replacement that
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -94,7 +94,7 @@ test("worktree fingerprint includes index and HEAD identity and rejects oversize
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
@@ -109,7 +109,7 @@ test("worktree fingerprint includes index and HEAD identity and rejects oversize
     await exec("git", ["reset", "--hard", "HEAD"], { cwd: info.path });
     assert.equal(await manager.fingerprint(info), initial);
 
-    await exec("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "empty"], { cwd: info.path });
+    await exec("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "empty"], { cwd: info.path });
     assert.notEqual(await manager.fingerprint(info), initial);
     await assert.rejects(manager.fingerprint({ ...info, path: repo }), /escapes configured directory/);
 
@@ -127,7 +127,7 @@ test("worktree fingerprint fails closed for assume-unchanged and skip-worktree i
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
-    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
     await writeFile(join(repo, "seed.txt"), "base\n");
     await exec("git", ["add", "seed.txt"], { cwd: repo });
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
