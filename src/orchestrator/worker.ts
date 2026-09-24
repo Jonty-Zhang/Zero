@@ -14,6 +14,19 @@ import type {
 import { GitWorktreeManager, type WorktreeInfo } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
+import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
+
+type ResumeStage = "route" | "execute" | "review";
+interface WorkerCheckpoint {
+  version: 1;
+  stage: ResumeStage;
+  baseCommit: string;
+  worktreeFingerprint: string;
+  revision: number;
+  revisionBrief: string;
+  finalRoute?: RouteDecision;
+  finalChecks?: CheckResult[];
+}
 
 export interface RouteContext {
   attemptId: string;
@@ -103,6 +116,12 @@ export class TaskWorker {
     let resultCommit: string | undefined;
     let errorMessage: string | undefined;
     let markedDone = false;
+    let stage: ResumeStage = "route";
+    let revision = 0;
+    let revisionBrief = task.prompt;
+    let finalRoute: RouteDecision | undefined;
+    let finalChecks: CheckResult[] = [];
+    let continuingExecution = false;
     const interval = setInterval(() => {
       try {
         if (!this.#options.store.heartbeat(taskId, owner, this.#options.leaseMs)) {
@@ -120,64 +139,89 @@ export class TaskWorker {
 
     try {
       const priorAttempts = this.#options.store.attempts(taskId);
+      const checkpoint = parseCheckpoint(task.resumeCheckpoint);
       this.#assertNotCancelled(active);
       if (priorAttempts.some(attempt => attempt.status === "interrupted")) {
         throw new Error("An earlier attempt was interrupted; inspect its process, artifacts, and worktree before retrying");
       }
-      // A crash can happen after worktree creation but before the first attempt row is committed.
-      if (await this.#options.worktrees.exists(taskId)) {
-        throw new Error("An existing task worktree requires recovery inspection; refusing to create or reuse it automatically");
+      if (checkpoint) {
+        if (task.revisionCount !== checkpoint.revision) throw new Error("Quota checkpoint revision does not match the task record");
+        if (!await this.#options.worktrees.exists(taskId)) throw new Error("Quota checkpoint worktree is missing");
+        worktree = await this.#options.worktrees.reopen(taskId, task.repoPath, checkpoint.baseCommit);
+        const fingerprint = await this.#worktreeFingerprint(worktree);
+        if (fingerprint !== checkpoint.worktreeFingerprint) throw new Error("Quota checkpoint worktree changed while waiting; inspection is required");
+        baseCommit = checkpoint.baseCommit;
+        stage = checkpoint.stage;
+        revision = checkpoint.revision;
+        revisionBrief = checkpoint.revisionBrief;
+        finalRoute = checkpoint.finalRoute;
+        finalChecks = checkpoint.finalChecks ?? [];
+        continuingExecution = stage === "execute";
+        if (stage !== "route" && !finalRoute) throw new Error("Quota checkpoint has no execution route");
+        if (finalRoute) this.#validateRoute(task, finalRoute);
+        if (stage === "review" && (!finalChecks.length || finalChecks.some(check => check.status !== "passed"))) {
+          throw new Error("Quota checkpoint has no passing validation evidence for review");
+        }
+      } else {
+        // A crash can happen after worktree creation but before the first attempt row is committed.
+        if (await this.#options.worktrees.exists(taskId)) {
+          throw new Error("An existing task worktree requires recovery inspection; refusing to create or reuse it automatically");
+        }
+        worktree = await this.#options.worktrees.create(taskId, task.repoPath, task.baseRef);
+        baseCommit = worktree.baseCommit;
       }
-      worktree = await this.#options.worktrees.create(taskId, task.repoPath, task.baseRef);
-      baseCommit = worktree.baseCommit;
       this.#assertNotCancelled(active);
       this.#assertLease(taskId, owner, () => leaseLost);
 
       const requiredChecks = task.checks ?? [];
       if (!requiredChecks.length) throw new Error("No validation checks are configured; this task cannot be marked DONE");
       const maximumRevisions = Math.max(0, task.maxRevisions ?? 0);
-      let revision = 0;
-      let revisionBrief = task.prompt;
-      let finalRoute: RouteDecision | undefined;
-      let finalChecks: CheckResult[] = [];
       let finalReview: ReviewResult | undefined;
 
       while (true) {
         task = this.#requireTask(taskId);
         this.#assertLease(taskId, owner, () => leaseLost);
-        const routeAttempt = this.#options.store.createAttempt(taskId, "route", { owner, harness: "codex" });
-        activeAttempt = routeAttempt;
-        active.adapter = this.#options.adapters.get("codex");
-        active.attempt = routeAttempt;
-        this.#assertNotCancelled(active);
-        let route: RouteDecision;
-        try {
-          route = await this.#options.router.route(task, {
-            attemptId: routeAttempt.id,
-            cwd: worktree.path,
-            baseCommit,
-            checks: requiredChecks,
-            revision,
-            ...(finalRoute ? { previousDecision: finalRoute } : {}),
-          });
-          this.#validateRoute(task, route);
-          this.#options.store.saveRoute(route);
-        this.#options.store.finishAttempt(routeAttempt.id, {
-          status: "succeeded",
-          stdoutPath: route.artifacts?.stdoutPath,
-          stderrPath: route.artifacts?.stderrPath,
-          resultPath: route.artifacts?.eventsPath,
-          metadata: { decision: route },
-        });
-        } catch (error) {
-          this.#options.store.finishAttempt(routeAttempt.id, { status: "failed", error: errorText(error) });
-          throw error;
+        if (stage === "route") {
+          const routeAttempt = this.#options.store.createAttempt(taskId, "route", { owner, harness: "codex" });
+          activeAttempt = routeAttempt;
+          active.adapter = this.#options.adapters.get("codex");
+          active.attempt = routeAttempt;
+          this.#assertNotCancelled(active);
+          try {
+            const route = await this.#options.router.route(task, {
+              attemptId: routeAttempt.id,
+              cwd: worktree.path,
+              baseCommit,
+              checks: requiredChecks,
+              revision,
+              ...(finalRoute ? { previousDecision: finalRoute } : {}),
+            });
+            this.#validateRoute(task, route);
+            this.#options.store.saveRoute(route);
+            this.#options.store.finishAttempt(routeAttempt.id, {
+              status: "succeeded",
+              stdoutPath: route.artifacts?.stdoutPath,
+              stderrPath: route.artifacts?.stderrPath,
+              resultPath: route.artifacts?.eventsPath,
+              metadata: { decision: route },
+            });
+            finalRoute = route;
+            stage = "execute";
+          } catch (error) {
+            this.#options.store.finishAttempt(routeAttempt.id, { status: "failed", error: errorText(error) });
+            activeAttempt = undefined;
+            active.adapter = undefined;
+            active.attempt = undefined;
+            throw error;
+          }
+          activeAttempt = undefined;
+          active.adapter = undefined;
+          active.attempt = undefined;
+          this.#assertNotCancelled(active);
         }
-        activeAttempt = undefined;
-        active.adapter = undefined;
-        active.attempt = undefined;
-        this.#assertNotCancelled(active);
-        finalRoute = route;
+        const route = finalRoute;
+        if (!route) throw new Error("Execution route is missing");
+        if (stage === "execute") {
         const adapter = this.#options.adapters.get(route.harness);
         if (!adapter) throw new Error(`No HarnessAdapter is registered for ${route.harness}`);
         const role = revision === 0 ? "implement" : "revise";
@@ -195,7 +239,9 @@ export class TaskWorker {
           attemptId: attempt.id,
           role,
           cwd: worktree.path,
-          prompt: revisionBrief,
+          prompt: continuingExecution
+            ? `${revisionBrief}\n\nZero paused this attempt after a verified provider usage limit. Continue in this same worktree. Inspect the existing changes first, preserve correct work, and complete the task.`
+            : revisionBrief,
           harness: route.harness,
           model: route.model,
           reasoningEffort: route.effectiveReasoningEffort ?? route.reasoningEffort,
@@ -218,8 +264,10 @@ export class TaskWorker {
         active.attempt = undefined;
         this.#assertNotCancelled(active);
         if (runResult.status !== "completed" || runResult.exitCode !== 0) {
+          if (runResult.quota) throw new QuotaLimitError(`Execution Harness reached a usage limit (${route.harness}/${route.model})`, runResult.quota.retryAt);
           throw new Error(`Execution Harness failed (${runResult.status}, exit ${String(runResult.exitCode)}): ${runResult.error ?? "no additional details"}`);
         }
+        continuingExecution = false;
         this.#assertLease(taskId, owner, () => leaseLost);
 
         const changedPaths = await this.#options.worktrees.changedPaths(worktree);
@@ -237,10 +285,15 @@ export class TaskWorker {
           revision++;
           revisionBrief = brief;
           task = this.#options.store.transition(taskId, "revision", "running", { owner, reason: "starting validation revision" });
+          stage = "route";
           continue;
         }
 
         task = this.#options.store.transition(taskId, "running", "reviewing", { owner, reason: "validation checks passed" });
+        stage = "review";
+        }
+        if (stage !== "review") throw new Error("Worker has no resumable stage");
+        if (task.status === "running") task = this.#options.store.transition(taskId, "running", "reviewing", { owner, reason: "resuming quota-paused review" });
         this.#assertNotCancelled(active);
         const diffBefore = await this.#options.worktrees.diff(worktree);
         const statusBefore = await this.#options.worktrees.status(worktree);
@@ -249,7 +302,7 @@ export class TaskWorker {
         active.adapter = this.#options.adapters.get("codex");
         active.attempt = reviewAttempt;
         this.#assertNotCancelled(active);
-        const review = await this.#options.reviewer.review(task, worktree, route, checks, diffBefore, { attemptId: reviewAttempt.id });
+        const review = await this.#options.reviewer.review(task, worktree, route, finalChecks, diffBefore, { attemptId: reviewAttempt.id });
         const diffAfter = await this.#options.worktrees.diff(worktree);
         const statusAfter = await this.#options.worktrees.status(worktree);
         if (statusAfter !== statusBefore || hash(diffAfter) !== hash(diffBefore)) {
@@ -283,6 +336,7 @@ export class TaskWorker {
           revision++;
           revisionBrief = brief;
           task = this.#options.store.transition(taskId, "revision", "running", { owner, reason: "starting review revision" });
+          stage = "route";
           continue;
         }
 
@@ -309,6 +363,31 @@ export class TaskWorker {
       errorMessage = cancelled ? "Cancelled by user" : errorText(error);
       if (activeAttempt) {
         try { this.#options.store.finishAttempt(activeAttempt.id, { status: leaseLost ? "interrupted" : "failed", error: errorMessage }); } catch { /* best effort */ }
+      }
+      if (error instanceof QuotaLimitError && !cancelled && !leaseLost && worktree && baseCommit) {
+        try {
+          this.#assertLease(taskId, owner, () => leaseLost);
+          this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+          const checkpoint: WorkerCheckpoint = {
+            version: 1,
+            stage,
+            baseCommit,
+            worktreeFingerprint: await this.#worktreeFingerprint(worktree),
+            revision,
+            revisionBrief,
+            ...(finalRoute ? { finalRoute } : {}),
+            ...(stage === "review" ? { finalChecks } : {}),
+          };
+          const retryAt = quotaRetryAt(task.quotaRetryCount ?? 0, { source: error.retryAt ? "provider_message" : "fallback", retryAt: error.retryAt });
+          task = this.#options.store.pauseForQuota(taskId, owner, { retryAt, checkpoint: { ...checkpoint }, reason: errorMessage,
+            source: error.retryAt ? "provider_message" : "fallback" });
+          try {
+            await this.#writeReport(taskId, "waiting", { task, baseCommit, error: errorMessage, diff: await this.#options.worktrees.diff(worktree) });
+          } catch { /* SQLite retains the waiting state and checkpoint. */ }
+          return task;
+        } catch (pauseError) {
+          errorMessage = `Unable to preserve quota checkpoint: ${errorText(pauseError)}`;
+        }
       }
       if (!leaseLost) {
         const current = this.#options.store.get(taskId);
@@ -383,6 +462,10 @@ export class TaskWorker {
 
   #artifactDirectory(taskId: string): string { return resolve(this.#options.artifactRoot, taskId); }
 
+  async #worktreeFingerprint(worktree: WorktreeInfo): Promise<string> {
+    return hash(`${await this.#options.worktrees.status(worktree)}\0${await this.#options.worktrees.diff(worktree)}`);
+  }
+
   async #writeReport(taskId: string, finalStatus: TaskReport["finalStatus"], values: {
     task: TaskRecord; baseCommit?: string; resultCommit?: string; error?: string; diff?: string;
   }): Promise<void> {
@@ -440,6 +523,20 @@ export class TaskWorker {
 
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+
+function parseCheckpoint(raw: Record<string, unknown> | undefined): WorkerCheckpoint | undefined {
+  if (!raw) return undefined;
+  if (raw.version !== 1 || !["route", "execute", "review"].includes(String(raw.stage))
+    || typeof raw.baseCommit !== "string" || !/^[a-fA-F0-9]{40,64}$/.test(raw.baseCommit)
+    || typeof raw.worktreeFingerprint !== "string" || !/^[a-fA-F0-9]{64}$/.test(raw.worktreeFingerprint)
+    || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0
+    || typeof raw.revisionBrief !== "string" || !raw.revisionBrief.trim()) {
+    throw new Error("Invalid quota resume checkpoint");
+  }
+  if (raw.finalRoute !== undefined && (!raw.finalRoute || typeof raw.finalRoute !== "object")) throw new Error("Invalid checkpoint route");
+  if (raw.finalChecks !== undefined && !Array.isArray(raw.finalChecks)) throw new Error("Invalid checkpoint checks");
+  return raw as unknown as WorkerCheckpoint;
+}
 
 function isReviewResult(value: ReviewResult): boolean {
   if (!value || !["pass", "changes_requested", "blocked"].includes(value.verdict)

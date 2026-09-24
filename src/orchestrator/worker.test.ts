@@ -8,6 +8,7 @@ import type { HarnessAdapter, HarnessCapabilities, RouteDecision, RunRequest, Ru
 import { GitWorktreeManager } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
+import { QuotaLimitError } from "../core/quota.js";
 import { TaskWorker, type TaskReviewer, type TaskRouter } from "./worker.js";
 
 const exec = promisify(execFile);
@@ -262,4 +263,118 @@ test("worker refuses to reuse an existing worktree after lease recovery", async 
     store.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("quota pause survives service restart and resumes partial work without consuming a revision", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-quota-test-"));
+  const repo = join(root, "repo");
+  const db = join(root, "tasks.sqlite");
+  await mkdir(repo);
+  let store = new TaskStore(db);
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Complete result.txt", maxRevisions: 0,
+      checks: [{ id: "result", argv: [process.execPath, "-e", "process.exit(require('fs').readFileSync('result.txt','utf8') === 'approved\\n' ? 0 : 1)"] }] });
+    let routes = 0;
+    let executions = 0;
+    const router: TaskRouter = { async route(current) { routes++; return routeFor(current); } };
+    const adapter: HarnessAdapter = {
+      id: "fake",
+      async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+      async run(request) {
+        executions++;
+        if (executions === 1) {
+          await writeFile(join(request.cwd, "result.txt"), "partial\n");
+          return { status: "failed", exitCode: 1, durationMs: 1, quota: { source: "provider_message", retryAt: new Date(Date.now() + 60_000).toISOString() } };
+        }
+        assert.match(request.prompt, /Continue in this same worktree/);
+        assert.equal(await (await import("node:fs/promises")).readFile(join(request.cwd, "result.txt"), "utf8"), "partial\n");
+        await writeFile(join(request.cwd, "result.txt"), "approved\n");
+        return { status: "completed", exitCode: 0, durationMs: 1 };
+      },
+    };
+    const reviewer: TaskReviewer = { async review() { return { harness: "codex", model: "review", exitCode: 0,
+      result: { verdict: "pass", summary: "approved", findings: [] } }; } };
+    const createWorker = () => new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")),
+      testRunner: new TestRunner(), router, reviewer, adapters: new Map([["fake", adapter]]), artifactRoot: join(root, "artifacts") });
+    const firstOwner = "quota-worker-1";
+    assert.equal(store.claimNext(firstOwner)?.id, task.id);
+    const waiting = await createWorker().runClaimed(task.id, firstOwner);
+    assert.equal(waiting.status, "waiting");
+    assert.equal(waiting.revisionCount, 0);
+    assert.equal(waiting.resumeStage, "execute");
+    assert.ok(waiting.retryAt);
+    assert.equal(store.claimNext("early"), undefined);
+    store.close();
+    store = new TaskStore(db);
+    const secondOwner = "quota-worker-2";
+    assert.equal(store.claimNext(secondOwner, 60_000, new Date(Date.parse(waiting.retryAt!) + 1000))?.id, task.id);
+    const done = await createWorker().runClaimed(task.id, secondOwner);
+    assert.equal(done.status, "done");
+    assert.equal(done.revisionCount, 0);
+    assert.equal(routes, 1);
+    assert.equal(executions, 2);
+    assert.equal((await createWorker().readReport(task.id))?.finalStatus, "done");
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex allocation and review quota pauses resume at their exact stages", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-quota-stage-test-"));
+  const repo = join(root, "repo");
+  const db = join(root, "tasks.sqlite");
+  await mkdir(repo);
+  let store = new TaskStore(db);
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Write result", maxRevisions: 0,
+      checks: [{ id: "result", argv: [process.execPath, "-e", "process.exit(require('fs').readFileSync('result.txt','utf8').includes('approved') ? 0 : 1)"] }] });
+    let routeCalls = 0;
+    let runCalls = 0;
+    let reviewCalls = 0;
+    const retry = () => new Date(Date.now() + 60_000).toISOString();
+    const router: TaskRouter = { async route(current) {
+      routeCalls++;
+      if (routeCalls === 1) throw new QuotaLimitError("Codex allocation usage limit", retry());
+      return routeFor(current);
+    } };
+    const adapter: HarnessAdapter = { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+      async run(request) { runCalls++; await writeFile(join(request.cwd, "result.txt"), "approved\n");
+        return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+    const reviewer: TaskReviewer = { async review() { reviewCalls++;
+      if (reviewCalls === 1) throw new QuotaLimitError("Codex review usage limit", retry());
+      return { harness: "codex", model: "review", exitCode: 0, result: { verdict: "pass", summary: "pass", findings: [] } };
+    } };
+    const worker = () => new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")),
+      testRunner: new TestRunner(), router, reviewer, adapters: new Map([["fake", adapter]]), artifactRoot: join(root, "artifacts") });
+    for (let cycle = 0; cycle < 3; cycle++) {
+      const current = store.get(task.id)!;
+      const now = current.retryAt ? new Date(Date.parse(current.retryAt) + 1000) : new Date();
+      const owner = `quota-stage-${cycle}`;
+      assert.equal(store.claimNext(owner, 60_000, now)?.id, task.id);
+      const result = await worker().runClaimed(task.id, owner);
+      if (cycle < 2) {
+        assert.equal(result.status, "waiting");
+        assert.equal(result.resumeStage, cycle === 0 ? "route" : "review");
+        assert.equal(result.revisionCount, 0);
+        store.close();
+        store = new TaskStore(db);
+      } else assert.equal(result.status, "done");
+    }
+    assert.equal(routeCalls, 2);
+    assert.equal(runCalls, 1);
+    assert.equal(reviewCalls, 2);
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
 });

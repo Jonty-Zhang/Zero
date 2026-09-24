@@ -5,6 +5,7 @@ export type TaskStatus =
   | "running"
   | "reviewing"
   | "revision"
+  | "waiting"
   | "done"
   | "failed";
 
@@ -69,6 +70,10 @@ export interface TaskRecord extends TaskSubmission {
   failureReason?: string;
   route?: RouteDecision;
   activeAttemptId?: string;
+  retryAt?: string;
+  resumeStage?: "route" | "implementation" | "review";
+  resumeCheckpoint?: Record<string, unknown>;
+  quotaRetryCount?: number;
 }
 
 export type AttemptRole = "implement" | "revise" | "review" | "route";
@@ -125,6 +130,7 @@ export interface RunResult {
   sessionId?: string;
   error?: string;
   metadata?: Record<string, unknown>;
+  quota?: { retryAt?: string; source: "provider_message" | "retry_after" | "fallback" };
 }
 
 export interface HarnessCapabilities {

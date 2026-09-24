@@ -17,6 +17,7 @@ type TaskRow = {
   payload: string; revision_count: number; lease_owner: string | null;
   lease_expires_at: string | null; heartbeat_at: string | null;
   failure_reason: string | null; active_attempt_id: string | null;
+  retry_at?: string | null;
 };
 
 const encode = (v: unknown): Json => v === undefined ? null : JSON.stringify(v);
@@ -61,6 +62,11 @@ export class TaskStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
         attempt_id TEXT, at TEXT NOT NULL, result TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS quota_pauses (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id), retry_at TEXT NOT NULL,
+        retry_count INTEGER NOT NULL DEFAULT 0, checkpoint TEXT NOT NULL, reason TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'fallback'
+      );
     `);
   }
 
@@ -101,10 +107,11 @@ export class TaskStore {
     const expires = new Date(now.getTime() + leaseMs).toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.#db.prepare("SELECT id FROM tasks WHERE status='pending' ORDER BY created_at, id LIMIT 1").get() as { id: string } | undefined;
+      const row = this.#db.prepare(`SELECT id FROM tasks WHERE status='pending' OR (status='waiting' AND id IN
+        (SELECT task_id FROM quota_pauses WHERE retry_at<=?)) ORDER BY created_at, id LIMIT 1`).get(at) as { id: string } | undefined;
       if (!row) { this.#db.exec("COMMIT"); return undefined; }
       const result = this.#db.prepare(`UPDATE tasks SET status='running', updated_at=?, lease_owner=?, lease_expires_at=?, heartbeat_at=?
-        WHERE id=? AND status='pending'`).run(at, owner, expires, at, row.id);
+        WHERE id=? AND status IN ('pending','waiting')`).run(at, owner, expires, at, row.id);
       if (Number(result.changes) !== 1) { this.#db.exec("ROLLBACK"); return undefined; }
       this.#event(row.id, "task.claimed", { owner, leaseExpiresAt: expires }, at);
       this.#db.exec("COMMIT");
@@ -119,6 +126,7 @@ export class TaskStore {
     if (!expectedList.length) throw new Error("expected state is required");
     const allowed: Record<TaskStatus, TaskStatus[]> = {
       pending: ["running", "failed"],
+      waiting: ["running", "failed"],
       running: ["reviewing", "revision", "failed"],
       reviewing: ["done", "revision", "failed"],
       revision: ["running", "failed"],
@@ -137,6 +145,7 @@ export class TaskStore {
       const changed = this.#db.prepare(sql).run(...args);
       if (Number(changed.changes) !== 1) throw new Error(`Task ${id} state transition rejected (expected ${expectedList.join("|")})`);
       if (next === "failed" && options.reason) this.#db.prepare("UPDATE tasks SET failure_reason=? WHERE id=?").run(options.reason, id);
+      if (next === "done" || next === "failed") this.#db.prepare("DELETE FROM quota_pauses WHERE task_id=?").run(id);
       this.#event(id, "task.transition", { from: expectedList, to: next, reason: options.reason }, at);
     });
     const task = this.get(id);
@@ -147,6 +156,35 @@ export class TaskStore {
   fail(id: string, expected: TaskStatus | TaskStatus[], reason: string, owner?: string): TaskRecord {
     const task = this.transition(id, expected, "failed", { owner, clearLease: true, reason });
     return { ...task, failureReason: reason };
+  }
+
+  /** Persist a known provider-quota pause and release its lease. The checkpoint is the worker's explicit resume boundary. */
+  pauseForQuota(taskId: string, owner: string, input: { retryAt: string; reason: string; checkpoint: Record<string, unknown>; source?: "provider_message" | "retry_after" | "fallback" }): TaskRecord {
+    const retryAt = new Date(input.retryAt);
+    if (!Number.isFinite(retryAt.getTime()) || retryAt.getTime() <= Date.now()) throw new Error("Quota retryAt must be a future timestamp");
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const row = this.#db.prepare("SELECT status,lease_owner FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; lease_owner: string | null } | undefined;
+      if (!row || row.lease_owner !== owner || !["running", "reviewing", "revision"].includes(row.status)) throw new Error(`Task ${taskId} is not actively leased by ${owner}`);
+      const previous = this.#db.prepare("SELECT retry_count FROM quota_pauses WHERE task_id=?").get(taskId) as { retry_count: number } | undefined;
+      const count = (previous?.retry_count ?? 0) + 1;
+      this.#db.prepare(`INSERT INTO quota_pauses(task_id,retry_at,retry_count,checkpoint,reason,source) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(task_id) DO UPDATE SET retry_at=excluded.retry_at,retry_count=excluded.retry_count,checkpoint=excluded.checkpoint,reason=excluded.reason,source=excluded.source`)
+        .run(taskId, retryAt.toISOString(), count, JSON.stringify(input.checkpoint), input.reason, input.source ?? "fallback");
+      this.#db.prepare(`UPDATE tasks SET status='waiting',updated_at=?,failure_reason=?,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,active_attempt_id=NULL WHERE id=?`).run(at, input.reason, taskId);
+      this.#event(taskId, "task.quota_waiting", { retryAt: retryAt.toISOString(), retryCount: count, checkpoint: input.checkpoint, source: input.source ?? "fallback", reason: input.reason }, at);
+    });
+    return this.get(taskId)!;
+  }
+
+  quotaCheckpoint(taskId: string): Record<string, unknown> | undefined {
+    const row = this.#db.prepare("SELECT checkpoint FROM quota_pauses WHERE task_id=?").get(taskId) as { checkpoint: string } | undefined;
+    return row ? JSON.parse(row.checkpoint) as Record<string, unknown> : undefined;
+  }
+
+  quotaRetryCount(taskId: string): number {
+    const row = this.#db.prepare("SELECT retry_count FROM quota_pauses WHERE task_id=?").get(taskId) as { retry_count: number } | undefined;
+    return row?.retry_count ?? 0;
   }
 
   heartbeat(id: string, owner: string, leaseMs = 60_000, now = new Date()): boolean {
@@ -267,10 +305,13 @@ export class TaskStore {
   }
 
   #task(row: TaskRow): TaskRecord {
+    const quota = this.#db.prepare("SELECT retry_at,checkpoint,retry_count FROM quota_pauses WHERE task_id=?").get(row.id) as { retry_at: string; checkpoint: string; retry_count: number } | undefined;
     return { ...(JSON.parse(row.payload) as TaskSubmission), id: row.id, status: row.status, createdAt: row.created_at,
       updatedAt: row.updated_at, revisionCount: row.revision_count, leaseOwner: row.lease_owner ?? undefined,
       leaseExpiresAt: row.lease_expires_at ?? undefined, heartbeatAt: row.heartbeat_at ?? undefined,
       failureReason: row.failure_reason ?? undefined, activeAttemptId: row.active_attempt_id ?? undefined,
+      ...(quota ? { retryAt: quota.retry_at, resumeCheckpoint: JSON.parse(quota.checkpoint) as Record<string, unknown>, quotaRetryCount: quota.retry_count,
+        ...(typeof (JSON.parse(quota.checkpoint) as Record<string, unknown>).stage === "string" ? { resumeStage: (JSON.parse(quota.checkpoint) as Record<string, unknown>).stage as TaskRecord["resumeStage"] } : {}) } : {}),
       route: this.getRoute(row.id) };
   }
 

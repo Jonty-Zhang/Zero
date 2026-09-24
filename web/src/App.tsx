@@ -6,11 +6,13 @@ import type { Binding, Capabilities, Choice, Config, HarnessHealth, Status, Task
 const columns: { id: Status; label: string; tone: string }[] = [
   { id: 'pending', label: '待处理', tone: 'slate' }, { id: 'running', label: '执行中', tone: 'blue' },
   { id: 'reviewing', label: '审核中', tone: 'violet' }, { id: 'revision', label: '返工中', tone: 'amber' },
+  { id: 'waiting', label: '等待额度恢复', tone: 'amber' },
   { id: 'done', label: '已完成', tone: 'green' }, { id: 'failed', label: '失败', tone: 'red' },
 ];
 const statusLabel: Record<string, string> = Object.fromEntries(columns.map(x => [x.id, x.label]));
 const nice = (value?: string) => value ? value.replaceAll('_', ' ') : '—';
 const date = (value?: string) => value ? new Date(value).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '时间未知';
+const retryDate = (value?: string) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
 const routeName = (route?: Task['route']) => [route?.harnessId, route?.modelId, route?.reasoningEffort].filter(Boolean).join(' · ') || '等待路由分配';
 const taskTitle = (task: Task) => task.title || task.prompt?.split('\n')[0]?.slice(0, 72) || `任务 ${task.id.slice(0, 8)}`;
 
@@ -100,7 +102,7 @@ function HarnessStrip({ harnesses, error }: { harnesses: HarnessHealth[]; error:
 function TaskCard({ task, onClick }: { task: Task; onClick: () => void }) {
   const doneTests = task.tests?.filter(t => t.status === 'passed' || t.status === 'success').length;
   const totalTests = task.tests?.length || 0;
-  return <button className="task-card" onClick={onClick}><div className="task-card-top"><span className={`status-pill ${task.status}`}>{statusLabel[task.status] || task.status}</span><span className="task-time">{date(task.updatedAt || task.createdAt)}</span></div><h3>{taskTitle(task)}</h3><p className="task-repo"><FolderGit2 size={13} />{task.repoPath || '未指定仓库'}{task.baseRef && <span>@ {task.baseRef}</span>}</p><div className="task-card-bottom"><span className="route-chip"><Activity size={12} />{routeName(task.route)}</span>{totalTests > 0 && <span className="test-count">{doneTests}/{totalTests} 检查</span>}</div></button>;
+  return <button className="task-card" onClick={onClick}><div className="task-card-top"><span className={`status-pill ${task.status}`}>{statusLabel[task.status] || task.status}</span><span className="task-time">{date(task.updatedAt || task.createdAt)}</span></div><h3>{taskTitle(task)}</h3><p className="task-repo"><FolderGit2 size={13} />{task.repoPath || '未指定仓库'}{task.baseRef && <span>@ {task.baseRef}</span>}</p>{task.status === 'waiting' && <p className="quota-card-note"><Clock3 size={12} />{retryDate(task.retryAt) ? `预计 ${retryDate(task.retryAt)} 自动重试` : '额度恢复后自动继续'}</p>}<div className="task-card-bottom"><span className="route-chip"><Activity size={12} />{routeName(task.route)}</span>{totalTests > 0 && <span className="test-count">{doneTests}/{totalTests} 检查</span>}</div></button>;
 }
 
 function SubmitModal({ capabilities, capabilityError, onClose, onCreated }: { capabilities: Capabilities | null; capabilityError: string; onClose: () => void; onCreated: (task: Task) => void }) {
@@ -131,7 +133,8 @@ function TaskDrawer({ task, loading, loadError, onClose, onCancel }: { task: Tas
   const attempts = task?.attempts ?? [];
   const logs = Array.isArray(task?.logs) ? task?.logs.join('\n') : task?.logs;
   return <div className="drawer-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}><aside className="task-drawer"><header className="drawer-header"><div><div className="eyebrow">任务详情</div><h2>{task ? taskTitle(task) : '正在读取任务'}</h2></div><button className="icon-button" onClick={onClose}><X size={18} /></button></header>
-    {loading ? <div className="loading-state"><LoaderCircle className="spin" size={22} />正在读取任务详情…</div> : loadError || !task ? <div className="alert error drawer-load-error"><AlertCircle size={17} /><div><b>任务详情加载失败</b><span>{loadError}</span></div></div> : <div className="drawer-content"><div className="drawer-status-row"><span className={`status-pill ${task.status}`}>{statusLabel[task.status] || task.status}</span><span className="muted">创建于 {date(task.createdAt)}</span>{['pending', 'running', 'reviewing', 'revision'].includes(task.status) && <Button variant="danger" disabled={cancelBusy} onClick={() => void cancel()}>{cancelBusy ? '正在取消…' : '取消任务'}</Button>}</div>
+    {loading ? <div className="loading-state"><LoaderCircle className="spin" size={22} />正在读取任务详情…</div> : loadError || !task ? <div className="alert error drawer-load-error"><AlertCircle size={17} /><div><b>任务详情加载失败</b><span>{loadError}</span></div></div> : <div className="drawer-content"><div className="drawer-status-row"><span className={`status-pill ${task.status}`}>{statusLabel[task.status] || task.status}</span><span className="muted">创建于 {date(task.createdAt)}</span>{['pending', 'running', 'reviewing', 'revision', 'waiting'].includes(task.status) && <Button variant="danger" disabled={cancelBusy} onClick={() => void cancel()}>{cancelBusy ? '正在取消…' : '取消任务'}</Button>}</div>
+      {task.status === 'waiting' && <section className="quota-wait-panel"><div className="quota-wait-icon"><Clock3 size={17} /></div><div><b>模型额度暂时受限</b><p>Zero 会保留当前进度，并在可重试时自动继续这个任务。</p><span>{retryDate(task.retryAt) ? `下一次自动重试：${retryDate(task.retryAt)}` : '下一次重试时间暂未确定；Zero 会在额度恢复后继续。'}</span>{task.error && <small>{task.error}</small>}</div></section>}
       {cancelError && <div className="alert error compact"><AlertCircle size={15} />{cancelError}</div>}
       <div className="detail-block"><h3><FolderGit2 size={15} />仓库与任务</h3><dl className="detail-list"><div><dt>仓库</dt><dd>{task.repoPath || '—'}</dd></div><div><dt>基础 Ref</dt><dd>{task.baseRef || '—'}</dd></div><div><dt>最大返工</dt><dd>{task.maxRevisions ?? '—'} 次</dd></div></dl><p className="pre-wrap">{task.prompt || '无任务描述'}</p>{task.acceptanceCriteria && <><div className="sub-label">验收标准</div><p className="pre-wrap">{task.acceptanceCriteria}</p></>}</div>
       <div className="detail-block"><h3><Activity size={15} />路由决策</h3><div className="route-detail"><div><span>执行路线</span><b>{routeName(task.route)}</b></div><div><span>选择来源</span><b>{nice(task.route?.selectionSource)}</b></div>{task.route?.reason && <p>{task.route.reason}</p>}</div></div>

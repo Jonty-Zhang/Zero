@@ -3,6 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { buildChildEnv, runProcess } from './process-runner.js';
 import type { AdapterRunResult, HarnessId, Invocation, ModelBinding, ParsedOutput, ReasoningEffort, RunContext } from './types.js';
+import { classifyQuota } from '../core/quota.js';
 
 export interface AdapterConfig {
   executable?: string;
@@ -111,6 +112,9 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
         sessionId: parsed.sessionId,
         error: runError,
       };
+      const quota = outcome.status === 'failed' && outcome.exitCode !== 0
+        ? classifyQuota(`${outcome.stdout}\n${outcome.stderr}\n${parsed.events.map(event => event.message ?? '').join('\n')}`)
+        : undefined;
       return {
         status: result.status,
         exitCode: result.exitCode,
@@ -128,6 +132,7 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
           eventCount: result.events.length,
           modelVerification: result.actualModel ? 'event_confirmed' : 'selector_only',
         },
+        ...(quota ? { quota } : {}),
       };
     } catch (error) {
       return this.domainResult('failed', null, 0, {

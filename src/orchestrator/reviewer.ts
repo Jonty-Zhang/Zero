@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { CheckResult, HarnessAdapter, HarnessCapabilities, ReviewFinding, ReviewResult, RouteDecision, RunResult, TaskRecord } from '../domain/types.js';
 import type { WorktreeInfo } from '../core/git-worktree.js';
 import { createTrustedCodexCwd } from './trusted-codex-cwd.js';
+import { QuotaLimitError } from '../core/quota.js';
 
 export interface ReviewerConfig {
   codex: HarnessAdapter;
@@ -63,6 +64,10 @@ export class TaskReviewer {
         ...(this.config.timeoutMs ? { deadline: new Date(Date.now() + this.config.timeoutMs).toISOString() } : {}),
       });
     } finally { await trustedCwd.dispose(); }
+
+    if ((run.status !== 'completed' || run.exitCode !== 0) && run.quota) {
+      throw new QuotaLimitError("Codex review paused because the model usage limit was reached", run.quota.retryAt);
+    }
 
     let result: ReviewResult;
     if (run.status !== 'completed' || run.exitCode !== 0) {

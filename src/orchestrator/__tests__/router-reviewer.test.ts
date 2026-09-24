@@ -9,6 +9,7 @@ import { TaskRouter, type RouteCandidate } from '../router.js';
 import { parseReviewOutput, TaskReviewer } from '../reviewer.js';
 import { createTrustedCodexCwd, isWithin } from '../trusted-codex-cwd.js';
 import type { WorktreeInfo } from '../../core/git-worktree.js';
+import { QuotaLimitError } from '../../core/quota.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -140,6 +141,18 @@ test('router rejects malformed JSON, nonexistent bindings, unsupported efforts a
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test('router propagates an explicit usage-limit response as a resumable quota signal', async () => {
+  const dir = await tempDir();
+  try {
+    const workspace = await taskWorkspace(dir);
+    const codex = new FakeCodex();
+    codex.response = { status: 'failed', exitCode: 1, quota: { source: 'provider_message', retryAt: '2026-09-24T05:00:00.000Z' } };
+    const router = new TaskRouter({ codex, coordinatorModel: 'coord-model', cwd: workspace, artifactDir: join(dir, 'artifacts') });
+    await assert.rejects(router.decide({ taskId: 'quota-route', submission: { repoPath: dir, baseRef: 'main', prompt: 'x' }, candidates, repositorySummary: 'repo' }),
+      error => error instanceof QuotaLimitError && error.retryAt === '2026-09-24T05:00:00.000Z');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 const task: TaskRecord = {
   id: 'review-task', repoPath: 'C:/repo', baseRef: 'main', prompt: 'Add a robust parser', status: 'reviewing',
   createdAt: '2026-09-24T00:00:00.000Z', updatedAt: '2026-09-24T00:00:00.000Z', revisionCount: 0,
@@ -203,6 +216,19 @@ test('reviewer blocks a pass-shaped response when the Codex process exits nonzer
     assert.equal(outcome.result.verdict, 'blocked');
     assert.equal(outcome.exitCode, 7);
     assert.match(outcome.result.summary, /process failed/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('reviewer propagates an explicit usage-limit response instead of returning a blocked verdict', async () => {
+  const dir = await tempDir();
+  try {
+    const workspace = await taskWorkspace(dir);
+    const codex = new FakeCodex();
+    codex.response = { status: 'failed', exitCode: 1, quota: { source: 'provider_message', retryAt: '2026-09-24T05:00:00.000Z' } };
+    const reviewer = new TaskReviewer({ codex, artifactDir: join(dir, 'artifacts') });
+    const route = { taskId: task.id, harness: 'zcode', model: 'glm', selectionSource: 'codex' as const, reason: 'test', decidedAt: '2026-09-24T00:00:00.000Z' };
+    await assert.rejects(reviewer.review(task, worktreeInfo(workspace), route, [], 'diff', { attemptId: 'quota-review' }),
+      error => error instanceof QuotaLimitError && error.retryAt === '2026-09-24T05:00:00.000Z');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

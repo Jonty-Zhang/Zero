@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { TaskStore } from "./task-store.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
 
 test("task queue claims once and recovers an expired lease with an interrupted attempt", () => {
   const store = new TaskStore();
@@ -52,4 +54,32 @@ test("attempt completion persists the final reviewer Harness, model, effort, and
     assert.equal(saved.stderrPath, "review.stderr.log");
     assert.equal(saved.resultPath, "review.events.jsonl");
   } finally { store.close(); }
+});
+
+test("quota pause survives store restart and is claimable only at its persisted retry time", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-quota-store-"));
+  const path = join(root, "tasks.sqlite");
+  let store = new TaskStore(path);
+  try {
+    const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "continue" }, "quota_resume_test");
+    store.claimNext("quota-worker");
+    const retryAt = new Date(Date.now() + 60_000).toISOString();
+    store.pauseForQuota(task.id, "quota-worker", { retryAt, reason: "Codex usage limit reached", source: "provider_message", checkpoint: { stage: "implementation", revision: 1, worktree: { baseCommit: "abc" } } });
+    store.close();
+
+    store = new TaskStore(path);
+    const waiting = store.get(task.id)!;
+    assert.equal(waiting.status, "waiting");
+    assert.equal(waiting.retryAt, retryAt);
+    assert.equal(waiting.quotaRetryCount, 1);
+    assert.deepEqual(waiting.resumeCheckpoint, { stage: "implementation", revision: 1, worktree: { baseCommit: "abc" } });
+    assert.equal(store.claimNext("early-worker", 60_000, new Date(Date.now() + 30_000)), undefined);
+    const resumed = store.claimNext("resumed-worker", 60_000, new Date(Date.now() + 120_000));
+    assert.equal(resumed?.id, task.id);
+    assert.equal(resumed?.status, "running");
+    assert.deepEqual(resumed?.resumeCheckpoint, waiting.resumeCheckpoint);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });

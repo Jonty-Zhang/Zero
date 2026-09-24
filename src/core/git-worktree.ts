@@ -54,6 +54,34 @@ export class GitWorktreeManager {
     return { taskId, repoPath: canonicalRepo, path, branch, baseCommit };
   }
 
+  /** Reopen only a task worktree that is still registered with the expected repository and branch. */
+  async reopen(taskId: string, repoPath: string, baseCommit: string): Promise<WorktreeInfo> {
+    this.#assertTaskId(taskId);
+    if (!/^[a-fA-F0-9]{40,64}$/.test(baseCommit)) throw new Error("Invalid checkpoint base commit");
+    const root = await realpath(this.#root);
+    const path = resolve(root, taskId);
+    this.#assertInside(root, path);
+    if (await realpath(path) !== path) throw new Error("Task worktree path changed since quota pause");
+    const repo = await realpath(repoPath);
+    const { stdout: repoTop } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: repo, windowsHide: true });
+    const canonicalRepo = await realpath(repoTop.trim());
+    const { stdout: worktreeTop } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: path, windowsHide: true });
+    if (await realpath(worktreeTop.trim()) !== path) throw new Error("Checkpoint path is not the task worktree");
+    const [repoCommon, worktreeCommon] = await Promise.all([
+      execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: canonicalRepo, windowsHide: true }),
+      execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: path, windowsHide: true }),
+    ]);
+    if (await realpath(repoCommon.stdout.trim()) !== await realpath(worktreeCommon.stdout.trim())) {
+      throw new Error("Checkpoint worktree belongs to a different repository");
+    }
+    const info = { taskId, repoPath: canonicalRepo, path, branch: `zero/${taskId}`, baseCommit };
+    await this.#ensureTaskBranch(info);
+    const { stdout: commit } = await execFileAsync("git", ["rev-parse", "--verify", `${baseCommit}^{commit}`], { cwd: path, windowsHide: true });
+    if (commit.trim().toLowerCase() !== baseCommit.toLowerCase()) throw new Error("Checkpoint base commit is missing");
+    await execFileAsync("git", ["merge-base", "--is-ancestor", baseCommit, "HEAD"], { cwd: path, windowsHide: true });
+    return info;
+  }
+
   async diff(info: WorktreeInfo): Promise<string> {
     await this.#validateInfo(info);
     await this.#ensureTaskBranch(info);

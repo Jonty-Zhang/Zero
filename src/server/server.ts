@@ -242,8 +242,8 @@ function tokenize(line: string): string[] {
 async function cancelTask(res: ServerResponse, id: string, options: ZeroServerOptions): Promise<void> {
   const task = options.store.get(id);
   if (!task) throw new HttpError(404, '任务不存在');
-  if (task.status === 'pending') {
-    options.store.fail(id, 'pending', 'Cancelled by user');
+  if (task.status === 'pending' || task.status === 'waiting') {
+    options.store.fail(id, task.status, 'Cancelled by user');
     return json(res, 200, { ok: true });
   }
   if (!['running', 'reviewing', 'revision'].includes(task.status)) throw new HttpError(409, '任务已结束，无法取消');
@@ -289,7 +289,7 @@ function mapTaskList(task: TaskRecord) {
   return { id: task.id, title: task.prompt.split(/\r?\n/, 1)[0]?.slice(0, 100), status: task.status,
     repoPath: task.repoPath, baseRef: task.baseRef, createdAt: task.createdAt, updatedAt: task.updatedAt,
     maxRevisions: task.maxRevisions, route: route ? mapRoute(route as unknown as Record<string, unknown>) : undefined,
-    error: task.failureReason };
+    retryAt: task.status === 'waiting' ? task.retryAt : undefined, error: task.failureReason };
 }
 function mapRoute(route: Record<string, unknown> | RouteDecision) { const value = route as Record<string, unknown>; return { harnessId: value.harness, modelId: value.model, reasoningEffort: value.effectiveReasoningEffort ?? value.reasoningEffort, selectionSource: value.selectionSource, reason: value.reason }; }
 function mapAttempt(value: Attempt) {

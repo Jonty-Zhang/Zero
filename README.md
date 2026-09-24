@@ -9,6 +9,7 @@ Zero ships as one application: a Node.js service with a local Web UI and a CLI. 
 - Windows-first, single machine and single user; local HTTP binding only.
 - Codex, DeepSeek Harness (DSH) and ZCode adapters. A pair of Harness and model is routable only after its CLI and model binding have been verified. DSH and ZCode require installation and version-specific model-locking evidence; they are not enabled merely because an adapter exists.
 - SQLite queue with leases, isolated Git worktrees, bounded logs, direct-argv checks, Codex review and limited revisions.
+- Explicit model usage limits pause the task with a persisted retry time and stage checkpoint. The background worker automatically resumes the same worktree after the limit resets; an unknown reset time uses bounded backoff, including across service restarts.
 - Successful output remains on a `zero/<task-id>` branch in the source repository. Zero does not automatically merge or push task branches.
 - A recovered task with an interrupted execution or an existing worktree stops for inspection rather than rerunning an unknown external action.
 
@@ -40,6 +41,7 @@ The UI lets you specify any subset of execution Harness, model and reasoning eff
 - [Zero v1 architecture, upstream comparison and licenses](docs/zero-v1-proposal.md)
 - [Routing and review contract](docs/route-review-contract.md)
 - [Windows unattended deployment](docs/windows-deployment.md)
+- [Super Plumber integration assessment](docs/super-plumber-assessment.md)
 
 The code is original and does not fork any of the reviewed projects. CAO and Hydra informed the architecture. Zero is licensed under [Apache-2.0](LICENSE).
 

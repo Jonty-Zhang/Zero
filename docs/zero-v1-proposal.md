@@ -20,6 +20,7 @@ Zero v1 做成**一个独立安装的应用**：后台服务负责无人值守�
 | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | Cordis 插件架构；[headless profile](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/bundle/headless/README.md) 为一次性任务提供 NDJSON、session id 和明确退出码；[Codex subagent backend](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/subagent/subagent-codex/README.md) 通过 app-server。 | [MIT](https://github.com/deepseek-ai/deepseek-harness/blob/master/LICENSE) | 作为 DSH Harness 接入。仍标为 developer preview；其 Codex subagent 的 provider/model 静态绑定，不代替 Zero Router。 |
 | [Codex + DSH Delegation](https://github.com/LomoMao/delegate-to-deepseek-harness) | Codex Skill 与 wrapper；任务 brief、指定 cwd、独立验证和工作区范围检查。见 [Skill](https://github.com/LomoMao/delegate-to-deepseek-harness/blob/master/SKILL.md)。 | [MIT](https://github.com/LomoMao/delegate-to-deepseek-harness/blob/master/LICENSE) | 借鉴执行契约与验证器；不是调度系统。 |
 | [ZCode（Z.ai 官方）](https://github.com/zai-org/ZCode) | Agent CLI 支持 headless prompt、cwd、执行模式和 NDJSON。见 [参数源码](https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/cli/src/arguments.ts)。模型由 provider registry/default selection 读取，当前 headless 参数中未核实到 `--model`。 | [Apache-2.0](https://github.com/zai-org/ZCode/blob/main/LICENSE)；[NOTICE](https://github.com/zai-org/ZCode/blob/main/NOTICE.md) 限定第一方范围。 | 作为 ZCode Harness 接入；必须做逐版本模型绑定及认证冒烟测试。[官方反馈](https://github.com/zai-org/feedback/issues/744) 已有近期 headless 模型选择失败报告，不能将源码有 CLI 等同于当前发行包可用。 |
+| [Super Plumber](https://github.com/LUKAWI/super-plumber) | TypeScript 的任务依赖图、状态、checkpoint、交接报告；提供 CLI、MCP 与 Web UI，YAML/Git 为图数据来源。 | [MIT](https://github.com/LUKAWI/super-plumber/blob/main/LICENSE) | 可作为未来的可选任务规划/可视化模块；不代替 Zero 的 SQLite 执行状态、Harness 路由或额度恢复。详见[单独评估](super-plumber-assessment.md)。 |
 
 **底座判断：**若必须从现有代码库直接 fork，Hydra 的需求覆盖最高且许可证清楚；但 Zero v1 需要更小、更可证明的状态与能力边界。CAO 即使已有 model override、workflow journal 和 worktree，当前机器仍需要额外 Linux/WSL/tmux 环境，且 Zero 仍要实现自己的交付状态机。故选独立核心，参考并在将来允许接入 CAO 运行时。这个结论是基于上述事实的架构推断，不是对项目质量的排名。
 
@@ -61,10 +62,13 @@ pending → running → reviewing → done
              └──→ revision ←──┘
                     │
                     └──→ running
+running / reviewing → waiting（模型额度）→ running（到期自动领取）
 任一阶段超过预算或发生不可恢复错误 → failed
 ```
 
 `max_revisions = N` 表示 **首次执行 + 最多 N 次内容返工**。CLI/网络暂时性故障重试单独计数，不消耗内容返工次数；测试失败和 reviewer 的 `changes_requested` 都会生成明确的返工 brief。每次返工后重新运行全部必需门禁。`failed` 保存工作树与证据以便人工诊断。
+
+显式模型使用额度耗尽时，Zero 保存当前阶段、worktree 指纹、路由/检查证据和下次尝试时间，释放 lease；后台服务到期后在同一 worktree 继续，额度等待不计入内容返工。以供应商明确的重置时间为准；无可信时间时从短间隔逐步退避，最长每 6 小时重新探测一次，因周额度也可能耗尽而不设置固定 5 小时或固定总尝试次数。普通认证、网络、超时、账单问题不归类为可自动恢复的额度暂停。断电发生在活跃外部命令中时仍按未知副作用故障关闭，不能无条件重放。
 
 ## 统一 Harness Adapter
 
