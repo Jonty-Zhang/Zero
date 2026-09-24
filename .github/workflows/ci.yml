@@ -28,10 +28,21 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Locate MSVC tools
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw 'vswhere.exe was not found' }
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw 'MSVC tools were not found' }
+          $vcvars = Join-Path $installation 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) { throw 'vcvars64.bat was not found' }
+          "VCVARS=$vcvars" >> $env:GITHUB_ENV
       - name: Build guardian and native tests
         shell: cmd
         run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          call "%VCVARS%"
+          if errorlevel 1 exit /b 1
           cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE native\windows-guardian\guardian.cpp /Fe:guardian.exe Advapi32.lib
           if errorlevel 1 exit /b 1
           cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE native\windows-guardian\tests\guardian_tests.cpp /Fe:guardian_tests.exe Ole32.lib
