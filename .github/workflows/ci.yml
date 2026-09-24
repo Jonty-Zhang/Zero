@@ -13,6 +13,8 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - name: Check public tree for local data and secrets
+        run: node scripts/check-public-tree.mjs
       - name: Install core dependencies
         run: npm ci
       - name: Build and test core

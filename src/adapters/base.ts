@@ -198,14 +198,16 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
     return env;
   }
 
-  async command(args: string[], cwd = process.cwd()): Promise<{ code: number | null; stdout: string; stderr: string; error?: string }> {
-    const result = await runProcess({ executable: this.executable, args, cwd, env: this.probeEnv, timeoutMs: 8_000, maxLogBytes: 64 * 1024 });
+  async command(args: string[], cwd = process.cwd(), envOverrides: NodeJS.ProcessEnv = {}): Promise<{ code: number | null; stdout: string; stderr: string; error?: string }> {
+    const result = await runProcess({ executable: this.executable, args, cwd, env: { ...this.probeEnv, ...envOverrides }, timeoutMs: 8_000, maxLogBytes: 64 * 1024 });
     return { code: result.exitCode, stdout: result.stdout, stderr: result.stderr, ...(result.error ? { error: result.error } : {}) };
   }
 
-  protected parsePlainText(stdout: string): ParsedOutput {
+  protected parsePlainText(stdout: string, stderr = ''): ParsedOutput {
     const text = stdout.trim();
-    return { events: text ? [{ type: 'output', message: text }] : [], finalText: text || undefined };
+    const events: ParsedOutput['events'] = text ? [{ type: 'output', message: text }] : [];
+    if (stderr.trim()) events.push({ type: 'stderr', message: stderr.trim() });
+    return { events, finalText: text || undefined };
   }
 
   protected domainResult(status: RunResult['status'], exitCode: number | null, durationMs: number, extra: Partial<RunResult> = {}): RunResult {
@@ -276,6 +278,6 @@ export async function probeExecutable(adapter: BaseHarnessAdapter, helpArgs: str
 export function assertPromptFitsArgv(args: string[]): void {
   const estimatedLength = args.reduce((sum, arg) => sum + arg.length + 3, 0);
   if (estimatedLength > 16_000) {
-    throw new Error('Prompt exceeds this Harness safe command-line budget; it cannot receive this prompt through stdin.');
+    throw new Error('Prompt exceeds this Harness safe command-line budget.');
   }
 }

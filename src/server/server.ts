@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { access, readFile, realpath, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
@@ -51,9 +52,15 @@ const JSON_HEADERS = { ...SECURITY_HEADERS, 'Content-Type': 'application/json; c
 export function createDefaultAdapters(bindings: ModelBinding[]): AdapterMap {
   return {
     codex: createCodexAdapter(bindings),
-    dsh: new DshAdapter({ bindings }),
+    dsh: new DshAdapter({ bindings, dshHome: resolve(zeroDataRoot(), 'dsh-home') }),
     zcode: new ZCodeAdapter({ bindings }),
   };
+}
+
+function zeroDataRoot(): string {
+  return resolve(process.env.ZERO_DATA_DIR || (process.platform === 'win32'
+    ? resolve(process.env.LOCALAPPDATA || resolve(homedir(), 'AppData/Local'), 'Zero')
+    : resolve(homedir(), '.local/share/zero')));
 }
 
 /** Use the explicitly configured Codex CLI path for both runtime and binding verification. */
