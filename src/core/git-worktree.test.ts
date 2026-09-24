@@ -2,9 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { GitWorktreeManager } from "./git-worktree.js";
+import { GitWorktreeManager, WORKTREE_FINGERPRINT_MAX_FILE_BYTES } from "./git-worktree.js";
 
 const exec = promisify(execFile);
 
@@ -57,5 +57,94 @@ test("commit refuses a harness-created empty commit when base-to-HEAD has no cha
     assert.deepEqual(await manager.changedPaths(info), []);
     assert.equal(await manager.commit(info, "Zero result"), undefined);
     await manager.remove(info, { deleteBranch: true });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("worktree fingerprint detects same-length untracked binary replacement that diff and status miss", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-git-fingerprint-binary-test-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const manager = new GitWorktreeManager(join(root, "worktrees"));
+    const info = await manager.create("binary_fingerprint", repo, "main");
+    const binaryPath = join(info.path, "payload.bin");
+    await writeFile(binaryPath, Buffer.from([0, 17, 34, 51]));
+    const oldState = async () => `${await manager.status(info)}\0${await manager.diff(info)}`;
+    const oldBefore = await oldState();
+    const before = await manager.fingerprint(info);
+    await writeFile(binaryPath, Buffer.from([0, 17, 34, 52]));
+    const oldAfter = await oldState();
+    const after = await manager.fingerprint(info);
+    assert.equal(oldAfter, oldBefore);
+    assert.notEqual(after, before);
+    assert.match(before, /^[a-f0-9]{64}$/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("worktree fingerprint includes index and HEAD identity and rejects oversized files and escaped paths", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-git-fingerprint-bounds-test-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const manager = new GitWorktreeManager(join(root, "worktrees"));
+    const info = await manager.create("state_fingerprint", repo, "main");
+    const initial = await manager.fingerprint(info);
+
+    await writeFile(join(info.path, "seed.txt"), "staged content\n");
+    await exec("git", ["add", "seed.txt"], { cwd: info.path });
+    await writeFile(join(info.path, "seed.txt"), "base\n");
+    assert.notEqual(await manager.fingerprint(info), initial);
+    await exec("git", ["reset", "--hard", "HEAD"], { cwd: info.path });
+    assert.equal(await manager.fingerprint(info), initial);
+
+    await exec("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "empty"], { cwd: info.path });
+    assert.notEqual(await manager.fingerprint(info), initial);
+    await assert.rejects(manager.fingerprint({ ...info, path: repo }), /escapes configured directory/);
+
+    const largeFile = join(info.path, "too-large.bin");
+    await writeFile(largeFile, Buffer.alloc(0));
+    await truncate(largeFile, WORKTREE_FINGERPRINT_MAX_FILE_BYTES + 1);
+    await assert.rejects(manager.fingerprint(info), /exceeds .* byte limit/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("worktree fingerprint fails closed for assume-unchanged and skip-worktree index flags", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-git-fingerprint-index-flags-test-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const manager = new GitWorktreeManager(join(root, "worktrees"));
+    const info = await manager.create("index_flag_fingerprint", repo, "main");
+
+    await exec("git", ["update-index", "--assume-unchanged", "seed.txt"], { cwd: info.path });
+    await writeFile(join(info.path, "seed.txt"), "hidden assume-unchanged edit\n");
+    assert.equal(await manager.status(info), "");
+    await assert.rejects(manager.fingerprint(info), /assume-unchanged or skip-worktree/);
+    await writeFile(join(info.path, "seed.txt"), "base\n");
+    await exec("git", ["update-index", "--no-assume-unchanged", "seed.txt"], { cwd: info.path });
+
+    await exec("git", ["update-index", "--skip-worktree", "seed.txt"], { cwd: info.path });
+    await writeFile(join(info.path, "seed.txt"), "hidden skip-worktree edit\n");
+    await assert.rejects(manager.fingerprint(info), /assume-unchanged or skip-worktree/);
+    await writeFile(join(info.path, "seed.txt"), "base\n");
+    await exec("git", ["update-index", "--no-skip-worktree", "seed.txt"], { cwd: info.path });
   } finally { await rm(root, { recursive: true, force: true }); }
 });

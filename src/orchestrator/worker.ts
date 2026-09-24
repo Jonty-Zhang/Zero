@@ -469,7 +469,7 @@ export class TaskWorker {
   #artifactDirectory(taskId: string): string { return resolve(this.#options.artifactRoot, taskId); }
 
   async #worktreeFingerprint(worktree: WorktreeInfo): Promise<string> {
-    return hash(`${await this.#options.worktrees.status(worktree)}\0${await this.#options.worktrees.diff(worktree)}`);
+    return this.#options.worktrees.fingerprint(worktree);
   }
 
   async #writeReport(taskId: string, finalStatus: TaskReport["finalStatus"], values: {
