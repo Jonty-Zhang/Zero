@@ -5,9 +5,13 @@ import type {
   Attempt,
   CheckDefinition,
   CheckResult,
+  HandoffRecord,
+  HandoffV1,
   HarnessAdapter,
   ReviewResult,
   RouteDecision,
+  StageRecord,
+  StageStatus,
   TaskRecord,
   TaskStatus,
 } from "../domain/types.js";
@@ -15,6 +19,7 @@ import { GitWorktreeManager, type WorktreeInfo } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
+import { HANDOFF_V1_MAX_BYTES } from "../domain/handoff.js";
 
 type ResumeStage = "route" | "execute" | "review";
 interface WorkerCheckpoint {
@@ -81,6 +86,9 @@ export interface TaskReport {
   resultCommit?: string;
   routeDecisions: RouteDecision[];
   attempts: Attempt[];
+  /** Optional for backwards compatibility with previously archived schemaVersion 1 reports. */
+  stages?: StageRecord[];
+  handoffs?: HandoffRecord[];
   checks: CheckResult[];
   reviews: ReviewResult[];
   diffPath?: string;
@@ -111,6 +119,10 @@ export class TaskWorker {
     this.#active.set(taskId, active);
     let leaseLost = false;
     let activeAttempt: Attempt | undefined;
+    let executionStage: StageRecord | undefined;
+    let executionAttempt: Attempt | undefined;
+    let executionChecks: CheckResult[] = [];
+    let finalizedExecutionFingerprint: string | undefined;
     let worktree: WorktreeInfo | undefined;
     let baseCommit: string | undefined;
     let resultCommit: string | undefined;
@@ -225,11 +237,28 @@ export class TaskWorker {
         const adapter = this.#options.adapters.get(route.harness);
         if (!adapter) throw new Error(`No HarnessAdapter is registered for ${route.harness}`);
         const role = revision === 0 ? "implement" : "revise";
-        const attempt = this.#options.store.createAttempt(taskId, role, {
-          owner, harness: route.harness, model: route.model,
+        const inputFingerprint = await this.#options.worktrees.fingerprint(worktree);
+        const previousExecutionStage = this.#options.store.stages(taskId).filter(item => item.role === "implement" || item.role === "revise").at(-1);
+        const processStartId = randomUUID();
+        const pendingStage = this.#options.store.createStage(taskId, {
+          role,
+          ...(previousExecutionStage ? { predecessorStageId: previousExecutionStage.id } : {}),
+          harness: route.harness,
+          model: route.model,
           reasoningEffort: route.effectiveReasoningEffort ?? route.reasoningEffort,
+          configHash: route.configHash,
+          processStartId,
+          inputFingerprint,
+        });
+        executionStage = this.#options.store.startStage(pendingStage.id, owner, processStartId);
+        executionChecks = [];
+        const attempt = this.#options.store.createAttempt(taskId, role, {
+          owner, stageId: executionStage.id, harness: route.harness, model: route.model,
+          reasoningEffort: route.effectiveReasoningEffort ?? route.reasoningEffort,
+          configHash: route.configHash,
           metadata: { revision },
         });
+        executionAttempt = attempt;
         activeAttempt = attempt;
         active.adapter = adapter;
         active.attempt = attempt;
@@ -251,14 +280,14 @@ export class TaskWorker {
           deadline: new Date(Date.now() + 30 * 60_000).toISOString(),
         });
         this.#options.store.finishAttempt(attempt.id, {
-          status: runResult.status === "completed" && runResult.exitCode === 0 ? "succeeded" : "failed",
+          status: runResult.status === "completed" && runResult.exitCode === 0 ? "succeeded" : runResult.status === "cancelled" ? "interrupted" : "failed",
           exitCode: runResult.exitCode ?? undefined,
           stdoutPath: runResult.stdoutPath,
           stderrPath: runResult.stderrPath,
           resultPath: runResult.eventsPath,
           error: runResult.error,
           metadata: { actualModel: runResult.actualModel, durationMs: runResult.durationMs, sessionId: runResult.sessionId },
-        });
+        }, { owner, processStartId });
         activeAttempt = undefined;
         active.adapter = undefined;
         active.attempt = undefined;
@@ -274,11 +303,18 @@ export class TaskWorker {
         this.#assertAllowedPaths(task, changedPaths);
         const checks = await this.#options.testRunner.run(requiredChecks, worktree.path, { signal: active.controller.signal });
         finalChecks = checks;
+        executionChecks = checks;
         for (const check of checks) this.#options.store.saveCheck(taskId, check, attempt.id);
         this.#assertNotCancelled(active);
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
         const failedChecks = checks.filter(check => check.status !== "passed");
         if (failedChecks.length) {
+          await this.#finishExecutionStage({
+            task, worktree, stage: executionStage, attempt: executionAttempt, route, owner,
+            status: "failed", checks, summary: "Zero observed one or more failed validation checks.",
+          });
+          executionStage = undefined;
+          executionAttempt = undefined;
           if (revision >= maximumRevisions) throw new Error(`Validation failed after ${revision} content revisions: ${failedChecks.map(check => check.id).join(", ")}`);
           const brief = this.#revisionBrief(task, failedChecks, undefined, revision + 1);
           task = this.#options.store.transition(taskId, "running", "revision", { owner, incrementRevision: true, reason: "validation checks failed" });
@@ -288,6 +324,13 @@ export class TaskWorker {
           stage = "route";
           continue;
         }
+
+        await this.#finishExecutionStage({
+          task, worktree, stage: executionStage, attempt: executionAttempt, route, owner,
+          status: "succeeded", checks, summary: "Zero observed successful execution and passing validation checks.",
+        });
+        executionStage = undefined;
+        executionAttempt = undefined;
 
         task = this.#options.store.transition(taskId, "running", "reviewing", { owner, reason: "validation checks passed" });
         stage = "review";
@@ -367,18 +410,57 @@ export class TaskWorker {
     } catch (error) {
       const cancelled = active.cancelRequested;
       errorMessage = cancelled ? "Cancelled by user" : errorText(error);
+      const quotaFailure = error instanceof QuotaLimitError && !cancelled && !leaseLost;
+      let executionStageFinalizationFailed = false;
       if (activeAttempt) {
-        try { this.#options.store.finishAttempt(activeAttempt.id, { status: leaseLost ? "interrupted" : "failed", error: errorMessage }); } catch { /* best effort */ }
+        try {
+          const linkedStage = activeAttempt.stageId ? this.#options.store.getStage(activeAttempt.stageId) : undefined;
+          this.#options.store.finishAttempt(activeAttempt.id, {
+            status: leaseLost || cancelled ? "interrupted" : "failed",
+            error: errorMessage,
+          }, linkedStage ? { owner, processStartId: linkedStage.processStartId } : undefined);
+        } catch {
+          if (activeAttempt.stageId) {
+            try { this.#assertLease(taskId, owner, () => leaseLost); }
+            catch { leaseLost = true; }
+          }
+        }
       }
-      if (error instanceof QuotaLimitError && !cancelled && !leaseLost && worktree && baseCommit) {
+      if (executionStage && !leaseLost && this.#options.store.getStage(executionStage.id)?.status === "running") {
+        try {
+          this.#assertLease(taskId, owner, () => leaseLost);
+          finalizedExecutionFingerprint = await this.#finishExecutionStage({
+            task, worktree: worktree!, stage: executionStage, attempt: executionAttempt, route: finalRoute!, owner,
+            status: quotaFailure ? "interrupted" : cancelled ? "interrupted" : "failed",
+            checks: executionChecks,
+            summary: quotaFailure
+              ? "Zero observed the execution stopped after a provider usage limit."
+              : cancelled
+                ? "Zero observed that the stage was cancelled."
+                : "Zero observed that execution ended before all required gates succeeded.",
+          });
+          executionStage = undefined;
+          executionAttempt = undefined;
+        } catch (stageError) {
+          executionStageFinalizationFailed = true;
+          errorMessage = `Unable to finalize execution stage: ${errorText(stageError)}`;
+          try { this.#assertLease(taskId, owner, () => leaseLost); }
+          catch { leaseLost = true; }
+        }
+      }
+      if (quotaFailure && !executionStageFinalizationFailed && !leaseLost && worktree && baseCommit) {
         try {
           this.#assertLease(taskId, owner, () => leaseLost);
           this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+          const checkpointFingerprint = await this.#worktreeFingerprint(worktree);
+          if (finalizedExecutionFingerprint && finalizedExecutionFingerprint !== checkpointFingerprint) {
+            throw new Error("Worktree changed after the interrupted execution stage was archived; quota resume is unsafe");
+          }
           const checkpoint: WorkerCheckpoint = {
             version: 1,
             stage,
             baseCommit,
-            worktreeFingerprint: await this.#worktreeFingerprint(worktree),
+            worktreeFingerprint: checkpointFingerprint,
             revision,
             revisionBrief,
             ...(finalRoute ? { finalRoute } : {}),
@@ -472,6 +554,122 @@ export class TaskWorker {
     return this.#options.worktrees.fingerprint(worktree);
   }
 
+  async #finishExecutionStage(input: {
+    task: TaskRecord;
+    worktree: WorktreeInfo;
+    stage: StageRecord | undefined;
+    attempt: Attempt | undefined;
+    route: RouteDecision;
+    owner: string;
+    status: Extract<StageStatus, "succeeded" | "failed" | "interrupted">;
+    checks: CheckResult[];
+    summary: string;
+  }): Promise<string | undefined> {
+    const { task, worktree, stage, attempt, route, owner, checks, summary } = input;
+    if (!stage) throw new Error("Execution stage record is missing");
+    this.#assertLease(task.id, owner, () => false);
+
+    let fingerprint: string | undefined;
+    let changedFiles: string[] | undefined;
+    let workspaceState: HandoffV1["workspace"]["state"] = "unknown";
+    let snapshotFailed = false;
+    try {
+      const statusBefore = await this.#options.worktrees.status(worktree);
+      const pathsBefore = (await this.#options.worktrees.changedPaths(worktree)).sort();
+      fingerprint = await this.#options.worktrees.fingerprint(worktree);
+      const statusAfter = await this.#options.worktrees.status(worktree);
+      const pathsAfter = (await this.#options.worktrees.changedPaths(worktree)).sort();
+      if (statusBefore !== statusAfter || JSON.stringify(pathsBefore) !== JSON.stringify(pathsAfter)) {
+        throw new Error("Worktree moved while building handoff snapshot");
+      }
+      if (pathsAfter.length > 40 || pathsAfter.some(path => path.length > 512)) {
+        throw new Error("Changed path list exceeds the bounded handoff representation");
+      }
+      workspaceState = statusAfter ? "dirty" : "clean";
+      changedFiles = pathsAfter;
+    } catch {
+      fingerprint = undefined;
+      changedFiles = undefined;
+      workspaceState = "unknown";
+      snapshotFailed = true;
+    }
+
+    const finalStatus = input.status === "succeeded" && snapshotFailed ? "failed" : input.status;
+    this.#options.store.finishStage(stage.id, owner, stage.processStartId, finalStatus, fingerprint);
+    if (attempt) {
+      const observedChecks = (task.checks ?? []).slice(0, 40).map(definition => {
+        const result = checks.find(item => item.id === definition.id);
+        return {
+          id: definition.id.slice(0, 160),
+          status: result === undefined ? "not_run" as const
+            : result.status === "passed" ? "passed" as const
+              : result.status === "timed_out" ? "timed_out" as const : "failed" as const,
+          ...(result ? { evidence: `exitCode=${String(result.exitCode)}; durationMs=${result.durationMs}` } : { evidence: "not run" }),
+        };
+      });
+      const risks = [
+        ...(snapshotFailed ? ["Workspace snapshot is incomplete or exceeded the handoff path limits; inspect the archived task evidence."] : []),
+        ...((task.checks?.length ?? 0) > 40 ? ["Only the first 40 configured checks fit the handoff schema; see the task report for all checks."] : []),
+      ];
+      const completed = [summary, ...observedChecks.filter(check => check.status === "passed").map(check => `Validation check passed: ${check.id}`)].slice(0, 40);
+      const changed = changedFiles ?? [];
+      const handoff: HandoffV1 = {
+        schemaVersion: 1,
+        taskId: task.id,
+        stageId: stage.id,
+        createdAt: new Date().toISOString(),
+        source: {
+          attemptId: attempt.id,
+          harness: route.harness,
+          model: route.model,
+          ...(route.configHash ? { configHash: route.configHash } : {}),
+          processStartId: stage.processStartId,
+        },
+        task: {
+          objective: truncateWithReference(task.prompt, 8_000, task.id),
+          acceptanceCriteria: boundedAcceptanceCriteria(task.acceptanceCriteria ?? [], task.id),
+        },
+        workspace: workspaceState === "unknown"
+          ? { state: "unknown" }
+          : { baseCommit: worktree.baseCommit, fingerprint: fingerprint!, state: workspaceState, changedFiles: changed },
+        completed,
+        currentState: summary,
+        decisions: [],
+        rejectedOptions: [],
+        keyFiles: changed.slice(0, 20).map(path => ({ path, reason: "Git reports this path changed from the task base." })),
+        checks: observedChecks,
+        blockers: finalStatus === "succeeded" ? [] : ["Execution stage did not complete all required validation gates."],
+        risks,
+        nextSteps: finalStatus === "succeeded"
+          ? ["Continue through Zero's review and task completion gates."]
+          : ["Inspect the task report and worktree before starting another attempt."],
+      };
+      if (Buffer.byteLength(JSON.stringify(handoff), "utf8") > HANDOFF_V1_MAX_BYTES) {
+        handoff.task.objective = taskRecordReference(task.id, "The original task objective is omitted from this handoff because of its payload size.");
+        handoff.keyFiles = [];
+        handoff.risks.push("The changed-file list may be truncated to keep this handoff within 64 KiB; the fingerprint covers the full worktree. Inspect the task record and report for complete evidence.");
+        let boundedChangedFiles = handoff.workspace.state === "unknown" ? undefined : [...(handoff.workspace.changedFiles ?? [])];
+        if (boundedChangedFiles) {
+          boundedChangedFiles = boundedChangedFiles.slice(0, 20);
+          handoff.workspace.changedFiles = boundedChangedFiles;
+        }
+        if (Buffer.byteLength(JSON.stringify(handoff), "utf8") > HANDOFF_V1_MAX_BYTES) {
+          handoff.task.acceptanceCriteria = [taskRecordReference(task.id, "Full acceptance criteria are retained in the primary task record; omitted here because of the 64 KiB handoff payload limit.")];
+        }
+        while (Buffer.byteLength(JSON.stringify(handoff), "utf8") > HANDOFF_V1_MAX_BYTES
+          && boundedChangedFiles && boundedChangedFiles.length > 0) {
+          boundedChangedFiles = boundedChangedFiles.slice(0, Math.floor(boundedChangedFiles.length / 2));
+          handoff.workspace.changedFiles = boundedChangedFiles;
+        }
+      }
+      this.#options.store.saveHandoff(handoff);
+    }
+    if (input.status === "succeeded" && snapshotFailed) {
+      throw new Error("Zero could not capture a complete output worktree snapshot for the execution stage");
+    }
+    return fingerprint;
+  }
+
   async #writeReport(taskId: string, finalStatus: TaskReport["finalStatus"], values: {
     task: TaskRecord; baseCommit?: string; resultCommit?: string; error?: string; diff?: string;
   }): Promise<void> {
@@ -497,6 +695,8 @@ export class TaskWorker {
       resultCommit: values.resultCommit,
       routeDecisions: this.#options.store.events(taskId).filter(event => event.type === "route.decided").map(event => event.payload?.decision as RouteDecision),
       attempts: this.#options.store.attempts(taskId),
+      stages: this.#options.store.stages(taskId),
+      handoffs: this.#options.store.handoffs(taskId),
       checks: this.#options.store.checks(taskId),
       reviews: this.#options.store.reviews(taskId),
       diffPath,
@@ -519,7 +719,14 @@ export class TaskWorker {
     if (!task) return undefined;
     try {
       const report = JSON.parse(await readFile(resolve(this.#artifactDirectory(taskId), "report.json"), "utf8")) as TaskReport;
-      return { ...report, finalStatus: task.status, task, updatedAt: task.updatedAt };
+      return {
+        ...report,
+        finalStatus: task.status,
+        task,
+        updatedAt: task.updatedAt,
+        stages: report.stages ?? this.#options.store.stages(taskId),
+        handoffs: report.handoffs ?? this.#options.store.handoffs(taskId),
+      };
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
       throw error;
@@ -529,6 +736,25 @@ export class TaskWorker {
 
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+
+function taskRecordReference(taskId: string, message: string): string {
+  return `${message} See primary Zero task record ${taskId}.`;
+}
+
+function truncateWithReference(value: string, limit: number, taskId: string): string {
+  if (value.length <= limit) return value;
+  const suffix = `\n\n[Truncated; see primary Zero task record ${taskId} for the full text.]`;
+  return `${value.slice(0, Math.max(0, limit - suffix.length))}${suffix}`;
+}
+
+function boundedAcceptanceCriteria(criteria: string[], taskId: string): string[] {
+  if (!criteria.length) return [];
+  const omitted = criteria.length > 20;
+  const values = criteria.slice(0, omitted ? 19 : 20)
+    .map(item => truncateWithReference(item, 1_000, taskId));
+  if (omitted) values.push(taskRecordReference(taskId, "Additional acceptance criteria were omitted;"));
+  return values;
+}
 
 function parseCheckpoint(raw: Record<string, unknown> | undefined): WorkerCheckpoint | undefined {
   if (!raw) return undefined;

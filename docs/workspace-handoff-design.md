@@ -45,7 +45,7 @@ Agent Orchestrator 的 [#3317 设计记录](https://github.com/Untrivial-ai/agen
 
 ## 当前 Zero 与差距
 
-当前 [TaskWorker](../src/orchestrator/worker.ts)已经让路由、执行、测试和返工围绕一个 task worktree 运行；返工保持已有文件。阶段间传递的是原始任务、失败检查摘要或 Review finding。[TaskStore](../src/core/task-store.ts)已有阶段、尝试关联和版本化交接的持久结构，但当前 worker 尚未写入或消费这些记录，也没有一个任务内 GLM → DeepSeek 这样的多个成功执行阶段。当前 [Reviewer](../src/orchestrator/reviewer.ts)在可信空目录启动，仅接收 diff、任务和检查摘要，不能按需检查完整项目文件。普通进程崩溃后工作树需要人工检查；额度暂停才有校验工作树指纹的恢复路径。
+当前 [TaskWorker](../src/orchestrator/worker.ts)已经让路由、执行、测试和返工围绕一个 task worktree 运行；返工保持已有文件。worker 为单次实现或返工写入阶段、关联尝试、工作树指纹和版本化交接，报告也收录这些记录。阶段间传递的执行提示仍是原始任务、失败检查摘要或 Review finding；worker 尚未消费交接单来规划下一执行阶段，也没有一个任务内 GLM → DeepSeek 这样的多个成功执行阶段。当前 [Reviewer](../src/orchestrator/reviewer.ts)在可信空目录启动，仅接收 diff、任务和检查摘要，不能按需检查完整项目文件。普通进程崩溃后工作树需要人工检查；额度暂停才有校验工作树指纹的恢复路径。
 
 因此，现有一次路由到一次执行再审核的流程是多阶段引擎的最小路径，不能把它称为完整跨 Harness 接力。
 
@@ -74,7 +74,7 @@ SQLite 是任务、阶段、尝试和交接的权威状态；Zero 数据目录�
 ## 实施顺序和验收
 
 1. **验证接入事实。** 对本机 ZCode 只读检查已表明会话协议可按 `providerId/modelId` 选 GLM/DeepSeek，选择会写会话局部状态，不改全局模型默认值；仍需在隔离任务工作区验证协议调用、思考等级和退出/取消行为。不得移动或改写用户现有 ZCode 配置。
-2. **接通阶段与交接数据。** 可迁移的 stage/attempt/handoff 表及版本化 schema 已建立；下一步让 worker 写入阶段状态、交接和工作树事实。先让单执行阶段完整走新契约，再支持 GLM → DeepSeek 等多个执行阶段。
+2. **接通阶段与交接数据。** 可迁移的 stage/attempt/handoff 表、版本化 schema，以及单次实现/返工的 worker 阶段与交接记录已建立；下一步让 worker 将交接单作为后继阶段输入，并把路由、审核纳入阶段记录，再支持 GLM → DeepSeek 等多个执行阶段。
 3. **实现串行接力。** 统一工作区版本采集、进程停止确认、阶段输入构造、降级交接和额度等待后恢复；用不同 Harness 的真实任务验证文件与上下文接续。
 4. **加强审核。** 先验证可信目录下的只读源码访问，再使 Codex Review 可检查相关文件与完整测试证据，保留独立会话和改动检测。
 5. **项目级集成。** 多任务项目增加项目分支、依赖门禁、已完成任务的集成与冲突处理；并行子任务独立 worktree，不能直接共享一个写入目录。
@@ -86,5 +86,6 @@ SQLite 是任务、阶段、尝试和交接的权威状态；Zero 数据目录�
 - ZCode 协议的模型选择已从源码确认，尚未用本机用户会话执行真实的 GLM/DeepSeek 任务；若实际启动改变桌面默认配置或不能正确关闭子进程，停止接入并重新设计。
 - ZCode 的会话协议可能发出权限或用户输入请求；仅等待 `turn.completed` 会让无人值守任务一直停住。接入进程必须识别交互事件，按任务明确的权限边界应答，无法安全自动处理时记录阻塞原因并停止该阶段。不可把 `session/send` 的接收回执当作完成。协议 `session/close` 会删除产品会话；正常收尾应关闭进程资源并保留会话历史。
 - 本机审查的 ZCode 版本仍支持 `session/send`，但其源码已将它标为兼容旧客户端的入口，主路径转向 `v4/command` 的 `sendText`。当前未接路由的原型只验证旧协议的事件和生命周期；正式绑定需核对并优先验证 v4 的模型选择、回执、交互与完成事件，或明确锁定已验证版本。
+- [ZCode v4 命令 schema](https://github.com/zai-org/ZCode/blob/main/packages/shared/src/zcode-protocol-v4/command.ts)允许每条 `sendText` 显式提交 `{providerId,modelId,options.reasoningLevel}`；[执行入口](https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/commands/handlers/session-flow.ts)把它固定到本次输入。因此 Zero 应按任务阶段逐条固定模型，并核对实际回合事件。`createSession.config` 应用失败时[会退回会话默认配置](https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/commands/handlers/session-mgmt.ts)，不能只凭创建会话成功或 ACK 宣称指定模型已执行。以上是上游源码行为，仍须在本机已安装版本做隔离验证。
 - Codex 审核从可信目录读取任务源码的可用范围尚未实测；若读不到文件，就改用 Zero 控制的只读文件通道或快照，不降低审核证据要求。
 - 多个任务目前没有项目集成分支。若用户在主仓库 A 中期望立即看到任务分支的代码，必须完成集成步骤或由界面明确展示任务 worktree，不能把任务隔离误说成主仓库已更新。
