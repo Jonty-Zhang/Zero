@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { HarnessAdapter, HarnessCapabilities, RouteDecision, RunRequest, RunResult, TaskRecord } from "../domain/types.js";
-import { GitWorktreeManager } from "../core/git-worktree.js";
+import { GitWorktreeManager, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError } from "../core/quota.js";
@@ -93,6 +93,71 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
     assert.equal(report?.handoffs?.[0]?.task.objective, task.prompt);
     assert.deepEqual(report?.handoffs?.[0]?.task.acceptanceCriteria, task.acceptanceCriteria);
     assert.match(await (await import("node:fs/promises")).readFile(report!.diffPath!, "utf8"), /result\.txt/);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("worker refuses a late allowed-path edit injected after review checks and before commit", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-reviewed-tree-race-test-"));
+  const repo = join(root, "repo");
+  const artifacts = join(root, "artifacts");
+  const worktreeRoot = join(root, "worktrees");
+  const store = new TaskStore();
+  await mkdir(repo);
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const { stdout: baseOutput } = await exec("git", ["rev-parse", "HEAD"], { cwd: repo });
+    const baseCommit = baseOutput.trim();
+
+    class LateEditWorktrees extends GitWorktreeManager {
+      override async commit(info: WorktreeInfo, message: string, reviewed: WorktreeReviewSnapshot): Promise<string | undefined> {
+        // This runs only after Worker has completed its post-review fingerprint check.
+        await writeFile(join(info.path, "result.txt"), "late unreviewed edit\n");
+        return super.commit(info, message, reviewed);
+      }
+    }
+
+    const task = store.submit({
+      repoPath: repo,
+      baseRef: "main",
+      prompt: "Create the approved result file",
+      acceptanceCriteria: ["result.txt contains approved content"],
+      maxRevisions: 0,
+      checks: [{ id: "result-check", argv: [process.execPath, "-e", "process.exit(require('fs').readFileSync('result.txt','utf8') === 'approved\\n' ? 0 : 1)"] }],
+    });
+    const owner = "worker-review-race";
+    assert.equal(store.claimNext(owner)?.id, task.id);
+    const reviewer: TaskReviewer = {
+      async review() {
+        return { harness: "codex", model: "review", exitCode: 0,
+          result: { verdict: "pass", summary: "Approved", findings: [] } };
+      },
+    };
+    const worker = new TaskWorker({
+      store,
+      worktrees: new LateEditWorktrees(worktreeRoot),
+      testRunner: new TestRunner({ logDirectory: join(artifacts, "checks") }),
+      router: { async route(current) { return routeFor(current); } },
+      reviewer,
+      adapters: new Map([["fake", new FakeAdapter()]]),
+      artifactRoot: artifacts,
+    });
+
+    const failed = await worker.runClaimed(task.id, owner);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.failureReason ?? "", /unstaged tracked changes|no longer matches the reviewed snapshot before commit/);
+    const worktreePath = join(worktreeRoot, task.id);
+    const { stdout: headOutput } = await exec("git", ["rev-parse", "HEAD"], { cwd: worktreePath });
+    assert.equal(headOutput.trim(), baseCommit);
+    assert.equal(await (await import("node:fs/promises")).readFile(join(worktreePath, "result.txt"), "utf8"), "late unreviewed edit\n");
+    assert.equal(store.reviews(task.id)[0]?.verdict, "pass");
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });

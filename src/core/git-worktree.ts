@@ -19,6 +19,14 @@ export interface WorktreeInfo {
   baseCommit: string;
 }
 
+/** Immutable, staged tree and complete patch that a reviewer approved. */
+export interface WorktreeReviewSnapshot {
+  fingerprint: string;
+  diff: string;
+  diffHash: string;
+  treeId: string;
+}
+
 export class GitWorktreeManager {
   readonly #root: string;
 
@@ -114,6 +122,34 @@ export class GitWorktreeManager {
     await this.#validateInfo(info);
     const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: info.path, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
     return stdout;
+  }
+
+  /** Stage the current task output and capture the exact tree/diff the reviewer will see. */
+  async prepareReview(info: WorktreeInfo): Promise<WorktreeReviewSnapshot> {
+    await this.#validateInfo(info);
+    await this.#ensureTaskBranch(info);
+    await execFileAsync("git", ["add", "-A"], { cwd: info.path, windowsHide: true });
+    return this.captureReviewSnapshot(info);
+  }
+
+  /** Capture a stable staged tree and canonical base-to-tree patch without modifying the index. */
+  async captureReviewSnapshot(info: WorktreeInfo): Promise<WorktreeReviewSnapshot> {
+    await this.#validateInfo(info);
+    await this.#ensureTaskBranch(info);
+    await this.#assertNoUnstagedChanges(info);
+    const fingerprintBefore = await this.fingerprint(info);
+    const treeBefore = await this.#writeTree(info);
+    const diff = await this.#diffTree(info, treeBefore);
+    const diffHash = hash(diff);
+    const fingerprintAfter = await this.fingerprint(info);
+    const treeAfter = await this.#writeTree(info);
+    let cleanAfter = true;
+    try { await this.#assertNoUnstagedChanges(info); }
+    catch { cleanAfter = false; }
+    if (!cleanAfter || fingerprintBefore !== fingerprintAfter || treeBefore !== treeAfter) {
+      throw new Error("Worktree changed while capturing the staged review snapshot");
+    }
+    return { fingerprint: fingerprintAfter, diff, diffHash, treeId: treeAfter };
   }
 
   /**
@@ -244,14 +280,11 @@ export class GitWorktreeManager {
 
   async changedPaths(info: WorktreeInfo): Promise<string[]> {
     await this.#ensureTaskBranch(info);
-    const { stdout: committed } = await execFileAsync("git", ["diff", "--name-status", "-z", info.baseCommit, "HEAD", "--"], { cwd: info.path, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
-    const committedParts = committed.split("\0").filter(Boolean);
-    const committedPaths: string[] = [];
-    for (let i = 0; i < committedParts.length;) {
-      const status = committedParts[i++]!;
-      const count = /^[RC]/.test(status) ? 2 : 1;
-      for (let j = 0; j < count && i < committedParts.length; j++) committedPaths.push(committedParts[i++]!.replaceAll("\\", "/"));
-    }
+    const [committed, staged] = await Promise.all([
+      execFileAsync("git", ["diff", "--name-status", "-z", info.baseCommit, "HEAD", "--"], { cwd: info.path, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }),
+      execFileAsync("git", ["diff", "--cached", "--name-status", "-z", "HEAD", "--"], { cwd: info.path, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }),
+    ]);
+    const committedPaths = [...readNameStatusPaths(committed.stdout), ...readNameStatusPaths(staged.stdout)];
     const status = await this.status(info);
     const chunks = status.split("\0").filter(Boolean);
     const paths: string[] = [];
@@ -265,23 +298,98 @@ export class GitWorktreeManager {
     return [...new Set([...committedPaths, ...paths])];
   }
 
-  async commit(info: WorktreeInfo, message = "Zero task result"): Promise<string | undefined> {
+  async commit(info: WorktreeInfo, message: string, reviewed: WorktreeReviewSnapshot): Promise<string | undefined> {
     await this.#validateInfo(info);
     await this.#ensureTaskBranch(info);
-    const before = await this.diff(info);
-    if (!before.trim()) return undefined;
-    await execFileAsync("git", ["add", "-A"], { cwd: info.path, windowsHide: true });
-    const status = await execFileAsync("git", ["diff", "--cached", "--quiet"], { cwd: info.path, windowsHide: true }).catch(e => e as { code?: number });
-    if ((status as { code?: number }).code === 1) {
+    assertReviewSnapshot(reviewed);
+    await this.#assertMatchesReview(info, reviewed, "before commit");
+
+    const headTree = await this.#headTree(info);
+    if (headTree !== reviewed.treeId) {
       await execFileAsync("git", ["-c", "user.name=Zero", "-c", "user.email=zero@localhost", "commit", "-m", message], { cwd: info.path, windowsHide: true, maxBuffer: 2 * 1024 * 1024 });
-    } else if ((status as { code?: number }).code !== undefined) {
-      throw new Error("Unable to inspect staged changes before task commit");
     }
+
     const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: info.path, windowsHide: true });
     const head = stdout.trim();
-    if (head === info.baseCommit) return undefined;
-    const { stdout: committedDiff } = await execFileAsync("git", ["diff", "--no-ext-diff", "--no-renames", "--binary", `${info.baseCommit}..${head}`, "--"], { cwd: info.path, windowsHide: true, maxBuffer: 32 * 1024 * 1024 });
-    return committedDiff.trim() ? head : undefined;
+    const committedTree = await this.#headTree(info);
+    const committedDiff = await this.#diffCommit(info, head);
+    if (committedTree !== reviewed.treeId || hash(committedDiff) !== reviewed.diffHash) {
+      throw new Error("Committed tree does not match the reviewed worktree snapshot");
+    }
+    if (await this.status(info)) throw new Error("Worktree changed while verifying the reviewed commit");
+    if (head === info.baseCommit || !committedDiff.trim()) return undefined;
+    return head;
+  }
+
+  /** Final pre-DONE assertion that HEAD and the clean worktree still equal the reviewed commit. */
+  async verifyReviewedCommit(info: WorktreeInfo, commit: string, reviewed: WorktreeReviewSnapshot): Promise<void> {
+    await this.#validateInfo(info);
+    await this.#ensureTaskBranch(info);
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: info.path, windowsHide: true });
+    const head = stdout.trim();
+    if (head !== commit || await this.#headTree(info) !== reviewed.treeId) {
+      throw new Error("Task branch moved away from the reviewed commit");
+    }
+    const diff = await this.#diffCommit(info, commit);
+    if (hash(diff) !== reviewed.diffHash || await this.status(info)) {
+      throw new Error("Worktree no longer matches the reviewed commit");
+    }
+  }
+
+  async #assertMatchesReview(info: WorktreeInfo, reviewed: WorktreeReviewSnapshot, phase: string): Promise<void> {
+    const current = await this.captureReviewSnapshot(info);
+    if (
+      current.fingerprint !== reviewed.fingerprint ||
+      current.treeId !== reviewed.treeId ||
+      current.diffHash !== reviewed.diffHash
+    ) {
+      throw new Error(`Worktree no longer matches the reviewed snapshot ${phase}`);
+    }
+  }
+
+  async #assertNoUnstagedChanges(info: WorktreeInfo): Promise<void> {
+    const tracked = await execFileAsync("git", ["diff", "--quiet", "--"], { cwd: info.path, windowsHide: true })
+      .catch(error => error as { code?: number });
+    if ((tracked as { code?: number }).code === 1) throw new Error("Worktree has unstaged tracked changes");
+    if ((tracked as { code?: number }).code !== undefined) throw new Error("Unable to inspect unstaged tracked changes");
+    const { stdout: untracked } = await execFileAsync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+      cwd: info.path,
+      windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    if (untracked) throw new Error("Worktree has unstaged untracked files");
+  }
+
+  async #writeTree(info: WorktreeInfo): Promise<string> {
+    const { stdout } = await execFileAsync("git", ["write-tree"], { cwd: info.path, windowsHide: true });
+    const treeId = stdout.trim();
+    if (!/^[a-fA-F0-9]{40,64}$/.test(treeId)) throw new Error("Git returned an invalid staged tree id");
+    return treeId;
+  }
+
+  async #headTree(info: WorktreeInfo): Promise<string> {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: info.path, windowsHide: true });
+    const treeId = stdout.trim();
+    if (!/^[a-fA-F0-9]{40,64}$/.test(treeId)) throw new Error("Git returned an invalid HEAD tree id");
+    return treeId;
+  }
+
+  async #diffTree(info: WorktreeInfo, treeId: string): Promise<string> {
+    const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff", "--no-renames", "--binary", info.baseCommit, treeId, "--"], {
+      cwd: info.path,
+      windowsHide: true,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return stdout;
+  }
+
+  async #diffCommit(info: WorktreeInfo, commit: string): Promise<string> {
+    const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff", "--no-renames", "--binary", info.baseCommit, commit, "--"], {
+      cwd: info.path,
+      windowsHide: true,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return stdout;
   }
 
   async remove(info: WorktreeInfo, options: { deleteBranch?: boolean } = {}): Promise<void> {
@@ -338,5 +446,30 @@ export class GitWorktreeManager {
     const rel = relative(root, target);
     if (!rel || rel === ".") return;
     if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error(`Path escapes configured directory: ${target}`);
+  }
+}
+
+function hash(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function readNameStatusPaths(value: string): string[] {
+  const chunks = value.split("\0").filter(Boolean);
+  const paths: string[] = [];
+  for (let index = 0; index < chunks.length;) {
+    const status = chunks[index++]!;
+    const count = /^[RC]/.test(status) ? 2 : 1;
+    for (let part = 0; part < count && index < chunks.length; part++) {
+      paths.push(chunks[index++]!.replaceAll("\\", "/"));
+    }
+  }
+  return paths;
+}
+
+function assertReviewSnapshot(value: WorktreeReviewSnapshot): void {
+  if (!value || !/^[a-f0-9]{64}$/.test(value.fingerprint) || !/^[a-f0-9]{64}$/.test(value.diffHash)
+    || !/^[a-fA-F0-9]{40,64}$/.test(value.treeId) || typeof value.diff !== "string"
+    || hash(value.diff) !== value.diffHash) {
+    throw new Error("Invalid reviewed worktree snapshot");
   }
 }

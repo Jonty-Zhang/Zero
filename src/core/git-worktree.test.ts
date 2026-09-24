@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, rm, truncate, writeFile } from "node:fs/promises";
@@ -31,7 +32,8 @@ test("worktree is isolated, diff includes untracked files, and commit records ou
     await exec("git", ["add", "-A"], { cwd: info.path });
     await exec("git", ["-c", "user.name=Harness", "-c", "user.email=harness@example.com", "commit", "-m", "harness internal commit"], { cwd: info.path });
     assert.deepEqual((await manager.changedPaths(info)).sort(), ["new.txt", "seed.txt"]);
-    const commit = await manager.commit(info, "task result");
+    const reviewed = await manager.prepareReview(info);
+    const commit = await manager.commit(info, "task result", reviewed);
     assert.ok(commit);
     assert.equal((await readFile(join(info.path, "new.txt"), "utf8")), "new data\n");
     await manager.remove(info, { deleteBranch: true });
@@ -55,7 +57,44 @@ test("commit refuses a harness-created empty commit when base-to-HEAD has no cha
     await exec("git", ["-c", "user.name=Harness", "-c", "user.email=harness@example.com", "commit", "--allow-empty", "-m", "empty"], { cwd: info.path });
     assert.equal((await manager.diff(info)).trim(), "");
     assert.deepEqual(await manager.changedPaths(info), []);
-    assert.equal(await manager.commit(info, "Zero result"), undefined);
+    const reviewed = await manager.prepareReview(info);
+    assert.equal(await manager.commit(info, "Zero result", reviewed), undefined);
+    await manager.remove(info, { deleteBranch: true });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("review snapshot stages complete text and binary diffs and commit preserves its exact tree", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-git-reviewed-tree-test-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const manager = new GitWorktreeManager(join(root, "worktrees"));
+    const info = await manager.create("reviewed_tree", repo, "main");
+    await writeFile(join(info.path, "seed.txt"), "reviewed text\n");
+    await writeFile(join(info.path, "new.txt"), "new text\n");
+    await writeFile(join(info.path, "payload.bin"), Buffer.from([0, 17, 34, 51, 68]));
+
+    const reviewed = await manager.prepareReview(info);
+    assert.match(reviewed.diff, /seed\.txt/);
+    assert.match(reviewed.diff, /new\.txt/);
+    assert.match(reviewed.diff, /payload\.bin/);
+    assert.match(reviewed.diff, /GIT binary patch/);
+    assert.equal(reviewed.diffHash, createHash("sha256").update(reviewed.diff, "utf8").digest("hex"));
+    assert.deepEqual((await manager.changedPaths(info)).sort(), ["new.txt", "payload.bin", "seed.txt"]);
+    assert.notEqual(await manager.status(info), "");
+
+    const commit = await manager.commit(info, "approved tree", reviewed);
+    assert.ok(commit);
+    await manager.verifyReviewedCommit(info, commit, reviewed);
+    const { stdout: tree } = await exec("git", ["rev-parse", "HEAD^{tree}"], { cwd: info.path });
+    assert.equal(tree.trim(), reviewed.treeId);
+    assert.equal(await readFile(join(info.path, "new.txt"), "utf8"), "new text\n");
     await manager.remove(info, { deleteBranch: true });
   } finally { await rm(root, { recursive: true, force: true }); }
 });

@@ -15,7 +15,7 @@ import type {
   TaskRecord,
   TaskStatus,
 } from "../domain/types.js";
-import { GitWorktreeManager, type WorktreeInfo } from "../core/git-worktree.js";
+import { GitWorktreeManager, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
@@ -338,23 +338,22 @@ export class TaskWorker {
         if (stage !== "review") throw new Error("Worker has no resumable stage");
         if (task.status === "running") task = this.#options.store.transition(taskId, "running", "reviewing", { owner, reason: "resuming quota-paused review" });
         this.#assertNotCancelled(active);
-        const diffBefore = await this.#options.worktrees.diff(worktree);
-        const statusBefore = await this.#options.worktrees.status(worktree);
+        const reviewSnapshot = await this.#options.worktrees.prepareReview(worktree);
+        this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
         const reviewAttempt = this.#options.store.createAttempt(taskId, "review", { owner, harness: "codex" });
         activeAttempt = reviewAttempt;
         active.adapter = this.#options.adapters.get("codex");
         active.attempt = reviewAttempt;
         this.#assertNotCancelled(active);
-        const review = await this.#options.reviewer.review(task, worktree, route, finalChecks, diffBefore, { attemptId: reviewAttempt.id });
-        const diffAfter = await this.#options.worktrees.diff(worktree);
-        const statusAfter = await this.#options.worktrees.status(worktree);
-        if (statusAfter !== statusBefore || hash(diffAfter) !== hash(diffBefore)) {
+        const review = await this.#options.reviewer.review(task, worktree, route, finalChecks, reviewSnapshot.diff, { attemptId: reviewAttempt.id });
+        const reviewAfter = await this.#options.worktrees.captureReviewSnapshot(worktree);
+        if (!sameReviewSnapshot(reviewSnapshot, reviewAfter)) {
           this.#options.store.finishAttempt(reviewAttempt.id, { status: "failed", exitCode: review.exitCode,
             stdoutPath: review.stdoutPath, stderrPath: review.stderrPath, resultPath: review.eventsPath,
             model: review.model, reasoningEffort: review.reasoningEffort,
-            error: "Reviewer changed the worktree despite read-only mode" });
+            error: "Worktree changed after the reviewed snapshot was captured" });
           activeAttempt = undefined;
-          throw new Error("Reviewer changed the worktree; its verdict is invalid");
+          throw new Error("Worktree changed after review; its verdict is invalid");
         }
         if (review.harness !== "codex" || review.exitCode !== 0 || !isReviewResult(review.result)) {
           this.#options.store.finishAttempt(reviewAttempt.id, { status: "failed", exitCode: review.exitCode,
@@ -391,18 +390,18 @@ export class TaskWorker {
 
         this.#assertLease(taskId, owner, () => leaseLost);
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
-        resultCommit = await this.#options.worktrees.commit(worktree, `Zero task ${taskId}`);
+        resultCommit = await this.#options.worktrees.commit(worktree, `Zero task ${taskId}`, reviewSnapshot);
         this.#assertNotCancelled(active);
         if (!resultCommit) throw new Error("No changes were committed; refusing to mark a no-op task DONE");
-        const diff = await this.#options.worktrees.diff(worktree);
+        const diff = reviewSnapshot.diff;
         if (!diff.trim()) throw new Error("The result has no base-to-HEAD diff; refusing to mark a no-op task DONE");
-        const dirty = await this.#options.worktrees.status(worktree);
-        if (dirty) throw new Error("Worktree is still dirty after commit; refusing to mark DONE");
+        await this.#options.worktrees.verifyReviewedCommit(worktree, resultCommit, reviewSnapshot);
         // Archive all evidence before the irreversible DONE transition. The DB remains authoritative
         // if a crash occurs here; readReport overlays the live state when serving the artifact.
         await this.#writeReport(taskId, "done", { task, baseCommit, resultCommit, diff });
         this.#assertNotCancelled(active);
         this.#assertLease(taskId, owner, () => leaseLost);
+        await this.#options.worktrees.verifyReviewedCommit(worktree, resultCommit, reviewSnapshot);
         task = this.#options.store.transition(taskId, "reviewing", "done", { owner, clearLease: true, reason: "checks, review, commit, and report completed" });
         markedDone = true;
         return this.#requireTask(taskId);
@@ -736,6 +735,12 @@ export class TaskWorker {
 
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+
+function sameReviewSnapshot(left: WorktreeReviewSnapshot, right: WorktreeReviewSnapshot): boolean {
+  return left.fingerprint === right.fingerprint
+    && left.treeId === right.treeId
+    && left.diffHash === right.diffHash;
+}
 
 function taskRecordReference(taskId: string, message: string): string {
   return `${message} See primary Zero task record ${taskId}.`;
