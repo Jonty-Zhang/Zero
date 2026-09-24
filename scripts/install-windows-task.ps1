@@ -6,6 +6,8 @@ param(
     [string]$Account,
     [string]$InstallDir = (Split-Path -Parent $PSScriptRoot),
     [string]$NodePath,
+    [string]$CodexExe,
+    [string]$ProxyUrl,
     [string]$DataDir,
     [string]$LogDir,
     [ValidateRange(1, 65535)][int]$Port = 4179
@@ -26,11 +28,26 @@ function Stop-TaskIfRunning($Task) {
 }
 
 if ($Install -and $Uninstall) { throw 'Choose either -Install or -Uninstall.' }
+if (-not $Uninstall -and $CodexExe) {
+    if (-not [System.IO.Path]::IsPathRooted($CodexExe)) { throw 'CodexExe must be an absolute path.' }
+    $CodexExe = [System.IO.Path]::GetFullPath($CodexExe)
+    if (-not (Test-Path -LiteralPath $CodexExe -PathType Leaf)) { throw "Codex executable not found: $CodexExe" }
+}
+if (-not $Uninstall -and $ProxyUrl) {
+    $proxyUri = $null
+    if (-not [Uri]::TryCreate($ProxyUrl, [UriKind]::Absolute, [ref]$proxyUri) -or
+        $proxyUri.Scheme -notin @('http', 'https', 'socks5', 'socks5h') -or
+        -not $proxyUri.Host -or $proxyUri.UserInfo -or $proxyUri.AbsolutePath -ne '/' -or $proxyUri.Query -or $proxyUri.Fragment) {
+        throw 'ProxyUrl must be an authority-only HTTP(S) or SOCKS5 URL without user info, path, query, or fragment. Configure proxy credentials outside the task action.'
+    }
+}
 if (-not $Install -and -not $Uninstall) {
     Write-Output 'Dry run only. Review the resolved paths, then use -Install or -Uninstall explicitly.'
     Write-Output ("Task name: {0}" -f $TaskName)
     Write-Output ("Install directory: {0}" -f [System.IO.Path]::GetFullPath($InstallDir))
     if ($Account) { Write-Output ("Task account: {0}" -f $Account) }
+    if ($CodexExe) { Write-Output ("Codex executable: {0}" -f $CodexExe) }
+    if ($ProxyUrl) { Write-Output 'Credential-free proxy URL: configured.' }
     return
 }
 
@@ -120,6 +137,8 @@ try {
         '-InstallDir', $resolvedInstallDir, '-NodePath', $resolvedNodePath,
         '-DataDir', $resolvedDataDir, '-LogDir', $resolvedLogDir, '-Port', [string]$Port
     )
+    if ($CodexExe) { $actionArguments += @('-CodexExe', $CodexExe) }
+    if ($ProxyUrl) { $actionArguments += @('-ProxyUrl', $ProxyUrl) }
     $quotedArguments = foreach ($argument in $actionArguments) {
         if ($argument.Contains('"') -or $argument.Contains("`r") -or $argument.Contains("`n")) { throw 'Task action arguments may not contain quotes or line breaks.' }
         '"' + $argument + '"'

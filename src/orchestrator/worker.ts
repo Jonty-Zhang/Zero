@@ -306,12 +306,18 @@ export class TaskWorker {
         const diffAfter = await this.#options.worktrees.diff(worktree);
         const statusAfter = await this.#options.worktrees.status(worktree);
         if (statusAfter !== statusBefore || hash(diffAfter) !== hash(diffBefore)) {
-          this.#options.store.finishAttempt(reviewAttempt.id, { status: "failed", exitCode: review.exitCode, error: "Reviewer changed the worktree despite read-only mode" });
+          this.#options.store.finishAttempt(reviewAttempt.id, { status: "failed", exitCode: review.exitCode,
+            stdoutPath: review.stdoutPath, stderrPath: review.stderrPath, resultPath: review.eventsPath,
+            model: review.model, reasoningEffort: review.reasoningEffort,
+            error: "Reviewer changed the worktree despite read-only mode" });
           activeAttempt = undefined;
           throw new Error("Reviewer changed the worktree; its verdict is invalid");
         }
         if (review.harness !== "codex" || review.exitCode !== 0 || !isReviewResult(review.result)) {
-          this.#options.store.finishAttempt(reviewAttempt.id, { status: "failed", exitCode: review.exitCode, error: "Reviewer failed or returned an invalid verdict" });
+          this.#options.store.finishAttempt(reviewAttempt.id, { status: "failed", exitCode: review.exitCode,
+            stdoutPath: review.stdoutPath, stderrPath: review.stderrPath, resultPath: review.eventsPath,
+            model: review.model, reasoningEffort: review.reasoningEffort,
+            error: `Reviewer failed or returned an invalid verdict: ${review.result.summary}` });
           activeAttempt = undefined;
           throw new Error("Codex Reviewer failed or returned an invalid verdict");
         }

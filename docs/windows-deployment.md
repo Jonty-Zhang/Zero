@@ -41,6 +41,8 @@ node .\dist\cli.js help
   -Install `
   -Account 'COMPUTER\zero-runner' `
   -NodePath 'C:\Program Files\nodejs\node.exe' `
+  -CodexExe 'C:\Users\zero-runner\AppData\Local\Programs\Codex\codex.exe' `
+  -ProxyUrl 'http://proxy.example:8080' `
   -DataDir 'C:\Users\zero-runner\AppData\Local\Zero' `
   -LogDir 'C:\Users\zero-runner\AppData\Local\Zero\logs' `
   -Port 4179
@@ -53,6 +55,8 @@ node .\dist\cli.js help
 | 触发器 | 系统启动时 |
 | 任务账户 | 必须显式指定，且是当前登录的标准账户 |
 | Node.js | 已验证的 Node.js 24+ 绝对路径 |
+| Codex CLI | 可选；用 `-CodexExe` 指定绝对 `codex.exe` 路径，启动器会设置 `ZERO_CODEX_EXE` |
+| 网络代理 | 可选；`-ProxyUrl` 设置为 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`，仅接受不含凭据、路径、查询或片段的 HTTP(S)/SOCKS5 authority URL |
 | `ZERO_DATA_DIR` | `%LOCALAPPDATA%\Zero`，可用 `-DataDir` 覆盖 |
 | 日志目录 | `%LOCALAPPDATA%\Zero\logs`，可用 `-LogDir` 覆盖 |
 | 服务监听 | `127.0.0.1:4179`，可用 `-Port` 更改端口 |
@@ -65,9 +69,17 @@ node .\dist\cli.js help
 
 ```powershell
 $env:ZERO_DATA_DIR = 'C:\Users\zero-runner\AppData\Local\Zero'
+$env:ZERO_CODEX_EXE = 'C:\Users\zero-runner\AppData\Local\Programs\Codex\codex.exe'
 node .\dist\cli.js verify-binding codex gpt-6-sol
 Remove-Item Env:\ZERO_DATA_DIR
+Remove-Item Env:\ZERO_CODEX_EXE
 ```
+
+绑定验证必须使用与计划任务相同的 Codex CLI 路径和代理出口。安装时传入 `-CodexExe`、`-ProxyUrl` 后，计划任务启动器会在每次启动时重新设置这些值，不依赖交互终端的临时环境。`-ProxyUrl` 只接受无用户信息、路径、查询或片段的 HTTP(S)/SOCKS5 authority URL；该 URL 会作为无凭据的任务参数保存。需要代理认证时，不要把凭据传给 `-ProxyUrl`，请通过组织管理的服务账户环境配置注入代理环境变量；启动器在未传 `-ProxyUrl` 时会保留这些环境变量。Zero 会在 harness 捕获的输出中脱敏代理 URL 与用户名/密码。
+
+若代理监听器依赖交互式桌面，它可能在用户登录前尚未启动。应先配置一个能在系统启动阶段运行并监听该地址的代理服务，再启动 Zero；否则 Zero 发起的外部 CLI 调用会因代理不可达而失败。必须在重启后保持 Zero 账户退出登录的情况下复验代理监听、Zero 健康检查和一次真实模型调用。
+
+Codex 进程在共享相同 `CODEX_HOME` 和账户时可能显示在 Codex 应用的 Recent 列表中；分配和审核会话使用 ephemeral 模式。Zero 的任务状态与报告保存在 Zero 中。Codex 应用的项目分组可能因 Zero 使用 worktree 而不同。
 
 不要把 Codex API 密钥写入命令行、计划任务参数、脚本、`config.json` 或日志。使用 Codex CLI 支持的账户登录或安全凭据存储。计划任务使用指定账户的 profile 启动；部署验证必须确认凭据在该非交互运行环境里仍可用。
 

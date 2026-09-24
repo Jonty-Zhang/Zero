@@ -5,6 +5,7 @@ import { extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
 import { TaskStore } from '../core/task-store.js';
 import { CodexAdapter } from '../adapters/codex.js';
+import type { AdapterConfig } from '../adapters/base.js';
 import { DshAdapter } from '../adapters/dsh.js';
 import { ZCodeAdapter } from '../adapters/zcode.js';
 import type { ModelBinding } from '../adapters/types.js';
@@ -49,10 +50,16 @@ const JSON_HEADERS = { ...SECURITY_HEADERS, 'Content-Type': 'application/json; c
 
 export function createDefaultAdapters(bindings: ModelBinding[]): AdapterMap {
   return {
-    codex: new CodexAdapter({ bindings }),
+    codex: createCodexAdapter(bindings),
     dsh: new DshAdapter({ bindings }),
     zcode: new ZCodeAdapter({ bindings }),
   };
+}
+
+/** Use the explicitly configured Codex CLI path for both runtime and binding verification. */
+export function createCodexAdapter(bindings: ModelBinding[], config: Omit<AdapterConfig, 'bindings' | 'executable'> = {}): CodexAdapter {
+  const executable = process.env.ZERO_CODEX_EXE?.trim();
+  return new CodexAdapter({ ...config, bindings, ...(executable ? { executable } : {}) });
 }
 
 export function createZeroServer(options: ZeroServerOptions): Server {
@@ -296,6 +303,7 @@ function mapAttempt(value: Attempt) {
   const metadata = value.metadata ?? {};
   return { number: value.sequence, status: value.status, startedAt: value.startedAt, endedAt: value.finishedAt,
     route: value.harness || value.model ? { harnessId: value.harness, modelId: value.model, reasoningEffort: value.reasoningEffort } : undefined,
+    sessionId: typeof metadata.sessionId === 'string' ? metadata.sessionId : undefined,
     summary: value.error ?? metadata.summary };
 }
 function mapCheck(value: CheckResult) { return { name: value.id, command: value.argv.join(' '), status: value.status, exitCode: value.exitCode, durationMs: value.durationMs, output: value.error }; }

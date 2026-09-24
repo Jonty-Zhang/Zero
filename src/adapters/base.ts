@@ -15,7 +15,10 @@ export interface AdapterConfig {
   maxLogBytes?: number;
 }
 
-const DEFAULT_ENV_ALLOWLIST = ['PATH', 'Path', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'APPDATA', 'USERPROFILE', 'HOME', 'XDG_CONFIG_HOME'];
+const DEFAULT_ENV_ALLOWLIST = [
+  'PATH', 'Path', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'APPDATA', 'USERPROFILE', 'HOME', 'XDG_CONFIG_HOME',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+];
 
 export abstract class BaseHarnessAdapter implements DomainAdapter {
   abstract readonly id: HarnessId;

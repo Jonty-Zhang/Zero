@@ -9,7 +9,7 @@ import type { HarnessAdapter, HarnessCapabilities, RunRequest, RunResult, TaskSu
 import type { ModelBinding } from '../adapters/types.js';
 import { TaskStore } from '../core/task-store.js';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
-import { createZeroServer } from './server.js';
+import { createCodexAdapter, createZeroServer } from './server.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -55,6 +55,20 @@ const binding: ModelBinding = {
   harness: 'zcode', model, selector: 'isolated_config', configDir: 'unused-in-probe-test', mode: 'yolo', verified: true,
   reasoningEfforts: ['low', 'high'], verificationSource: 'smoke_test', verifiedCliVersion: 'zcode-test-1',
 };
+
+test('Codex adapter uses ZERO_CODEX_EXE in its execution invocation', async () => {
+  const previous = process.env.ZERO_CODEX_EXE;
+  process.env.ZERO_CODEX_EXE = 'C:\\tools\\codex\\codex.exe';
+  try {
+    const adapter = createCodexAdapter([{ harness: 'codex', model, selector: 'cli_argument', verified: true }]);
+    const invocation = await adapter.prepare({ taskId: 'task', attemptId: 'attempt', role: 'implement', cwd: process.cwd(), prompt: 'hello' },
+      { harness: 'codex', model, selector: 'cli_argument', verified: true });
+    assert.equal(invocation.executable, 'C:\\tools\\codex\\codex.exe');
+  } finally {
+    if (previous === undefined) delete process.env.ZERO_CODEX_EXE;
+    else process.env.ZERO_CODEX_EXE = previous;
+  }
+});
 
 function testConfig(hasLiveVerification: boolean): LocalZeroConfig {
   return {

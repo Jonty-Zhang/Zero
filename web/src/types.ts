@@ -27,6 +27,7 @@ export type Attempt = {
   status?: string;
   startedAt?: string;
   endedAt?: string;
+  sessionId?: string;
   route?: RouteInfo;
   summary?: string;
   tests?: TestResult[];

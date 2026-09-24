@@ -48,6 +48,16 @@ function routeResponse(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({ taskType: 'implementation', complexity: 'medium', bindingId: 'zcode:glm', reasoningEffort: 'high', reason: 'The task is a complex code change.', ...overrides });
 }
 
+function assertStrictOutputSchema(schema: any): void {
+  if (schema.type === 'object') {
+    assert.equal(schema.additionalProperties, false);
+    assert.deepEqual([...schema.required].sort(), Object.keys(schema.properties).sort());
+    for (const property of Object.values(schema.properties) as any[]) assertStrictOutputSchema(property);
+  }
+  if (schema.items) assertStrictOutputSchema(schema.items);
+  if (schema.anyOf) for (const variant of schema.anyOf) assertStrictOutputSchema(variant);
+}
+
 test('router uses only verified healthy candidates and records field-level lock sources', async () => {
   const dir = await tempDir();
   try {
@@ -74,7 +84,9 @@ test('router uses only verified healthy candidates and records field-level lock 
     assert.equal(codex.calls[0]!.role, 'route');
     assert.equal(codex.calls[0]!.readOnly, true);
     assert.ok(codex.calls[0]!.outputSchemaPath);
-    assert.match(await readFile(codex.calls[0]!.outputSchemaPath!, 'utf8'), /bindingId/);
+    const routeSchema = JSON.parse(await readFile(codex.calls[0]!.outputSchemaPath!, 'utf8'));
+    assert.match(JSON.stringify(routeSchema), /bindingId/);
+    assertStrictOutputSchema(routeSchema);
     assert.match(codex.calls[0]!.prompt, /zcode:glm/);
     assert.ok(!codex.calls[0]!.prompt.includes('zcode:unverified'));
     assert.ok(!codex.calls[0]!.prompt.includes('codex:offline'));
@@ -189,7 +201,13 @@ test('reviewer starts a fresh read-only Codex call with schema, attempt ID, and 
     assert.equal(codex.calls[0]!.model, 'coord-model');
     assert.equal(codex.calls[0]!.reasoningEffort, 'high');
     assert.ok(codex.calls[0]!.outputSchemaPath);
-    assert.match(await readFile(codex.calls[0]!.outputSchemaPath!, 'utf8'), /changes_requested/);
+    const reviewSchema = JSON.parse(await readFile(codex.calls[0]!.outputSchemaPath!, 'utf8'));
+    assert.match(JSON.stringify(reviewSchema), /changes_requested/);
+    assertStrictOutputSchema(reviewSchema);
+    const findingSchema = reviewSchema.properties.findings.items;
+    assert.deepEqual(findingSchema.required, ['file', 'line', 'severity', 'evidence', 'requestedChange']);
+    assert.deepEqual(findingSchema.properties.file.anyOf.map((variant: any) => variant.type), ['string', 'null']);
+    assert.deepEqual(findingSchema.properties.line.anyOf.map((variant: any) => variant.type), ['integer', 'null']);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -234,8 +252,11 @@ test('reviewer propagates an explicit usage-limit response instead of returning 
 
 test('review parser rejects markdown, contradictory pass findings, and malformed findings', () => {
   assert.throws(() => parseReviewOutput(`\`\`\`json\n${passReview}\n\`\`\``), /strict JSON/);
-  assert.throws(() => parseReviewOutput(JSON.stringify({ verdict: 'pass', summary: 'ok', findings: [{ severity: 'low', evidence: 'x', requestedChange: 'y' }] })), /pass with unresolved findings/);
-  assert.throws(() => parseReviewOutput(JSON.stringify({ verdict: 'changes_requested', summary: 'fix', findings: [{ severity: 'high', line: 0, evidence: 'x', requestedChange: 'y' }] })), /positive integer/);
+  assert.throws(() => parseReviewOutput(JSON.stringify({ verdict: 'pass', summary: 'ok', findings: [{ severity: 'low', evidence: 'x', requestedChange: 'y' }] })), /invalid object shape/);
+  assert.throws(() => parseReviewOutput(JSON.stringify({ verdict: 'pass', summary: 'ok', findings: [{ file: null, line: null, severity: 'low', evidence: 'x', requestedChange: 'y' }] })), /pass with unresolved findings/);
+  assert.throws(() => parseReviewOutput(JSON.stringify({ verdict: 'changes_requested', summary: 'fix', findings: [{ file: null, line: 0, severity: 'high', evidence: 'x', requestedChange: 'y' }] })), /positive integer/);
+  assert.deepEqual(parseReviewOutput(JSON.stringify({ verdict: 'changes_requested', summary: 'fix', findings: [{ file: null, line: null, severity: 'high', evidence: 'x', requestedChange: 'y' }] })).findings[0],
+    { severity: 'high', evidence: 'x', requestedChange: 'y' });
 });
 
 test('reviewer rejects a manual model or effort absent from verified Codex capabilities', async () => {

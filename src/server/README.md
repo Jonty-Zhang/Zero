@@ -4,6 +4,20 @@ The server binds to `127.0.0.1:4179` by default and serves the production UI fro
 
 Run `zero serve` to start the long-lived process. It periodically checks the SQLite queue, so closing the browser does not stop work. On startup it recovers expired leases; an interrupted attempt remains fail-closed and is not silently rerun.
 
+Zero uses `codex` from `PATH` by default. Set `ZERO_CODEX_EXE` to an explicit Codex CLI executable when the desired binary is not on `PATH`; the setting is used by both the server runtime and `zero verify-binding`. For example, in PowerShell:
+
+```powershell
+$env:ZERO_CODEX_EXE = 'C:\Users\you\AppData\Local\Programs\codex\codex.exe'
+zero verify-binding codex gpt-6-sol
+zero serve
+```
+
+Keep the variable set in the environment that launches the server so runtime calls use the same CLI installation and version that was verified.
+
+Codex Harness child processes inherit `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` (including lowercase spellings) when present. If a proxy URL contains credentials, Zero redacts the URL and its username/password if the CLI echoes them in captured output. Test/check commands keep their separate restricted environment unless explicitly configured.
+
+Codex CLI sessions may appear under Recent in the Codex app when they use the same `CODEX_HOME` and account; allocator and reviewer sessions are ephemeral. Zero's task state and report remain in Zero. App-created project grouping can differ because Zero runs tasks in worktrees.
+
 The initial local registry contains the `gpt-6-sol` model entry and no verified bindings. A Codex CLI version/help check can report CLI health, but it does not prove login, model selection or a successful model call. Stop the Zero server before running `zero verify-binding codex gpt-6-sol`; the command makes a minimal headless model call using `codex exec` with `--model` and a verified reasoning effort (high by default), requires a successful exit and unique response token, and records the timestamp, CLI version, requested model, exit code and evidence level in the local `config.json`. If Codex reports the actual model in its JSONL events, the command requires a match and records `event_confirmed`; if it omits that evidence, the binding is recorded as `selector_only` and is never described as actual-model-confirmed. Only the tested reasoning effort is enabled; verify additional levels one at a time with `--effort low`, for example. Restart the server after verification.
 
 To register another model, edit the local `models` array in the platform-specific config file and run the verification command. Never put credentials in this file. Adapter credentials come from the process environment or CLI login. DSH and ZCode remain unavailable as execution candidates unless they have a version-specific, model-locked binding confirmed by an equivalent real invocation.

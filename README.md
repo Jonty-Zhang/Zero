@@ -42,6 +42,7 @@ The UI lets you specify any subset of execution Harness, model and reasoning eff
 - [Routing and review contract](docs/route-review-contract.md)
 - [Windows unattended deployment](docs/windows-deployment.md)
 - [Super Plumber integration assessment](docs/super-plumber-assessment.md)
+- [Live Codex end-to-end validation](docs/live-validation.md)
 
 The code is original and does not fork any of the reviewed projects. CAO and Hydra informed the architecture. Zero is licensed under [Apache-2.0](LICENSE).
 

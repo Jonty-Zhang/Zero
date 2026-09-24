@@ -125,10 +125,10 @@ const REVIEW_SCHEMA = {
       type: 'array', maxItems: 100,
       items: {
         type: 'object', additionalProperties: false,
-        required: ['severity', 'evidence', 'requestedChange'],
+        required: ['file', 'line', 'severity', 'evidence', 'requestedChange'],
         properties: {
-          file: { type: 'string', minLength: 1 },
-          line: { type: 'integer', minimum: 1 },
+          file: { anyOf: [{ type: 'string', minLength: 1 }, { type: 'null' }] },
+          line: { anyOf: [{ type: 'integer', minimum: 1 }, { type: 'null' }] },
           severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
           evidence: { type: 'string', minLength: 1, maxLength: 4000 },
           requestedChange: { type: 'string', minLength: 1, maxLength: 4000 },
@@ -189,8 +189,9 @@ export function parseReviewOutput(final?: string): ReviewResult {
 
 function validateFinding(value: unknown): ReviewFinding {
   if (!isRecord(value) || extraKeys(value, ['file', 'line', 'severity', 'evidence', 'requestedChange'])) throw new Error('Review finding has an invalid object shape');
-  if (value.file !== undefined && (typeof value.file !== 'string' || !value.file.trim())) throw new Error('Review finding file must be a non-empty string when present');
-  if (value.line !== undefined && (!Number.isSafeInteger(value.line) || (value.line as number) < 1)) throw new Error('Review finding line must be a positive integer when present');
+  if (!Object.hasOwn(value, 'file') || !Object.hasOwn(value, 'line') || !Object.hasOwn(value, 'severity') || !Object.hasOwn(value, 'evidence') || !Object.hasOwn(value, 'requestedChange')) throw new Error('Review finding has an invalid object shape');
+  if (value.file !== null && (typeof value.file !== 'string' || !value.file.trim())) throw new Error('Review finding file must be null or a non-empty string');
+  if (value.line !== null && (!Number.isSafeInteger(value.line) || (value.line as number) < 1)) throw new Error('Review finding line must be null or a positive integer');
   if (!['critical', 'high', 'medium', 'low'].includes(String(value.severity))) throw new Error('Review finding severity is invalid');
   if (typeof value.evidence !== 'string' || !value.evidence.trim() || value.evidence.length > 4000) throw new Error('Review finding evidence must be a non-empty string');
   if (typeof value.requestedChange !== 'string' || !value.requestedChange.trim() || value.requestedChange.length > 4000) throw new Error('Review finding requestedChange must be a non-empty string');

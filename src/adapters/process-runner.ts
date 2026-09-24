@@ -134,11 +134,14 @@ export function buildChildEnv(
   overrides: NodeJS.ProcessEnv = {},
 ): { env: NodeJS.ProcessEnv; secrets: string[] } {
   const env: NodeJS.ProcessEnv = {};
+  const secrets: string[] = [];
   for (const key of allowlist) {
     const value = process.env[key];
-    if (value !== undefined) env[key] = value;
+    if (value !== undefined) {
+      env[key] = value;
+      if (/^(?:https?|all)_proxy$/i.test(key)) secrets.push(...proxyCredentialSecrets(value));
+    }
   }
-  const secrets: string[] = [];
   for (const [key, ref] of Object.entries(secretRefs)) {
     const value = resolveSecret?.(ref);
     if (value === undefined) throw new Error(`Secret reference could not be resolved: ${ref}`);
@@ -146,7 +149,24 @@ export function buildChildEnv(
     secrets.push(value);
   }
   for (const [key, value] of Object.entries(overrides)) {
-    if (value !== undefined) env[key] = value;
+    if (value !== undefined) {
+      env[key] = value;
+      if (/^(?:https?|all)_proxy$/i.test(key)) secrets.push(...proxyCredentialSecrets(value));
+    }
   }
   return { env, secrets };
+}
+
+function proxyCredentialSecrets(value: string): string[] {
+  try {
+    const url = new URL(value);
+    if (!url.username && !url.password) return [];
+    const decoded = [url.username, url.password].map(component => {
+      try { return decodeURIComponent(component); } catch { return component; }
+    });
+    return [value, ...decoded].filter(Boolean);
+  } catch {
+    // A malformed URL may still contain userinfo. Redact its complete value if echoed.
+    return value.includes('@') ? [value] : [];
+  }
 }

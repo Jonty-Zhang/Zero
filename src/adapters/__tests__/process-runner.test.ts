@@ -17,6 +17,30 @@ test('child environment inherits only allowlisted keys and resolves secret refer
   }
 });
 
+test('child environment forwards proxy settings and redacts URL credentials from CLI output', async () => {
+  const oldHttpsProxy = process.env.HTTPS_PROXY;
+  const oldNoProxy = process.env.NO_PROXY;
+  const proxy = 'http://proxy-user:p%40ss@proxy.example:8080';
+  process.env.HTTPS_PROXY = proxy;
+  process.env.NO_PROXY = 'localhost,127.0.0.1';
+  try {
+    const built = buildChildEnv(['HTTPS_PROXY', 'NO_PROXY']);
+    assert.equal(built.env.HTTPS_PROXY, proxy);
+    assert.equal(built.env.NO_PROXY, 'localhost,127.0.0.1');
+    const result = await runProcess({
+      executable: process.execPath,
+      args: ['-e', `process.stderr.write(${JSON.stringify('proxy-user p@ss')})`],
+      cwd: process.cwd(), env: built.env, secrets: built.secrets, timeoutMs: 5_000,
+    });
+    assert.equal(result.stderr, '[REDACTED] [REDACTED]');
+    assert.ok(!JSON.stringify(result).includes('proxy-user'));
+    assert.ok(!JSON.stringify(result).includes('p@ss'));
+  } finally {
+    if (oldHttpsProxy === undefined) delete process.env.HTTPS_PROXY; else process.env.HTTPS_PROXY = oldHttpsProxy;
+    if (oldNoProxy === undefined) delete process.env.NO_PROXY; else process.env.NO_PROXY = oldNoProxy;
+  }
+});
+
 test('child environment fails closed when a secret reference cannot be resolved', () => {
   assert.throws(() => buildChildEnv([], { API_TOKEN: 'vault://missing' }, () => undefined), /could not be resolved/);
 });

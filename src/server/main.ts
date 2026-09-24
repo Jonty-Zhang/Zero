@@ -3,7 +3,6 @@ import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { CodexAdapter } from '../adapters/codex.js';
 import type { ModelBinding, ReasoningEffort } from '../adapters/types.js';
 import { GitWorktreeManager } from '../core/git-worktree.js';
 import { TaskStore } from '../core/task-store.js';
@@ -12,7 +11,7 @@ import { TaskRouter } from '../orchestrator/router.js';
 import { TaskReviewer } from '../orchestrator/reviewer.js';
 import { TaskWorker } from '../orchestrator/worker.js';
 import { ConfigStore } from './config-store.js';
-import { createDefaultAdapters, createZeroServer } from './server.js';
+import { createCodexAdapter, createDefaultAdapters, createZeroServer } from './server.js';
 import type { TaskStatus } from '../domain/types.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -107,7 +106,7 @@ export async function runBindingVerification(modelId: string, effort: string = '
   const model = current.models.find(item => item.id === modelId || item.modelId === modelId);
   if (!model) throw new Error(`Unknown model ${modelId}. Add it to ${resolve(dataRoot, 'config.json')} first.`);
   const binding: ModelBinding = { harness: 'codex', model, selector: 'cli_argument', verified: true, reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh'] };
-  const adapter = new CodexAdapter({ bindings: [binding], timeoutMs: 90_000, maxLogBytes: 128 * 1024 });
+  const adapter = createCodexAdapter([binding], { timeoutMs: 90_000, maxLogBytes: 128 * 1024 });
   const caps = await adapter.probe();
   if (!caps.available || !caps.models.includes(model.id)) throw new Error(`Codex CLI probe failed: ${caps.unavailableReason ?? 'model binding unavailable'}`);
   const version = caps.version ?? 'unknown';
