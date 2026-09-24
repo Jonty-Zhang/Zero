@@ -83,7 +83,7 @@ normalize(raw_output) -> RunResult
 `RunContext` 至少含 task_id、attempt_id、role（implement/review/revise）、cwd、base commit、任务 brief、允许的文件范围、预算与所需输出格式。`RunResult` 含状态、退出码、结构化 final、事件流路径、stdout/stderr 路径、请求及实际模型、Harness 版本、耗时、session id（若可用）。Adapter 用 argv 数组启动独立子进程，设置 cwd、受控环境、超时，并终止完整进程树；日志流量有上限且对凭据脱敏。**退出码 0 只证明 Harness 回合完成，不能证明任务成功。**
 
 - Codex：采用官方 [OpenAI Docs 的 `codex exec` 无交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)，用 JSONL 事件及显式模型与 sandbox 配置；review 阶段只读。
-- DSH：已核实 `@deepseek-ai/dsh@0.1.5-rc.2` 的 Windows headless CLI 形式为 `dsh --profile <name> <task...>`；headless 模板帮助展示 task 为位置参数，未发现 stdin 输入契约，也不支持 `--json`。stdout 是最终文本，reasoning 输出到 stderr，因此 Adapter 不把 stdout 当作 JSONL。实测 `--dump-config` 中 `agent-default-model` 为 `provider: deepseek-official`、`model: deepseek-flash`。Zero 将 `DSH_HOME` 固定到自己的数据目录，并允许不同模型使用不同的安全 profile 名称（例如 `headless-deepseek`、`headless-glm`）；当前 probe 不把任何 profile 声明的模型或思考强度列为可用 binding，直到能逐版本检查每个隔离 profile 的有效配置。DSH 不会因 CLI 可运行就被 Router 选中。可通过 `ZERO_DSH_EXE` 指向明确的 CLI 安装。
+- DSH：已核实 `@deepseek-ai/dsh@0.1.5-rc.2` 的 Windows headless CLI 形式为 `dsh --profile <name> <task...>`；headless 模板帮助展示 task 为位置参数，未发现 stdin 输入契约，也不支持 `--json`。stdout 是最终文本，reasoning 输出到 stderr，因此 Adapter 不把 stdout 当作 JSONL。实测 `--dump-config` 中 `agent-default-model` 为 `provider: deepseek-official`、`model: deepseek-flash`。Zero 将 `DSH_HOME` 固定到自己的数据目录；probe 和执行前均比对命名 profile 的有效 provider/model 与已验证绑定，并按 CLI 版本固定。`zero verify-binding dsh <model-id> --profile <name>` 会在隔离目录进行最小真实调用，成功后才登记绑定。DSH 不会因 CLI 可运行就被 Router 选中；当前本机尚未通过 DSH 真实模型调用，也没有可路由的 DSH 绑定。Windows npm 安装的 `.cmd` 启动器不能直接用于无 shell 子进程；可用 `ZERO_DSH_ENTRY` 指向绝对 JavaScript 入口，由 Node 启动。
 - ZCode：采用官方 `--prompt` 和 `--output-format stream-json`。adapter 将绑定的独立数据根传给官方 `ZCODE_DATA_BASE_DIR`，要求其中 `.zcode/cli/config.json` 的 `model.main` 与绑定的 provider/model 完全一致；不会用 Windows `APPDATA` 冒充配置目录。当前 CLI 参数没有 per-call 模型或思考强度 selector，因此手动指定思考强度会被拒绝，绑定若声明思考强度也不会进入候选。`--mode` 是权限模式，不代表思考强度。headless `yolo` 仅在明确配置且经版本验证后使用，仍由外层工作区隔离约束权限。
 
 ## Harness 与 Model 解耦
@@ -107,7 +107,7 @@ bindings:
   - {harness: zcode, model: deepseek_primary, selector: isolated_config}
 ```
 
-`models` 记录模型能力、上下文上限、成本/配额元数据（若已核实）；`bindings` 才代表 Harness **实际可调用** 某模型。每个 binding 需要 `probe` 证明 CLI 版本、认证、模型选择和最小读写任务通过。无法确认实际模型时将其置为 `unavailable`，不能让 Router 使用。若 DSH/ZCode 的配置只能修改全局状态，则先做运行级隔离或串行化，不允许并发任务互相改写默认模型。DSH 当前不暴露模型或思考强度候选；ZCode 当前的 per-run reasoning effort 不可验证，因此不展示为可选能力。配置快照及有效模型写入报告。
+`models` 记录模型能力、上下文上限、成本/配额元数据（若已核实）；`bindings` 才代表 Harness **实际可调用** 某模型。每个 binding 需要 `probe` 证明 CLI 版本、认证、模型选择和最小调用通过。无法确认 profile 选择的模型时将其置为 `unavailable`；若 CLI 在成功调用中不报告实际模型，报告以 `selector_only` 标明证据范围。若 DSH/ZCode 的配置只能修改全局状态，则先做运行级隔离或串行化，不允许并发任务互相改写默认模型。DSH 和 ZCode 当前的 per-run reasoning effort 不可验证，因此不展示为可选能力。配置快照及有效模型写入报告。
 
 ## Codex 分配器与双层路由
 
@@ -129,7 +129,7 @@ Codex 做语义判断，Zero 做约束验证和状态推进。质量、速度与
 
 ## 实施顺序与验收门槛
 
-1. **环境与仓库**：建立 Zero 的 Git 仓库与公开 GitHub 仓库，Zero 原创代码采用 Apache-2.0；建立忽略规则、密钥扫描、CI。先验证 Codex、DSH、ZCode 在目标机器上的 CLI 版本、认证和无头任务，尤其验证 ZCode+GLM 与 ZCode+DeepSeek 的逐任务模型锁定。2026-09-24 已完成本地 Git 初始化，GitHub CLI 已登录；本机有 Node 24 与 Codex CLI，尚无 DSH/ZCode。Codex CLI 的参数可用性已核实，但当前工具沙箱拦截其模型网络连接，提权环境又拒绝启动 WindowsApps 中的可执行文件，因此真实认证和模型调用仍待目标运行环境冒烟测试。公开发布前仍须完成密钥检查。
+1. **环境与仓库**：建立 Zero 的 Git 仓库与公开 GitHub 仓库，Zero 原创代码采用 Apache-2.0；建立忽略规则、密钥扫描、CI。逐个验证 Codex、DSH、ZCode 在目标机器上的 CLI 版本、认证、模型绑定和无头任务。2026-09-24 已发布公开仓库、配置隐私检查和 CI；Codex 已通过一次真实的分配→执行→检查→审核→归档任务。DSH 已隔离安装并完成无模型请求的 CLI 版本、headless 帮助及配置检查；它仍缺少认证和模型调用证据。ZCode 的实际发行版与模型锁定仍待验证。Windows 开机启动和退出登录后的真实运行也尚未验收。
 2. **状态核心**：SQLite schema、task/event/attempt、原子领取、lease/恢复、HTTP API 与 CLI submit/status/cancel；用假 Adapter 证明掉电重启后不丢任务、不重复 DONE。
 3. **工作区与测试**：worktree 创建/保留/清理、范围检查、测试执行器、进程超时与日志归档；证明并行任务互不影响。
 4. **三个 Harness Adapter**：先实现 Codex，再接 DSH 和 ZCode；每个 binding 通过真实冒烟测试才进入 Router 候选。原始事件与标准结果均存档。

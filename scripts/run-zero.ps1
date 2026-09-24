@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)][string]$DataDir,
     [Parameter(Mandatory = $true)][string]$LogDir,
     [string]$CodexExe,
+    [string]$DshEntry,
     [string]$ProxyUrl,
     [ValidateRange(1, 65535)][int]$Port = 4179
 )
@@ -21,6 +22,15 @@ if ($CodexExe) {
     $resolvedCodexExe = [System.IO.Path]::GetFullPath($CodexExe)
     if (-not (Test-Path -LiteralPath $resolvedCodexExe -PathType Leaf)) { throw "Codex executable not found: $resolvedCodexExe" }
     $env:ZERO_CODEX_EXE = $resolvedCodexExe
+}
+if ($DshEntry) {
+    if (-not [System.IO.Path]::IsPathRooted($DshEntry)) { throw 'DshEntry must be an absolute JavaScript CLI entry path.' }
+    $resolvedDshEntry = [System.IO.Path]::GetFullPath($DshEntry)
+    if ([System.IO.Path]::GetExtension($resolvedDshEntry).ToLowerInvariant() -notin @('.js', '.mjs', '.cjs')) {
+        throw 'DshEntry must point to a .js, .mjs, or .cjs file.'
+    }
+    if (-not (Test-Path -LiteralPath $resolvedDshEntry -PathType Leaf)) { throw 'Configured DSH JavaScript CLI entry was not found.' }
+    $env:ZERO_DSH_ENTRY = $resolvedDshEntry
 }
 if ($ProxyUrl) {
     $proxyUri = $null

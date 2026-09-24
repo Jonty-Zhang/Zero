@@ -7,6 +7,7 @@ param(
     [string]$InstallDir = (Split-Path -Parent $PSScriptRoot),
     [string]$NodePath,
     [string]$CodexExe,
+    [string]$DshEntry,
     [string]$ProxyUrl,
     [string]$DataDir,
     [string]$LogDir,
@@ -33,6 +34,14 @@ if (-not $Uninstall -and $CodexExe) {
     $CodexExe = [System.IO.Path]::GetFullPath($CodexExe)
     if (-not (Test-Path -LiteralPath $CodexExe -PathType Leaf)) { throw "Codex executable not found: $CodexExe" }
 }
+if (-not $Uninstall -and $DshEntry) {
+    if (-not [System.IO.Path]::IsPathRooted($DshEntry)) { throw 'DshEntry must be an absolute JavaScript CLI entry path.' }
+    $DshEntry = [System.IO.Path]::GetFullPath($DshEntry)
+    if ([System.IO.Path]::GetExtension($DshEntry).ToLowerInvariant() -notin @('.js', '.mjs', '.cjs')) {
+        throw 'DshEntry must point to a .js, .mjs, or .cjs file.'
+    }
+    if (-not (Test-Path -LiteralPath $DshEntry -PathType Leaf)) { throw 'Configured DSH JavaScript CLI entry was not found.' }
+}
 if (-not $Uninstall -and $ProxyUrl) {
     $proxyUri = $null
     if (-not [Uri]::TryCreate($ProxyUrl, [UriKind]::Absolute, [ref]$proxyUri) -or
@@ -47,6 +56,7 @@ if (-not $Install -and -not $Uninstall) {
     Write-Output ("Install directory: {0}" -f [System.IO.Path]::GetFullPath($InstallDir))
     if ($Account) { Write-Output ("Task account: {0}" -f $Account) }
     if ($CodexExe) { Write-Output ("Codex executable: {0}" -f $CodexExe) }
+    if ($DshEntry) { Write-Output 'DSH JavaScript CLI entry: configured.' }
     if ($ProxyUrl) { Write-Output 'Credential-free proxy URL: configured.' }
     return
 }
@@ -138,6 +148,7 @@ try {
         '-DataDir', $resolvedDataDir, '-LogDir', $resolvedLogDir, '-Port', [string]$Port
     )
     if ($CodexExe) { $actionArguments += @('-CodexExe', $CodexExe) }
+    if ($DshEntry) { $actionArguments += @('-DshEntry', $DshEntry) }
     if ($ProxyUrl) { $actionArguments += @('-ProxyUrl', $ProxyUrl) }
     $quotedArguments = foreach ($argument in $actionArguments) {
         if ($argument.Contains('"') -or $argument.Contains("`r") -or $argument.Contains("`n")) { throw 'Task action arguments may not contain quotes or line breaks.' }

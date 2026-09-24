@@ -8,7 +8,7 @@ export interface LocalZeroConfig {
   bindings: ModelBinding[];
   allocator: { modelId: string | null; reasoningEffort: ReasoningEffort | null };
   reviewer: { modelId: string | null; reasoningEffort: ReasoningEffort | null };
-  verifications: Record<string, { verifiedAt: string; cliVersion: string; requestedModel: string; exitCode: 0; level: 'selector_only' | 'event_confirmed'; actualModel?: string; reasoningEfforts: ReasoningEffort[]; effortEvidence?: Record<string, { verifiedAt: string; cliVersion: string; exitCode: 0 }> }>;
+  verifications: Record<string, { verifiedAt: string; cliVersion: string; requestedModel: string; exitCode: 0; level: 'selector_only' | 'event_confirmed'; actualModel?: string; profile?: string; reasoningEfforts: ReasoningEffort[]; effortEvidence?: Record<string, { verifiedAt: string; cliVersion: string; exitCode: 0 }> }>;
   /** Environment variable name -> secret reference; never returned by HTTP APIs. */
   secretRefs?: Record<string, string>;
 }
@@ -64,6 +64,26 @@ export class ConfigStore {
     await this.persist(config);
   }
 
+  async markDshVerified(modelId: string, expectedModel: ModelConfig, profile: string, evidence: Omit<LocalZeroConfig['verifications'][string], 'reasoningEfforts' | 'profile'>): Promise<void> {
+    if (!isSafeDshProfile(profile)) throw new Error('DSH profile must be a safe profile name');
+    if (!evidence.cliVersion.trim() || evidence.cliVersion === 'unknown') throw new Error('DSH CLI version is required to pin a verified binding');
+    const config = await this.read();
+    const matches = config.models.filter(item => item.id === modelId);
+    if (matches.length !== 1) throw new Error(`Expected exactly one local model ID: ${modelId}`);
+    const model = matches[0]!;
+    if (model.provider !== expectedModel.provider || model.modelId !== expectedModel.modelId) {
+      throw new Error(`Local model ${modelId} changed during DSH verification; run verification again`);
+    }
+    const key = `dsh:${model.id}`;
+    const binding: ModelBinding = {
+      harness: 'dsh', model, selector: 'profile', profile, verified: true,
+      verificationSource: 'smoke_test', verifiedCliVersion: evidence.cliVersion, reasoningEfforts: [],
+    };
+    config.bindings = [...config.bindings.filter(item => !(item.harness === 'dsh' && item.model.id === model.id)), binding];
+    config.verifications[key] = { ...evidence, profile, reasoningEfforts: [] };
+    await this.persist(config);
+  }
+
   async markReasoningEffortVerified(harness: 'codex', modelId: string, effort: ReasoningEffort, cliVersion: string): Promise<void> {
     const config = await this.read();
     const model = config.models.find(item => item.id === modelId || item.modelId === modelId);
@@ -100,4 +120,8 @@ export class ConfigStore {
       throw error;
     }
   }
+}
+
+function isSafeDshProfile(profile: string): boolean {
+  return profile.toLowerCase() !== 'desktop' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(profile);
 }

@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexAdapter } from '../codex.js';
-import { DshAdapter } from '../dsh.js';
+import { DshAdapter, parseEffectiveModel } from '../dsh.js';
 import { ZCodeAdapter } from '../zcode.js';
 import { BaseHarnessAdapter, parseJsonLines } from '../base.js';
 import type { AdapterConfig } from '../base.js';
@@ -56,6 +56,9 @@ test('Codex rejects an unverified reasoning level for the selected model binding
 
 test('DSH uses the positional headless task interface and plain final output', async () => {
   const adapter = new DshAdapter({ dshHome: 'C:/zero/dsh-home' });
+  adapter.command = async args => args[0] === '--version'
+    ? { code: 0, stdout: '0.1.5-rc.2', stderr: '' }
+    : { code: 0, stdout: '- id: agent-default-model\n  config:\n    provider: deepseek\n    model: deepseek-v3', stderr: '' };
   const invocation = await adapter.prepare(context(), dshBinding);
   assert.deepEqual(invocation.args, ['--profile', 'headless-deepseek', 'Fix the thing; keep spaces intact.']);
   assert.equal(invocation.env.DSH_HOME, 'C:/zero/dsh-home');
@@ -78,45 +81,94 @@ test('DSH uses the positional headless task interface and plain final output', a
   await assert.rejects(new DshAdapter().prepare(context(), dshBinding), /DSH_HOME/);
 });
 
-test('DSH honors ZERO_DSH_EXE for isolated CLI installation paths', async () => {
+test('DSH honors ZERO_DSH_EXE for direct native executable paths', async () => {
   const previous = process.env.ZERO_DSH_EXE;
-  process.env.ZERO_DSH_EXE = 'C:/zero-tools/dsh.cmd';
+  process.env.ZERO_DSH_EXE = 'C:/zero-tools/dsh.exe';
   try {
-    const invocation = await new DshAdapter({ dshHome: 'C:/zero/dsh-home' }).prepare(context(), dshBinding);
-    assert.equal(invocation.executable, 'C:/zero-tools/dsh.cmd');
+    const adapter = new DshAdapter({ dshHome: 'C:/zero/dsh-home' });
+    adapter.command = async args => args[0] === '--version'
+      ? { code: 0, stdout: '0.1.5-rc.2', stderr: '' }
+      : { code: 0, stdout: '- id: agent-default-model\n  config:\n    provider: deepseek\n    model: deepseek-v3', stderr: '' };
+    const invocation = await adapter.prepare(context(), dshBinding);
+    assert.equal(invocation.executable, 'C:/zero-tools/dsh.exe');
+    assert.deepEqual(invocation.args.slice(0, 2), ['--profile', 'headless-deepseek']);
   } finally {
     if (previous === undefined) delete process.env.ZERO_DSH_EXE;
     else process.env.ZERO_DSH_EXE = previous;
   }
 });
 
-test('DSH version/help probe detects the real headless grammar but never enables unverified profiles', async () => {
+test('DSH launches ZERO_DSH_ENTRY through Node for probes and task argv', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'zero-dsh-entry-'));
+  const dshHome = join(tempDir, 'dsh-home');
+  const entry = join(tempDir, 'fake-dsh.mjs');
+  await mkdir(dshHome, { recursive: true });
+  await writeFile(entry, [
+    `if (process.env.DSH_HOME !== ${JSON.stringify(dshHome)}) process.exit(12);`,
+    'const args = process.argv.slice(2);',
+    "if (args[0] === '--version') console.log('0.1.5-rc.2');",
+    "else if (args.join(' ') === '--profile headless --help') console.log('Usage: dsh --profile headless [options] [task...]');",
+    "else if (args[0] === '--profile' && args[2] === '--dump-config') console.log('- id: agent-default-model\\n  config:\\n    provider: deepseek\\n    model: deepseek-v3');",
+    "else console.log('unexpected args');",
+  ].join('\n'));
+  const previousEntry = process.env.ZERO_DSH_ENTRY;
+  const previousExe = process.env.ZERO_DSH_EXE;
+  delete process.env.ZERO_DSH_EXE;
+  process.env.ZERO_DSH_ENTRY = entry;
+  try {
+    const adapter = new DshAdapter({ dshHome });
+    const probe = await adapter.probe();
+    assert.equal(probe.available, true);
+    assert.equal(probe.version, '0.1.5-rc.2');
+    assert.deepEqual(probe.models, []);
+    const invocation = await adapter.prepare(context(), dshBinding);
+    assert.equal(invocation.executable, process.execPath);
+    assert.deepEqual(invocation.args, [entry, '--profile', 'headless-deepseek', 'Fix the thing; keep spaces intact.']);
+    assert.equal(invocation.env.DSH_HOME, dshHome);
+  } finally {
+    if (previousEntry === undefined) delete process.env.ZERO_DSH_ENTRY;
+    else process.env.ZERO_DSH_ENTRY = previousEntry;
+    if (previousExe === undefined) delete process.env.ZERO_DSH_EXE;
+    else process.env.ZERO_DSH_EXE = previousExe;
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('DSH rejects Windows command shims with a clear shell-free launch error', async () => {
+  const adapter = new DshAdapter({ dshHome: 'C:/zero/dsh-home', executable: 'C:/tools/dsh.cmd' });
+  const probe = await adapter.probe();
+  assert.equal(probe.available, false);
+  assert.match(probe.unavailableReason ?? '', /\.cmd\/.bat launchers cannot run with shell:false/);
+  await assert.rejects(adapter.prepare(context(), dshBinding), /\.cmd\/.bat launchers cannot run with shell:false/);
+});
+
+test('DSH probe only exposes version-matched bindings whose effective profile model matches', async () => {
   const seen: string[][] = [];
   const adapter = new DshAdapter({ dshHome: 'C:/zero/dsh-home', bindings: [dshBinding, codexBinding] });
   adapter.command = async (args) => {
     seen.push(args);
-    return args[0] === '--version'
-      ? { code: 0, stdout: '0.1.5-rc.2', stderr: '' }
-      : { code: 0, stdout: 'Usage: dsh --profile headless [options] [task...]', stderr: '' };
+    if (args[0] === '--version') return { code: 0, stdout: '0.1.5-rc.2', stderr: '' };
+    if (args[2] === '--dump-config') return { code: 0, stdout: '- id: agent-default-model\n  config:\n    provider: deepseek\n    model: deepseek-v3', stderr: '' };
+    return { code: 0, stdout: 'Usage: dsh --profile headless [options] [task...]', stderr: '' };
   };
   const probe = await adapter.probe();
-  assert.deepEqual(seen, [['--version'], ['--profile', 'headless', '--help']]);
+  assert.deepEqual(seen, [['--version'], ['--profile', 'headless', '--help'], ['--version'], ['--profile', 'headless-deepseek', '--dump-config']]);
   assert.equal(probe.available, true);
   assert.equal(probe.version, '0.1.5-rc.2');
-  assert.deepEqual(probe.models, []);
+  assert.deepEqual(probe.models, ['deepseek-main']);
   assert.deepEqual(probe.reasoningEfforts, []);
-  assert.equal(probe.probeEvidence?.configuredBindings, 'none');
-  assert.deepEqual(probe.probeEvidence?.bindingVerification, {});
+  assert.equal(probe.probeEvidence?.configuredBindings, 'declared_verified');
+  assert.deepEqual(probe.probeEvidence?.bindingVerification, { 'deepseek-main': 'manual_config' });
 });
 
-test('DSH run refuses a declared profile binding before starting a task process', async () => {
+test('DSH run refuses a profile whose effective model does not match before starting a task process', async () => {
   const seen: string[][] = [];
   const adapter = new DshAdapter({ dshHome: 'C:/zero/dsh-home', bindings: [dshBinding] });
   adapter.command = async (args) => {
     seen.push(args);
-    return args[0] === '--version'
-      ? { code: 0, stdout: '0.1.5-rc.2', stderr: '' }
-      : { code: 0, stdout: 'Usage: dsh --profile headless [options] [task...]', stderr: '' };
+    if (args[0] === '--version') return { code: 0, stdout: '0.1.5-rc.2', stderr: '' };
+    if (args[2] === '--dump-config') return { code: 0, stdout: '- id: agent-default-model\n  config:\n    provider: deepseek-official\n    model: deepseek-flash', stderr: '' };
+    return { code: 0, stdout: 'Usage: dsh --profile headless [options] [task...]', stderr: '' };
   };
   const result = await adapter.run({
     taskId: 'task-dsh', attemptId: 'attempt-1', role: 'implement', cwd: process.cwd(), prompt: 'no model request',
@@ -124,7 +176,12 @@ test('DSH run refuses a declared profile binding before starting a task process'
   });
   assert.equal(result.status, 'failed');
   assert.match(result.error ?? '', /not verified for the installed dsh CLI version/);
-  assert.deepEqual(seen, [['--version'], ['--profile', 'headless', '--help']]);
+  assert.ok(seen.some(args => args[2] === '--dump-config'));
+});
+
+test('DSH effective model parser applies later profile layers and rejects missing target config', () => {
+  assert.deepEqual(parseEffectiveModel(`# == base\n- id: agent-default-model\n  config:\n    provider: deepseek-official\n    model: deepseek-flash\n# == profile\n- id: agent-default-model\n  config:\n    provider: deepseek\n    model: deepseek-v3`), { provider: 'deepseek', modelId: 'deepseek-v3' });
+  assert.equal(parseEffectiveModel('- id: unrelated\n  config:\n    provider: deepseek\n    model: deepseek-v3'), undefined);
 });
 
 test('ZCode requires an isolated profile selecting the exact provider/model', async () => {
