@@ -1,0 +1,194 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <sddl.h>
+
+#include <cwchar>
+#include <string>
+#include <vector>
+
+namespace {
+constexpr DWORD kFailure = 70;
+constexpr DWORD kInvalidArgs = 64;
+constexpr DWORD kPollMilliseconds = 25;
+
+bool IsSafeLockId(const wchar_t* value) {
+  if (value == nullptr || *value == L'\0') return false;
+  size_t length = 0;
+  for (const wchar_t* p = value; *p != L'\0'; ++p) {
+    if (++length > 64) return false;
+    const wchar_t c = *p;
+    if (!((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+          (c >= L'0' && c <= L'9') || c == L'_' || c == L'-')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::wstring QuoteArgument(const std::wstring& argument) {
+  if (!argument.empty() && argument.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
+    return argument;
+  }
+
+  std::wstring quoted = L"\"";
+  size_t backslashes = 0;
+  for (wchar_t c : argument) {
+    if (c == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (c == L'\"') {
+      quoted.append(backslashes * 2 + 1, L'\\');
+      quoted.push_back(c);
+    } else {
+      quoted.append(backslashes, L'\\');
+      quoted.push_back(c);
+    }
+    backslashes = 0;
+  }
+  quoted.append(backslashes * 2, L'\\');
+  quoted.push_back(L'\"');
+  return quoted;
+}
+
+std::wstring BuildCommandLine(int argc, wchar_t** argv, int child_start) {
+  std::wstring result;
+  for (int i = child_start; i < argc; ++i) {
+    if (!result.empty()) result.push_back(L' ');
+    result += QuoteArgument(argv[i]);
+  }
+  return result;
+}
+
+std::wstring CurrentUserSidString() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return {};
+
+  DWORD bytes = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+  if (bytes == 0) {
+    CloseHandle(token);
+    return {};
+  }
+  std::vector<unsigned char> buffer(bytes);
+  if (!GetTokenInformation(token, TokenUser, buffer.data(), bytes, &bytes)) {
+    CloseHandle(token);
+    return {};
+  }
+  CloseHandle(token);
+
+  auto* user = reinterpret_cast<TOKEN_USER*>(buffer.data());
+  LPWSTR sid = nullptr;
+  if (!ConvertSidToStringSidW(user->User.Sid, &sid)) return {};
+  std::wstring result(sid);
+  LocalFree(sid);
+  return result;
+}
+
+DWORD WaitForJobToBecomeEmpty(HANDLE job) {
+  // Keep the Job handle open on any accounting error. Closing it while members
+  // may remain would weaken the exit guarantee this process is responsible for.
+  for (;;) {
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+    if (QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                                  &accounting, sizeof(accounting), nullptr) &&
+        accounting.ActiveProcesses == 0) {
+      return ERROR_SUCCESS;
+    }
+    Sleep(kPollMilliseconds);
+  }
+}
+}  // namespace
+
+int wmain(int argc, wchar_t** argv) {
+  if (argc < 5 || wcscmp(argv[1], L"--lock-id") != 0 ||
+      !IsSafeLockId(argv[2]) || wcscmp(argv[3], L"--") != 0 ||
+      argv[4][0] == L'\0') {
+    return static_cast<int>(kInvalidArgs);
+  }
+
+  const std::wstring sid = CurrentUserSidString();
+  if (sid.empty()) return static_cast<int>(kFailure);
+
+  // The default DACL restricts the object to the current user's token. Including
+  // the SID in the name makes the lock per-user across interactive sessions.
+  const std::wstring mutex_name = L"Global\\ZeroGuardian_" + sid + L"_" + argv[2];
+  SECURITY_ATTRIBUTES non_inheritable{};
+  non_inheritable.nLength = sizeof(non_inheritable);
+  non_inheritable.bInheritHandle = FALSE;
+  HANDLE mutex = CreateMutexW(&non_inheritable, FALSE, mutex_name.c_str());
+  if (mutex == nullptr) return static_cast<int>(kFailure);
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    CloseHandle(mutex);
+    return static_cast<int>(ERROR_ALREADY_EXISTS);
+  }
+
+  HANDLE job = CreateJobObjectW(&non_inheritable, nullptr);
+  if (job == nullptr) {
+    CloseHandle(mutex);
+    return static_cast<int>(kFailure);
+  }
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
+                               sizeof(limits))) {
+    CloseHandle(job);
+    CloseHandle(mutex);
+    return static_cast<int>(kFailure);
+  }
+
+  std::wstring command_line = BuildCommandLine(argc, argv, 4);
+  if (command_line.size() >= 32767) {
+    CloseHandle(job);
+    CloseHandle(mutex);
+    return static_cast<int>(kInvalidArgs);
+  }
+  std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
+  mutable_command.push_back(L'\0');
+
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(argv[4], mutable_command.data(), nullptr, nullptr, FALSE,
+                      CREATE_SUSPENDED, nullptr, nullptr, &startup, &process)) {
+    CloseHandle(job);
+    CloseHandle(mutex);
+    return static_cast<int>(kFailure);
+  }
+
+  if (!AssignProcessToJobObject(job, process.hProcess)) {
+    TerminateProcess(process.hProcess, kFailure);
+    WaitForSingleObject(process.hProcess, INFINITE);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    CloseHandle(job);
+    CloseHandle(mutex);
+    return static_cast<int>(kFailure);
+  }
+
+  if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+    TerminateJobObject(job, kFailure);
+    WaitForSingleObject(process.hProcess, INFINITE);
+    WaitForJobToBecomeEmpty(job);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    CloseHandle(job);
+    CloseHandle(mutex);
+    return static_cast<int>(kFailure);
+  }
+
+  WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD child_exit_code = kFailure;
+  GetExitCodeProcess(process.hProcess, &child_exit_code);
+
+  // The direct launcher can exit while descendants still run. Kill all remaining
+  // members, then retain both handles until the Job reports no active processes.
+  TerminateJobObject(job, child_exit_code);
+  WaitForJobToBecomeEmpty(job);
+
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  CloseHandle(job);
+  CloseHandle(mutex);
+  return static_cast<int>(child_exit_code);
+}
