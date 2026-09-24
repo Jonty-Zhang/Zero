@@ -41,12 +41,12 @@ node .\dist\cli.js help
   -Install `
   -Account 'COMPUTER\zero-runner' `
   -NodePath 'C:\Program Files\nodejs\node.exe' `
-  -CodexExe 'C:\Users\zero-runner\AppData\Local\Programs\Codex\codex.exe' `
+  -CodexExe (Join-Path $env:USERPROFILE 'AppData\Local\Programs\Codex\codex.exe') `
   -DshEntry '<absolute path to the DSH JavaScript CLI entry>' `
   -ZcodeEntry '<absolute path to the ZCode JavaScript CLI entry>' `
   -ProxyUrl 'http://proxy.example:8080' `
-  -DataDir 'C:\Users\zero-runner\AppData\Local\Zero' `
-  -LogDir 'C:\Users\zero-runner\AppData\Local\Zero\logs' `
+  -DataDir (Join-Path $env:USERPROFILE 'AppData\Local\Zero') `
+  -LogDir (Join-Path $env:USERPROFILE 'AppData\Local\Zero\logs') `
   -Port 4179
 ```
 
@@ -72,8 +72,8 @@ node .\dist\cli.js help
 确认 Codex CLI 在该任务账户下能找到并登录。首次安装后，使用相同账户和数据目录运行绑定验证；如模型配置尚未建立，先按本地配置说明添加模型，再验证：
 
 ```powershell
-$env:ZERO_DATA_DIR = 'C:\Users\zero-runner\AppData\Local\Zero'
-$env:ZERO_CODEX_EXE = 'C:\Users\zero-runner\AppData\Local\Programs\Codex\codex.exe'
+$env:ZERO_DATA_DIR = (Join-Path $env:USERPROFILE 'AppData\Local\Zero')
+$env:ZERO_CODEX_EXE = (Join-Path $env:USERPROFILE 'AppData\Local\Programs\Codex\codex.exe')
 node .\dist\cli.js verify-binding codex gpt-6-sol
 Remove-Item Env:\ZERO_DATA_DIR
 Remove-Item Env:\ZERO_CODEX_EXE
@@ -96,7 +96,7 @@ Start-ScheduledTask -TaskName 'Zero Task Node'
 Start-Sleep -Seconds 5
 Get-ScheduledTaskInfo -TaskName 'Zero Task Node' | Format-List LastRunTime, LastTaskResult, NextRunTime
 Invoke-RestMethod 'http://127.0.0.1:4179/api/health'
-Get-Content 'C:\Users\zero-runner\AppData\Local\Zero\logs\zero-*.log' -Tail 80
+Get-Content (Join-Path $env:USERPROFILE 'AppData\Local\Zero\logs\zero-*.log') -Tail 80
 ```
 
 健康检查应返回 `status: ok`，日志应显示服务监听 `http://127.0.0.1:4179`。`LastTaskResult` 为 `0` 通常表示任务动作正常结束；Zero 服务是常驻进程，所以运行期间任务显示 Running 是预期的。若进程很快退出，先看日志中的 Node 入口、端口冲突、配置和 CLI 登录错误。
