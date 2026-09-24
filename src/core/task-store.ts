@@ -3,13 +3,19 @@ import { DatabaseSync } from "node:sqlite";
 import type {
   Attempt,
   CheckResult,
+  HandoffRecord,
+  HandoffV1,
   ReviewResult,
   RouteDecision,
+  StageRecord,
+  StageRole,
+  StageStatus,
   TaskEvent,
   TaskRecord,
   TaskStatus,
   TaskSubmission,
 } from "../domain/types.js";
+import { HANDOFF_V1_MAX_BYTES, parseHandoffV1 } from "../domain/handoff.js";
 
 type Json = string | null;
 type TaskRow = {
@@ -19,6 +25,8 @@ type TaskRow = {
   failure_reason: string | null; active_attempt_id: string | null;
   retry_at?: string | null;
 };
+type StageRow = Record<string, unknown>;
+type HandoffRow = { id: string; task_id: string; stage_id: string; attempt_id: string; schema_version: number; created_at: string; payload: string; payload_bytes: number };
 
 const encode = (v: unknown): Json => v === undefined ? null : JSON.stringify(v);
 const decode = <T>(v: string | null): T | undefined => v === null ? undefined : JSON.parse(v) as T;
@@ -50,6 +58,24 @@ export class TaskStore {
         stderr_path TEXT, result_path TEXT, error TEXT, metadata TEXT,
         UNIQUE(task_id, sequence)
       );
+      CREATE TABLE IF NOT EXISTS stages (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), sequence INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('implement','revise','review','route')),
+        status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed','interrupted')),
+        predecessor_stage_id TEXT REFERENCES stages(id), harness TEXT, harness_version TEXT, model TEXT, reasoning_effort TEXT,
+        binding_version TEXT, config_hash TEXT, process_start_id TEXT NOT NULL,
+        input_fingerprint TEXT, output_fingerprint TEXT, error TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+        UNIQUE(task_id, sequence)
+      );
+      CREATE TABLE IF NOT EXISTS handoffs (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), stage_id TEXT NOT NULL REFERENCES stages(id),
+        attempt_id TEXT NOT NULL REFERENCES attempts(id), schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+        created_at TEXT NOT NULL, payload TEXT NOT NULL,
+        payload_bytes INTEGER NOT NULL CHECK(payload_bytes >= 0 AND payload_bytes <= 65536),
+        UNIQUE(stage_id, attempt_id)
+      );
+      CREATE INDEX IF NOT EXISTS stages_task_sequence ON stages(task_id, sequence);
+      CREATE INDEX IF NOT EXISTS handoffs_task_created ON handoffs(task_id, created_at, id);
       CREATE TABLE IF NOT EXISTS routes (
         id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
         decided_at TEXT NOT NULL, decision TEXT NOT NULL
@@ -68,6 +94,17 @@ export class TaskStore {
         source TEXT NOT NULL DEFAULT 'fallback'
       );
     `);
+    // Additive, idempotent migration: old attempts remain valid with a NULL stage_id.
+    // Existing databases are not rebuilt or rewritten.
+    const attemptColumns = this.#db.prepare("PRAGMA table_info(attempts)").all() as Array<{ name: string }>;
+    if (!attemptColumns.some(column => column.name === "stage_id")) {
+      this.#db.exec("ALTER TABLE attempts ADD COLUMN stage_id TEXT REFERENCES stages(id)");
+    }
+    const stageColumns = this.#db.prepare("PRAGMA table_info(stages)").all() as Array<{ name: string }>;
+    if (!stageColumns.some(column => column.name === "error")) {
+      this.#db.exec("ALTER TABLE stages ADD COLUMN error TEXT");
+    }
+    this.#db.exec("CREATE INDEX IF NOT EXISTS attempts_stage_sequence ON attempts(stage_id, sequence)");
   }
 
   close(): void { this.#db.close(); }
@@ -76,6 +113,15 @@ export class TaskStore {
     this.#db.exec("BEGIN IMMEDIATE");
     try { const result = fn(); this.#db.exec("COMMIT"); return result; }
     catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+  }
+
+  #stageTaskStatus(role: StageRole): TaskStatus {
+    return role === "review" ? "reviewing" : "running";
+  }
+
+  #hasLiveStageLease(task: { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null }, owner: string, role: StageRole): boolean {
+    const expiresAt = task.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
+    return task.status === this.#stageTaskStatus(role) && task.lease_owner === owner && Number.isFinite(expiresAt) && expiresAt > Date.now();
   }
 
   submit(submission: TaskSubmission, id: string = randomUUID()): TaskRecord {
@@ -209,6 +255,14 @@ export class TaskStore {
         this.#db.prepare(`UPDATE tasks SET status='pending', updated_at=?, lease_owner=NULL, lease_expires_at=NULL,
           heartbeat_at=NULL, active_attempt_id=NULL WHERE id=?`).run(at, row.id);
         if (row.active_attempt_id) this.#db.prepare("UPDATE attempts SET status='interrupted', finished_at=?, error=COALESCE(error,'lease expired') WHERE id=? AND status='running'").run(at, row.active_attempt_id);
+        const runningStages = this.#db.prepare("SELECT id,process_start_id FROM stages WHERE task_id=? AND status='running'").all(row.id) as Array<{ id: string; process_start_id: string }>;
+        this.#db.prepare("UPDATE attempts SET status='interrupted',finished_at=?,error=COALESCE(error,'task lease expired') WHERE task_id=? AND stage_id IN (SELECT id FROM stages WHERE task_id=? AND status='running') AND status='running'")
+          .run(at, row.id, row.id);
+        for (const stage of runningStages) {
+          const reason = "task lease expired; inspect process and worktree before resuming";
+          this.#db.prepare("UPDATE stages SET status='interrupted',finished_at=?,error=? WHERE id=? AND status='running'").run(at, reason, stage.id);
+          this.#event(row.id, "stage.finished", { stageId: stage.id, status: "interrupted", processStartId: stage.process_start_id, error: reason }, at);
+        }
         this.#event(row.id, "task.lease_expired", { previousAttemptId: row.active_attempt_id }, at);
       }
       this.#db.exec("COMMIT");
@@ -216,28 +270,230 @@ export class TaskStore {
     } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
   }
 
-  createAttempt(taskId: string, role: Attempt["role"], options: { owner?: string; harness?: string; model?: string; reasoningEffort?: string; metadata?: Record<string, unknown> } = {}): Attempt {
+  createStage(taskId: string, input: {
+    role: StageRole;
+    predecessorStageId?: string;
+    harness?: string;
+    harnessVersion?: string;
+    model?: string;
+    reasoningEffort?: string;
+    bindingVersion?: string;
+    configHash?: string;
+    processStartId: string;
+    inputFingerprint?: string;
+  }): StageRecord {
+    if (!this.get(taskId)) throw new Error(`Unknown task ${taskId}`);
+    let stage!: StageRecord;
+    this.#transaction(() => {
+      if (input.predecessorStageId) {
+        const predecessor = this.getStage(input.predecessorStageId);
+        if (!predecessor || predecessor.taskId !== taskId) throw new Error("Predecessor stage must belong to the same task");
+      }
+      if (!input.processStartId.trim()) throw new Error("processStartId is required for a stage");
+      const sequence = Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0)+1 AS n FROM stages WHERE task_id=?").get(taskId) as { n: number }).n);
+      stage = {
+        id: randomUUID(), taskId, sequence, role: input.role, status: "pending",
+        predecessorStageId: input.predecessorStageId, harness: input.harness, harnessVersion: input.harnessVersion, model: input.model,
+        reasoningEffort: input.reasoningEffort, bindingVersion: input.bindingVersion,
+        configHash: input.configHash, processStartId: input.processStartId, inputFingerprint: input.inputFingerprint,
+        createdAt: new Date().toISOString(),
+      };
+      this.#db.prepare(`INSERT INTO stages(id,task_id,sequence,role,status,predecessor_stage_id,harness,harness_version,model,reasoning_effort,binding_version,config_hash,process_start_id,input_fingerprint,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(stage.id, taskId, sequence, stage.role, stage.status,
+        stage.predecessorStageId ?? null, stage.harness ?? null, stage.harnessVersion ?? null, stage.model ?? null, stage.reasoningEffort ?? null,
+        stage.bindingVersion ?? null, stage.configHash ?? null, stage.processStartId ?? null,
+        stage.inputFingerprint ?? null, stage.createdAt);
+      this.#event(taskId, "stage.created", { stage }, stage.createdAt);
+    });
+    return stage;
+  }
+
+  getStage(stageId: string): StageRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM stages WHERE id=?").get(stageId) as StageRow | undefined;
+    return row ? this.#stage(row) : undefined;
+  }
+
+  stages(taskId: string): StageRecord[] {
+    return (this.#db.prepare("SELECT * FROM stages WHERE task_id=? ORDER BY sequence").all(taskId) as StageRow[]).map(row => this.#stage(row));
+  }
+
+  /**
+   * Claims a stage under the task lease. Only one stage per task may be active;
+   * failed/interrupted predecessors are terminal so a revision/recovery stage can follow.
+   */
+  startStage(stageId: string, owner: string, processStartId: string): StageRecord {
+    return this.#transaction(() => {
+      const stage = this.getStage(stageId);
+      if (!stage) throw new Error(`Unknown stage ${stageId}`);
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(stage.taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
+      if (!task || !this.#hasLiveStageLease(task, owner, stage.role)) throw new Error(`Task ${stage.taskId} is not leased by ${owner} for ${stage.role} (wrong state or expired lease)`);
+      if (stage.processStartId !== processStartId) throw new Error(`Stage ${stageId} process generation does not match`);
+      const activeStage = this.#db.prepare("SELECT id FROM stages WHERE task_id=? AND status='running' LIMIT 1").get(stage.taskId) as { id: string } | undefined;
+      if (activeStage) throw new Error(`Task ${stage.taskId} already has a running stage ${activeStage.id}`);
+      if (stage.predecessorStageId) {
+        const predecessor = this.getStage(stage.predecessorStageId);
+        if (!predecessor || predecessor.taskId !== stage.taskId || predecessor.status === "pending" || predecessor.status === "running") {
+          throw new Error(`Predecessor stage ${stage.predecessorStageId} has not reached a terminal state`);
+        }
+      }
+      const startedAt = new Date().toISOString();
+      const changed = this.#db.prepare("UPDATE stages SET status='running',started_at=? WHERE id=? AND status='pending' AND process_start_id=?")
+        .run(startedAt, stageId, processStartId);
+      if (Number(changed.changes) !== 1) throw new Error(`Stage ${stageId} is not pending`);
+      this.#event(stage.taskId, "stage.started", { stageId, processStartId }, startedAt);
+      return this.getStage(stageId)!;
+    });
+  }
+
+  finishStage(stageId: string, owner: string, processStartId: string, status: Extract<StageStatus, "succeeded" | "failed" | "interrupted">, outputFingerprint?: string): StageRecord {
+    return this.#transaction(() => {
+      const stage = this.getStage(stageId);
+      if (!stage) throw new Error(`Unknown stage ${stageId}`);
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(stage.taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
+      if (!task || !this.#hasLiveStageLease(task, owner, stage.role)) throw new Error(`Task ${stage.taskId} is not leased by ${owner} for ${stage.role} (wrong state or expired lease)`);
+      if (stage.processStartId !== processStartId) throw new Error(`Stage ${stageId} process generation does not match`);
+      const activeAttempt = this.#db.prepare("SELECT id FROM attempts WHERE stage_id=? AND status='running' LIMIT 1").get(stageId);
+      if (activeAttempt) throw new Error(`Stage ${stageId} still has a running attempt`);
+      if (status === "succeeded") {
+        const counts = this.#db.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN status='succeeded' THEN 1 ELSE 0 END) AS succeeded FROM attempts WHERE stage_id=?")
+          .get(stageId) as { total: number; succeeded: number | null };
+        if (Number(counts.total) === 0 || Number(counts.succeeded ?? 0) === 0) {
+          throw new Error(`Stage ${stageId} cannot succeed without a succeeded attempt`);
+        }
+      }
+      const finishedAt = new Date().toISOString();
+      const changed = this.#db.prepare("UPDATE stages SET status=?,finished_at=?,output_fingerprint=?,error=? WHERE id=? AND status='running' AND process_start_id=?")
+        .run(status, finishedAt, outputFingerprint ?? null, status === "succeeded" ? null : "stage completed without success", stageId, processStartId);
+      if (Number(changed.changes) !== 1) throw new Error(`Stage ${stageId} is not running`);
+      this.#event(stage.taskId, "stage.finished", { stageId, status, outputFingerprint, processStartId }, finishedAt);
+      return this.getStage(stageId)!;
+    });
+  }
+
+  saveHandoff(value: unknown): HandoffRecord {
+    const handoff = parseHandoffV1(value);
+    const payload = JSON.stringify(handoff);
+    const byteLength = Buffer.byteLength(payload, "utf8");
+    if (byteLength > HANDOFF_V1_MAX_BYTES) throw new Error(`handoff payload exceeds ${HANDOFF_V1_MAX_BYTES} bytes`);
+    const id = randomUUID();
+    this.#transaction(() => {
+      const stage = this.getStage(handoff.stageId);
+      if (!stage || stage.taskId !== handoff.taskId) throw new Error("Handoff stage must belong to the handoff task");
+      if (!(stage.status === "succeeded" || stage.status === "failed" || stage.status === "interrupted")) {
+        throw new Error("Handoff can only be saved after its stage reaches a terminal state");
+      }
+      const attempt = this.#db.prepare("SELECT task_id,stage_id,status,harness,model FROM attempts WHERE id=?")
+        .get(handoff.source.attemptId) as { task_id: string; stage_id: string | null; status: Attempt["status"]; harness: string | null; model: string | null } | undefined;
+      if (!attempt || attempt.task_id !== handoff.taskId || attempt.stage_id !== handoff.stageId) {
+        throw new Error("Handoff source attempt must be linked to its stage and task");
+      }
+      if (attempt.status === "running") throw new Error("Handoff source attempt must be terminal");
+      if (attempt.harness !== handoff.source.harness || attempt.model !== handoff.source.model) {
+        throw new Error("Handoff source Harness/model must match the persisted attempt");
+      }
+      for (const key of ["harnessVersion", "bindingVersion", "configHash", "processStartId"] as const) {
+        if (handoff.source[key] !== undefined && stage[key] !== undefined && handoff.source[key] !== stage[key]) {
+          throw new Error(`Handoff source ${key} must match the persisted stage`);
+        }
+      }
+      this.#db.prepare(`INSERT INTO handoffs(id,task_id,stage_id,attempt_id,schema_version,created_at,payload,payload_bytes)
+        VALUES(?,?,?,?,1,?,?,?)`).run(id, handoff.taskId, handoff.stageId, handoff.source.attemptId,
+        handoff.createdAt, payload, byteLength);
+      this.#event(handoff.taskId, "handoff.saved", { handoffId: id, stageId: handoff.stageId, attemptId: handoff.source.attemptId, byteLength }, handoff.createdAt);
+    });
+    return { ...handoff, id, byteLength };
+  }
+
+  handoffs(taskId: string): HandoffRecord[] {
+    const rows = this.#db.prepare("SELECT * FROM handoffs WHERE task_id=? ORDER BY created_at,id").all(taskId) as HandoffRow[];
+    return rows.map(row => this.#handoff(row));
+  }
+
+  getHandoff(handoffId: string): HandoffRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM handoffs WHERE id=?").get(handoffId) as HandoffRow | undefined;
+    return row ? this.#handoff(row) : undefined;
+  }
+
+  createAttempt(taskId: string, role: Attempt["role"], options: { owner?: string; stageId?: string; harness?: string; harnessVersion?: string; model?: string; reasoningEffort?: string; bindingVersion?: string; configHash?: string; metadata?: Record<string, unknown> } = {}): Attempt {
     const task = this.get(taskId);
     if (!task) throw new Error(`Unknown task ${taskId}`);
     if (options.owner !== undefined && task.leaseOwner !== options.owner) throw new Error(`Task ${taskId} is not leased by ${options.owner}`);
+    if (options.stageId) {
+      const stage = this.getStage(options.stageId);
+      if (!stage || stage.taskId !== taskId) throw new Error(`Stage ${options.stageId} does not belong to task ${taskId}`);
+      if (stage.status !== "running") throw new Error(`Stage ${options.stageId} is not running`);
+      if (!options.owner || !this.#hasLiveStageLease({ status: task.status, lease_owner: task.leaseOwner ?? null, lease_expires_at: task.leaseExpiresAt ?? null }, options.owner, stage.role)) throw new Error(`Task ${taskId} is not leased for a ${stage.role} stage attempt (wrong state or expired lease)`);
+      if (stage.role !== role) throw new Error(`Attempt role ${role} does not match stage role ${stage.role}`);
+      if (stage.harness !== undefined && stage.harness !== options.harness) throw new Error(`Attempt Harness does not match stage selection`);
+      if (stage.model !== undefined && stage.model !== options.model) throw new Error(`Attempt model does not match stage selection`);
+      if (stage.reasoningEffort !== undefined && stage.reasoningEffort !== options.reasoningEffort) throw new Error(`Attempt reasoning effort does not match stage selection`);
+      if (stage.harnessVersion !== undefined && stage.harnessVersion !== options.harnessVersion) throw new Error(`Attempt Harness version does not match stage selection`);
+      if (stage.bindingVersion !== undefined && stage.bindingVersion !== options.bindingVersion) throw new Error(`Attempt binding version does not match stage selection`);
+      if (stage.configHash !== undefined && stage.configHash !== options.configHash) throw new Error(`Attempt config hash does not match stage selection`);
+    }
     let attempt!: Attempt;
     this.#transaction(() => {
+      if (options.stageId) {
+        const currentTask = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
+        const currentStage = this.#db.prepare("SELECT role,status,harness,harness_version,model,reasoning_effort,binding_version,config_hash FROM stages WHERE id=? AND task_id=?")
+          .get(options.stageId, taskId) as { role: StageRole; status: StageStatus; harness: string | null; harness_version: string | null; model: string | null; reasoning_effort: string | null; binding_version: string | null; config_hash: string | null } | undefined;
+        if (!currentTask || !currentStage || !this.#hasLiveStageLease(currentTask, options.owner!, currentStage.role)) throw new Error(`Task ${taskId} is not leased for a ${role} stage attempt (wrong state or expired lease)`);
+        if (!currentStage || currentStage.status !== "running" || currentStage.role !== role) throw new Error(`Stage ${options.stageId} changed before its attempt started`);
+        for (const [name, expected, actual] of [
+          ["Harness", currentStage.harness, options.harness], ["Harness version", currentStage.harness_version, options.harnessVersion],
+          ["model", currentStage.model, options.model], ["reasoning effort", currentStage.reasoning_effort, options.reasoningEffort],
+          ["binding version", currentStage.binding_version, options.bindingVersion], ["config hash", currentStage.config_hash, options.configHash],
+        ] as Array<[string, string | null, string | undefined]>) {
+          if (expected !== null && expected !== actual) throw new Error(`Attempt ${name} does not match stage selection`);
+        }
+      }
       const active = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? AND status='running' LIMIT 1").get(taskId);
       if (active) throw new Error(`Task ${taskId} already has a running attempt`);
       const sequence = Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0)+1 AS n FROM attempts WHERE task_id=?").get(taskId) as { n: number }).n);
-      attempt = { id: randomUUID(), taskId, sequence, role, status: "running", harness: options.harness,
+      attempt = { id: randomUUID(), taskId, stageId: options.stageId, sequence, role, status: "running", harness: options.harness,
         model: options.model, reasoningEffort: options.reasoningEffort, startedAt: new Date().toISOString(), metadata: options.metadata };
-      this.#db.prepare(`INSERT INTO attempts(id,task_id,sequence,role,status,harness,model,reasoning_effort,started_at,metadata)
-        VALUES(?,?,?,?,?,?,?,?,?,?)`).run(attempt.id, taskId, sequence, role, "running", attempt.harness ?? null,
-        attempt.model ?? null, attempt.reasoningEffort ?? null, attempt.startedAt, encode(attempt.metadata));
+      this.#db.prepare(`INSERT INTO attempts(id,task_id,sequence,role,status,harness,model,reasoning_effort,started_at,metadata,stage_id)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(attempt.id, taskId, sequence, role, "running", attempt.harness ?? null,
+        attempt.model ?? null, attempt.reasoningEffort ?? null, attempt.startedAt, encode(attempt.metadata), attempt.stageId ?? null);
+      if (options.stageId) {
+        this.#db.prepare(`UPDATE stages SET harness=COALESCE(harness,?),harness_version=COALESCE(harness_version,?),
+          model=COALESCE(model,?),reasoning_effort=COALESCE(reasoning_effort,?),binding_version=COALESCE(binding_version,?),config_hash=COALESCE(config_hash,?)
+          WHERE id=? AND status='running'`)
+          .run(options.harness ?? null, options.harnessVersion ?? null, options.model ?? null, options.reasoningEffort ?? null,
+            options.bindingVersion ?? null, options.configHash ?? null, options.stageId);
+      }
       this.#db.prepare("UPDATE tasks SET active_attempt_id=? WHERE id=?").run(attempt.id, taskId);
       this.#event(taskId, "attempt.started", { attempt }, attempt.startedAt);
     });
     return attempt;
   }
 
-  finishAttempt(id: string, result: Partial<Attempt> & { status: Attempt["status"] }): Attempt {
+  finishAttempt(id: string, result: Partial<Attempt> & { status: Attempt["status"] }, guard?: { owner: string; processStartId: string }): Attempt {
     return this.#transaction(() => {
+      const existing = this.#db.prepare("SELECT * FROM attempts WHERE id=?").get(id) as Record<string, unknown> | undefined;
+      if (!existing || existing.status !== "running") throw new Error(`Attempt ${id} is not running`);
+      const stageId = existing.stage_id as string | null | undefined;
+      if (stageId) {
+        if (!guard?.owner || !guard.processStartId) throw new Error(`Stage-linked attempt ${id} requires owner and processStartId`);
+        const stage = this.#db.prepare("SELECT task_id,role,status,process_start_id,harness,model,reasoning_effort FROM stages WHERE id=?")
+          .get(stageId) as { task_id: string; role: StageRole; status: StageStatus; process_start_id: string; harness: string | null; model: string | null; reasoning_effort: string | null } | undefined;
+        const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(String(existing.task_id)) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
+        if (!stage || stage.status !== "running" || stage.process_start_id !== guard.processStartId) throw new Error(`Attempt ${id} belongs to a stale stage generation`);
+        if (!task || !this.#hasLiveStageLease(task, guard.owner, stage.role)) throw new Error(`Task ${String(existing.task_id)} is not leased by ${guard.owner} for ${stage.role} (wrong state or expired lease)`);
+        for (const [name, expected, actual] of [
+          ["Harness", stage.harness, result.harness], ["model", stage.model, result.model],
+          ["reasoning effort", stage.reasoning_effort, result.reasoningEffort],
+        ] as Array<[string, string | null, string | undefined]>) {
+          if (actual !== undefined && expected !== null && actual !== expected) throw new Error(`Attempt result ${name} conflicts with its stage selection`);
+        }
+        for (const [name, expected, actual] of [
+          ["Harness", existing.harness as string | null, result.harness],
+          ["model", existing.model as string | null, result.model],
+          ["reasoning effort", existing.reasoning_effort as string | null, result.reasoningEffort],
+        ] as Array<[string, string | null, string | undefined]>) {
+          if (actual !== undefined && expected !== null && actual !== expected) throw new Error(`Attempt result ${name} conflicts with the created attempt`);
+        }
+      }
       const changed = this.#db.prepare(`UPDATE attempts SET status=?, finished_at=?, exit_code=?, stdout_path=?, stderr_path=?,
       result_path=?, error=?, metadata=COALESCE(?,metadata), harness=COALESCE(?,harness), model=COALESCE(?,model),
       reasoning_effort=COALESCE(?,reasoning_effort) WHERE id=? AND status='running'`).run(result.status,
@@ -317,11 +573,39 @@ export class TaskStore {
 
   #attempt(row: Record<string, unknown>): Attempt {
     return { id: String(row.id), taskId: String(row.task_id), sequence: Number(row.sequence), role: row.role as Attempt["role"],
-      status: row.status as Attempt["status"], harness: row.harness as string | null ?? undefined,
+      stageId: row.stage_id as string | null ?? undefined, status: row.status as Attempt["status"], harness: row.harness as string | null ?? undefined,
       model: row.model as string | null ?? undefined, reasoningEffort: row.reasoning_effort as string | null ?? undefined,
       startedAt: String(row.started_at), finishedAt: row.finished_at as string | null ?? undefined,
       exitCode: row.exit_code as number | null ?? undefined, stdoutPath: row.stdout_path as string | null ?? undefined,
       stderrPath: row.stderr_path as string | null ?? undefined, resultPath: row.result_path as string | null ?? undefined,
       error: row.error as string | null ?? undefined, metadata: decode(row.metadata as string | null) };
+  }
+
+  #stage(row: StageRow): StageRecord {
+    return {
+      id: String(row.id), taskId: String(row.task_id), sequence: Number(row.sequence),
+      role: row.role as StageRole, status: row.status as StageStatus,
+      predecessorStageId: row.predecessor_stage_id as string | null ?? undefined,
+      harness: row.harness as string | null ?? undefined, harnessVersion: row.harness_version as string | null ?? undefined,
+      model: row.model as string | null ?? undefined,
+      reasoningEffort: row.reasoning_effort as string | null ?? undefined,
+      bindingVersion: row.binding_version as string | null ?? undefined,
+      configHash: row.config_hash as string | null ?? undefined,
+      processStartId: String(row.process_start_id),
+      inputFingerprint: row.input_fingerprint as string | null ?? undefined,
+      outputFingerprint: row.output_fingerprint as string | null ?? undefined,
+      error: row.error as string | null ?? undefined,
+      createdAt: String(row.created_at), startedAt: row.started_at as string | null ?? undefined,
+      finishedAt: row.finished_at as string | null ?? undefined,
+    };
+  }
+
+  #handoff(row: HandoffRow): HandoffRecord {
+    if (row.schema_version !== 1) throw new Error(`Unsupported persisted handoff schema version ${row.schema_version}`);
+    const handoff = parseHandoffV1(JSON.parse(row.payload) as unknown);
+    if (handoff.taskId !== row.task_id || handoff.stageId !== row.stage_id || handoff.source.attemptId !== row.attempt_id) {
+      throw new Error(`Persisted handoff ${row.id} provenance does not match its indexed columns`);
+    }
+    return { ...handoff, id: row.id, byteLength: row.payload_bytes };
   }
 }

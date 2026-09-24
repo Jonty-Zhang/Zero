@@ -82,6 +82,8 @@ export type AttemptStatus = "running" | "succeeded" | "failed" | "interrupted";
 export interface Attempt {
   id: string;
   taskId: string;
+  /** Optional logical-stage link; absent on pre-stage attempts. */
+  stageId?: string;
   sequence: number;
   role: AttemptRole;
   status: AttemptStatus;
@@ -96,6 +98,61 @@ export interface Attempt {
   resultPath?: string;
   error?: string;
   metadata?: Record<string, unknown>;
+}
+
+export type StageRole = "implement" | "revise" | "review" | "route";
+export type StageStatus = "pending" | "running" | "succeeded" | "failed" | "interrupted";
+
+export interface StageRecord {
+  id: string;
+  taskId: string;
+  sequence: number;
+  role: StageRole;
+  status: StageStatus;
+  predecessorStageId?: string;
+  harness?: string;
+  harnessVersion?: string;
+  model?: string;
+  reasoningEffort?: string;
+  bindingVersion?: string;
+  configHash?: string;
+  processStartId: string;
+  inputFingerprint?: string;
+  outputFingerprint?: string;
+  error?: string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+export interface HandoffV1 {
+  schemaVersion: 1;
+  taskId: string;
+  stageId: string;
+  createdAt: string;
+  source: { attemptId: string; harness: string; model: string; harnessVersion?: string; bindingVersion?: string; configHash?: string; processStartId?: string };
+  task: { objective: string; latestUserInstruction?: string; acceptanceCriteria: string[] };
+  workspace: {
+    baseCommit?: string;
+    headCommit?: string;
+    fingerprint?: string;
+    state: "clean" | "dirty" | "unknown";
+    changedFiles?: string[];
+  };
+  completed: string[];
+  currentState: string;
+  decisions: Array<{ decision: string; rationale: string }>;
+  rejectedOptions: Array<{ option: string; reason: string }>;
+  keyFiles: Array<{ path: string; reason: string }>;
+  checks: Array<{ id: string; status: "passed" | "failed" | "timed_out" | "not_run"; evidence?: string }>;
+  blockers: string[];
+  risks: string[];
+  nextSteps: string[];
+}
+
+export interface HandoffRecord extends HandoffV1 {
+  id: string;
+  byteLength: number;
 }
 
 export interface RunRequest {
