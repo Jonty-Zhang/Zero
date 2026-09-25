@@ -2,10 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { HandoffV1, HarnessAdapter, HarnessCapabilities, RouteDecision, RunRequest, RunResult, TaskRecord } from "../domain/types.js";
-import { GitWorktreeManager, type WorktreeCreationEvidence, type WorktreeCreationPlan, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
+import { GitWorktreeManager, type ReviewedCommitCandidate, type ReviewedCommitMetadata, type WorktreeCreationEvidence, type WorktreeCreationPlan, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError } from "../core/quota.js";
@@ -363,6 +363,12 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
     });
     const done = await worker.runClaimed(task.id, owner);
     assert.equal(done.status, "done");
+    const doneTransitions = store.events(task.id).filter(event => event.type === "task.transition"
+      && (event.payload as { to?: string } | undefined)?.to === "done");
+    assert.equal(doneTransitions.length, 1);
+    assert.throws(() => store.transition(task.id, "reviewing", "done"), /Illegal task state transition/);
+    assert.equal(store.events(task.id).filter(event => event.type === "task.transition"
+      && (event.payload as { to?: string } | undefined)?.to === "done").length, 1);
     const creation = store.getWorktreeCreation(task.id);
     assert.equal(creation?.status, "created");
     assert.match(creation?.fingerprint ?? "", /^[a-f0-9]{64}$/);
@@ -384,6 +390,17 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
         && attempt.metadata?.packageId === verdict.packageId
         && attempt.metadata?.generationId === verdict.generationId;
     }));
+    const commitOperations = store.commitOperations(task.id);
+    assert.equal(commitOperations.length, 1);
+    assert.equal(commitOperations[0]?.status, "applied");
+    assert.equal(commitOperations[0]?.packageId, packageVerdicts.at(-1)?.packageId);
+    assert.equal(commitOperations[0]?.verdictId, packageVerdicts.at(-1)?.id);
+    assert.match(commitOperations[0]?.candidateSha ?? "", /^[a-f0-9]{40,64}$/);
+    assert.equal(commitOperations[0]?.appliedEvidence?.refHead, commitOperations[0]?.candidateSha);
+    assert.equal(commitOperations[0]?.appliedEvidence?.worktreeHead, commitOperations[0]?.candidateSha);
+    assert.equal(commitOperations[0]?.appliedEvidence?.candidateObjectVerified, true);
+    assert.equal(commitOperations[0]?.appliedEvidence?.indexMatchesReviewedTree, true);
+    assert.equal(commitOperations[0]?.appliedEvidence?.worktreeClean, true);
     assert.deepEqual(checkRunsFor(store, task.id).map(item => item.status), ["completed", "completed"]);
     assert.ok(checkRunsFor(store, task.id).every(item => store.checkRunResults(item.id).every(check => check.status === "passed")));
     const executionStages = store.stages(task.id);
@@ -401,12 +418,70 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
     assert.equal(report?.finalStatus, "done");
     assert.ok(report?.resultCommit);
     assert.ok(report?.diffPath);
+    const reportOperations = store.reportOperations(task.id);
+    assert.equal(reportOperations.length, 1);
+    assert.equal(reportOperations[0]?.status, "complete");
+    assert.equal(reportOperations[0]?.reportSha256.length, 64);
+    assert.equal(reportOperations[0]?.diffSha256.length, 64);
     assert.equal(report?.stages?.length, 2);
     assert.equal(report?.handoffs?.length, 2);
     assert.match(report?.handoffs?.[0]?.workspace.fingerprint ?? "", /^[a-f0-9]{64}$/);
     assert.equal(report?.handoffs?.[0]?.task.objective, task.prompt);
     assert.deepEqual(report?.handoffs?.[0]?.task.acceptanceCriteria, task.acceptanceCriteria);
     assert.match(await (await import("node:fs/promises")).readFile(report!.diffPath!, "utf8"), /result\.txt/);
+    await unlink(join(artifacts, task.id, "report.json"));
+    await writeFile(report!.diffPath!, "corrupt projection\n", "utf8");
+    const repaired = await worker.readReport(task.id);
+    assert.equal(repaired?.finalStatus, "done");
+    assert.deepEqual(await (await import("node:fs/promises")).readFile(join(artifacts, task.id, "report.json")), reportOperations[0]!.reportBytes);
+    assert.deepEqual(await (await import("node:fs/promises")).readFile(report!.diffPath!), reportOperations[0]!.diffBytes);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("worker leaves a raced reviewed branch failed with its candidate intent and never marks DONE", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-commit-race-test-"));
+  const repo = join(root, "repo");
+  const artifacts = join(root, "artifacts");
+  const store = new TaskStore();
+  await initRepo(repo);
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create the approved result file", maxRevisions: 0,
+      checks: [{ id: "pass", argv: [process.execPath, "-e", "process.exit(0)"] }] }, "commit_race");
+    const owner = "commit-race-worker";
+    assert.equal(store.claimNext(owner)?.id, task.id);
+    const worktrees = new GitWorktreeManager(join(root, "worktrees"));
+    const createCandidate = worktrees.createReviewedCommitCandidate.bind(worktrees);
+    worktrees.createReviewedCommitCandidate = async (info, preHead, snapshot, metadata) => {
+      const candidate = await createCandidate(info, preHead, snapshot, metadata);
+      // Simulate another process moving the task branch after the candidate object
+      // is durable but immediately before Zero's compare-and-swap apply.
+      const competing = await exec("git", ["commit-tree", snapshot.treeId, "-p", preHead, "-m", "competing commit"], { cwd: info.path });
+      await exec("git", ["update-ref", candidate.branchRef, competing.stdout.trim()], { cwd: info.path });
+      return candidate;
+    };
+    const worker = new TaskWorker({
+      store,
+      worktrees,
+      testRunner: new TestRunner({ logDirectory: join(artifacts, "checks") }),
+      router: { async route(current) { return routeFor(current); } },
+      reviewer: { async review() {
+        return { harness: "codex", model: "review-model", exitCode: 0,
+          result: { verdict: "pass", summary: "Checks and review passed.", findings: [] } };
+      } },
+      adapters: new Map([["fake", new FakeAdapter()]]),
+      artifactRoot: artifacts,
+    });
+
+    const result = await worker.runClaimed(task.id, owner);
+    assert.equal(result.status, "failed");
+    assert.match(result.failureReason ?? "", /Task branch moved before candidate apply/);
+    assert.equal(store.events(task.id).some(event => event.type === "task.done"), false);
+    assert.equal(store.commitOperations(task.id).length, 1);
+    assert.equal(store.commitOperations(task.id)[0]?.status, "candidate");
+    assert.match(store.commitOperations(task.id)[0]?.candidateSha ?? "", /^[a-f0-9]{40,64}$/);
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });
@@ -582,10 +657,12 @@ test("worker refuses a late allowed-path edit injected after review checks and b
     const baseCommit = baseOutput.trim();
 
     class LateEditWorktrees extends GitWorktreeManager {
-      override async commit(info: WorktreeInfo, message: string, reviewed: WorktreeReviewSnapshot): Promise<string | undefined> {
-        // This runs only after Worker has completed its post-review fingerprint check.
+      override async createReviewedCommitCandidate(info: WorktreeInfo, preHead: string, reviewed: WorktreeReviewSnapshot,
+        metadata: ReviewedCommitMetadata): Promise<ReviewedCommitCandidate> {
+        // Inject after the atomic passing verdict and commit intent exist, but
+        // before Git creates the candidate from the reviewed tree.
         await writeFile(join(info.path, "result.txt"), "late unreviewed edit\n");
-        return super.commit(info, message, reviewed);
+        return super.createReviewedCommitCandidate(info, preHead, reviewed, metadata);
       }
     }
 
@@ -617,12 +694,16 @@ test("worker refuses a late allowed-path edit injected after review checks and b
 
     const failed = await worker.runClaimed(task.id, owner);
     assert.equal(failed.status, "failed");
-    assert.match(failed.failureReason ?? "", /unstaged tracked changes|no longer matches the reviewed snapshot before commit/);
+    assert.match(failed.failureReason ?? "", /Worktree has unstaged tracked changes|no longer matches the reviewed snapshot before candidate creation/);
     const worktreePath = join(worktreeRoot, task.id);
     const { stdout: headOutput } = await exec("git", ["rev-parse", "HEAD"], { cwd: worktreePath });
     assert.equal(headOutput.trim(), baseCommit);
     assert.equal(await (await import("node:fs/promises")).readFile(join(worktreePath, "result.txt"), "utf8"), "late unreviewed edit\n");
     assert.equal(store.reviews(task.id)[0]?.verdict, "pass");
+    assert.equal(store.commitOperations(task.id).length, 1);
+    assert.equal(store.commitOperations(task.id)[0]?.status, "intent");
+    assert.equal(store.events(task.id).filter(event => event.type === "task.transition"
+      && (event.payload as { to?: string } | undefined)?.to === "done").length, 0);
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });
@@ -695,8 +776,11 @@ test("worker refuses DONE when Harness creates only an empty commit", async () =
     });
     const result = await worker.runClaimed(task.id, owner);
     assert.equal(result.status, "failed");
-    assert.match(result.failureReason ?? "", /no-op task DONE/);
+    assert.match(result.failureReason ?? "", /empty reviewed diff/);
     assert.notEqual((await worker.readReport(task.id))?.finalStatus, "done");
+    assert.equal(store.commitOperations(task.id).length, 0);
+    assert.equal(store.events(task.id).filter(event => event.type === "task.transition"
+      && (event.payload as { to?: string } | undefined)?.to === "done").length, 0);
   } finally { store.close(); await rm(root, { recursive: true, force: true }); }
 });
 

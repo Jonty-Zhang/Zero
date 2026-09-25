@@ -43,6 +43,48 @@ test("reviewed candidate is deterministic and only moves the task branch after C
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+test("a fresh manager verifies an applied candidate after restart without its old pre-CAS fingerprint", async () => {
+  const fixture = await candidateFixture("candidate_restart_verify");
+  try {
+    const { manager, info, reviewed, branch, metadata, root } = fixture;
+    const candidate = await manager.createReviewedCommitCandidate(info, branch.head, reviewed, metadata);
+    await manager.applyReviewedCommitCandidate(info, candidate, reviewed);
+
+    const restartedManager = new GitWorktreeManager(join(root, "worktrees"));
+    await restartedManager.verifyAppliedReviewedCommitCandidate(info, candidate, reviewed);
+    assert.equal((await restartedManager.readTaskBranchHead(info)).head, candidate.commit);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("restart verification rejects index pollution, wrong candidate metadata, and a moved branch", async () => {
+  const fixture = await candidateFixture("candidate_restart_reject");
+  try {
+    const { manager, info, reviewed, branch, metadata, root } = fixture;
+    const candidate = await manager.createReviewedCommitCandidate(info, branch.head, reviewed, metadata);
+    await manager.applyReviewedCommitCandidate(info, candidate, reviewed);
+    const restartedManager = new GitWorktreeManager(join(root, "worktrees"));
+
+    await writeFile(join(info.path, "seed.txt"), "index pollution\n");
+    await exec("git", ["add", "seed.txt"], { cwd: info.path });
+    await assert.rejects(
+      restartedManager.verifyAppliedReviewedCommitCandidate(info, candidate, reviewed),
+      /clean worktree matching the reviewed snapshot/,
+    );
+
+    await exec("git", ["reset", "--hard", candidate.commit], { cwd: info.path });
+    await assert.rejects(
+      restartedManager.verifyAppliedReviewedCommitCandidate(info, { ...candidate, opId: "wrong-operation" }, reviewed),
+      /operation id does not match/,
+    );
+
+    await exec("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "competing"], { cwd: info.path });
+    await assert.rejects(
+      restartedManager.verifyAppliedReviewedCommitCandidate(info, candidate, reviewed),
+      /Task branch did not move to the reviewed candidate/,
+    );
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 test("reviewed candidate refuses a competing branch ref update", async () => {
   const fixture = await candidateFixture("candidate_competing");
   try {
@@ -94,7 +136,7 @@ test("reviewed candidate accepts a self-committed pre-HEAD with the reviewed tre
     assert.equal(parentOutput.trim(), info.baseCommit);
     assert.equal((await manager.readTaskBranchHead(info)).head, branch.head);
     await manager.applyReviewedCommitCandidate(info, candidate, reviewed);
-    await manager.verifyReviewedCommit(info, candidate.commit, reviewed);
+    await manager.verifyAppliedReviewedCommitCandidate(info, candidate, reviewed);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 

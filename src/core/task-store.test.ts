@@ -46,7 +46,7 @@ function reviewFixture(checks = [{ id: "unit", argv: ["node", "test.js"] }], lea
   const execution = store.createAttempt(task.id, "implement", { owner, stageId: stage.id, harness: "zcode", model: "model-x" });
   store.finishAttempt(execution.id, { status: "succeeded" }, { owner, processStartId: "process-1" });
   const diff = "diff --git a/a b/a\n+change\n";
-  const snapshot = { baseCommit: "base", preHead: "head", treeId: "tree", fingerprint: "fingerprint",
+  const snapshot = { baseCommit: "a".repeat(40), preHead: "b".repeat(40), treeId: "c".repeat(40), fingerprint: "fingerprint",
     diffHash: createHash("sha256").update(diff, "utf8").digest("hex"), diff };
   const expectedCheckIds = checks.map(check => check.id);
   const checkDefinitionHash = createHash("sha256").update(JSON.stringify(checks), "utf8").digest("hex");
@@ -108,6 +108,333 @@ function startBoundReviewAttempt(f: ReturnType<typeof reviewFixture>, packageId:
   return f.store.createAttempt(f.task.id, "review", { owner: f.owner, harness: "codex",
     metadata: { packageId, generationId: f.generationId } });
 }
+
+function completePassingReview(f: ReturnType<typeof reviewFixture>) {
+  const pkg = completeReviewPackage(f);
+  const attempt = startBoundReviewAttempt(f, pkg.id);
+  const verdict = f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner,
+    generationId: f.generationId, recheckedSnapshot: pkg.snapshot,
+    result: { verdict: "pass", summary: "No findings.", findings: [] }, attemptResult: { exitCode: 0 } });
+  const input = { operationId: "commit-test-1", packageId: pkg.id, verdictId: verdict.id, owner: f.owner,
+    generationId: f.generationId, branchRef: pkg.branchRef, preHead: pkg.snapshot.preHead, treeId: pkg.snapshot.treeId,
+    diffHash: pkg.snapshot.diffHash, message: "Implement reviewed change", timestamp: "2026-09-26T12:00:00.000Z" };
+  return { pkg, attempt, verdict, input };
+}
+
+function completeAppliedCommit(f: ReturnType<typeof reviewFixture>) {
+  const prepared = completePassingReview(f);
+  const operation = f.store.createCommitOperation(prepared.input);
+  const candidateSha = "d".repeat(40);
+  f.store.recordCommitOperationCandidate(operation.id, { owner: f.owner, generationId: f.generationId }, candidateSha);
+  const applied = f.store.markCommitOperationApplied(operation.id, { owner: f.owner, generationId: f.generationId }, {
+    branchRef: operation.branchRef, refHead: candidateSha, worktreeHead: candidateSha, treeId: operation.treeId,
+    diffHash: operation.diffHash, candidateObjectVerified: true, indexMatchesReviewedTree: true, worktreeClean: true,
+  });
+  return { ...prepared, operation: applied, candidateSha };
+}
+
+function reportInput(f: ReturnType<typeof reviewFixture>, applied: ReturnType<typeof completeAppliedCommit>, operationId = "report-test-1") {
+  const artifactDirectory = join(process.cwd(), ".zero-artifacts", f.task.id);
+  const reportBytes = Buffer.from(`${JSON.stringify({ taskId: f.task.id, resultCommit: applied.candidateSha,
+    finalStatus: "done", diffPath: join(artifactDirectory, "result.diff") }, null, 2)}\n`, "utf8");
+  const diffBytes = Buffer.from(applied.pkg.snapshot.diff, "utf8");
+  const eventHighWater = f.store.events(f.task.id).at(-1)?.id ?? 0;
+  return { operationId, commitOperationId: applied.operation.id, owner: f.owner, generationId: f.generationId,
+    artifactDirectory, eventHighWater, reportBytes, diffBytes };
+}
+
+function completeReportOperation(f: ReturnType<typeof reviewFixture>, applied: ReturnType<typeof completeAppliedCommit>) {
+  const input = reportInput(f, applied);
+  const prepared = f.store.createReportOperation(input);
+  return f.store.completeReportOperation(prepared.id, { owner: f.owner, generationId: f.generationId },
+    { reportBytes: input.reportBytes, diffBytes: input.diffBytes });
+}
+
+test("dedicated DONE transaction requires the complete evidence chain and fresh Git verification", () => {
+  const f = reviewFixture();
+  try {
+    const applied = completeAppliedCommit(f);
+    const gitEvidence = { branchRef: applied.operation.branchRef, refHead: applied.candidateSha, worktreeHead: applied.candidateSha,
+      treeId: applied.operation.treeId, diffHash: applied.operation.diffHash, candidateObjectVerified: true as const,
+      indexMatchesReviewedTree: true as const, worktreeClean: true as const };
+    const report = completeReportOperation(f, applied);
+    const doneInput = { taskId: f.task.id, reportOperationId: report.id, owner: f.owner,
+      generationId: f.generationId, gitEvidence };
+
+    assert.throws(() => f.store.transition(f.task.id, "reviewing", "done"), /Illegal task state transition/);
+    assert.throws(() => f.store.completeReviewedTask({ ...doneInput, gitEvidence: { ...gitEvidence, refHead: "e".repeat(40) } }), /Fresh Git verification does not match/);
+    assert.equal(f.store.get(f.task.id)?.status, "reviewing");
+
+    const completed = f.store.completeReviewedTask(doneInput);
+    assert.equal(completed.status, "done");
+    assert.equal(completed.leaseOwner, undefined);
+    assert.equal(completed.leaseExpiresAt, undefined);
+    assert.equal(f.store.events(f.task.id).filter(event => event.type === "task.transition" &&
+      (event.payload as { to?: string } | undefined)?.to === "done").length, 1);
+    assert.throws(() => f.store.completeReviewedTask(doneInput), /not reviewing under live owner/);
+    assert.equal(f.store.events(f.task.id).filter(event => event.type === "task.transition" &&
+      (event.payload as { to?: string } | undefined)?.to === "done").length, 1);
+  } finally { f.store.close(); }
+});
+
+test("DONE rejects missing or incomplete report operations and a stale lease", async () => {
+  const f = reviewFixture(undefined, 150);
+  try {
+    const applied = completeAppliedCommit(f);
+    const gitEvidence = { branchRef: applied.operation.branchRef, refHead: applied.candidateSha, worktreeHead: applied.candidateSha,
+      treeId: applied.operation.treeId, diffHash: applied.operation.diffHash, candidateObjectVerified: true as const,
+      indexMatchesReviewedTree: true as const, worktreeClean: true as const };
+    assert.throws(() => f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: "missing-report",
+      owner: f.owner, generationId: f.generationId, gitEvidence }), /complete report operation/);
+    const input = reportInput(f, applied);
+    const prepared = f.store.createReportOperation(input);
+    assert.throws(() => f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: prepared.id,
+      owner: f.owner, generationId: f.generationId, gitEvidence }), /complete report operation/);
+    await new Promise(resolve => setTimeout(resolve, 170));
+    assert.throws(() => f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: prepared.id,
+      owner: f.owner, generationId: f.generationId, gitEvidence }), /live owner/);
+    assert.equal(f.store.get(f.task.id)?.status, "reviewing");
+  } finally { f.store.close(); }
+});
+
+test("DONE rechecks the atomic verdict instead of trusting an applied commit or report", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-done-verdict-"));
+  const dbPath = join(root, "tasks.sqlite");
+  const f = reviewFixture(undefined, 60_000, dbPath);
+  try {
+    const applied = completeAppliedCommit(f);
+    const report = completeReportOperation(f, applied);
+    const evidence = { branchRef: applied.operation.branchRef, refHead: applied.candidateSha, worktreeHead: applied.candidateSha,
+      treeId: applied.operation.treeId, diffHash: applied.operation.diffHash, candidateObjectVerified: true as const,
+      indexMatchesReviewedTree: true as const, worktreeClean: true as const };
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec("DROP TRIGGER review_verdicts_no_update");
+      db.prepare("UPDATE review_verdicts SET result=? WHERE id=?")
+        .run(JSON.stringify({ verdict: "changes_requested", summary: "not accepted", findings: [{ severity: "high", evidence: "failed", requestedChange: "fix" }] }), applied.verdict.id);
+    } finally { db.close(); }
+    assert.throws(() => f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: report.id,
+      owner: f.owner, generationId: f.generationId, gitEvidence: evidence }), /passing verdict/);
+    assert.equal(f.store.get(f.task.id)?.status, "reviewing");
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("report operation stores fixed UTF-8 bytes, hashes, paths, and repairs after store reopen", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-report-operation-"));
+  const dbPath = join(root, "tasks.sqlite");
+  const f = reviewFixture(undefined, 60_000, dbPath);
+  try {
+    const applied = completeAppliedCommit(f);
+    const input = reportInput(f, applied);
+    const operation = f.store.createReportOperation(input);
+    assert.equal(operation.status, "prepared");
+    assert.equal(operation.packageId, applied.pkg.id);
+    assert.equal(operation.verdictId, applied.verdict.id);
+    assert.equal(operation.eventHighWater, input.eventHighWater);
+    assert.equal(operation.artifactDirectory, input.artifactDirectory);
+    assert.equal(operation.reportPath, join(input.artifactDirectory, "report.json"));
+    assert.equal(operation.diffPath, join(input.artifactDirectory, "result.diff"));
+    assert.deepEqual(operation.reportBytes, input.reportBytes);
+    assert.deepEqual(operation.diffBytes, input.diffBytes);
+    assert.equal(operation.reportSize, input.reportBytes.byteLength);
+    assert.equal(operation.diffSize, input.diffBytes.byteLength);
+    assert.equal(operation.reportSha256, createHash("sha256").update(input.reportBytes).digest("hex"));
+    assert.equal(operation.diffSha256, applied.operation.diffHash);
+    assert.throws(() => f.store.createReportOperation({ ...input, eventHighWater: f.store.events(f.task.id).at(-1)!.id }), /UNIQUE constraint failed/);
+
+    f.store.close();
+    const reopened = new TaskStore(dbPath);
+    try {
+      const recovered = reopened.getReportOperation(operation.id)!;
+      assert.deepEqual(recovered.reportBytes, input.reportBytes);
+      assert.deepEqual(recovered.diffBytes, input.diffBytes);
+      assert.equal(recovered.reportSha256, operation.reportSha256);
+      assert.equal(reopened.reportOperations(f.task.id).length, 1);
+    } finally { reopened.close(); }
+  } finally {
+    try { f.store.close(); } catch { /* closed before reopen */ }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("report completion requires exact independent readback bytes and live claim", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-report-operation-guard-"));
+  const dbPath = join(root, "tasks.sqlite");
+  const f = reviewFixture(undefined, 60_000, dbPath);
+  try {
+    const applied = completeAppliedCommit(f);
+    const input = reportInput(f, applied);
+    const operation = f.store.createReportOperation(input);
+    const guard = { owner: f.owner, generationId: f.generationId };
+    assert.throws(() => f.store.completeReportOperation(operation.id, { owner: "stale", generationId: f.generationId },
+      { reportBytes: input.reportBytes, diffBytes: input.diffBytes }), /guard/);
+    assert.throws(() => f.store.completeReportOperation(operation.id, guard,
+      { reportBytes: Buffer.from(`${input.reportBytes.toString("utf8")}tamper`), diffBytes: input.diffBytes }), /readback bytes/);
+    assert.throws(() => f.store.completeReportOperation(operation.id, guard,
+      { reportBytes: input.reportBytes, diffBytes: Buffer.from(`${input.diffBytes.toString("utf8")}tamper`) }), /readback bytes/);
+    assert.equal(f.store.getReportOperation(operation.id)?.status, "prepared");
+
+    const completed = f.store.completeReportOperation(operation.id, guard, { reportBytes: input.reportBytes, diffBytes: input.diffBytes });
+    assert.equal(completed.status, "complete");
+    assert.ok(completed.completedAt);
+    assert.deepEqual(f.store.completeReportOperation(operation.id, guard, { reportBytes: input.reportBytes, diffBytes: input.diffBytes }), completed);
+
+    const db = new DatabaseSync(dbPath);
+    try { db.prepare("UPDATE tasks SET lease_expires_at=? WHERE id=?").run("2000-01-01T00:00:00.000Z", f.task.id); }
+    finally { db.close(); }
+    assert.throws(() => f.store.completeReportOperation(operation.id, guard,
+      { reportBytes: input.reportBytes, diffBytes: input.diffBytes }), /live owner/);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("report creation rejects premature commits, stale event snapshots, and modified diff content", () => {
+  const f = reviewFixture();
+  try {
+    const prepared = completePassingReview(f);
+    const commit = f.store.createCommitOperation(prepared.input);
+    const invalidBase = { operationId: "report-premature", commitOperationId: commit.id, owner: f.owner,
+      generationId: f.generationId, artifactDirectory: join(process.cwd(), ".zero-artifacts", f.task.id),
+      eventHighWater: f.store.events(f.task.id).at(-1)!.id,
+      reportBytes: Buffer.from(JSON.stringify({ taskId: f.task.id, resultCommit: "d".repeat(40), finalStatus: "done",
+        diffPath: join(process.cwd(), ".zero-artifacts", f.task.id, "result.diff") })), diffBytes: Buffer.from(prepared.pkg.snapshot.diff) };
+    assert.throws(() => f.store.createReportOperation(invalidBase), /applied commit operation/);
+
+    const candidateSha = "d".repeat(40);
+    f.store.recordCommitOperationCandidate(commit.id, { owner: f.owner, generationId: f.generationId }, candidateSha);
+    f.store.markCommitOperationApplied(commit.id, { owner: f.owner, generationId: f.generationId }, {
+      branchRef: commit.branchRef, refHead: candidateSha, worktreeHead: candidateSha, treeId: commit.treeId,
+      diffHash: commit.diffHash, candidateObjectVerified: true, indexMatchesReviewedTree: true, worktreeClean: true,
+    });
+    const applied = f.store.getCommitOperation(commit.id)!;
+    assert.throws(() => f.store.createReportOperation({ ...reportInput(f, { ...prepared, operation: applied, candidateSha }), eventHighWater: 0 }), /event high-water changed/);
+    assert.throws(() => f.store.createReportOperation({ ...reportInput(f, { ...prepared, operation: applied, candidateSha }, "report-wrong-diff"),
+      diffBytes: Buffer.from("changed") }), /diff hash/);
+    assert.throws(() => f.store.createReportOperation({ ...reportInput(f, { ...prepared, operation: applied, candidateSha }, "report-wrong-commit"),
+      reportBytes: Buffer.from(JSON.stringify({ taskId: f.task.id, resultCommit: "e".repeat(40) })) }), /exact task ID and applied result commit/);
+    const wrongStatus = reportInput(f, { ...prepared, operation: applied, candidateSha }, "report-wrong-status");
+    assert.throws(() => f.store.createReportOperation({ ...wrongStatus,
+      reportBytes: Buffer.from(JSON.stringify({ ...JSON.parse(wrongStatus.reportBytes.toString("utf8")), finalStatus: "reviewing" })) }), /finalStatus done/);
+    const wrongDiffPath = reportInput(f, { ...prepared, operation: applied, candidateSha }, "report-wrong-diff-path");
+    assert.throws(() => f.store.createReportOperation({ ...wrongDiffPath,
+      reportBytes: Buffer.from(JSON.stringify({ ...JSON.parse(wrongDiffPath.reportBytes.toString("utf8")), diffPath: "other/result.diff" })) }), /fixed task result.diff path/);
+  } finally { f.store.close(); }
+});
+
+test("commit operation persists deterministic intent then candidate and verified applied evidence", () => {
+  const f = reviewFixture();
+  try {
+    const prepared = completePassingReview(f);
+    const operation = f.store.createCommitOperation(prepared.input);
+    assert.equal(operation.status, "intent");
+    assert.equal(operation.packageId, prepared.pkg.id);
+    assert.equal(operation.verdictId, prepared.verdict.id);
+    assert.equal(operation.preHead, prepared.pkg.snapshot.preHead);
+    assert.equal(operation.treeId, prepared.pkg.snapshot.treeId);
+    assert.equal(operation.authorName, "Zero");
+    assert.equal(operation.authorEmail, "zero@localhost");
+    assert.equal(operation.committerName, "Zero");
+    assert.equal(operation.committerEmail, "zero@localhost");
+    assert.equal(operation.encoding, "UTF-8");
+    assert.equal(operation.candidateSha, undefined);
+
+    const candidateSha = "d".repeat(40);
+    const candidate = f.store.recordCommitOperationCandidate(operation.id, { owner: f.owner, generationId: f.generationId }, candidateSha);
+    assert.equal(candidate.status, "candidate");
+    assert.equal(candidate.candidateSha, candidateSha);
+    assert.equal(f.store.recordCommitOperationCandidate(operation.id, { owner: f.owner, generationId: f.generationId }, candidateSha).candidateSha, candidateSha);
+    assert.throws(() => f.store.recordCommitOperationCandidate(operation.id, { owner: f.owner, generationId: f.generationId }, "e".repeat(40)), /different candidate SHA/);
+
+    const evidence = { branchRef: operation.branchRef, refHead: candidateSha, worktreeHead: candidateSha,
+      treeId: operation.treeId, diffHash: operation.diffHash, candidateObjectVerified: true as const,
+      indexMatchesReviewedTree: true as const, worktreeClean: true as const };
+    assert.throws(() => f.store.markCommitOperationApplied(operation.id, { owner: f.owner, generationId: f.generationId },
+      { ...evidence, branchRef: "refs/heads/zero/another-task" }), /does not match.*operation/);
+    assert.equal(f.store.getCommitOperation(operation.id)?.status, "candidate");
+    const applied = f.store.markCommitOperationApplied(operation.id, { owner: f.owner, generationId: f.generationId }, evidence);
+    assert.equal(applied.status, "applied");
+    assert.deepEqual(applied.appliedEvidence, evidence);
+    assert.deepEqual(f.store.commitOperations(f.task.id), [applied]);
+    assert.deepEqual(f.store.markCommitOperationApplied(operation.id, { owner: f.owner, generationId: f.generationId }, evidence), applied);
+    assert.throws(() => f.store.markCommitOperationApplied(operation.id, { owner: f.owner, generationId: f.generationId },
+      { ...evidence, refHead: "e".repeat(40) }), /verified Git evidence|cannot be changed/);
+  } finally { f.store.close(); }
+});
+
+test("commit operation fails closed for duplicate, wrong binding, non-pass verdict, and invalid candidate", () => {
+  const f = reviewFixture();
+  try {
+    const prepared = completePassingReview(f);
+    assert.throws(() => f.store.createCommitOperation({ ...prepared.input, verdictId: "legacy-review-only" }), /successful atomic Codex package verdict/);
+    assert.throws(() => f.store.createCommitOperation({ ...prepared.input, generationId: "different-generation" }), /live owner|successful atomic/);
+    assert.throws(() => f.store.createCommitOperation({ ...prepared.input, preHead: "wrong" }), /valid Git pre-HEAD/);
+    assert.throws(() => f.store.createCommitOperation({ ...prepared.input, treeId: "e".repeat(40) }), /do not match.*snapshot/);
+    const operation = f.store.createCommitOperation(prepared.input);
+    assert.throws(() => f.store.createCommitOperation({ ...prepared.input, operationId: "commit-test-duplicate" }), /UNIQUE constraint failed/);
+    assert.throws(() => f.store.recordCommitOperationCandidate(operation.id, { owner: f.owner, generationId: f.generationId }, "nope"), /Invalid candidate/);
+    assert.throws(() => f.store.recordCommitOperationCandidate(operation.id, { owner: "other-worker", generationId: f.generationId }, "d".repeat(40)), /guard/);
+    assert.throws(() => f.store.markCommitOperationApplied(operation.id, { owner: f.owner, generationId: f.generationId }, {
+      branchRef: operation.branchRef, refHead: "d".repeat(40), worktreeHead: "d".repeat(40), treeId: operation.treeId,
+      diffHash: operation.diffHash, candidateObjectVerified: true, indexMatchesReviewedTree: true, worktreeClean: true,
+    }), /no persisted candidate SHA/);
+    assert.deepEqual(f.store.commitOperations(f.task.id).map(item => item.id), [operation.id]);
+  } finally { f.store.close(); }
+});
+
+test("commit intent verifies package branch and check definitions against the completed run and task", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-commit-operation-evidence-"));
+  const path = join(root, "tasks.sqlite");
+  const f = reviewFixture(undefined, 60_000, path);
+  try {
+    const prepared = completePassingReview(f);
+    const db = new DatabaseSync(path);
+    try {
+      db.prepare("UPDATE check_runs SET check_definition_hash=? WHERE id=?")
+        .run("f".repeat(64), prepared.pkg.checkRunId);
+      assert.throws(() => f.store.createCommitOperation(prepared.input), /definitions do not match/);
+      db.prepare("UPDATE check_runs SET check_definition_hash=? WHERE id=?")
+        .run(prepared.pkg.checkDefinitionHash, prepared.pkg.checkRunId);
+      db.exec("DROP TRIGGER review_packages_no_update");
+      db.prepare("UPDATE review_packages SET branch_ref=? WHERE id=?")
+        .run("refs/heads/zero/tampered", prepared.pkg.id);
+      assert.throws(() => f.store.createCommitOperation(prepared.input), /package's exact task branch ref/);
+    } finally { db.close(); }
+    assert.deepEqual(f.store.commitOperations(f.task.id), []);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("commit operation cannot authorize failed review or a stale reviewing lease", async () => {
+  const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 150);
+  try {
+    const pkg = completeReviewPackage(f);
+    const attempt = startBoundReviewAttempt(f, pkg.id);
+    const verdict = f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner,
+      generationId: f.generationId, recheckedSnapshot: pkg.snapshot,
+      result: { verdict: "changes_requested", summary: "Needs a correction.", findings: [
+        { severity: "medium", evidence: "missing case", requestedChange: "add the case" },
+      ] }, attemptResult: { exitCode: 0 } });
+    const input = { operationId: "commit-failed-verdict", packageId: pkg.id, verdictId: verdict.id, owner: f.owner,
+      generationId: f.generationId, branchRef: pkg.branchRef, preHead: pkg.snapshot.preHead, treeId: pkg.snapshot.treeId,
+      diffHash: pkg.snapshot.diffHash, message: "Should not commit", timestamp: "2026-09-26T12:00:00.000Z" };
+    assert.throws(() => f.store.createCommitOperation(input), /passing review verdict/);
+  } finally { f.store.close(); }
+
+  const stale = reviewFixture(undefined, 500);
+  try {
+    const prepared = completePassingReview(stale);
+    await new Promise(resolve => setTimeout(resolve, 520));
+    assert.throws(() => stale.store.createCommitOperation(prepared.input), /live owner/);
+    assert.deepEqual(stale.store.commitOperations(stale.task.id), []);
+  } finally { stale.store.close(); }
+});
 
 test("package review atomically finishes a bound codex attempt and persists legacy and immutable verdict evidence", () => {
   const f = reviewFixture();
@@ -659,8 +986,8 @@ test("task transitions reject illegal shortcuts and record only committed state 
     assert.equal(store.events(task.id).filter(e => e.type === "task.transition").length, 0);
     store.transition(task.id, "pending", "running");
     store.transition(task.id, "running", "reviewing");
-    store.transition(task.id, "reviewing", "done");
-    assert.equal(store.get(task.id)?.status, "done");
+    assert.throws(() => store.transition(task.id, "reviewing", "done"), /Illegal task state transition/);
+    assert.equal(store.get(task.id)?.status, "reviewing");
   } finally { store.close(); }
 });
 
@@ -967,17 +1294,17 @@ test("concurrent startup generations yield at most one SQLite execution recovery
         const claimed = store.claimExecutionRecovery(workerData.taskId, workerData.owner, {
           now, identity: { checkedAt: now.toISOString(), observed: workerData.observed, fingerprint: workerData.fingerprint }
         });
-        parentPort.postMessage({ owner: workerData.owner, claimed: Boolean(claimed), status: store.get(workerData.taskId)?.status });
+        parentPort.postMessage({ owner: workerData.owner, generationId: workerData.generationId, claimed: Boolean(claimed) });
       } catch (error) { parentPort.postMessage({ error: error instanceof Error ? error.message : String(error) }); }
       finally { store?.close(); }
     })();
   `;
   const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   const moduleUrl = new URL("./task-store.js", import.meta.url).href;
-  const start = (generationId: string, owner: string) => new Promise<{ owner: string; claimed: boolean; status: string }>((resolve, reject) => {
+  const start = (generationId: string, owner: string) => new Promise<{ owner: string; generationId: string; claimed: boolean }>((resolve, reject) => {
     const worker = new Worker(workerSource, { eval: true, workerData: { moduleUrl, path, taskId: task.id, lockId,
       generationId, owner, observed, fingerprint: "c".repeat(64), barrier } });
-    let result: { owner: string; claimed: boolean; status: string } | undefined;
+    let result: { owner: string; generationId: string; claimed: boolean } | undefined;
     worker.once("message", value => { if (value?.error) reject(new Error(value.error)); else result = value; });
     worker.once("error", reject);
     worker.once("exit", code => {
@@ -992,12 +1319,16 @@ test("concurrent startup generations yield at most one SQLite execution recovery
       start("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "recovery-racer-b"),
     ]);
     assert.equal(outcomes.filter(outcome => outcome.claimed).length, 1);
-    assert.equal(outcomes.filter(outcome => outcome.status === "running").length, 1);
+    const winner = outcomes.find(outcome => outcome.claimed)!;
     const check = new TaskStore(path);
     try {
-      assert.equal(check.get(task.id)?.status, "running");
-      assert.ok(["recovery-racer-a", "recovery-racer-b"].includes(check.get(task.id)?.leaseOwner ?? ""));
-      assert.equal(check.executionRecoveryCheckpoint(task.id)?.kind, "execution_recovery");
+      const recovered = check.get(task.id);
+      assert.equal(recovered?.status, "running");
+      assert.equal(recovered?.leaseOwner, winner.owner);
+      const checkpoint = check.executionRecoveryCheckpoint(task.id);
+      assert.equal(checkpoint?.kind, "execution_recovery");
+      assert.equal(checkpoint?.owner, winner.owner);
+      assert.equal(checkpoint?.claimedGenerationId, winner.generationId);
     } finally { check.close(); }
   } finally { await rm(root, { recursive: true, force: true }); }
 });

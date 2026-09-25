@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import path from "node:path";
 import type {
   Attempt,
   CheckResult,
@@ -109,6 +110,125 @@ export interface PackageReviewVerdictRecord {
   createdAt: string;
 }
 
+export type CommitOperationStatus = "intent" | "candidate" | "applied";
+
+/** Immutable Git inputs captured before Zero creates a commit object or moves a branch. */
+export interface CommitOperationRecord {
+  id: string;
+  taskId: string;
+  packageId: string;
+  verdictId: string;
+  generationId: string;
+  owner: string;
+  claimOwner: string;
+  claimGenerationId: string;
+  branchRef: string;
+  preHead: string;
+  treeId: string;
+  diffHash: string;
+  message: string;
+  timestamp: string;
+  authorName: "Zero";
+  authorEmail: "zero@localhost";
+  committerName: "Zero";
+  committerEmail: "zero@localhost";
+  encoding: "UTF-8";
+  status: CommitOperationStatus;
+  candidateSha?: string;
+  createdAt: string;
+  candidateAt?: string;
+  appliedAt?: string;
+  appliedEvidence?: VerifiedAppliedCommitEvidence;
+}
+
+export interface CreateCommitOperationInput {
+  operationId: string;
+  packageId: string;
+  verdictId: string;
+  owner: string;
+  generationId: string;
+  branchRef: string;
+  preHead: string;
+  treeId: string;
+  diffHash: string;
+  message: string;
+  timestamp: string;
+}
+
+/**
+ * Caller attestation produced only after Git object/ref/worktree verification has completed.
+ * TaskStore validates that the fields match the stored intent; it cannot independently prove Git state.
+ * Worker must call the GitWorktreeManager candidate/applied verification APIs before supplying this value.
+ */
+export interface VerifiedAppliedCommitEvidence {
+  branchRef: string;
+  refHead: string;
+  worktreeHead: string;
+  treeId: string;
+  diffHash: string;
+  candidateObjectVerified: true;
+  indexMatchesReviewedTree: true;
+  worktreeClean: true;
+}
+
+export interface ReportOperationRecord {
+  id: string;
+  taskId: string;
+  commitOperationId: string;
+  packageId: string;
+  verdictId: string;
+  generationId: string;
+  owner: string;
+  claimOwner: string;
+  claimGenerationId: string;
+  artifactDirectory: string;
+  reportPath: string;
+  diffPath: string;
+  eventHighWater: number;
+  reportBytes: Buffer;
+  reportSha256: string;
+  reportSize: number;
+  diffBytes: Buffer;
+  diffSha256: string;
+  diffSize: number;
+  status: "prepared" | "complete";
+  createdAt: string;
+  completedAt?: string;
+}
+
+export interface CreateReportOperationInput {
+  operationId: string;
+  commitOperationId: string;
+  owner: string;
+  generationId: string;
+  artifactDirectory: string;
+  /** Highest event ID represented by reportBytes, measured before this operation is inserted. */
+  eventHighWater: number;
+  reportBytes: Uint8Array;
+  diffBytes: Uint8Array;
+}
+
+export interface CompleteReportOperationReadback {
+  /** Independently read bytes from the final report.json projection. */
+  reportBytes: Uint8Array;
+  /** Independently read bytes from the final result.diff projection. */
+  diffBytes: Uint8Array;
+}
+
+export interface CompleteReviewedTaskInput {
+  taskId: string;
+  reportOperationId: string;
+  owner: string;
+  generationId: string;
+  /** Freshly obtained after report completion by independently verifying Git immediately before this call. */
+  gitEvidence: VerifiedAppliedCommitEvidence;
+}
+
+const ZERO_COMMIT_IDENTITY = {
+  authorName: "Zero" as const, authorEmail: "zero@localhost" as const,
+  committerName: "Zero" as const, committerEmail: "zero@localhost" as const, encoding: "UTF-8" as const,
+};
+
 export interface FinishPackageReviewInput {
   packageId: string;
   attemptId: string;
@@ -138,6 +258,8 @@ export interface StartCheckRunInput {
 export interface CheckRunGuard { owner: string; generationId: string; }
 
 const MAX_REVIEW_DIFF_BYTES = 64 * 1024 * 1024;
+const MAX_REPORT_JSON_BYTES = 8 * 1024 * 1024;
+const MAX_REPORT_DIFF_BYTES = 64 * 1024 * 1024;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
 const encode = (v: unknown): Json => v === undefined ? null : JSON.stringify(v);
@@ -257,6 +379,64 @@ export class TaskStore {
       CREATE INDEX IF NOT EXISTS review_verdicts_task_created ON review_verdicts(task_id, created_at, id);
       CREATE TRIGGER IF NOT EXISTS review_verdicts_no_update BEFORE UPDATE ON review_verdicts BEGIN SELECT RAISE(ABORT,'review verdicts are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS review_verdicts_no_delete BEFORE DELETE ON review_verdicts BEGIN SELECT RAISE(ABORT,'review verdicts are immutable'); END;
+      CREATE TABLE IF NOT EXISTS commit_operations (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), package_id TEXT NOT NULL UNIQUE REFERENCES review_packages(id),
+        verdict_id TEXT NOT NULL REFERENCES review_verdicts(id), generation_id TEXT NOT NULL REFERENCES startup_generations(id),
+        owner TEXT NOT NULL, claim_owner TEXT NOT NULL, claim_generation_id TEXT NOT NULL REFERENCES startup_generations(id),
+        branch_ref TEXT NOT NULL, pre_head TEXT NOT NULL, tree_id TEXT NOT NULL, diff_hash TEXT NOT NULL,
+        message TEXT NOT NULL, timestamp TEXT NOT NULL, author_name TEXT NOT NULL, author_email TEXT NOT NULL,
+        committer_name TEXT NOT NULL, committer_email TEXT NOT NULL, encoding TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('intent','candidate','applied')), candidate_sha TEXT,
+        created_at TEXT NOT NULL, candidate_at TEXT, applied_at TEXT, applied_evidence TEXT
+      );
+      CREATE INDEX IF NOT EXISTS commit_operations_task_created ON commit_operations(task_id, created_at, id);
+      CREATE TRIGGER IF NOT EXISTS commit_operations_no_delete BEFORE DELETE ON commit_operations BEGIN SELECT RAISE(ABORT,'commit operations cannot be deleted'); END;
+      CREATE TRIGGER IF NOT EXISTS commit_operations_guard_update BEFORE UPDATE ON commit_operations
+      WHEN NEW.id!=OLD.id OR NEW.task_id!=OLD.task_id OR NEW.package_id!=OLD.package_id OR NEW.verdict_id!=OLD.verdict_id
+        OR NEW.generation_id!=OLD.generation_id OR NEW.owner!=OLD.owner OR NEW.branch_ref!=OLD.branch_ref
+        OR NEW.pre_head!=OLD.pre_head OR NEW.tree_id!=OLD.tree_id OR NEW.diff_hash!=OLD.diff_hash
+        OR NEW.message!=OLD.message OR NEW.timestamp!=OLD.timestamp OR NEW.author_name!=OLD.author_name
+        OR NEW.author_email!=OLD.author_email OR NEW.committer_name!=OLD.committer_name
+        OR NEW.committer_email!=OLD.committer_email OR NEW.encoding!=OLD.encoding OR NEW.created_at!=OLD.created_at
+        OR NOT ((OLD.status=NEW.status AND OLD.status IN ('intent','candidate','applied')
+          AND (OLD.claim_owner!=NEW.claim_owner OR OLD.claim_generation_id!=NEW.claim_generation_id)
+          AND OLD.candidate_sha IS NEW.candidate_sha AND OLD.candidate_at IS NEW.candidate_at
+          AND OLD.applied_at IS NEW.applied_at AND OLD.applied_evidence IS NEW.applied_evidence)
+          OR (OLD.status='intent' AND NEW.status='candidate' AND OLD.candidate_sha IS NULL
+          AND NEW.candidate_sha IS NOT NULL AND NEW.candidate_at IS NOT NULL AND NEW.applied_at IS NULL AND NEW.applied_evidence IS NULL)
+          OR (OLD.status='candidate' AND NEW.status='applied' AND OLD.candidate_sha=NEW.candidate_sha
+          AND OLD.candidate_at=NEW.candidate_at AND NEW.applied_at IS NOT NULL AND NEW.applied_evidence IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT,'invalid commit operation transition'); END;
+      CREATE TABLE IF NOT EXISTS report_operations (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+        commit_operation_id TEXT NOT NULL UNIQUE REFERENCES commit_operations(id),
+        package_id TEXT NOT NULL REFERENCES review_packages(id), verdict_id TEXT NOT NULL REFERENCES review_verdicts(id),
+        generation_id TEXT NOT NULL REFERENCES startup_generations(id), owner TEXT NOT NULL,
+        claim_owner TEXT NOT NULL, claim_generation_id TEXT NOT NULL REFERENCES startup_generations(id),
+        artifact_directory TEXT NOT NULL, report_path TEXT NOT NULL, diff_path TEXT NOT NULL,
+        event_high_water INTEGER NOT NULL CHECK(event_high_water >= 0),
+        report_bytes BLOB NOT NULL, report_sha256 TEXT NOT NULL, report_size INTEGER NOT NULL CHECK(report_size >= 0),
+        diff_bytes BLOB NOT NULL, diff_sha256 TEXT NOT NULL, diff_size INTEGER NOT NULL CHECK(diff_size >= 0),
+        status TEXT NOT NULL CHECK(status IN ('prepared','complete')),
+        created_at TEXT NOT NULL, completed_at TEXT, readback_evidence TEXT
+      );
+      CREATE INDEX IF NOT EXISTS report_operations_task_created ON report_operations(task_id, created_at, id);
+      CREATE TRIGGER IF NOT EXISTS report_operations_no_delete BEFORE DELETE ON report_operations BEGIN SELECT RAISE(ABORT,'report operations cannot be deleted'); END;
+      CREATE TRIGGER IF NOT EXISTS report_operations_guard_update BEFORE UPDATE ON report_operations
+      WHEN NEW.id!=OLD.id OR NEW.task_id!=OLD.task_id OR NEW.commit_operation_id!=OLD.commit_operation_id
+        OR NEW.package_id!=OLD.package_id OR NEW.verdict_id!=OLD.verdict_id OR NEW.generation_id!=OLD.generation_id
+        OR NEW.owner!=OLD.owner OR NEW.artifact_directory!=OLD.artifact_directory OR NEW.report_path!=OLD.report_path
+        OR NEW.diff_path!=OLD.diff_path OR NEW.event_high_water!=OLD.event_high_water
+        OR NEW.report_bytes!=OLD.report_bytes OR NEW.report_sha256!=OLD.report_sha256 OR NEW.report_size!=OLD.report_size
+        OR NEW.diff_bytes!=OLD.diff_bytes OR NEW.diff_sha256!=OLD.diff_sha256 OR NEW.diff_size!=OLD.diff_size
+        OR NEW.created_at!=OLD.created_at
+        OR NOT ((OLD.status='prepared' AND NEW.status='prepared'
+          AND (OLD.claim_owner!=NEW.claim_owner OR OLD.claim_generation_id!=NEW.claim_generation_id)
+          AND OLD.completed_at IS NULL AND OLD.readback_evidence IS NULL)
+          OR (OLD.status='prepared' AND NEW.status='complete'
+          AND OLD.claim_owner=NEW.claim_owner AND OLD.claim_generation_id=NEW.claim_generation_id
+          AND OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL AND NEW.readback_evidence IS NOT NULL))
+      BEGIN SELECT RAISE(ABORT,'invalid report operation transition'); END;
       CREATE TRIGGER IF NOT EXISTS check_run_results_no_update BEFORE UPDATE ON check_run_results BEGIN SELECT RAISE(ABORT,'check results are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS check_run_results_no_delete BEFORE DELETE ON check_run_results BEGIN SELECT RAISE(ABORT,'check results are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS check_run_results_only_while_running BEFORE INSERT ON check_run_results
@@ -516,7 +696,7 @@ export class TaskStore {
       pending: ["running", "failed"],
       waiting: ["running", "failed"],
       running: ["reviewing", "revision", "failed"],
-      reviewing: ["done", "revision", "failed"],
+      reviewing: ["revision", "failed"],
       revision: ["running", "failed"],
       recovery_required: [],
       done: [], failed: [],
@@ -1264,6 +1444,427 @@ export class TaskStore {
       .map(row => this.#packageReviewVerdict(row));
   }
 
+  /** Persist all deterministic commit inputs before the caller creates a Git object or moves a ref. */
+  createCommitOperation(input: CreateCommitOperationInput): CommitOperationRecord {
+    const operationId = input?.operationId;
+    if (!input || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(operationId ?? "")) throw new Error("Invalid commit operation ID");
+    if (!input.owner?.trim() || !input.generationId?.trim()) throw new Error("Commit operation requires a live owner and generation");
+    if (!/^refs\/heads\/zero\/[A-Za-z0-9][A-Za-z0-9._:_-]{0,127}$/.test(input.branchRef ?? "")) throw new Error("Invalid task commit branch ref");
+    if (!/^[a-fA-F0-9]{40,64}$/.test(input.preHead ?? "") || !/^[a-fA-F0-9]{40,64}$/.test(input.treeId ?? "")) {
+      throw new Error("Commit operation requires valid Git pre-HEAD and reviewed tree object IDs");
+    }
+    if (!SHA256_PATTERN.test(input.diffHash ?? "")) throw new Error("Commit operation requires a SHA-256 reviewed diff hash");
+    if (typeof input.message !== "string" || !input.message.trim() || input.message.includes("\0") ||
+        Buffer.byteLength(input.message, "utf8") > 65_536 || Buffer.from(input.message, "utf8").toString("utf8") !== input.message) {
+      throw new Error("Commit operation message must be valid UTF-8 text of at most 64 KiB");
+    }
+    if (typeof input.timestamp !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(input.timestamp) ||
+        !Number.isFinite(Date.parse(input.timestamp)) || new Date(input.timestamp).toISOString() !== input.timestamp) {
+      throw new Error("Commit operation timestamp must be a canonical UTC ISO timestamp");
+    }
+    const createdAt = new Date().toISOString();
+    this.#transaction(() => {
+      const pkg = this.#db.prepare(`SELECT p.*,c.status AS check_status,c.expected_check_ids AS run_expected_check_ids,
+        c.check_definition_hash AS run_check_definition_hash,c.snapshot AS run_snapshot
+        FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id WHERE p.id=?`)
+        .get(input.packageId) as Record<string, unknown> | undefined;
+      if (!pkg || pkg.check_status !== "completed") throw new Error("Commit intent requires a completed package check run");
+      const taskId = String(pkg.task_id);
+      if (input.branchRef !== `refs/heads/zero/${taskId}` || pkg.branch_ref !== input.branchRef) {
+        throw new Error("Commit intent must target the package's exact task branch ref");
+      }
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id,payload FROM tasks WHERE id=?")
+        .get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null; payload: string } | undefined;
+      this.#assertCommitOperationLease(task, input.owner, input.generationId);
+      const packageSnapshot = JSON.parse(String(pkg.snapshot)) as CheckRunSnapshot;
+      if (input.preHead.toLowerCase() !== packageSnapshot.preHead.toLowerCase() ||
+          input.treeId.toLowerCase() !== packageSnapshot.treeId.toLowerCase() || input.diffHash !== packageSnapshot.diffHash) {
+        throw new Error("Commit intent Git inputs do not match the immutable review package snapshot");
+      }
+      if (!packageSnapshot.diff.trim()) throw new Error("Commit intent cannot be created for an empty reviewed diff");
+      const latestPackage = this.#db.prepare("SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1").get(taskId) as { id: string } | undefined;
+      if (latestPackage?.id !== input.packageId) throw new Error("Commit intent package is not the latest package for this task");
+      const packageCheckIds = JSON.parse(String(pkg.expected_check_ids)) as string[];
+      const runCheckIds = JSON.parse(String(pkg.run_expected_check_ids)) as string[];
+      const packageDefinitionHash = String(pkg.check_definition_hash);
+      if (!sameStringSet(packageCheckIds, runCheckIds) || packageDefinitionHash !== pkg.run_check_definition_hash ||
+          !sameSnapshot(JSON.parse(String(pkg.snapshot)) as CheckRunSnapshot, JSON.parse(String(pkg.run_snapshot)) as CheckRunSnapshot)) {
+        throw new Error("Review package check definitions do not match their completed check run");
+      }
+      const submittedChecks = (JSON.parse(task!.payload) as TaskSubmission).checks ?? [];
+      const submittedDefinitionHash = createHash("sha256").update(JSON.stringify(submittedChecks), "utf8").digest("hex");
+      if (submittedDefinitionHash !== packageDefinitionHash ||
+          !sameStringSet(submittedChecks.map(check => check.id), packageCheckIds)) {
+        throw new Error("Commit intent check definitions do not match the submitted task checks");
+      }
+      const verdictRow = this.#db.prepare(`SELECT v.*,a.status AS attempt_status,a.role AS attempt_role,a.harness AS attempt_harness,
+        a.metadata AS attempt_metadata FROM review_verdicts v JOIN attempts a ON a.id=v.attempt_id WHERE v.id=? AND v.package_id=?`)
+        .get(input.verdictId, input.packageId) as Record<string, unknown> | undefined;
+      if (!verdictRow || verdictRow.task_id !== taskId || verdictRow.generation_id !== input.generationId ||
+          verdictRow.attempt_status !== "succeeded" || verdictRow.attempt_role !== "review" || verdictRow.attempt_harness !== "codex") {
+        throw new Error("Commit intent requires this generation's successful atomic Codex package verdict");
+      }
+      const latestVerdict = this.#db.prepare("SELECT id FROM review_verdicts WHERE package_id=? ORDER BY rowid DESC LIMIT 1")
+        .get(input.packageId) as { id: string } | undefined;
+      if (latestVerdict?.id !== input.verdictId) throw new Error("Commit intent verdict is not the latest verdict for the package");
+      const result = JSON.parse(String(verdictRow.result)) as ReviewResult;
+      const snapshot = JSON.parse(String(pkg.snapshot)) as CheckRunSnapshot;
+      if (!isValidReviewResult(result) || result.verdict !== "pass" || !sameSnapshot(snapshot, JSON.parse(String(verdictRow.snapshot)) as CheckRunSnapshot)) {
+        throw new Error("Commit intent requires an exact immutable passing review verdict");
+      }
+      const attemptMetadata = verdictRow.attempt_metadata ? JSON.parse(String(verdictRow.attempt_metadata)) as Record<string, unknown> : {};
+      if (attemptMetadata.packageId !== input.packageId || attemptMetadata.generationId !== input.generationId) {
+        throw new Error("Passing review attempt does not bind the package and generation");
+      }
+      const expectedCheckIds = packageCheckIds;
+      const checkRows = this.#db.prepare("SELECT result FROM check_run_results WHERE run_id=? ORDER BY id")
+        .all(String(pkg.check_run_id)) as Array<{ result: string }>;
+      const checkResults = checkRows.map(row => JSON.parse(row.result) as CheckResult);
+      if (!Array.isArray(expectedCheckIds) || checkResults.length !== expectedCheckIds.length ||
+          expectedCheckIds.some(id => !checkResults.some(check => check.id === id && check.status === "passed" && check.exitCode === 0))) {
+        throw new Error("Commit intent requires the complete passing check result set");
+      }
+      this.#db.prepare(`INSERT INTO commit_operations(id,task_id,package_id,verdict_id,generation_id,owner,claim_owner,claim_generation_id,branch_ref,pre_head,tree_id,diff_hash,
+        message,timestamp,author_name,author_email,committer_name,committer_email,encoding,status,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'intent',?)`).run(operationId, taskId, input.packageId, input.verdictId,
+        input.generationId, input.owner, input.owner, input.generationId, input.branchRef, input.preHead.toLowerCase(), input.treeId.toLowerCase(), input.diffHash,
+        input.message, input.timestamp, ZERO_COMMIT_IDENTITY.authorName, ZERO_COMMIT_IDENTITY.authorEmail,
+        ZERO_COMMIT_IDENTITY.committerName, ZERO_COMMIT_IDENTITY.committerEmail, ZERO_COMMIT_IDENTITY.encoding, createdAt);
+      this.#event(taskId, "commit_operation.created", { operationId, packageId: input.packageId, verdictId: input.verdictId,
+        branchRef: input.branchRef, preHead: input.preHead.toLowerCase(), treeId: input.treeId.toLowerCase(), diffHash: input.diffHash }, createdAt);
+    });
+    return this.getCommitOperation(operationId)!;
+  }
+
+  /** Save the independently-created commit object ID before any branch update. */
+  recordCommitOperationCandidate(operationId: string, guard: CheckRunGuard, candidateSha: string): CommitOperationRecord {
+    if (!/^[a-fA-F0-9]{40,64}$/.test(candidateSha ?? "")) throw new Error("Invalid candidate commit object ID");
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const operation = this.#db.prepare("SELECT * FROM commit_operations WHERE id=?").get(operationId) as Record<string, unknown> | undefined;
+      if (!operation) throw new Error("Commit operation does not exist");
+      this.#assertCommitOperationGuard(operation, guard);
+      if (operation.status === "candidate" || operation.status === "applied") {
+        if (String(operation.candidate_sha).toLowerCase() !== candidateSha.toLowerCase()) throw new Error("Commit operation already records a different candidate SHA");
+        return;
+      }
+      if (operation.status !== "intent") throw new Error("Commit operation is not awaiting a candidate SHA");
+      this.#assertCommitOperationLease(this.#commitTask(String(operation.task_id)), guard.owner, guard.generationId);
+      const changed = this.#db.prepare(`UPDATE commit_operations SET status='candidate',candidate_sha=?,candidate_at=? WHERE id=? AND status='intent'`)
+        .run(candidateSha.toLowerCase(), at, operationId);
+      if (Number(changed.changes) !== 1) throw new Error("Commit operation candidate transition was not applied");
+      this.#event(String(operation.task_id), "commit_operation.candidate", { operationId, candidateSha: candidateSha.toLowerCase() }, at);
+    });
+    return this.getCommitOperation(operationId)!;
+  }
+
+  /** Mark an operation applied only after the worker has independently verified the exact Git state. */
+  markCommitOperationApplied(operationId: string, guard: CheckRunGuard, evidence: VerifiedAppliedCommitEvidence): CommitOperationRecord {
+    if (!evidence || !/^[a-fA-F0-9]{40,64}$/.test(evidence.refHead ?? "") ||
+        !/^[a-fA-F0-9]{40,64}$/.test(evidence.worktreeHead ?? "") || !/^[a-fA-F0-9]{40,64}$/.test(evidence.treeId ?? "") ||
+        !SHA256_PATTERN.test(evidence.diffHash ?? "") || evidence.candidateObjectVerified !== true ||
+        evidence.indexMatchesReviewedTree !== true || evidence.worktreeClean !== true) {
+      throw new Error("Applied commit operation requires complete verified Git evidence");
+    }
+    const at = new Date().toISOString();
+    const normalizedEvidence: VerifiedAppliedCommitEvidence = { ...evidence, refHead: evidence.refHead.toLowerCase(),
+      worktreeHead: evidence.worktreeHead.toLowerCase(), treeId: evidence.treeId.toLowerCase() };
+    this.#transaction(() => {
+      const operation = this.#db.prepare("SELECT * FROM commit_operations WHERE id=?").get(operationId) as Record<string, unknown> | undefined;
+      if (!operation) throw new Error("Commit operation does not exist");
+      this.#assertCommitOperationGuard(operation, guard);
+      const canonicalEvidence = JSON.stringify(normalizedEvidence);
+      if (operation.status === "applied") {
+        if (String(operation.applied_evidence) !== canonicalEvidence) throw new Error("Applied commit operation evidence cannot be changed");
+        return;
+      }
+      if (operation.status !== "candidate" || typeof operation.candidate_sha !== "string") throw new Error("Commit operation has no persisted candidate SHA");
+      this.#assertCommitOperationLease(this.#commitTask(String(operation.task_id)), guard.owner, guard.generationId);
+      if (normalizedEvidence.branchRef !== operation.branch_ref || normalizedEvidence.refHead !== String(operation.candidate_sha).toLowerCase() ||
+          normalizedEvidence.worktreeHead !== String(operation.candidate_sha).toLowerCase() ||
+          normalizedEvidence.treeId !== String(operation.tree_id).toLowerCase() || normalizedEvidence.diffHash !== operation.diff_hash) {
+        throw new Error("Verified Git evidence does not match the persisted commit operation");
+      }
+      const changed = this.#db.prepare(`UPDATE commit_operations SET status='applied',applied_at=?,applied_evidence=? WHERE id=? AND status='candidate'`)
+        .run(at, canonicalEvidence, operationId);
+      if (Number(changed.changes) !== 1) throw new Error("Commit operation applied transition was not applied");
+      this.#event(String(operation.task_id), "commit_operation.applied", { operationId, candidateSha: operation.candidate_sha,
+        branchRef: operation.branch_ref }, at);
+    });
+    return this.getCommitOperation(operationId)!;
+  }
+
+  getCommitOperation(operationId: string): CommitOperationRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM commit_operations WHERE id=?").get(operationId) as Record<string, unknown> | undefined;
+    return row ? this.#commitOperation(row) : undefined;
+  }
+
+  commitOperations(taskId: string): CommitOperationRecord[] {
+    return (this.#db.prepare("SELECT * FROM commit_operations WHERE task_id=? ORDER BY rowid").all(taskId) as Record<string, unknown>[])
+      .map(row => this.#commitOperation(row));
+  }
+
+  /** Persist immutable report bytes only after the exact reviewed commit has been marked applied. */
+  createReportOperation(input: CreateReportOperationInput): ReportOperationRecord {
+    const operationId = input?.operationId;
+    if (!input || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(operationId ?? "")) throw new Error("Invalid report operation ID");
+    if (!input.owner?.trim() || !input.generationId?.trim()) throw new Error("Report operation requires a live owner and generation");
+    if (!Number.isSafeInteger(input.eventHighWater) || input.eventHighWater < 0) throw new Error("Report event high-water must be a non-negative safe integer");
+    const reportBytes = copyUtf8Bytes(input.reportBytes, "report.json", MAX_REPORT_JSON_BYTES);
+    const diffBytes = copyUtf8Bytes(input.diffBytes, "result.diff", MAX_REPORT_DIFF_BYTES);
+    let parsedReport: unknown;
+    try { parsedReport = JSON.parse(reportBytes.toString("utf8")) as unknown; }
+    catch { throw new Error("Report operation report.json bytes must contain valid UTF-8 JSON"); }
+    if (!parsedReport || typeof parsedReport !== "object" || Array.isArray(parsedReport)) throw new Error("Report operation report.json must contain a JSON object");
+    const createdAt = new Date().toISOString();
+    this.#transaction(() => {
+      const commit = this.#db.prepare("SELECT * FROM commit_operations WHERE id=?").get(input.commitOperationId) as Record<string, unknown> | undefined;
+      if (!commit || commit.status !== "applied" || typeof commit.candidate_sha !== "string" || !commit.applied_evidence) {
+        throw new Error("Report operation requires an applied commit operation with verified candidate evidence");
+      }
+      const taskId = String(commit.task_id);
+      const artifactDirectory = path.resolve(input.artifactDirectory ?? "");
+      if (!path.isAbsolute(input.artifactDirectory ?? "") || input.artifactDirectory !== artifactDirectory || path.basename(artifactDirectory) !== taskId) {
+        throw new Error("Report artifact directory must be the fixed task directory ending in the exact task ID");
+      }
+      const task = this.#commitTask(taskId);
+      this.#assertCommitOperationLease(task, input.owner, input.generationId);
+      this.#assertCommitOperationGuard(commit, { owner: input.owner, generationId: input.generationId });
+      if (String(commit.claim_owner) !== input.owner || String(commit.claim_generation_id) !== input.generationId) {
+        throw new Error("Report operation claim must match the applied commit operation owner and generation");
+      }
+      if (!sameHexHash(sha256Bytes(diffBytes), String(commit.diff_hash))) {
+        throw new Error("result.diff bytes do not match the exact applied commit operation diff hash");
+      }
+      const reportObject = parsedReport as Record<string, unknown>;
+      if (reportObject.taskId !== taskId || reportObject.resultCommit !== String(commit.candidate_sha).toLowerCase()) {
+        throw new Error("report.json must bind the exact task ID and applied result commit SHA");
+      }
+      if (reportObject.finalStatus !== "done") throw new Error("Commit-backed report.json must record finalStatus done");
+      if (reportObject.diffPath !== path.join(artifactDirectory, "result.diff")) {
+        throw new Error("Commit-backed report.json must reference the fixed task result.diff path");
+      }
+      const latestPackage = this.#db.prepare("SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1").get(taskId) as { id: string } | undefined;
+      const latestVerdict = this.#db.prepare("SELECT id,package_id,result FROM review_verdicts WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
+        .get(taskId) as { id: string; package_id: string; result: string } | undefined;
+      if (latestPackage?.id !== commit.package_id || !latestVerdict || latestVerdict.id !== commit.verdict_id || latestVerdict.package_id !== commit.package_id ||
+          (JSON.parse(latestVerdict.result) as ReviewResult).verdict !== "pass") {
+        throw new Error("Report operation requires the latest passing package verdict used by the applied commit");
+      }
+      const eventMax = Number((this.#db.prepare("SELECT COALESCE(MAX(id),0) AS max_id FROM events WHERE task_id=?").get(taskId) as { max_id: number }).max_id);
+      if (input.eventHighWater !== eventMax) throw new Error("Report event high-water changed while report bytes were serialized");
+      const reportSha256 = sha256Bytes(reportBytes);
+      const diffSha256 = sha256Bytes(diffBytes);
+      const reportPath = path.join(artifactDirectory, "report.json");
+      const diffPath = path.join(artifactDirectory, "result.diff");
+      this.#db.prepare(`INSERT INTO report_operations(id,task_id,commit_operation_id,package_id,verdict_id,generation_id,owner,
+        claim_owner,claim_generation_id,artifact_directory,report_path,diff_path,event_high_water,
+        report_bytes,report_sha256,report_size,diff_bytes,diff_sha256,diff_size,status,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'prepared',?)`).run(operationId, taskId, input.commitOperationId,
+        String(commit.package_id), String(commit.verdict_id), String(commit.generation_id), String(commit.owner), input.owner, input.generationId,
+        artifactDirectory, reportPath, diffPath, input.eventHighWater, reportBytes, reportSha256, reportBytes.byteLength,
+        diffBytes, diffSha256, diffBytes.byteLength, createdAt);
+      this.#event(taskId, "report_operation.prepared", { operationId, commitOperationId: input.commitOperationId,
+        packageId: commit.package_id, verdictId: commit.verdict_id, eventHighWater: input.eventHighWater,
+        reportSha256, reportSize: reportBytes.byteLength, diffSha256, diffSize: diffBytes.byteLength }, createdAt);
+    });
+    return this.getReportOperation(operationId)!;
+  }
+
+  /** Complete only after the caller independently read both final files back from disk. */
+  completeReportOperation(operationId: string, guard: CheckRunGuard, readback: CompleteReportOperationReadback): ReportOperationRecord {
+    const reportBytes = copyUtf8Bytes(readback?.reportBytes, "report.json readback", MAX_REPORT_JSON_BYTES);
+    const diffBytes = copyUtf8Bytes(readback?.diffBytes, "result.diff readback", MAX_REPORT_DIFF_BYTES);
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const row = this.#db.prepare("SELECT * FROM report_operations WHERE id=?").get(operationId) as Record<string, unknown> | undefined;
+      if (!row) throw new Error("Report operation does not exist");
+      this.#assertReportOperationGuard(row, guard);
+      this.#assertCommitOperationLease(this.#commitTask(String(row.task_id)), guard.owner, guard.generationId);
+      const commit = this.#db.prepare("SELECT status,candidate_sha,package_id,verdict_id FROM commit_operations WHERE id=? AND task_id=?")
+        .get(String(row.commit_operation_id), String(row.task_id)) as { status: string; candidate_sha: string | null; package_id: string; verdict_id: string } | undefined;
+      const latestPackage = this.#db.prepare("SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
+        .get(String(row.task_id)) as { id: string } | undefined;
+      const latestVerdict = this.#db.prepare("SELECT id,package_id,result FROM review_verdicts WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
+        .get(String(row.task_id)) as { id: string; package_id: string; result: string } | undefined;
+      const fixedReport = JSON.parse(Buffer.from(row.report_bytes as Uint8Array).toString("utf8")) as Record<string, unknown>;
+      if (!commit || commit.status !== "applied" || commit.candidate_sha !== fixedReport.resultCommit ||
+          commit.package_id !== row.package_id || commit.verdict_id !== row.verdict_id || fixedReport.taskId !== row.task_id ||
+          latestPackage?.id !== row.package_id || !latestVerdict || latestVerdict.id !== row.verdict_id || latestVerdict.package_id !== row.package_id ||
+          (JSON.parse(latestVerdict.result) as ReviewResult).verdict !== "pass") {
+        throw new Error("Report completion requires the exact applied commit and latest passing package verdict");
+      }
+      if (sha256Bytes(reportBytes) !== String(row.report_sha256) || reportBytes.byteLength !== Number(row.report_size) ||
+          !reportBytes.equals(Buffer.from(row.report_bytes as Uint8Array))) {
+        throw new Error("report.json readback bytes do not match the immutable report operation content");
+      }
+      if (sha256Bytes(diffBytes) !== String(row.diff_sha256) || diffBytes.byteLength !== Number(row.diff_size) ||
+          !diffBytes.equals(Buffer.from(row.diff_bytes as Uint8Array))) {
+        throw new Error("result.diff readback bytes do not match the immutable report operation content");
+      }
+      if (row.status === "complete") {
+        const evidence = JSON.parse(String(row.readback_evidence)) as { reportSha256: string; reportSize: number; diffSha256: string; diffSize: number };
+        if (evidence.reportSha256 !== sha256Bytes(reportBytes) || evidence.reportSize !== reportBytes.byteLength ||
+            evidence.diffSha256 !== sha256Bytes(diffBytes) || evidence.diffSize !== diffBytes.byteLength) {
+          throw new Error("Completed report operation readback evidence cannot be changed");
+        }
+        return;
+      }
+      if (row.status !== "prepared") throw new Error("Report operation is not awaiting projection verification");
+      const evidence = JSON.stringify({ reportSha256: sha256Bytes(reportBytes), reportSize: reportBytes.byteLength,
+        diffSha256: sha256Bytes(diffBytes), diffSize: diffBytes.byteLength });
+      const changed = this.#db.prepare("UPDATE report_operations SET status='complete',completed_at=?,readback_evidence=? WHERE id=? AND status='prepared'")
+        .run(at, evidence, operationId);
+      if (Number(changed.changes) !== 1) throw new Error("Report operation completion marker was not applied");
+      this.#event(String(row.task_id), "report_operation.complete", { operationId, reportSha256: row.report_sha256,
+        reportSize: row.report_size, diffSha256: row.diff_sha256, diffSize: row.diff_size }, at);
+    });
+    return this.getReportOperation(operationId)!;
+  }
+
+  getReportOperation(operationId: string): ReportOperationRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM report_operations WHERE id=?").get(operationId) as Record<string, unknown> | undefined;
+    return row ? this.#reportOperation(row) : undefined;
+  }
+
+  reportOperations(taskId: string): ReportOperationRecord[] {
+    return (this.#db.prepare("SELECT * FROM report_operations WHERE task_id=? ORDER BY rowid").all(taskId) as Record<string, unknown>[])
+      .map(row => this.#reportOperation(row));
+  }
+
+  /**
+   * The sole transition to DONE. The caller must produce gitEvidence after report
+   * completion and immediately before calling this method; SQLite can bind its values,
+   * but cannot independently inspect the repository or prove when the attestation was made.
+   */
+  completeReviewedTask(input: CompleteReviewedTaskInput): TaskRecord {
+    if (!input?.taskId || !input.reportOperationId || !input.owner?.trim() || !input.generationId?.trim()) {
+      throw new Error("DONE requires a task, report operation, live owner, and current generation");
+    }
+    const evidence = input.gitEvidence;
+    if (!evidence || !/^[a-fA-F0-9]{40,64}$/.test(evidence.refHead ?? "") ||
+        !/^[a-fA-F0-9]{40,64}$/.test(evidence.worktreeHead ?? "") || !/^[a-fA-F0-9]{40,64}$/.test(evidence.treeId ?? "") ||
+        !SHA256_PATTERN.test(evidence.diffHash ?? "") || evidence.candidateObjectVerified !== true ||
+        evidence.indexMatchesReviewedTree !== true || evidence.worktreeClean !== true) {
+      throw new Error("DONE requires fresh complete Git verification evidence");
+    }
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const taskRow = this.#db.prepare("SELECT * FROM tasks WHERE id=?").get(input.taskId) as TaskRow | undefined;
+      this.#assertCommitOperationLease(taskRow ? {
+        status: taskRow.status, lease_owner: taskRow.lease_owner, lease_expires_at: taskRow.lease_expires_at,
+        claim_generation_id: taskRow.claim_generation_id ?? null,
+      } : undefined, input.owner, input.generationId);
+
+      const report = this.#db.prepare("SELECT * FROM report_operations WHERE id=? AND task_id=?")
+        .get(input.reportOperationId, input.taskId) as Record<string, unknown> | undefined;
+      if (!report || report.status !== "complete" || !report.readback_evidence) {
+        throw new Error("DONE requires a complete report operation with verified file readback");
+      }
+      this.#assertReportOperationGuard(report, { owner: input.owner, generationId: input.generationId });
+      const reportBytes = Buffer.from(report.report_bytes as Uint8Array);
+      const diffBytes = Buffer.from(report.diff_bytes as Uint8Array);
+      if (reportBytes.byteLength !== Number(report.report_size) || sha256Bytes(reportBytes) !== String(report.report_sha256) ||
+          diffBytes.byteLength !== Number(report.diff_size) || sha256Bytes(diffBytes) !== String(report.diff_sha256)) {
+        throw new Error("DONE report bytes do not match their stored sizes and hashes");
+      }
+      const readback = JSON.parse(String(report.readback_evidence)) as Record<string, unknown>;
+      if (readback.reportSha256 !== report.report_sha256 || readback.reportSize !== Number(report.report_size) ||
+          readback.diffSha256 !== report.diff_sha256 || readback.diffSize !== Number(report.diff_size)) {
+        throw new Error("DONE requires a matching complete report readback marker");
+      }
+      const reportObject = JSON.parse(reportBytes.toString("utf8")) as Record<string, unknown>;
+      const artifactDirectory = String(report.artifact_directory);
+      if (reportObject.taskId !== input.taskId || reportObject.finalStatus !== "done" ||
+          report.report_path !== path.join(artifactDirectory, "report.json") || report.diff_path !== path.join(artifactDirectory, "result.diff") ||
+          reportObject.diffPath !== String(report.diff_path)) {
+        throw new Error("DONE report does not match the fixed task report paths and final status");
+      }
+
+      const commit = this.#db.prepare("SELECT * FROM commit_operations WHERE id=? AND task_id=?")
+        .get(String(report.commit_operation_id), input.taskId) as Record<string, unknown> | undefined;
+      if (!commit || commit.status !== "applied" || typeof commit.candidate_sha !== "string" ||
+          commit.package_id !== report.package_id || commit.verdict_id !== report.verdict_id ||
+          commit.claim_owner !== input.owner || commit.claim_generation_id !== input.generationId ||
+          report.commit_operation_id !== commit.id) {
+        throw new Error("DONE requires the exact applied commit bound to this report and live claim");
+      }
+      const normalizedEvidence: VerifiedAppliedCommitEvidence = { ...evidence, refHead: evidence.refHead.toLowerCase(),
+        worktreeHead: evidence.worktreeHead.toLowerCase(), treeId: evidence.treeId.toLowerCase() };
+      if (normalizedEvidence.branchRef !== commit.branch_ref || normalizedEvidence.refHead !== String(commit.candidate_sha).toLowerCase() ||
+          normalizedEvidence.worktreeHead !== String(commit.candidate_sha).toLowerCase() || normalizedEvidence.treeId !== String(commit.tree_id).toLowerCase() ||
+          normalizedEvidence.diffHash !== commit.diff_hash) {
+        throw new Error("Fresh Git verification does not match the exact applied commit candidate");
+      }
+
+      const latestPackage = this.#db.prepare("SELECT id,check_run_id,snapshot,check_definition_hash,expected_check_ids FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
+        .get(input.taskId) as { id: string; check_run_id: string; snapshot: string; check_definition_hash: string; expected_check_ids: string } | undefined;
+      const packageSnapshot = latestPackage ? JSON.parse(latestPackage.snapshot) as CheckRunSnapshot : undefined;
+      const packageRow = this.#db.prepare("SELECT branch_ref FROM review_packages WHERE id=?")
+        .get(String(report.package_id)) as { branch_ref: string } | undefined;
+      const latestVerdict = this.#db.prepare(`SELECT v.*,a.status AS attempt_status,a.role AS attempt_role,a.harness AS attempt_harness,a.metadata AS attempt_metadata FROM review_verdicts v
+        JOIN attempts a ON a.id=v.attempt_id WHERE v.task_id=? ORDER BY v.rowid DESC LIMIT 1`).get(input.taskId) as Record<string, unknown> | undefined;
+      if (!latestPackage || latestPackage.id !== report.package_id || latestPackage.id !== commit.package_id || !latestVerdict ||
+          latestVerdict.id !== report.verdict_id || latestVerdict.id !== commit.verdict_id || latestVerdict.package_id !== latestPackage.id ||
+          latestVerdict.generation_id !== commit.generation_id || latestVerdict.attempt_status !== "succeeded" ||
+          latestVerdict.attempt_role !== "review" || latestVerdict.attempt_harness !== "codex") {
+        throw new Error("DONE requires the latest immutable passing verdict from its successful Codex review attempt");
+      }
+      const verdictResult = JSON.parse(String(latestVerdict.result)) as ReviewResult;
+      if (!isValidReviewResult(verdictResult) || verdictResult.verdict !== "pass" ||
+          !packageSnapshot || !sameSnapshot(packageSnapshot, JSON.parse(String(latestVerdict.snapshot)) as CheckRunSnapshot)) {
+        throw new Error("DONE requires an exact passing verdict for the reviewed commit package");
+      }
+      if (commit.branch_ref !== `refs/heads/zero/${input.taskId}` || packageRow?.branch_ref !== commit.branch_ref ||
+          commit.pre_head !== packageSnapshot.preHead.toLowerCase() || commit.tree_id !== packageSnapshot.treeId.toLowerCase() ||
+          commit.diff_hash !== packageSnapshot.diffHash) {
+        throw new Error("DONE commit operation does not match the exact task branch and immutable reviewed Git snapshot");
+      }
+      const attemptMetadata = latestVerdict.attempt_metadata ? JSON.parse(String(latestVerdict.attempt_metadata)) as Record<string, unknown> : {};
+      if (attemptMetadata.packageId !== latestPackage.id || attemptMetadata.generationId !== latestVerdict.generation_id) {
+        throw new Error("DONE review attempt must bind the exact package and source generation");
+      }
+      const packageRun = this.#db.prepare("SELECT * FROM check_runs WHERE id=? AND task_id=?")
+        .get(latestPackage.check_run_id, input.taskId) as Record<string, unknown> | undefined;
+      if (!packageRun || packageRun.status !== "completed" || packageRun.check_definition_hash !== latestPackage.check_definition_hash ||
+          packageRun.expected_check_ids !== latestPackage.expected_check_ids ||
+          !sameSnapshot(JSON.parse(String(packageRun.snapshot)) as CheckRunSnapshot, packageSnapshot)) {
+        throw new Error("DONE requires the complete check run bound to the latest review package");
+      }
+      const expectedIds = JSON.parse(latestPackage.expected_check_ids) as string[];
+      const checkRows = this.#db.prepare("SELECT check_id,result FROM check_run_results WHERE run_id=? ORDER BY id")
+        .all(latestPackage.check_run_id) as Array<{ check_id: string; result: string }>;
+      const checkResults = checkRows.map(row => JSON.parse(row.result) as CheckResult);
+      if (checkRows.length !== expectedIds.length || !sameStringSet(checkRows.map(row => row.check_id), expectedIds) ||
+          checkResults.some((result, index) => result.id !== checkRows[index]?.check_id || result.status !== "passed" || result.exitCode !== 0)) {
+        throw new Error("DONE requires every current check definition to have a passing result");
+      }
+      const submission = JSON.parse(String(taskRow!.payload)) as TaskSubmission;
+      const checks = submission.checks ?? [];
+      const checkDefinitionHash = createHash("sha256").update(JSON.stringify(checks), "utf8").digest("hex");
+      if (checkDefinitionHash !== latestPackage.check_definition_hash || !sameStringSet(checks.map(check => check.id), expectedIds)) {
+        throw new Error("DONE check results do not match the current submitted check definitions");
+      }
+      if (sha256Bytes(diffBytes) !== packageSnapshot.diffHash || reportObject.resultCommit !== String(commit.candidate_sha).toLowerCase()) {
+        throw new Error("DONE report diff or commit link does not match the reviewed package and applied commit");
+      }
+
+      const changed = this.#db.prepare(`UPDATE tasks SET status='done',updated_at=?,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,
+        active_attempt_id=NULL WHERE id=? AND status='reviewing' AND lease_owner=? AND claim_generation_id=? AND lease_expires_at>?`)
+        .run(at, input.taskId, input.owner, input.generationId, at);
+      if (Number(changed.changes) !== 1) throw new Error("Task lease or generation changed before DONE was committed");
+      this.#db.prepare("DELETE FROM quota_pauses WHERE task_id=?").run(input.taskId);
+      this.#disableExecutionRecoveryCheckpoint(input.taskId, at, "terminal:done");
+      this.#event(input.taskId, "task.transition", { from: ["reviewing"], to: "done", reportOperationId: input.reportOperationId,
+        commitOperationId: commit.id, packageId: latestPackage.id, verdictId: latestVerdict.id,
+        candidateSha: commit.candidate_sha, reportSha256: report.report_sha256, diffSha256: report.diff_sha256,
+        gitEvidence: normalizedEvidence }, at);
+    });
+    const completed = this.get(input.taskId);
+    if (!completed) throw new Error(`Task ${input.taskId} disappeared`);
+    return completed;
+  }
+
   /** Starts a durable check set tied to the live claim, successful execution attempt, and current route. */
   startCheckRun(input: StartCheckRunInput): CheckRunRecord {
     this.#validateReviewEvidence(input.snapshot, input.route, input.expectedCheckIds, input.checkDefinitionHash);
@@ -1463,6 +2064,26 @@ export class TaskStore {
     }
   }
 
+  #commitTask(taskId: string): { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null } | undefined {
+    return this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id FROM tasks WHERE id=?")
+      .get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null } | undefined;
+  }
+
+  #assertCommitOperationLease(task: { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null } | undefined,
+    owner: string, generationId: string): void {
+    const expiresAt = task?.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
+    if (!task || task.status !== "reviewing" || task.lease_owner !== owner || task.claim_generation_id !== generationId ||
+        !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      throw new Error(`Task is not reviewing under live owner ${owner} and generation ${generationId}`);
+    }
+  }
+
+  #assertCommitOperationGuard(operation: Record<string, unknown>, guard: CheckRunGuard): void {
+    if (!guard?.owner || !guard.generationId || operation.claim_owner !== guard.owner || operation.claim_generation_id !== guard.generationId) {
+      throw new Error("Commit operation guard does not match its owner and generation");
+    }
+  }
+
   #checkRun(row: Record<string, unknown>): CheckRunRecord {
     return { id: String(row.id), taskId: String(row.task_id), generationId: String(row.generation_id), owner: String(row.owner),
       executionAttemptId: String(row.execution_attempt_id), executionStageId: String(row.execution_stage_id), routeAttemptId: String(row.route_attempt_id),
@@ -1485,6 +2106,41 @@ export class TaskStore {
     return { id: String(row.id), taskId: String(row.task_id), packageId: String(row.package_id), attemptId: String(row.attempt_id),
       generationId: String(row.generation_id), snapshot: JSON.parse(String(row.snapshot)) as CheckRunSnapshot,
       result: JSON.parse(String(row.result)) as ReviewResult, createdAt: String(row.created_at) };
+  }
+
+  #commitOperation(row: Record<string, unknown>): CommitOperationRecord {
+    return { id: String(row.id), taskId: String(row.task_id), packageId: String(row.package_id), verdictId: String(row.verdict_id),
+      generationId: String(row.generation_id), owner: String(row.owner), claimOwner: String(row.claim_owner),
+      claimGenerationId: String(row.claim_generation_id), branchRef: String(row.branch_ref), preHead: String(row.pre_head),
+      treeId: String(row.tree_id), diffHash: String(row.diff_hash), message: String(row.message), timestamp: String(row.timestamp),
+      authorName: String(row.author_name) as "Zero", authorEmail: String(row.author_email) as "zero@localhost",
+      committerName: String(row.committer_name) as "Zero", committerEmail: String(row.committer_email) as "zero@localhost",
+      encoding: String(row.encoding) as "UTF-8", status: row.status as CommitOperationStatus,
+      candidateSha: row.candidate_sha as string | null ?? undefined, createdAt: String(row.created_at),
+      candidateAt: row.candidate_at as string | null ?? undefined, appliedAt: row.applied_at as string | null ?? undefined,
+      appliedEvidence: row.applied_evidence ? JSON.parse(String(row.applied_evidence)) as VerifiedAppliedCommitEvidence : undefined };
+  }
+
+  #reportOperation(row: Record<string, unknown>): ReportOperationRecord {
+    const reportBytes = Buffer.from(row.report_bytes as Uint8Array);
+    const diffBytes = Buffer.from(row.diff_bytes as Uint8Array);
+    if (reportBytes.byteLength !== Number(row.report_size) || sha256Bytes(reportBytes) !== String(row.report_sha256) ||
+        diffBytes.byteLength !== Number(row.diff_size) || sha256Bytes(diffBytes) !== String(row.diff_sha256)) {
+      throw new Error(`Persisted report operation ${String(row.id)} content does not match its stored size or SHA-256`);
+    }
+    return { id: String(row.id), taskId: String(row.task_id), commitOperationId: String(row.commit_operation_id),
+      packageId: String(row.package_id), verdictId: String(row.verdict_id), generationId: String(row.generation_id), owner: String(row.owner),
+      claimOwner: String(row.claim_owner), claimGenerationId: String(row.claim_generation_id), artifactDirectory: String(row.artifact_directory),
+      reportPath: String(row.report_path), diffPath: String(row.diff_path), eventHighWater: Number(row.event_high_water),
+      reportBytes, reportSha256: String(row.report_sha256), reportSize: Number(row.report_size),
+      diffBytes, diffSha256: String(row.diff_sha256), diffSize: Number(row.diff_size),
+      status: row.status as ReportOperationRecord["status"], createdAt: String(row.created_at), completedAt: row.completed_at as string | null ?? undefined };
+  }
+
+  #assertReportOperationGuard(operation: Record<string, unknown>, guard: CheckRunGuard): void {
+    if (!guard?.owner || !guard.generationId || operation.claim_owner !== guard.owner || operation.claim_generation_id !== guard.generationId) {
+      throw new Error("Report operation guard does not match its current owner and generation");
+    }
   }
 
   events(taskId: string): TaskEvent[] {
@@ -1562,3 +2218,18 @@ function isValidReviewResult(value: ReviewResult): boolean {
   return validFindings && (value.verdict !== "pass" || value.findings.length === 0) &&
     (value.verdict !== "changes_requested" || value.findings.length > 0);
 }
+
+function copyUtf8Bytes(value: Uint8Array, label: string, maxBytes: number): Buffer {
+  if (!(value instanceof Uint8Array)) throw new Error(`${label} content must be supplied as bytes`);
+  const bytes = Buffer.from(value);
+  if (bytes.byteLength > maxBytes) throw new Error(`${label} exceeds the ${maxBytes} byte limit`);
+  try {
+    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    if (!Buffer.from(decoded, "utf8").equals(bytes)) throw new Error("round-trip mismatch");
+  } catch { throw new Error(`${label} content must be valid UTF-8`); }
+  return bytes;
+}
+
+function sha256Bytes(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
+
+function sameHexHash(left: string, right: string): boolean { return left.toLowerCase() === right.toLowerCase(); }

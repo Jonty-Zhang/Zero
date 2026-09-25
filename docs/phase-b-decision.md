@@ -23,6 +23,14 @@
 
 随后执行 `git update-ref <taskBranchRef> <candidate> <preHEAD>`。带旧值的条件更新只在分支仍指向 `preHEAD` 时移动引用。恢复时仅接受分支精确指向 `preHEAD` 或已持久化的 candidate；前者重新核验 package/工作树后重试条件更新，后者先用 `git cat-file -e` 确认对象存在，再核验 commit、分支、index 和干净工作树后记录完成。其他 HEAD/ref、tree、parent、diff 或 index 状态一律隔离。若 Harness 已在审核快照前自行提交，且审核时 `preHEAD` 的 tree 就是 reviewed tree，核验 base-to-HEAD diff 与干净状态后将 `preHEAD` 记作 candidate，不再移动分支。审核包创建后分支才移动，即使内容相同，v1 也隔离。
 
+恢复中的 Git 判定有两个互斥分支。**CAS 前**，分支必须仍是 package 的 `preHEAD`，并要求新鲜完整快照（包括 fingerprint、tree、diff 与其字节）等于 package；没有 commit operation 时，也只有这个分支允许复用原子通过 verdict 并创建 intent。**CAS 后**，HEAD 已改变，不能再比较包含旧 HEAD 的 package fingerprint；须核验 ref/HEAD 精确指向已保存的 candidate、commit 对象类型与固定 operation ID、parent/tree、base-to-commit diff 哈希，以及 `HEAD^{tree}`、`write-tree` 和干净工作区。候选 SHA 已落库却找不到对象时隔离，不重新生成。恢复时不得把审核之后才出现的同树自提交当成审核时已有的自提交。
+
+复用 verdict 还须精确关联任务的最新 package、已完成且全部通过的 check run、当前检查定义哈希，以及成功的 Codex review attempt；attempt metadata 必须指向同一 package 与原 claim generation，后者必须由 guardian 证明已清空。旧 `reviews` 行只供报告展示，不能参与提交授权。
+
+跨代恢复时，verdict、审核 attempt、package、commit/report operation 的**来源 generation 与 owner**保持不可变；新 lease 的 owner/generation 是单独的当前授权字段。专用 reviewing 恢复事务先验证 guardian 对来源代际的直接清空证明，再核验任务与不可变证据，最后原子取得新 lease 并更新已有 operation 的 claim 字段。若 verdict 已通过但尚无 commit intent，则用明确区分“旧 verdict generation”和“新 lease generation”的恢复专用方法创建 intent；不得把旧 verdict 冒充为新代审核，也不得让普通创建方法隐式绕过同代检查。恢复每次都重新核验真实 Git 对象、ref、index 和工作区；SQLite applied 标记及调用者布尔仅记录审核经过，不能替代 Git 现场核验。
+
+已完成的 report operation 保留完成时的 claim 作为审计记录；恢复后专用 DONE 事务可在 guardian 证明该代清空、固定字节与读回 marker 自洽、当前任务 lease 有效时接受它。尚处于 prepared 的 report operation 必须在同一恢复认领事务内把 claim 转交新代，才能继续写文件并完成 marker。任务新 lease、commit operation claim 与 prepared report claim 的转交要作为同一个 SQLite 事务完成，任一步失败则全部回滚。
+
 `update-ref` 遇到残留 `.lock` 不等同于 CAS 冲突。恢复代码不得仅凭租约到期自动删除锁文件；先证明前代 guardian Job 已清空，再明确判定锁的归属和状态。v1 无法证明时隔离，保留现场供人工检查。
 
 此协议不运行 Git commit hooks，也不会继承常规 `git commit` 的签名流程。Zero 的配置检查和 Codex 审核是本流程的放行门禁；项目若依赖 hook，必须把相应命令显式列入任务检查。是否支持可选签名另行设计，不能在恢复中无声改变 candidate。

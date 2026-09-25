@@ -569,6 +569,25 @@ export class GitWorktreeManager {
     return candidate.commit;
   }
 
+  /**
+   * Verify after a process restart that a previously persisted candidate was
+   * already applied. This deliberately does not compare the pre-CAS snapshot:
+   * after the ref moves, the candidate is the expected HEAD. It only inspects
+   * the exact candidate object, target ref, HEAD, index, and clean worktree.
+   */
+  async verifyAppliedReviewedCommitCandidate(
+    info: WorktreeInfo,
+    candidate: ReviewedCommitCandidate,
+    reviewed: WorktreeReviewSnapshot,
+  ): Promise<void> {
+    await this.#validateInfo(info);
+    await this.#ensureTaskBranch(info);
+    assertReviewSnapshot(reviewed);
+    assertCandidate(candidate, info, reviewed);
+    await this.#verifyCandidate(info, candidate, reviewed);
+    await this.#verifyAppliedCandidate(info, candidate, reviewed);
+  }
+
   /** Final pre-DONE assertion that HEAD and the clean worktree still equal the reviewed commit. */
   async verifyReviewedCommit(info: WorktreeInfo, commit: string, reviewed: WorktreeReviewSnapshot): Promise<void> {
     await this.#validateInfo(info);

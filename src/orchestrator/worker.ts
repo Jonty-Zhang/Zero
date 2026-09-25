@@ -18,6 +18,7 @@ import type {
 import { GitWorktreeManager, type WorktreeCreationEvidence, type WorktreeCreationPlan, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
 import type { CheckRunSnapshot, ReviewPackageRecord } from "../core/task-store.js";
+import { materializeReportProjection } from "../core/report-projection.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
 import { HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
@@ -636,6 +637,7 @@ export class TaskWorker {
         activeAttempt = reviewAttempt;
         active.adapter = this.#options.adapters.get("codex");
         active.attempt = reviewAttempt;
+        let packageVerdictId: string | undefined;
         this.#assertNotCancelled(active);
         const review = await this.#options.reviewer.review(task, worktree, route, finalChecks, reviewSnapshot.diff, { attemptId: reviewAttempt.id });
         const reviewAfter = await this.#options.worktrees.captureReviewSnapshot(worktree);
@@ -658,7 +660,7 @@ export class TaskWorker {
           throw new Error("Codex Reviewer failed or returned an invalid verdict");
         }
         if (reviewPackage) {
-          this.#options.store.finishPackageReview({
+          const verdict = this.#options.store.finishPackageReview({
             packageId: reviewPackage.id,
             attemptId: reviewAttempt.id,
             owner,
@@ -674,6 +676,7 @@ export class TaskWorker {
               reasoningEffort: review.reasoningEffort,
             },
           });
+          packageVerdictId = verdict.id;
         } else {
           // Legacy quota checkpoints predate sealed packages. Keep them resumable,
           // but their verdicts remain outside immutable package evidence.
@@ -706,20 +709,91 @@ export class TaskWorker {
 
         this.#assertLease(taskId, owner, () => leaseLost);
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
-        resultCommit = await this.#options.worktrees.commit(worktree, `Zero task ${taskId}`, reviewSnapshot);
-        this.#assertNotCancelled(active);
+        if (!reviewPackage || !packageVerdictId) {
+          throw new Error("A legacy review verdict cannot authorize a new commit; a fresh sealed review package is required");
+        }
+        const commitSnapshot = await this.#options.worktrees.captureReviewSnapshot(worktree);
+        const commitBranch = await this.#options.worktrees.readTaskBranchHead(worktree);
+        if (!sameFullReviewSnapshot(reviewSnapshot, commitSnapshot)
+          || commitBranch.ref !== reviewPackage.branchRef
+          || commitBranch.head !== reviewPackage.snapshot.preHead) {
+          throw new Error("Review package snapshot or branch changed before commit intent creation");
+        }
+        this.#assertLease(taskId, owner, () => leaseLost);
+        const operationId = randomUUID();
+        const commitMessage = `Zero task ${taskId}`;
+        const commitTimestamp = new Date().toISOString();
+        const operation = this.#options.store.createCommitOperation({
+          operationId,
+          packageId: reviewPackage.id,
+          verdictId: packageVerdictId,
+          owner,
+          generationId,
+          branchRef: commitBranch.ref,
+          preHead: commitBranch.head,
+          treeId: commitSnapshot.treeId,
+          diffHash: commitSnapshot.diffHash,
+          message: commitMessage,
+          timestamp: commitTimestamp,
+        });
+        const candidate = await this.#options.worktrees.createReviewedCommitCandidate(worktree, operation.preHead, commitSnapshot, {
+          opId: operation.id,
+          message: operation.message,
+          timestamp: operation.timestamp,
+        });
+        if (candidate.opId !== operation.id || candidate.branchRef !== operation.branchRef
+          || candidate.preHead !== operation.preHead || candidate.treeId !== operation.treeId
+          || candidate.diffHash !== operation.diffHash) {
+          throw new Error("Git returned a candidate that does not match the persisted commit intent");
+        }
+        this.#options.store.recordCommitOperationCandidate(operation.id, { owner, generationId }, candidate.commit);
+        resultCommit = await this.#options.worktrees.applyReviewedCommitCandidate(worktree, candidate, commitSnapshot);
         if (!resultCommit) throw new Error("No changes were committed; refusing to mark a no-op task DONE");
         const diff = reviewSnapshot.diff;
         if (!diff.trim()) throw new Error("The result has no base-to-HEAD diff; refusing to mark a no-op task DONE");
+        await this.#options.worktrees.verifyAppliedReviewedCommitCandidate(worktree, candidate, commitSnapshot);
         await this.#options.worktrees.verifyReviewedCommit(worktree, resultCommit, reviewSnapshot);
+        const appliedBranch = await this.#options.worktrees.readTaskBranchHead(worktree);
+        if (appliedBranch.ref !== operation.branchRef || appliedBranch.head !== candidate.commit || resultCommit !== candidate.commit) {
+          throw new Error("Applied task branch does not equal the persisted reviewed commit candidate");
+        }
+        this.#options.store.markCommitOperationApplied(operation.id, { owner, generationId }, {
+          branchRef: appliedBranch.ref,
+          refHead: appliedBranch.head,
+          worktreeHead: resultCommit,
+          treeId: commitSnapshot.treeId,
+          diffHash: commitSnapshot.diffHash,
+          candidateObjectVerified: true,
+          indexMatchesReviewedTree: true,
+          worktreeClean: true,
+        });
         // Archive all evidence before the irreversible DONE transition. The DB remains authoritative
         // if a crash occurs here; readReport overlays the live state when serving the artifact.
-        await this.#writeReport(taskId, "done", { task, baseCommit, resultCommit, diff, checks: finalChecks,
-          authoritativeCheckAttemptId: finalCheckAttemptId });
-        this.#assertNotCancelled(active);
+        const reportOperationId = await this.#writeDoneReport(taskId, { task, baseCommit, resultCommit, diff, checks: finalChecks,
+          authoritativeCheckAttemptId: finalCheckAttemptId, commitOperationId: operation.id, owner, generationId });
         this.#assertLease(taskId, owner, () => leaseLost);
+        await this.#options.worktrees.verifyAppliedReviewedCommitCandidate(worktree, candidate, commitSnapshot);
         await this.#options.worktrees.verifyReviewedCommit(worktree, resultCommit, reviewSnapshot);
-        task = this.#options.store.transition(taskId, "reviewing", "done", { owner, clearLease: true, reason: "checks, review, commit, and report completed" });
+        const finalBranch = await this.#options.worktrees.readTaskBranchHead(worktree);
+        if (finalBranch.ref !== operation.branchRef || finalBranch.head !== candidate.commit || resultCommit !== candidate.commit) {
+          throw new Error("Task branch changed after report completion and before DONE");
+        }
+        task = this.#options.store.completeReviewedTask({
+          taskId,
+          reportOperationId,
+          owner,
+          generationId,
+          gitEvidence: {
+            branchRef: finalBranch.ref,
+            refHead: finalBranch.head,
+            worktreeHead: resultCommit,
+            treeId: commitSnapshot.treeId,
+            diffHash: commitSnapshot.diffHash,
+            candidateObjectVerified: true,
+            indexMatchesReviewedTree: true,
+            worktreeClean: true,
+          },
+        });
         markedDone = true;
         return this.#requireTask(taskId);
       }
@@ -1112,13 +1186,60 @@ export class TaskWorker {
     const rel = relative(root, directory);
     if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error("Report path escapes artifact root");
     await mkdir(directory, { recursive: true });
+    const serialized = this.#serializeReport(taskId, finalStatus, values, directory);
+    if (serialized.diffBytes) await writeFile(resolve(directory, "result.diff"), serialized.diffBytes);
+    const temp = resolve(directory, `report.${randomUUID()}.tmp`);
+    await writeFile(temp, serialized.reportBytes, { flag: "wx" });
+    await rename(temp, resolve(directory, "report.json"));
+  }
+
+  async #writeDoneReport(taskId: string, values: {
+    task: TaskRecord; baseCommit?: string; resultCommit?: string; error?: string; diff?: string;
+    checks?: CheckResult[]; authoritativeCheckAttemptId?: string;
+    commitOperationId: string; owner: string; generationId: string;
+  }): Promise<string> {
+    if (values.diff === undefined || values.resultCommit === undefined) throw new Error("DONE report requires fixed diff and result commit bytes");
+    const root = resolve(this.#options.artifactRoot);
+    const directory = this.#artifactDirectory(taskId);
+    const rel = relative(root, directory);
+    if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error("Report path escapes artifact root");
+    // Build both immutable byte sequences from one event high-water snapshot before
+    // any report file is created or replaced.
+    const serialized = this.#serializeReport(taskId, "done", values, directory);
+    if (!serialized.diffBytes) throw new Error("DONE report is missing result.diff bytes");
+    const operation = this.#options.store.createReportOperation({
+      operationId: randomUUID(),
+      commitOperationId: values.commitOperationId,
+      owner: values.owner,
+      generationId: values.generationId,
+      artifactDirectory: directory,
+      eventHighWater: serialized.eventHighWater,
+      reportBytes: serialized.reportBytes,
+      diffBytes: serialized.diffBytes,
+    });
+    await mkdir(operation.artifactDirectory, { recursive: true });
+    await materializeReportProjection(operation.artifactDirectory, "report.json", operation.reportBytes, operation.reportSha256);
+    await materializeReportProjection(operation.artifactDirectory, "result.diff", operation.diffBytes, operation.diffSha256);
+    // These reads are deliberately independent of the projection helper's own
+    // verification readback; the DB completion marker records these exact bytes.
+    const reportReadback = await readFile(operation.reportPath);
+    const diffReadback = await readFile(operation.diffPath);
+    const completed = this.#options.store.completeReportOperation(operation.id, { owner: values.owner, generationId: values.generationId }, {
+      reportBytes: reportReadback,
+      diffBytes: diffReadback,
+    });
+    if (completed.status !== "complete") throw new Error("DONE report operation did not reach its verified complete state");
+    return completed.id;
+  }
+
+  #serializeReport(taskId: string, finalStatus: TaskReport["finalStatus"], values: {
+    task: TaskRecord; baseCommit?: string; resultCommit?: string; error?: string; diff?: string;
+    checks?: CheckResult[]; authoritativeCheckAttemptId?: string;
+  }, directory: string): { reportBytes: Buffer; diffBytes?: Buffer; eventHighWater: number } {
     const now = new Date().toISOString();
-    let diffPath: string | undefined;
-    if (values.diff !== undefined) {
-      diffPath = resolve(directory, "result.diff");
-      await writeFile(diffPath, values.diff, "utf8");
-    }
+    const diffPath = values.diff === undefined ? undefined : resolve(directory, "result.diff");
     const taskEvents = this.#options.store.events(taskId);
+    const eventHighWater = taskEvents.at(-1)?.id ?? 0;
     const recoveryBoundary = taskEvents.filter(event => event.type === "task.execution_recovery_claimed").at(-1);
     const routeEvents = taskEvents.filter(event => event.type === "route.decided");
     const routeDecisions = routeEvents.map(event => event.payload?.decision as RouteDecision);
@@ -1157,9 +1278,9 @@ export class TaskWorker {
       diffPath,
       error: values.error,
     };
-    const temp = resolve(directory, `report.${randomUUID()}.tmp`);
-    await writeFile(temp, `${JSON.stringify(report, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
-    await rename(temp, resolve(directory, "report.json"));
+    const reportBytes = Buffer.from(`${JSON.stringify(report, null, 2)}\n`, "utf8");
+    const diffBytes = values.diff === undefined ? undefined : Buffer.from(values.diff, "utf8");
+    return { reportBytes, ...(diffBytes ? { diffBytes } : {}), eventHighWater };
   }
 
   #requireTask(taskId: string): TaskRecord {
@@ -1172,6 +1293,23 @@ export class TaskWorker {
   async readReport(taskId: string): Promise<TaskReport | undefined> {
     const task = this.#options.store.get(taskId);
     if (!task) return undefined;
+    if (task.status === "done") {
+      const operation = this.#options.store.reportOperations(taskId).filter(item => item.status === "complete").at(-1);
+      if (operation) {
+        await mkdir(operation.artifactDirectory, { recursive: true });
+        await materializeReportProjection(operation.artifactDirectory, "report.json", operation.reportBytes, operation.reportSha256);
+        await materializeReportProjection(operation.artifactDirectory, "result.diff", operation.diffBytes, operation.diffSha256);
+        const report = JSON.parse(operation.reportBytes.toString("utf8")) as TaskReport;
+        return {
+          ...report,
+          finalStatus: task.status,
+          task,
+          updatedAt: task.updatedAt,
+          stages: report.stages ?? this.#options.store.stages(taskId),
+          handoffs: report.handoffs ?? this.#options.store.handoffs(taskId),
+        };
+      }
+    }
     try {
       const report = JSON.parse(await readFile(resolve(this.#artifactDirectory(taskId), "report.json"), "utf8")) as TaskReport;
       return {
