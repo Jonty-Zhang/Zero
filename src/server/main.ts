@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { lstatSync } from 'node:fs';
 import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -31,8 +32,35 @@ const dataRoot = resolve(process.env.ZERO_DATA_DIR || (process.platform === 'win
   : resolve(homedir(), '.local/share/zero')));
 const allowedHost = (host: string) => host === '127.0.0.1' || host === 'localhost' || host === '::1';
 
-/** Guardian environment values are lineage assertions, not authentication against the same Windows account. */
-export function startupGenerationAttestation(dataDir: string, env: NodeJS.ProcessEnv = process.env, platform = process.platform): StartupGenerationAttestation {
+interface StartupGenerationOptions {
+  guardianPath?: string;
+  verifyMember?: (guardianPath: string, lockId: string, processId: number) => boolean;
+}
+
+function verifyPackagedGuardianMember(guardianPath: string, lockId: string, processId: number): boolean {
+  if (!isAbsolute(guardianPath)) return false;
+  const expectedPath = resolve(repoRoot, 'guardian', 'guardian.exe');
+  if (win32.resolve(guardianPath).toLowerCase() !== win32.resolve(expectedPath).toLowerCase()) return false;
+  try {
+    const volumeRoot = win32.parse(expectedPath).root;
+    let current = volumeRoot;
+    const parts = win32.relative(volumeRoot, expectedPath).split(/[\\/]+/).filter(Boolean);
+    for (const [index, part] of parts.entries()) {
+      current = win32.join(current, part);
+      const entry = lstatSync(current);
+      if (entry.isSymbolicLink()) return false;
+      if (index === parts.length - 1 ? !entry.isFile() : !entry.isDirectory()) return false;
+    }
+  } catch { return false; }
+  const result = spawnSync(guardianPath, ['--verify-member', '--lock-id', lockId, '--pid', String(processId)], {
+    encoding: 'utf8', windowsHide: true, timeout: 5_000, stdio: 'ignore',
+  });
+  return !result.error && result.status === 0;
+}
+
+/** Guardian environment values are lineage assertions; Job membership is checked separately by the packaged native helper. */
+export function startupGenerationAttestation(dataDir: string, env: NodeJS.ProcessEnv = process.env, platform = process.platform,
+  options: StartupGenerationOptions = {}): StartupGenerationAttestation {
   const lockId = env.ZERO_GUARDIAN_LOCK_ID;
   const generation = env.ZERO_GUARDIAN_GENERATION;
   const drained = env.ZERO_GUARDIAN_PREDECESSOR_DRAINED;
@@ -48,7 +76,12 @@ export function startupGenerationAttestation(dataDir: string, env: NodeJS.Proces
   if (!/^[a-f0-9]{32}$/.test(generation ?? '') || drained !== '1') {
     return { id: randomUUID(), lockId, predecessorDrained: false, evidenceKind: 'invalid_attestation' };
   }
-  return { id: generation!, lockId: lockId!, predecessorDrained: true, evidenceKind: 'guardian_env_assertion' };
+  const guardianPath = options.guardianPath ?? resolve(repoRoot, 'guardian', 'guardian.exe');
+  const verifyMember = options.verifyMember ?? verifyPackagedGuardianMember;
+  let memberVerified = false;
+  try { memberVerified = verifyMember(guardianPath, lockId!, process.pid); } catch { /* unavailable verifier fails closed */ }
+  if (!memberVerified) return { id: randomUUID(), lockId, predecessorDrained: false, memberVerified: false, evidenceKind: 'guardian_member_unverified' };
+  return { id: generation!, lockId: lockId!, predecessorDrained: true, memberVerified: true, evidenceKind: 'guardian_env_assertion' };
 }
 
 export async function startZeroServer(options: { host?: string; port?: number } = {}) {
@@ -71,6 +104,7 @@ export async function startZeroServer(options: { host?: string; port?: number } 
   const store = new TaskStore(resolve(dataRoot, 'tasks.sqlite'), generation);
   if (generation.evidenceKind === 'rejected_lock_id') console.warn('[zero] Ignored guardian startup assertion because its lock ID does not match ZERO_DATA_DIR.');
   else if (generation.evidenceKind === 'invalid_attestation') console.warn('[zero] Ignored incomplete guardian startup assertion.');
+  else if (generation.evidenceKind === 'guardian_member_unverified') console.warn('[zero] Ignored guardian startup assertion because the packaged guardian could not verify this process in its Job.');
   const worktrees = new GitWorktreeManager(resolve(dataRoot, 'worktrees'));
   const testRunner = new TestRunner({ logDirectory: resolve(dataRoot, 'artifacts/checks') });
   const codex = adapters.codex!;

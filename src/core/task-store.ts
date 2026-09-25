@@ -46,7 +46,8 @@ export interface StartupGenerationAttestation {
   id: string;
   lockId?: string;
   predecessorDrained: boolean;
-  evidenceKind: "guardian_env_assertion" | "unguarded" | "rejected_lock_id" | "invalid_attestation";
+  memberVerified?: boolean;
+  evidenceKind: "guardian_env_assertion" | "unguarded" | "rejected_lock_id" | "invalid_attestation" | "guardian_member_unverified";
 }
 
 export interface StartupGenerationRecord extends StartupGenerationAttestation {
@@ -78,7 +79,8 @@ export class TaskStore {
       );
       CREATE TABLE IF NOT EXISTS startup_generations (
         id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE, lock_id TEXT, predecessor_drained INTEGER NOT NULL CHECK(predecessor_drained IN (0,1)),
-        evidence_kind TEXT NOT NULL, predecessor_generation_id TEXT REFERENCES startup_generations(id), started_at TEXT NOT NULL
+        member_verified INTEGER NOT NULL DEFAULT 0 CHECK(member_verified IN (0,1)), evidence_kind TEXT NOT NULL,
+        predecessor_generation_id TEXT REFERENCES startup_generations(id), started_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status, created_at);
       CREATE TABLE IF NOT EXISTS events (
@@ -156,27 +158,35 @@ export class TaskStore {
       this.#db.exec("UPDATE startup_generations SET sequence=rowid WHERE sequence IS NULL");
       this.#db.exec("CREATE UNIQUE INDEX IF NOT EXISTS startup_generations_sequence ON startup_generations(sequence)");
     }
+    const currentGenerationColumns = this.#db.prepare("PRAGMA table_info(startup_generations)").all() as Array<{ name: string }>;
+    if (!currentGenerationColumns.some(column => column.name === "member_verified")) {
+      this.#db.exec("ALTER TABLE startup_generations ADD COLUMN member_verified INTEGER NOT NULL DEFAULT 0 CHECK(member_verified IN (0,1))");
+    }
     this.#db.exec("CREATE INDEX IF NOT EXISTS attempts_stage_sequence ON attempts(stage_id, sequence)");
     const attestation = startupAttestation ?? { id: randomUUID(), predecessorDrained: false, evidenceKind: "unguarded" as const };
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(attestation.id) || typeof attestation.predecessorDrained !== "boolean" ||
-        !["guardian_env_assertion", "unguarded", "rejected_lock_id", "invalid_attestation"].includes(attestation.evidenceKind) ||
+        !["guardian_env_assertion", "unguarded", "rejected_lock_id", "invalid_attestation", "guardian_member_unverified"].includes(attestation.evidenceKind) ||
         (attestation.lockId !== undefined && !/^[a-f0-9]{64}$/.test(attestation.lockId))) {
       throw new Error("Invalid startup generation attestation");
     }
-    if (attestation.predecessorDrained && (attestation.evidenceKind !== "guardian_env_assertion" || !/^[a-f0-9]{64}$/.test(attestation.lockId ?? ""))) {
-      throw new Error("A drained predecessor requires a matching guardian lock assertion");
+    if (attestation.predecessorDrained && (attestation.evidenceKind !== "guardian_env_assertion" || attestation.memberVerified !== true || !/^[a-f0-9]{64}$/.test(attestation.lockId ?? ""))) {
+      throw new Error("A drained predecessor requires matching guardian lock and Job membership assertions");
     }
-    if (attestation.evidenceKind === "guardian_env_assertion" && (!attestation.predecessorDrained ||
+    if (attestation.memberVerified === true && (attestation.evidenceKind !== "guardian_env_assertion" ||
         !/^[a-f0-9]{32}$/.test(attestation.id) || !/^[a-f0-9]{64}$/.test(attestation.lockId ?? ""))) {
-      throw new Error("Guardian startup assertions require a generation ID, lock ID, and drained predecessor");
+      throw new Error("Verified Job membership requires a guardian generation and lock ID");
+    }
+    if (attestation.evidenceKind === "guardian_env_assertion" && (!attestation.predecessorDrained || attestation.memberVerified !== true ||
+        !/^[a-f0-9]{32}$/.test(attestation.id) || !/^[a-f0-9]{64}$/.test(attestation.lockId ?? ""))) {
+      throw new Error("Guardian startup assertions require generation, lock, drained predecessor, and Job membership");
     }
     const startedAt = new Date().toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const sequence = Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0)+1 AS n FROM startup_generations").get() as { n: number }).n);
-      this.#db.prepare(`INSERT INTO startup_generations(id,sequence,lock_id,predecessor_drained,evidence_kind,predecessor_generation_id,started_at)
-        VALUES(?,?,?,?,?,NULL,?)`).run(attestation.id, sequence, attestation.lockId ?? null,
-        attestation.predecessorDrained ? 1 : 0, attestation.evidenceKind, startedAt);
+      this.#db.prepare(`INSERT INTO startup_generations(id,sequence,lock_id,predecessor_drained,member_verified,evidence_kind,predecessor_generation_id,started_at)
+        VALUES(?,?,?,?,?,?,NULL,?)`).run(attestation.id, sequence, attestation.lockId ?? null,
+        attestation.predecessorDrained ? 1 : 0, attestation.memberVerified === true ? 1 : 0, attestation.evidenceKind, startedAt);
       this.#db.exec("COMMIT");
       this.#startupGeneration = { ...attestation, sequence, predecessorGenerationId: undefined, startedAt };
     } catch (error) { this.#db.exec("ROLLBACK"); throw error; }

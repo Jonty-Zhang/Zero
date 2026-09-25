@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { startupGenerationAttestation } from './main.js';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { RunRequest, RunResult } from '../domain/types.js';
 import type { ModelBinding } from '../adapters/types.js';
@@ -21,9 +21,27 @@ test('guardian startup lineage is accepted only for a matching normalized data-d
   const hash = (path: string) => createHash('sha256').update(path.toLowerCase(), 'utf8').digest('hex');
   const env = { ZERO_GUARDIAN_LOCK_ID: hash('c:\\zerodata'), ZERO_GUARDIAN_GENERATION: id,
     ZERO_GUARDIAN_PREDECESSOR_DRAINED: '1' };
-  assert.deepEqual(startupGenerationAttestation('C:/ZeroData/', env, 'win32'), {
-    id, lockId: env.ZERO_GUARDIAN_LOCK_ID, predecessorDrained: true, evidenceKind: 'guardian_env_assertion',
+  const attested = startupGenerationAttestation('C:/ZeroData/', env, 'win32', {
+    verifyMember: (path, lockId, pid) => {
+      assert.ok(isAbsolute(path));
+      assert.match(path, /[\\/]guardian[\\/]guardian\.exe$/i);
+      assert.equal(lockId, env.ZERO_GUARDIAN_LOCK_ID);
+      assert.equal(pid, process.pid);
+      return true;
+    },
   });
+  assert.deepEqual(attested, { id, lockId: env.ZERO_GUARDIAN_LOCK_ID, predecessorDrained: true, memberVerified: true, evidenceKind: 'guardian_env_assertion' });
+  const membershipRejected = startupGenerationAttestation('C:/ZeroData/', env, 'win32', {
+    verifyMember: () => false,
+  });
+  assert.equal(membershipRejected.predecessorDrained, false);
+  assert.equal(membershipRejected.memberVerified, false);
+  assert.equal(membershipRejected.evidenceKind, 'guardian_member_unverified');
+  const unavailable = startupGenerationAttestation('C:/ZeroData/', env, 'win32', {
+    guardianPath: 'C:/missing/guardian.exe',
+  });
+  assert.equal(unavailable.predecessorDrained, false);
+  assert.equal(unavailable.evidenceKind, 'guardian_member_unverified');
   const mismatched = startupGenerationAttestation('C:/OtherData', env, 'win32');
   assert.equal(mismatched.predecessorDrained, false);
   assert.equal(mismatched.evidenceKind, 'rejected_lock_id');
@@ -42,7 +60,7 @@ test('guardian startup lock normalization preserves drive and UNC roots', () => 
     const evidence = startupGenerationAttestation(input, {
       ZERO_GUARDIAN_LOCK_ID: lockId(canonical), ZERO_GUARDIAN_GENERATION: 'abcdefabcdefabcdefabcdefabcdefab',
       ZERO_GUARDIAN_PREDECESSOR_DRAINED: '1',
-    }, 'win32');
+    }, 'win32', { verifyMember: () => true });
     assert.equal(evidence.evidenceKind, 'guardian_env_assertion');
   }
 });

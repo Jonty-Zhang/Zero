@@ -10,6 +10,8 @@
 namespace {
 constexpr DWORD kFailure = 70;
 constexpr DWORD kInvalidArgs = 64;
+constexpr DWORD kNotJobMember = 65;
+constexpr DWORD kVerifyFailure = 66;
 constexpr DWORD kPollMilliseconds = 25;
 
 bool IsSafeLockId(const wchar_t* value) {
@@ -23,6 +25,20 @@ bool IsSafeLockId(const wchar_t* value) {
       return false;
     }
   }
+  return true;
+}
+
+bool ParseProcessId(const wchar_t* value, DWORD* process_id) {
+  if (value == nullptr || *value == L'\0') return false;
+  DWORD parsed = 0;
+  for (const wchar_t* p = value; *p != L'\0'; ++p) {
+    if (*p < L'0' || *p > L'9') return false;
+    const DWORD digit = static_cast<DWORD>(*p - L'0');
+    if (parsed > (MAXDWORD - digit) / 10) return false;
+    parsed = parsed * 10 + digit;
+  }
+  if (parsed == 0) return false;
+  *process_id = parsed;
   return true;
 }
 
@@ -127,9 +143,37 @@ DWORD WaitForPreviousJobToBecomeEmpty(const std::wstring& job_name) {
   CloseHandle(previous_job);
   return result;
 }
+
+int VerifyMember(int argc, wchar_t** argv) {
+  DWORD process_id = 0;
+  if (argc != 6 || wcscmp(argv[2], L"--lock-id") != 0 || !IsSafeLockId(argv[3]) ||
+      wcscmp(argv[4], L"--pid") != 0 || !ParseProcessId(argv[5], &process_id)) {
+    return static_cast<int>(kInvalidArgs);
+  }
+
+  const std::wstring sid = CurrentUserSidString();
+  if (sid.empty()) return static_cast<int>(kVerifyFailure);
+  const std::wstring job_name = L"Global\\ZeroGuardianJob_" + sid + L"_" + argv[3];
+  HANDLE job = OpenJobObjectW(JOB_OBJECT_QUERY, FALSE, job_name.c_str());
+  if (job == nullptr) return static_cast<int>(kVerifyFailure);
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+  if (process == nullptr) {
+    CloseHandle(job);
+    return static_cast<int>(kVerifyFailure);
+  }
+  BOOL is_member = FALSE;
+  const BOOL queried = IsProcessInJob(process, job, &is_member);
+  CloseHandle(process);
+  CloseHandle(job);
+  if (!queried) return static_cast<int>(kVerifyFailure);
+  return is_member ? 0 : static_cast<int>(kNotJobMember);
+}
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  if (argc >= 2 && wcscmp(argv[1], L"--verify-member") == 0) {
+    return VerifyMember(argc, argv);
+  }
   if (argc < 5 || wcscmp(argv[1], L"--lock-id") != 0 ||
       !IsSafeLockId(argv[2]) || wcscmp(argv[3], L"--") != 0 ||
       argv[4][0] == L'\0') {

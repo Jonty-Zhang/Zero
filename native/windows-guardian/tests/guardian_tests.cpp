@@ -74,6 +74,22 @@ int Fail(const char* message) {
   return 1;
 }
 
+DWORD InvokeVerifier(const std::wstring& guardian, const std::wstring& lock_id,
+                     DWORD process_id) {
+  const std::wstring command = Quote(guardian) + L" --verify-member --lock-id " +
+      Quote(lock_id) + L" --pid " + std::to_wstring(process_id);
+  PROCESS_INFORMATION process{};
+  if (!Start(command, &process)) return MAXDWORD;
+  const bool exited = WaitForExit(process.hProcess, 5000);
+  DWORD exit_code = MAXDWORD;
+  if (exited) GetExitCodeProcess(process.hProcess, &exit_code);
+  else TerminateProcess(process.hProcess, 1);
+  WaitForSingleObject(process.hProcess, INFINITE);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return exit_code;
+}
+
 std::wstring TempPath(const wchar_t* suffix) {
   wchar_t directory[MAX_PATH]{};
   if (GetTempPathW(MAX_PATH, directory) == 0) return {};
@@ -151,6 +167,33 @@ int RunGenerationEnvironment(const std::wstring& guardian, const std::wstring& t
   if (!exited || exit_code != 0 || lock != "generation-env" || !valid_generation || drained != "1") {
     return Fail("guardian child did not receive valid startup lineage assertions");
   }
+  return 0;
+}
+
+int RunMemberVerification(const std::wstring& guardian,
+                          const std::wstring& test_exe) {
+  const std::wstring lock_id = L"member-check-" + std::to_wstring(GetCurrentProcessId());
+  const std::wstring command = Quote(guardian) + L" --lock-id " + lock_id + L" -- " +
+      Quote(test_exe) + L" --helper-verify-member " + Quote(guardian) + L" " +
+      lock_id + L" " + std::to_wstring(GetCurrentProcessId());
+  PROCESS_INFORMATION process{};
+  if (!Start(command, &process)) return Fail("could not start member-check guardian");
+  const bool exited = WaitForExit(process.hProcess, 15000);
+  DWORD exit_code = 1;
+  if (exited) GetExitCodeProcess(process.hProcess, &exit_code);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  if (!exited || exit_code != 0) return Fail("guardian member verification rejected a valid Job member or accepted a non-member");
+
+  const std::wstring invalid_command = Quote(guardian) + L" --verify-member --lock-id";
+  PROCESS_INFORMATION invalid{};
+  if (!Start(invalid_command, &invalid)) return Fail("could not start invalid-argument verifier");
+  const bool invalid_exited = WaitForExit(invalid.hProcess, 5000);
+  DWORD invalid_code = 0;
+  if (invalid_exited) GetExitCodeProcess(invalid.hProcess, &invalid_code);
+  CloseHandle(invalid.hThread);
+  CloseHandle(invalid.hProcess);
+  if (!invalid_exited || invalid_code == 0) return Fail("member verifier accepted invalid arguments");
   return 0;
 }
 
@@ -374,6 +417,16 @@ int wmain(int argc, wchar_t** argv) {
     output << lock << L"\n" << generation << L"\n" << drained << L"\n";
     return output ? 0 : 87;
   }
+  if (argc >= 5 && wcscmp(argv[1], L"--helper-verify-member") == 0) {
+    const std::wstring guardian(argv[2]);
+    const std::wstring lock_id(argv[3]);
+    const DWORD outside_process = static_cast<DWORD>(_wtoi(argv[4]));
+    if (InvokeVerifier(guardian, lock_id, GetCurrentProcessId()) != 0) return 88;
+    if (InvokeVerifier(guardian, lock_id, outside_process) == 0) return 89;
+    if (InvokeVerifier(guardian, lock_id + L"-wrong", GetCurrentProcessId()) == 0) return 90;
+    if (InvokeVerifier(guardian, lock_id, MAXDWORD) == 0) return 91;
+    return 0;
+  }
   if (argc >= 3 && wcscmp(argv[1], L"--helper-report-wait") == 0) {
     std::ofstream output{std::filesystem::path(argv[2])};
     output << GetCurrentProcessId() << "\n";
@@ -433,6 +486,7 @@ int wmain(int argc, wchar_t** argv) {
   if (test_exe.empty()) return Fail("could not resolve test executable path");
   if (RunNormalExit(guardian, test_exe) != 0) return 1;
   if (RunGenerationEnvironment(guardian, test_exe) != 0) return 1;
+  if (RunMemberVerification(guardian, test_exe) != 0) return 1;
   if (RunDuplicateLock(guardian, test_exe) != 0) return 1;
   if (RunForcedTreeCleanup(guardian, test_exe) != 0) return 1;
   if (RunSuccessorWaitsForPreviousTree(guardian, test_exe) != 0) return 1;

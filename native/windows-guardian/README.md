@@ -11,15 +11,30 @@ the guardian passes `ZERO_GUARDIAN_LOCK_ID`, a fresh 128-bit hexadecimal
 `ZERO_GUARDIAN_GENERATION`, and `ZERO_GUARDIAN_PREDECESSOR_DRAINED=1` to its
 child. A missing prior Job is treated as an empty predecessor under the same
 mutex check. Zero verifies that the lock ID is the SHA-256 of its normalized
-data directory before recording the startup lineage, then attaches that
-generation to task claims and started stages. If those values are absent,
-incomplete, or mismatched, Zero records the startup as unguarded or rejected.
+data directory and queries its own PID's Job membership before recording the
+startup lineage, then attaches that generation to task claims and started
+stages. If those values are absent, incomplete, mismatched, or unverifiable,
+Zero records the startup as unguarded, rejected, or member-unverified.
 
 These inherited variables are assertions, not authentication. A process
 running as the same Windows account can set them itself; they do not prove to
 SQLite that guardian.exe was the sender. They exist to correlate normal
 guardian launches and catch configuration mistakes, and they do not authorize
 replaying execution or review work.
+
+`guardian.exe --verify-member --lock-id <lock-id> --pid <pid>` is a read-only
+membership query. It derives the same per-user named Job, opens it for query,
+opens the target PID with limited query rights, and calls `IsProcessInJob` on
+that process handle. It exits 0 only when the target is a member; malformed
+arguments, a missing Job, an inaccessible PID, and a non-member all fail
+closed. Zero invokes this mode through the fixed absolute
+`guardian/guardian.exe` path in its installed package, rejects symlinked path
+components, does not search `PATH`, and checks its own PID before recording
+`member_verified`.
+This confirms current OS Job membership for that PID, while the lock ID and
+generation still come from environment assertions. Same-account software that
+can alter the installed package or create equivalent named objects is outside
+this check's threat boundary.
 
 The ordering matters: `KILL_ON_JOB_CLOSE` acts when the last Job handle closes.
 The successor must not open the previous Job before the previous guardian exits,

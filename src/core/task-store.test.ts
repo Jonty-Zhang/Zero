@@ -74,7 +74,7 @@ test("restart before lease expiry preserves active work and later scan quarantin
 
 test("startup generation is attached to claims and stage starts without enabling replay", () => {
   const generationId = "0123456789abcdef0123456789abcdef";
-  const store = new TaskStore(":memory:", { id: generationId, lockId: "a".repeat(64), predecessorDrained: true, evidenceKind: "guardian_env_assertion" });
+  const store = new TaskStore(":memory:", { id: generationId, lockId: "a".repeat(64), predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
   try {
     const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "lineage" }, "generation_test");
     const claimed = store.claimNext("lineage-worker");
@@ -91,8 +91,8 @@ test("startup generation is attached to claims and stage starts without enabling
 
 test("startup generation cannot mark predecessor drained without guardian assertion", () => {
   assert.throws(() => new TaskStore(":memory:", {
-    id: "invalid-generation", lockId: "a".repeat(64), predecessorDrained: true, evidenceKind: "unguarded",
-  }), /drained predecessor requires a matching guardian lock assertion/);
+    id: "invalid-generation", lockId: "a".repeat(64), predecessorDrained: true, memberVerified: false, evidenceKind: "guardian_env_assertion",
+  }), /drained predecessor requires matching guardian lock and Job membership assertions/);
   const store = new TaskStore(":memory:", { id: "unguarded-generation", predecessorDrained: false, evidenceKind: "unguarded" });
   try {
     assert.equal(store.startupGeneration().predecessorDrained, false);
@@ -104,7 +104,7 @@ test("startup generation lineage survives reopening an existing database", async
   const root = await mkdtemp(join(process.cwd(), ".zero-startup-generation-"));
   const path = join(root, "tasks.sqlite");
   const generationId = "abcdefabcdefabcdefabcdefabcdefab";
-  let store = new TaskStore(path, { id: generationId, lockId: "b".repeat(64), predecessorDrained: true, evidenceKind: "guardian_env_assertion" });
+  let store = new TaskStore(path, { id: generationId, lockId: "b".repeat(64), predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
   const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "persist lineage" }, "generation_persist_test");
   store.claimNext("persist-worker");
   const stage = store.createStage(task.id, { role: "implement", processStartId: "persist-process" });
@@ -118,6 +118,30 @@ test("startup generation lineage survives reopening an existing database", async
     assert.equal(store.stages(task.id)[0]?.generationId, generationId);
     assert.equal(store.events(task.id).find(event => event.type === "task.claimed")?.payload &&
       (store.events(task.id).find(event => event.type === "task.claimed")?.payload as { generationId?: string }).generationId, generationId);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("migration keeps legacy guardian generations unverified by default", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-generation-migration-"));
+  const path = join(root, "legacy.sqlite");
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE startup_generations (
+    id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE, lock_id TEXT, predecessor_drained INTEGER NOT NULL,
+    evidence_kind TEXT NOT NULL, predecessor_generation_id TEXT, started_at TEXT NOT NULL
+  )`);
+  legacy.prepare(`INSERT INTO startup_generations(id,sequence,lock_id,predecessor_drained,evidence_kind,started_at)
+    VALUES(?,?,?,?,?,?)`).run("legacy-generation", 1, "c".repeat(64), 1, "guardian_env_assertion", "2026-01-01T00:00:00.000Z");
+  legacy.close();
+  const store = new TaskStore(path);
+  try {
+    const migrated = new DatabaseSync(path);
+    try {
+      const row = migrated.prepare("SELECT member_verified FROM startup_generations WHERE id='legacy-generation'").get() as { member_verified: number };
+      assert.equal(row.member_verified, 0);
+    } finally { migrated.close(); }
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });

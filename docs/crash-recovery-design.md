@@ -6,7 +6,9 @@ Zero 的额度等待有明确的完成边界：适配器返回已分类的额度
 
 原生 Windows guardian 为同一用户和数据目录持有命名互斥锁，继任实例在启动 Zero 前等待上一代命名 Job 的活动进程清零。它现在把启动代际、lock ID 和 predecessor-drained 断言传给 Node；Node 按安装脚本相同的路径规范化规则计算 `ZERO_DATA_DIR` 的 SHA-256，只有 lock ID 完全匹配才将这项断言写入 SQLite。SQLite 保存每次启动代际、任务领取代际和阶段开始代际。旧数据库通过新增表和可空列迁移，旧记录的代际保持 NULL。
 
-这条环境变量链路用于关联与诊断，并不是抗同一 Windows 账户伪造的安全证明：同一账户能自行启动程序并设置相同环境变量。只有 guardian 在持有同用户、同 lock ID 的命名互斥锁后，完成旧命名 Job 查询且确认 ActiveProcesses 为零（或确认 Job 不存在）时，才会设置 `PREDECESSOR_DRAINED=1`。Node 的 lock ID 校验可拒绝目录错配，不能独立验证环境变量来源。没有 guardian 环境、字段不完整或 lock ID 不匹配时，Node 持久化 `unguarded`、`invalid_attestation` 或 `rejected_lock_id` 代际并将 drained 设为 false。启动代际目前不会触发执行/审核重放；租约过期、PID 或代际字段都不能单独授权接管已有 worktree。该机制只覆盖实际加入 Job 的进程，尚未在目标机器安装或完成开机及强制中断实机验收。实现与限制见[原生 guardian 说明](../native/windows-guardian/README.md)。
+只有 guardian 在持有同用户、同 lock ID 的命名互斥锁后，完成旧命名 Job 查询且确认 ActiveProcesses 为零（或确认 Job 不存在）时，才会设置 `PREDECESSOR_DRAINED=1`。Node 随后调用随包 guardian.exe 的绝对路径，以当前 Node PID 核验 `IsProcessInJob` 成员关系；数据目录 lock ID 不匹配、成员核验失败、超时或 helper 不可用时，`predecessor_drained` 与 `member_verified` 都不会置真。两个字段分别持久化，旧行的 `member_verified` 默认为 false。
+
+成员核验是进程树恢复判断的基础证据，不是对同一账户恶意篡改或仿造命名对象的密码学证明：环境变量仍可被同账户程序设置，且同账户程序可以影响本地安装目录。没有 guardian 环境、字段不完整或 lock ID 不匹配时，Node 持久化 `unguarded`、`invalid_attestation`、`rejected_lock_id` 或 `guardian_member_unverified` 代际。启动代际和 Job 成员核验目前不会触发执行/审核重放；租约过期、PID 或代际字段都不能单独授权接管已有 worktree。该机制只覆盖实际加入 Job 的进程，尚未在目标机器安装或完成开机及强制中断实机验收。实现与限制见[原生 guardian 说明](../native/windows-guardian/README.md)。
 
 ## 必须保持的约束
 
@@ -28,7 +30,7 @@ Zero 的额度等待有明确的完成边界：适配器返回已分类的额度
 
 ### 2. 进程树停止证明
 
-guardian 在启动服务前等待旧命名 Job 活动进程数归零；启动代际已关联到任务领取和阶段开始记录。下一步再把任务子进程启动意图和进程身份与代际关联，供 worker 恢复判断使用。仅凭 PID 不存在、租约超时或互斥锁可获取，均不足以证明旧写入者停止。若未由 guardian 承载或 lineage 断言丢失，保持 `recovery_required`。
+guardian 在启动服务前等待旧命名 Job 活动进程数归零；启动代际、Node 的 Job 成员核验结果已关联到任务领取和阶段开始记录。下一步再把任务子进程启动意图和进程身份与代际关联，供 worker 恢复判断使用。仅凭 PID 不存在、租约超时或互斥锁可获取，均不足以证明旧写入者停止。若未由 guardian 承载或 lineage 断言丢失，保持 `recovery_required`。
 
 ### 3. 阶段重入
 
