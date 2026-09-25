@@ -6,6 +6,7 @@ param(
     [string]$Account,
     [string]$InstallDir = (Split-Path -Parent $PSScriptRoot),
     [string]$NodePath,
+    [string]$GuardianPath,
     [string]$CodexExe,
     [string]$DshEntry,
     [string]$ZcodeEntry,
@@ -16,6 +17,47 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-CanonicalDataDir([string]$Path) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+    $root = [System.IO.Path]::GetPathRoot($fullPath)
+    if ($fullPath.Length -gt $root.Length) {
+        $fullPath = $fullPath.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    }
+    return $fullPath.ToLowerInvariant()
+}
+
+function Get-GuardianLockId([string]$CanonicalPath) {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($CanonicalPath)
+        return ([System.BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $sha256.Dispose() }
+}
+
+function Resolve-GuardianPath([string]$Path) {
+    if ($Path -notmatch '^(?:[A-Za-z]:\\|\\\\)') { throw 'GuardianPath must be a fully qualified absolute path to guardian.exe.' }
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if ([System.IO.Path]::GetExtension($fullPath).ToLowerInvariant() -ne '.exe') { throw 'GuardianPath must point to a Windows .exe file.' }
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "Guardian executable not found: $fullPath" }
+    $stream = [System.IO.File]::OpenRead($fullPath)
+    try {
+        if ($stream.Length -lt 64) { throw 'GuardianPath is not a valid Windows executable.' }
+        $reader = [System.IO.BinaryReader]::new($stream)
+        try {
+            if ($reader.ReadUInt16() -ne 0x5A4D) { throw 'GuardianPath is not a valid Windows executable.' }
+            $stream.Position = 0x3C
+            $peOffset = $reader.ReadInt32()
+            if ($peOffset -lt 64 -or $peOffset -gt ($stream.Length - 4)) { throw 'GuardianPath is not a valid Windows executable.' }
+            $stream.Position = $peOffset
+            if ($reader.ReadUInt32() -ne 0x00004550) { throw 'GuardianPath is not a valid Windows executable.' }
+        }
+        finally { $reader.Dispose() }
+    }
+    finally { $stream.Dispose() }
+    return $fullPath
+}
 
 function Stop-TaskIfRunning($Task) {
     if ($Task.State -ne 'Running') { return }
@@ -30,6 +72,14 @@ function Stop-TaskIfRunning($Task) {
 }
 
 if ($Install -and $Uninstall) { throw 'Choose either -Install or -Uninstall.' }
+if (-not $Uninstall) {
+    $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    if (-not $DataDir) { $DataDir = Join-Path $localAppData 'Zero' }
+    $canonicalDataDir = Get-CanonicalDataDir $DataDir
+    $guardianLockId = Get-GuardianLockId $canonicalDataDir
+    if ($GuardianPath) { $GuardianPath = Resolve-GuardianPath $GuardianPath }
+    if ($Install -and -not $GuardianPath) { throw '-GuardianPath is required for installation and must point to the built native guardian.exe.' }
+}
 if (-not $Uninstall -and $CodexExe) {
     if (-not [System.IO.Path]::IsPathRooted($CodexExe)) { throw 'CodexExe must be an absolute path.' }
     $CodexExe = [System.IO.Path]::GetFullPath($CodexExe)
@@ -63,6 +113,10 @@ if (-not $Install -and -not $Uninstall) {
     Write-Output 'Dry run only. Review the resolved paths, then use -Install or -Uninstall explicitly.'
     Write-Output ("Task name: {0}" -f $TaskName)
     Write-Output ("Install directory: {0}" -f [System.IO.Path]::GetFullPath($InstallDir))
+    Write-Output ("Zero data directory: {0}" -f [System.IO.Path]::GetFullPath($DataDir))
+    Write-Output ("Guardian lock ID: SHA-256 ({0} hex characters; data path is not passed to guardian)" -f $guardianLockId.Length)
+    if ($GuardianPath) { Write-Output ("Guardian executable: {0}" -f $GuardianPath) }
+    else { Write-Output 'Guardian executable: not configured (required with -Install).' }
     if ($Account) { Write-Output ("Task account: {0}" -f $Account) }
     if ($CodexExe) { Write-Output ("Codex executable: {0}" -f $CodexExe) }
     if ($DshEntry) { Write-Output 'DSH JavaScript CLI entry: configured.' }
@@ -161,13 +215,14 @@ try {
     if ($DshEntry) { $actionArguments += @('-DshEntry', $DshEntry) }
     if ($ZcodeEntry) { $actionArguments += @('-ZcodeEntry', $ZcodeEntry) }
     if ($ProxyUrl) { $actionArguments += @('-ProxyUrl', $ProxyUrl) }
-    $quotedArguments = foreach ($argument in $actionArguments) {
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) { throw "Windows PowerShell executable not found: $windowsPowerShell" }
+    $guardianArguments = @('--lock-id', $guardianLockId, '--', $windowsPowerShell) + $actionArguments
+    $quotedGuardianArguments = foreach ($argument in $guardianArguments) {
         if ($argument.Contains('"') -or $argument.Contains("`r") -or $argument.Contains("`n")) { throw 'Task action arguments may not contain quotes or line breaks.' }
         '"' + $argument + '"'
     }
-    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) { throw "Windows PowerShell executable not found: $windowsPowerShell" }
-    $action = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument ($quotedArguments -join ' ') -WorkingDirectory $resolvedInstallDir
+    $action = New-ScheduledTaskAction -Execute $GuardianPath -Argument ($quotedGuardianArguments -join ' ') -WorkingDirectory $resolvedInstallDir
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)

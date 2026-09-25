@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { TaskStore } from "./task-store.js";
+import type { TaskSubmission } from "../domain/types.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -34,6 +35,19 @@ test("task transitions reject illegal shortcuts and record only committed state 
     store.transition(task.id, "running", "reviewing");
     store.transition(task.id, "reviewing", "done");
     assert.equal(store.get(task.id)?.status, "done");
+  } finally { store.close(); }
+});
+
+test("execution stage submissions reject an empty stage list and persist valid stage selections", () => {
+  const store = new TaskStore();
+  try {
+    assert.throws(() => store.submit({ repoPath: ".", baseRef: "main", prompt: "x", executionStages: [] }), /1 to 16 execution stages/);
+    assert.throws(() => store.submit({ repoPath: ".", baseRef: "main", prompt: "x", executionStages: Array.from({ length: 17 }, () => ({})) }), /1 to 16 execution stages/);
+    assert.throws(() => store.submit({ repoPath: ".", baseRef: "main", prompt: "x", executionStages: [{ provider: "unknown" }] } as unknown as TaskSubmission), /supported selection field/);
+    const submission = { repoPath: ".", baseRef: "main", prompt: "x", executionStages: [{ harness: "glm" }, { model: "deepseek-chat" }] };
+    const task = store.submit(submission, "execution_stages_store_test");
+    assert.deepEqual(task.executionStages, submission.executionStages);
+    assert.deepEqual(store.get(task.id)?.executionStages, submission.executionStages);
   } finally { store.close(); }
 });
 

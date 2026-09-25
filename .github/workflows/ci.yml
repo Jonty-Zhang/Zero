@@ -50,3 +50,9 @@ jobs:
       - name: Test guardian process containment
         shell: pwsh
         run: .\guardian_tests.exe (Resolve-Path .\guardian.exe).Path
+      - name: Retain tested guardian executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: zero-windows-guardian
+          path: guardian.exe
+          if-no-files-found: error

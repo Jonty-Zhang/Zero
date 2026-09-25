@@ -32,6 +32,8 @@ export interface TaskSubmission {
   checks?: CheckDefinition[];
   /** Any omitted field is selected by the Codex coordinator. */
   selection?: ExecutionSelection;
+  /** Ordered execution stages in one task worktree. Omitted fields are completed by the Codex coordinator. */
+  executionStages?: ExecutionSelection[];
 }
 
 export type SelectionSource = "task" | "project" | "global" | "codex";

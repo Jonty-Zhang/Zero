@@ -174,6 +174,52 @@ test('POST /api/tasks rejects an incompatible Harness and model pair with 400', 
   } finally { await f.close(); }
 });
 
+test('POST /api/tasks persists ordered partial execution stages with global defaults', async () => {
+  const f = await createFixture();
+  try {
+    const response = await fetch(`${f.url}/api/tasks`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        repoPath: f.repoPath, baseRef: 'main', prompt: 'Run ordered execution stages with partial locks.',
+        execution: { harnessId: 'zcode', reasoningEffort: 'high' },
+        executionStages: [{ modelId: 'glm-main' }, { modelId: 'glm-main', reasoningEffort: 'low' }],
+      }),
+    });
+    assert.equal(response.status, 201);
+    const created = await response.json() as { id: string };
+    const stored = f.store.get(created.id);
+    assert.ok(stored);
+    assert.deepEqual(stored.selection, { harness: 'zcode', reasoningEffort: 'high' });
+    assert.deepEqual(stored.executionStages, [
+      { model: 'glm-main' },
+      { model: 'glm-main', reasoningEffort: 'low' },
+    ]);
+  } finally { await f.close(); }
+});
+
+test('POST /api/tasks rejects unavailable models, efforts, invalid stage counts, and incompatible merged locks', async () => {
+  const f = await createFixture();
+  try {
+    const base = { repoPath: f.repoPath, baseRef: 'main', prompt: 'Validate this execution stage submission.' };
+    const cases: Array<{ name: string; payload: Record<string, unknown>; error: RegExp }> = [
+      { name: 'unavailable model', payload: { executionStages: [{ harnessId: 'zcode', modelId: 'missing-model' }] }, error: /没有通过验证的可用 Harness 与模型组合/ },
+      { name: 'unavailable effort', payload: { executionStages: [{ harnessId: 'zcode', modelId: 'glm-main', reasoningEffort: 'xhigh' }] }, error: /没有已验证的可用组合/ },
+      { name: 'empty stages', payload: { executionStages: [] }, error: /1 到 16 个阶段/ },
+      { name: 'too many stages', payload: { executionStages: Array.from({ length: 17 }, () => ({})) }, error: /1 到 16 个阶段/ },
+      { name: 'incompatible global default and stage override', payload: { execution: { harnessId: 'zcode' }, executionStages: [{ modelId: 'missing-model' }] }, error: /没有通过验证的可用 Harness 与模型组合/ },
+    ];
+    for (const testCase of cases) {
+      const response = await fetch(`${f.url}/api/tasks`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...base, ...testCase.payload }),
+      });
+      assert.equal(response.status, 400, testCase.name);
+      assert.match((await response.json() as { error: string }).error, testCase.error, testCase.name);
+    }
+    assert.equal(f.store.list().length, 0);
+  } finally { await f.close(); }
+});
+
 test('GET /api/tasks/:id/report streams the actual archived report.json', async () => {
   const f = await createFixture();
   try {

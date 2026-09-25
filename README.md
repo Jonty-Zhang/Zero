@@ -10,16 +10,16 @@ Zero is an application made of one Node.js service, a local React web UI, and a 
 
 - A SQLite-backed task queue and local HTTP API, with `pending`, `running`, `reviewing`, `revision`, `waiting`, `done`, and `failed` task states.
 - Codex-based task allocation and a separate read-only Codex review. You can pin any subset of the execution Harness, model, and reasoning effort; Codex fills only fields you leave unset, from bindings Zero has verified.
-- Codex, DeepSeek Harness (DSH), and ZCode CLI adapters. An adapter being present does not make a Harness/model pair eligible: Zero requires a locally verified binding. DSH uses a Zero-owned profile. The current ZCode binding uses a Zero-owned isolated CLI profile and does not use the provider selection or credentials in the ZCode desktop app.
+- Codex, DeepSeek Harness (DSH), and ZCode adapters. An adapter being present does not make a Harness/model pair eligible: Zero requires a locally verified binding. DSH and isolated ZCode CLI bindings use Zero-owned profiles. The existing-desktop ZCode `app-server` adapter and `verify-binding zcode-desktop` path are mock-tested; live enrollment has not succeeded, so this route is not verified or available for routing. See [server setup](src/server/README.md) for the verification boundary.
 - A task-specific Git worktree, configured validation commands, bounded revision attempts, and an archived report with execution, test, review, and Git evidence. Successful task branches remain in the source repository; Zero does not automatically merge or push them.
-- Each implementation or revision records a stage, a linked attempt, a worktree fingerprint, and a versioned handoff based on facts Zero observed. Reports include this stage history.
-- A `waiting` state for verified provider usage limits, with a persisted checkpoint and scheduled retry. Recovery from an interrupted external command fails closed for inspection rather than blindly replaying it.
+- Ordered `executionStages` run serially in one task worktree through the core, HTTP API, and CLI `--stages-file` option. Each stage records a linked attempt, worktree fingerprint, and versioned handoff based on facts Zero observed. Reports include this stage history.
+- A `waiting` state for verified provider usage limits, with a persisted checkpoint and scheduled retry. Quota resume is mock-tested, including across service restart; a real provider quota event has not been observed. Ordinary crash recovery is not implemented: interrupted attempts fail closed for inspection rather than resuming automatically.
+- A native Windows process guardian with passing CI build and process-containment tests. Deployment to the target machine and a boot test remain unverified; see [Windows deployment](docs/windows-deployment.md).
 
 ## What is still a design or validation target
 
-- Automatic multi-stage execution such as ZCode + GLM handing the same worktree to ZCode + DeepSeek is **not yet implemented by the worker**. The worker records handoffs for one implementation or revision at a time but does not yet use them to plan a second execution stage. See [the worktree and handoff design](docs/workspace-handoff-design.md).
-- The ZCode desktop `app-server` session-protocol integration is under investigation. No claim is made that Zero can yet use the user's existing desktop GLM/DeepSeek setup, lock a model in a live session, or safely transfer its conversation context.
-- DSH and ZCode are not enabled for routing merely because their adapters exist. Their model bindings must be created and verified in Zero's isolated data area; availability and evidence level depend on the local CLI version and successful checks. See [server setup](src/server/README.md).
+- Live ZCode desktop enrollment remains unverified. The local app-server probe has not returned a usable model catalog, and no nonce-backed binding has been established; no GLM or DeepSeek desktop model is enabled for routing on that basis. The adapter does not claim actual served-model identity or transfer of the desktop conversation context. See [the enrollment design](docs/zcode-existing-desktop-enrollment.md).
+- DSH and isolated ZCode CLI bindings are not enabled for routing merely because their adapters exist. Their bindings must be created and verified in Zero's isolated data area; availability and evidence level depend on the local CLI version and successful checks. See [server setup](src/server/README.md).
 - Current review is a new Codex session. It is not a different-model guarantee: when the execution Harness is also Codex, model-level independence depends on the configured reviewer binding.
 
 For the broader target, upstream comparisons, and license review, see [the Zero v1 proposal](docs/zero-v1-proposal.md). The project is original code rather than a fork of the reviewed projects and is licensed under [Apache-2.0](LICENSE).
@@ -43,9 +43,20 @@ node dist/cli.js submit --repo 'C:\path\to\repo' --prompt 'Fix the parser bug' -
 node dist/cli.js status
 ```
 
+To submit ordered execution stage selections, pass a JSON array with `--stages-file`. Each stage may set any subset of `harnessId`, `modelId`, and `reasoningEffort`; omitted fields remain available to the Codex allocator. The existing `--harness`, `--model`, and `--effort` options set task-wide defaults, which individual stages can override. Every effective stage selection must match a currently available, locally verified binding.
+
+```json
+[
+  { "harnessId": "<first-harness-id>", "modelId": "<first-model-id>" },
+  { "harnessId": "<second-harness-id>", "modelId": "<second-model-id>", "reasoningEffort": "high" }
+]
+```
+
+Replace the example IDs with verified binding IDs, save this as `stages.json`, then run `node dist/cli.js submit --repo 'C:\path\to\repo' --prompt 'Implement the change' --stages-file stages.json`. The API checks each effective stage against currently available verified bindings and stores the order as submitted.
+
 The CLI also provides `node dist/cli.js cancel <task-id>`. Run `node dist/cli.js` without arguments for all options. The UI and CLI use the same local service and queue.
 
-On first run, no live-verified model binding is assumed. Follow [server setup and binding verification](src/server/README.md) before submitting a task. Binding verification may make a real model call. Do not put API keys, proxy credentials, or other secrets in the repository or Zero's model registry; authentication comes from the relevant CLI login or process environment. For DSH and ZCode, use the Zero-owned isolated profiles described in the server guide; do not copy or edit an existing desktop configuration.
+On first run, no live-verified model binding is assumed. Follow [server setup and binding verification](src/server/README.md) before submitting a task. Binding verification may make a real model call. Do not put API keys, proxy credentials, or other secrets in the repository or Zero's model registry; authentication comes from the relevant CLI login or process environment. DSH and isolated ZCode CLI bindings use the Zero-owned profiles described in the server guide. The separate existing-desktop ZCode path uses an app-server session and does not copy or edit desktop configuration.
 
 ## Runtime data and privacy
 

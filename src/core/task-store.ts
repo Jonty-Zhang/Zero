@@ -125,6 +125,19 @@ export class TaskStore {
   }
 
   submit(submission: TaskSubmission, id: string = randomUUID()): TaskRecord {
+    if (submission.executionStages !== undefined) {
+      if (!Array.isArray(submission.executionStages) || submission.executionStages.length === 0 || submission.executionStages.length > 16) {
+        throw new Error("executionStages must contain 1 to 16 execution stages");
+      }
+      for (const [index, stage] of submission.executionStages.entries()) {
+        if (!stage || typeof stage !== "object" || Array.isArray(stage)) throw new Error(`executionStages[${index}] must be an object`);
+        for (const [field, value] of Object.entries(stage)) {
+          if (!["harness", "model", "reasoningEffort"].includes(field) || typeof value !== "string" || !value.trim() || value !== value.trim()) {
+            throw new Error(`executionStages[${index}].${field} must be a non-empty supported selection field`);
+          }
+        }
+      }
+    }
     const now = new Date().toISOString();
     this.#transaction(() => {
       this.#db.prepare(`INSERT INTO tasks(id,status,created_at,updated_at,payload) VALUES(?, 'pending', ?, ?, ?)`)
@@ -330,6 +343,8 @@ export class TaskStore {
       if (stage.processStartId !== processStartId) throw new Error(`Stage ${stageId} process generation does not match`);
       const activeStage = this.#db.prepare("SELECT id FROM stages WHERE task_id=? AND status='running' LIMIT 1").get(stage.taskId) as { id: string } | undefined;
       if (activeStage) throw new Error(`Task ${stage.taskId} already has a running stage ${activeStage.id}`);
+      const activeAttempt = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? AND status='running' LIMIT 1").get(stage.taskId) as { id: string } | undefined;
+      if (activeAttempt) throw new Error(`Task ${stage.taskId} already has a running attempt ${activeAttempt.id}`);
       if (stage.predecessorStageId) {
         const predecessor = this.getStage(stage.predecessorStageId);
         if (!predecessor || predecessor.taskId !== stage.taskId || predecessor.status === "pending" || predecessor.status === "running") {

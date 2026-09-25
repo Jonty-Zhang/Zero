@@ -8,7 +8,7 @@ import { TaskStore } from '../core/task-store.js';
 import { CodexAdapter } from '../adapters/codex.js';
 import type { AdapterConfig } from '../adapters/base.js';
 import { DshAdapter } from '../adapters/dsh.js';
-import { ZCodeAdapter } from '../adapters/zcode.js';
+import { ZCodeCompositeAdapter } from '../adapters/zcode-composite.js';
 import type { ModelBinding } from '../adapters/types.js';
 import type { Attempt, CheckDefinition, CheckResult, HarnessAdapter, ReviewResult, RouteDecision, TaskEvent, TaskRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
 
@@ -53,7 +53,7 @@ export function createDefaultAdapters(bindings: ModelBinding[]): AdapterMap {
   return {
     codex: createCodexAdapter(bindings),
     dsh: new DshAdapter({ bindings, dshHome: resolve(zeroDataRoot(), 'dsh-home') }),
-    zcode: new ZCodeAdapter({ bindings }),
+    zcode: new ZCodeCompositeAdapter({ bindings }),
   };
 }
 
@@ -205,9 +205,54 @@ async function parseSubmission(raw: unknown, options: ZeroServerOptions): Promis
   const maxRevisions = input.maxRevisions == null ? 2 : Number(input.maxRevisions);
   if (!Number.isInteger(maxRevisions) || maxRevisions < 0 || maxRevisions > 10) throw new HttpError(400, 'maxRevisions 必须在 0 到 10 之间');
   const checks = parseChecks(input.checkCommands);
-  const rawSelection = input.execution;
-  const selection = rawSelection == null ? undefined : validateSelection(rawSelection, await capabilities(options));
+  const capability = await capabilities(options);
+  if (input.executionStages !== undefined) {
+    const global = input.execution == null ? {} : parsePublicSelection(input.execution, 'execution');
+    const stages = validateExecutionStages(input.executionStages, global, capability);
+    const selection = toExecutionSelection(global);
+    return { repoPath, baseRef, prompt, acceptanceCriteria: criteria, maxRevisions, checks,
+      ...(selection ? { selection } : {}), executionStages: stages };
+  }
+  const selection = input.execution == null ? undefined : validateSelection(input.execution, capability);
   return { repoPath, baseRef, prompt, acceptanceCriteria: criteria, maxRevisions, checks, ...(selection ? { selection } : {}) };
+}
+
+function validateExecutionStages(rawStages: unknown, global: Record<string, string>, capability: Awaited<ReturnType<typeof capabilities>>): NonNullable<TaskSubmission['executionStages']> {
+  if (!Array.isArray(rawStages) || rawStages.length < 1 || rawStages.length > 16) throw new HttpError(400, 'executionStages 必须包含 1 到 16 个阶段');
+  return rawStages.map((rawStage, index) => {
+    const stage = parsePublicSelection(rawStage, `executionStages[${index}]`);
+    const merged = { ...global, ...stage };
+    validateAvailableSelection(merged, capability, `executionStages[${index}]`);
+    return stage;
+  });
+}
+
+function parsePublicSelection(raw: unknown, label: string): Record<string, string> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, `${label} 必须是对象`);
+  const input = raw as Record<string, unknown>;
+  const fields = { harnessId: 'harness', modelId: 'model', reasoningEffort: 'reasoningEffort' } as const;
+  for (const key of Object.keys(input)) if (!(key in fields)) throw new HttpError(400, `${label}.${key} 不是支持的执行选项`);
+  const result: Record<string, string> = {};
+  for (const [publicField, internalField] of Object.entries(fields) as Array<[keyof typeof fields, string]>) {
+    const value = nullableString(input[publicField], `${label}.${publicField}`);
+    if (value) result[internalField] = value;
+  }
+  return result;
+}
+
+function validateAvailableSelection(selection: Record<string, string>, capability: Awaited<ReturnType<typeof capabilities>>, label: string): void {
+  const { harness, model, reasoningEffort } = selection;
+  const candidates = capability.bindings.filter(binding => binding.available && (!harness || binding.harnessId === harness) && (!model || binding.modelId === model));
+  if ((harness || model || reasoningEffort) && !candidates.length) throw new HttpError(400, `${label} 没有通过验证的可用 Harness 与模型组合`);
+  if (reasoningEffort && !candidates.some(binding => binding.reasoningEfforts.some((item: { id: string }) => item.id === reasoningEffort))) {
+    throw new HttpError(400, `${label} 的 Harness、模型与思考强度没有已验证的可用组合`);
+  }
+}
+
+function toExecutionSelection(selection: Record<string, string>): NonNullable<TaskSubmission['selection']> | undefined {
+  const { harness, model, reasoningEffort } = selection;
+  if (!harness && !model && !reasoningEffort) return undefined;
+  return { ...(harness ? { harness } : {}), ...(model ? { model } : {}), ...(reasoningEffort ? { reasoningEffort } : {}) };
 }
 
 function validateSelection(raw: unknown, capability: Awaited<ReturnType<typeof capabilities>>): NonNullable<TaskSubmission['selection']> | undefined {

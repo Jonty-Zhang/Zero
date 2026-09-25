@@ -28,6 +28,7 @@ interface WorkerCheckpoint {
   baseCommit: string;
   worktreeFingerprint: string;
   revision: number;
+  executionStageIndex: number;
   revisionBrief: string;
   finalRoute?: RouteDecision;
   finalChecks?: CheckResult[];
@@ -130,6 +131,7 @@ export class TaskWorker {
     let markedDone = false;
     let stage: ResumeStage = "route";
     let revision = 0;
+    let executionStageIndex = 0;
     let revisionBrief = task.prompt;
     let finalRoute: RouteDecision | undefined;
     let finalChecks: CheckResult[] = [];
@@ -165,12 +167,15 @@ export class TaskWorker {
         baseCommit = checkpoint.baseCommit;
         stage = checkpoint.stage;
         revision = checkpoint.revision;
+        executionStageIndex = checkpoint.executionStageIndex ?? 0;
         revisionBrief = checkpoint.revisionBrief;
         finalRoute = checkpoint.finalRoute;
         finalChecks = checkpoint.finalChecks ?? [];
         continuingExecution = stage === "execute";
         if (stage !== "route" && !finalRoute) throw new Error("Quota checkpoint has no execution route");
-        if (finalRoute) this.#validateRoute(task, finalRoute);
+        if (!Number.isSafeInteger(executionStageIndex) || executionStageIndex < 0
+          || executionStageIndex >= (task.executionStages?.length ?? 1)) throw new Error("Quota checkpoint execution stage index is invalid");
+        if (finalRoute) this.#validateRoute(this.#taskForExecutionStage(task, executionStageIndex), finalRoute);
         if (stage === "review" && (!finalChecks.length || finalChecks.some(check => check.status !== "passed"))) {
           throw new Error("Quota checkpoint has no passing validation evidence for review");
         }
@@ -194,13 +199,14 @@ export class TaskWorker {
         task = this.#requireTask(taskId);
         this.#assertLease(taskId, owner, () => leaseLost);
         if (stage === "route") {
+          const routeTask = this.#taskForExecutionStage(task, executionStageIndex);
           const routeAttempt = this.#options.store.createAttempt(taskId, "route", { owner, harness: "codex" });
           activeAttempt = routeAttempt;
           active.adapter = this.#options.adapters.get("codex");
           active.attempt = routeAttempt;
           this.#assertNotCancelled(active);
           try {
-            const route = await this.#options.router.route(task, {
+            const route = await this.#options.router.route(routeTask, {
               attemptId: routeAttempt.id,
               cwd: worktree.path,
               baseCommit,
@@ -208,7 +214,7 @@ export class TaskWorker {
               revision,
               ...(finalRoute ? { previousDecision: finalRoute } : {}),
             });
-            this.#validateRoute(task, route);
+            this.#validateRoute(routeTask, route);
             this.#options.store.saveRoute(route);
             this.#options.store.finishAttempt(routeAttempt.id, {
               status: "succeeded",
@@ -234,11 +240,18 @@ export class TaskWorker {
         const route = finalRoute;
         if (!route) throw new Error("Execution route is missing");
         if (stage === "execute") {
+        const executionStageCount = task.executionStages?.length ?? 1;
+        if (executionStageIndex >= executionStageCount) throw new Error("Execution stage index is outside the submitted stage list");
         const adapter = this.#options.adapters.get(route.harness);
         if (!adapter) throw new Error(`No HarnessAdapter is registered for ${route.harness}`);
         const role = revision === 0 ? "implement" : "revise";
         const inputFingerprint = await this.#options.worktrees.fingerprint(worktree);
         const previousExecutionStage = this.#options.store.stages(taskId).filter(item => item.role === "implement" || item.role === "revise").at(-1);
+        if (executionStageIndex > 0 && (!previousExecutionStage
+          || (!continuingExecution && previousExecutionStage.status !== "succeeded")
+          || !previousExecutionStage.outputFingerprint || previousExecutionStage.outputFingerprint !== inputFingerprint)) {
+          throw new Error("Worktree changed after the preceding execution stage completed; refusing to start another writer");
+        }
         const priorHandoffContext = previousExecutionStage
           ? this.#handoffContextForInput(taskId, previousExecutionStage, baseCommit, inputFingerprint)
           : undefined;
@@ -307,6 +320,19 @@ export class TaskWorker {
 
         const changedPaths = await this.#options.worktrees.changedPaths(worktree);
         this.#assertAllowedPaths(task, changedPaths);
+        if (executionStageIndex + 1 < executionStageCount) {
+          await this.#finishExecutionStage({
+            task, worktree, stage: executionStage, attempt: executionAttempt, route, owner,
+            status: "succeeded", checks: [], summary: `Execution stage ${executionStageIndex + 1} of ${executionStageCount} completed successfully; Zero deferred final validation until all configured execution stages finish.`,
+          });
+          executionStage = undefined;
+          executionAttempt = undefined;
+          executionStageIndex++;
+          finalRoute = undefined;
+          stage = "route";
+          continue;
+        }
+
         const checks = await this.#options.testRunner.run(requiredChecks, worktree.path, { signal: active.controller.signal });
         finalChecks = checks;
         executionChecks = checks;
@@ -328,6 +354,7 @@ export class TaskWorker {
           revisionBrief = brief;
           task = this.#options.store.transition(taskId, "revision", "running", { owner, reason: "starting validation revision" });
           stage = "route";
+          executionStageIndex = 0;
           continue;
         }
 
@@ -391,6 +418,7 @@ export class TaskWorker {
           revisionBrief = brief;
           task = this.#options.store.transition(taskId, "revision", "running", { owner, reason: "starting review revision" });
           stage = "route";
+          executionStageIndex = 0;
           continue;
         }
 
@@ -467,6 +495,7 @@ export class TaskWorker {
             baseCommit,
             worktreeFingerprint: checkpointFingerprint,
             revision,
+            executionStageIndex,
             revisionBrief,
             ...(finalRoute ? { finalRoute } : {}),
             ...(stage === "review" ? { finalChecks } : {}),
@@ -527,6 +556,13 @@ export class TaskWorker {
     const effort = route.effectiveReasoningEffort ?? route.reasoningEffort;
     if (selection?.reasoningEffort && selection.reasoningEffort !== effort) throw new Error("Router changed the task-pinned reasoning effort");
     if (!route.selectionSource || !route.decidedAt) throw new Error("Router omitted selection source or decision time");
+  }
+
+  #taskForExecutionStage(task: TaskRecord, index: number): TaskRecord {
+    const stageSelection = task.executionStages?.[index];
+    if (!stageSelection) return task;
+    const selection = { ...task.selection, ...stageSelection };
+    return { ...task, selection };
   }
 
   #assertAllowedPaths(task: TaskRecord, paths: string[]): void {
@@ -818,6 +854,9 @@ function parseCheckpoint(raw: Record<string, unknown> | undefined): WorkerCheckp
   }
   if (raw.finalRoute !== undefined && (!raw.finalRoute || typeof raw.finalRoute !== "object")) throw new Error("Invalid checkpoint route");
   if (raw.finalChecks !== undefined && !Array.isArray(raw.finalChecks)) throw new Error("Invalid checkpoint checks");
+  if (raw.executionStageIndex !== undefined && (!Number.isSafeInteger(raw.executionStageIndex) || Number(raw.executionStageIndex) < 0)) {
+    throw new Error("Invalid checkpoint execution stage index");
+  }
   return raw as unknown as WorkerCheckpoint;
 }
 

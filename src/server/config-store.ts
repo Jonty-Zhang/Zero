@@ -13,6 +13,22 @@ export interface LocalZeroConfig {
   secretRefs?: Record<string, string>;
 }
 
+export interface ZCodeAppServerVerificationEvidence {
+  verifiedAt: string;
+  cliVersion: string;
+  providerId: string;
+  modelId: string;
+}
+
+export interface ZCodeAppServerNonceProof {
+  nonce: string;
+  echoedNonce: string;
+  /** The one-time app-server verification request completed and its session ended successfully. */
+  sessionEndedSuccessfully: boolean;
+  /** The app-server peer confirmed that it exited after the verification request. */
+  peerExited: boolean;
+}
+
 const EMPTY: LocalZeroConfig = {
   models: [{ id: 'gpt-6-sol', provider: 'openai', modelId: 'gpt-6-sol' }],
   bindings: [],
@@ -105,6 +121,62 @@ export class ConfigStore {
     await this.persist(config);
   }
 
+  async markZCodeAppServerVerified(
+    modelId: string,
+    expectedModel: ModelConfig,
+    evidence: ZCodeAppServerVerificationEvidence,
+    proof: ZCodeAppServerNonceProof,
+  ): Promise<void> {
+    if (!isPinnedCliVersion(evidence.cliVersion)) throw new Error('ZCode CLI version is required to pin a verified app-server binding');
+    if (!isValidTimestamp(evidence.verifiedAt)) throw new Error('ZCode app-server verification timestamp is invalid');
+    if (expectedModel.id !== modelId || !expectedModel.provider.trim() || !expectedModel.modelId.trim()
+      || evidence.providerId !== expectedModel.provider || evidence.modelId !== expectedModel.modelId) {
+      throw new Error('ZCode app-server verification evidence must match the exact provider/model tuple');
+    }
+    if (!proof.nonce.trim() || !proof.echoedNonce.trim() || proof.nonce !== proof.echoedNonce) {
+      throw new Error('ZCode app-server nonce verification did not match');
+    }
+    if (proof.sessionEndedSuccessfully !== true || proof.peerExited !== true) {
+      throw new Error('ZCode app-server verification session must end successfully and the peer must exit');
+    }
+
+    // All checks run before persistence. A rejected proof leaves the existing config bytes untouched.
+    const config = await this.read();
+    const matches = config.models.filter(item => item.id === modelId);
+    if (matches.length !== 1) throw new Error(`Expected exactly one local model ID: ${modelId}`);
+    const model = matches[0]!;
+    if (model.provider !== expectedModel.provider || model.modelId !== expectedModel.modelId) {
+      throw new Error(`Local model ${modelId} changed during ZCode app-server verification; run verification again`);
+    }
+    const key = `zcode:${model.id}`;
+    const binding: Extract<ModelBinding, { selector: 'app_server_existing_desktop' }> = {
+      harness: 'zcode',
+      model,
+      selector: 'app_server_existing_desktop',
+      verified: true,
+      verificationSource: 'smoke_test',
+      verifiedCliVersion: evidence.cliVersion,
+      verificationEvidence: {
+        kind: 'selector_only',
+        verifiedAt: evidence.verifiedAt,
+        providerId: evidence.providerId,
+        modelId: evidence.modelId,
+        cliVersion: evidence.cliVersion,
+      },
+      reasoningEfforts: [],
+    };
+    config.bindings = [...config.bindings.filter(item => !(item.harness === 'zcode' && item.model.id === model.id)), binding];
+    config.verifications[key] = {
+      verifiedAt: evidence.verifiedAt,
+      cliVersion: evidence.cliVersion,
+      requestedModel: model.modelId,
+      exitCode: 0,
+      level: 'selector_only',
+      reasoningEfforts: [],
+    };
+    await this.persist(config);
+  }
+
   async markReasoningEffortVerified(harness: 'codex', modelId: string, effort: ReasoningEffort, cliVersion: string): Promise<void> {
     const config = await this.read();
     const model = config.models.find(item => item.id === modelId || item.modelId === modelId);
@@ -152,3 +224,11 @@ function isAbsoluteConfigDir(path: string): boolean {
 }
 
 function isSupportedZCodeMode(mode: string): boolean { return mode === 'build' || mode === 'yolo'; }
+
+function isPinnedCliVersion(version: string): boolean {
+  return version.trim().length > 0 && version === version.trim() && !/^unknown$/i.test(version) && !/[\r\n\0]/.test(version);
+}
+
+function isValidTimestamp(value: string): boolean {
+  return Number.isFinite(Date.parse(value));
+}

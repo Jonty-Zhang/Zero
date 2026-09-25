@@ -29,6 +29,25 @@ export type ModelBinding =
       verificationSource?: 'smoke_test' | 'manual_config';
       verifiedCliVersion?: string;
       reasoningEfforts?: ReasoningEffort[];
+    }
+  | {
+      harness: 'zcode';
+      model: ModelConfig;
+      selector: 'app_server_existing_desktop';
+      /** Must be pinned to the CLI release whose app-server behavior was verified. */
+      verified: true;
+      verifiedCliVersion: string;
+      verificationSource: 'smoke_test';
+      /** Evidence is selector-only: app-server completion does not identify the actual model. */
+      verificationEvidence: {
+        kind: 'selector_only';
+        verifiedAt: string;
+        providerId: string;
+        modelId: string;
+        cliVersion: string;
+      };
+      /** Only reasoning levels independently checked against the exact model catalog entry. */
+      reasoningEfforts?: ReasoningEffort[];
     };
 
 export interface HarnessCapabilities {

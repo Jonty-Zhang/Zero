@@ -45,9 +45,9 @@ Agent Orchestrator 的 [#3317 设计记录](https://github.com/Untrivial-ai/agen
 
 ## 当前 Zero 与差距
 
-当前 [TaskWorker](../src/orchestrator/worker.ts)已经让路由、执行、测试和返工围绕一个 task worktree 运行；返工保持已有文件。worker 为单次实现或返工写入阶段、关联尝试、工作树指纹和版本化交接，报告也收录这些记录。后续返工或额度恢复会核对紧邻前一执行阶段的交接来源、进程代号和当前工作树指纹，再以有界的不可信资料送入提示；不匹配时排除交接，不代替原任务和 Zero 实测事实。审核前先暂存任务输出，固定 Git tree、完整二进制 diff 与工作树指纹；审核后、提交前、提交后及标记 DONE 前逐次核对，防止晚到的写入混进已审核结果。[Reviewer](../src/orchestrator/reviewer.ts)在独立可信目录启动，从暂存 Git blob 构造有界的源码只读快照，包含未改动的调用方和 manifest；项目中的 `AGENTS.md` 与 `.codex` 在快照里改名为资料，避免自动加载。当前还没有一个任务内 GLM → DeepSeek 这样的多个成功执行阶段。普通进程崩溃后工作树需要人工检查；额度暂停才有校验工作树指纹的恢复路径。
+当前 [TaskWorker](../src/orchestrator/worker.ts)已经让路由、多个有序执行阶段、最终测试、审核和返工围绕一个 task worktree 运行；返工保持已有文件。每个执行阶段都单独路由、写入关联尝试、工作树指纹和版本化交接；下一阶段须核对前驱成功与输出指纹，并确认没有活动尝试。后续阶段或额度恢复会核对紧邻前一执行阶段的交接来源、进程代号和当前工作树指纹，再以有界的不可信资料送入提示；不匹配时排除交接，不代替原任务和 Zero 实测事实。审核前先暂存任务输出，固定 Git tree、完整二进制 diff 与工作树指纹；审核后、提交前、提交后及标记 DONE 前逐次核对，防止晚到的写入混进已审核结果。[Reviewer](../src/orchestrator/reviewer.ts)在独立可信目录启动，从暂存 Git blob 构造有界的源码只读快照，包含未改动的调用方和 manifest；项目中的 `AGENTS.md` 与 `.codex` 在快照里改名为资料，避免自动加载。GLM → DeepSeek 的接力已由 fake Harness 测试覆盖，但本机 ZCode 桌面模型尚未完成真实绑定。普通进程崩溃后工作树仍需人工检查；额度暂停已有校验工作树指纹的恢复路径。
 
-因此，现有一次路由到一次执行再审核的流程是多阶段引擎的最小路径，不能把它称为完整跨 Harness 接力。
+跨 Harness 的调度与文件交接现在有可运行的核心路径；真实模型选择、长任务质量和普通崩溃恢复仍待实机验收。
 
 ## 权威数据与交接契约
 
@@ -74,8 +74,8 @@ SQLite 是任务、阶段、尝试和交接的权威状态；Zero 数据目录�
 ## 实施顺序和验收
 
 1. **验证接入事实。** 官方 0.16.9 源码表明 `sendText` 可按 `providerId/modelId` 选择模型；Zero 必须同时传 `modelExecution.selectionScope: execution`，使本轮选择不写入会话默认模型。仍需在隔离任务工作区验证本机协议调用、思考等级和退出/取消行为。不得移动或改写用户现有 ZCode 配置。
-2. **接通阶段与交接数据。** 可迁移的 stage/attempt/handoff 表、版本化 schema，以及单次实现/返工的 worker 阶段与交接记录已建立；下一执行尝试现在可读取来源与工作树状态均匹配的交接。下一步把路由、审核纳入阶段记录，并支持 GLM → DeepSeek 等多个成功执行阶段。
-3. **实现串行接力。** 统一工作区版本采集、进程停止确认、阶段输入构造、降级交接和额度等待后恢复；用不同 Harness 的真实任务验证文件与上下文接续。
+2. **接通阶段与交接数据。** stage/attempt/handoff 表、版本化 schema、有序多执行阶段，以及按来源与工作树状态核对的交接消费已实现；路由与审核尚未全部纳入同一种阶段记录。
+3. **验证串行接力。** fake Harness 已覆盖同一 worktree 的两模型接续、额度暂停恢复与迟到写入拦截；真实 GLM → DeepSeek、进程退出保证和普通崩溃恢复尚待验证。
 4. **加强审核。** 有界 Git index 源码快照和提交一致性门禁已实现并由 FakeCodex/本地 Git 测试覆盖；仍需以真实 Codex CLI 验证读取和审核结果，并扩展完整测试证据的按需访问。
 5. **项目级集成。** 多任务项目增加项目分支、依赖门禁、已完成任务的集成与冲突处理；并行子任务独立 worktree，不能直接共享一个写入目录。
 
@@ -87,7 +87,7 @@ SQLite 是任务、阶段、尝试和交接的权威状态；Zero 数据目录�
 - ZCode 的会话协议可能发出权限或用户输入反向请求；仅等待 `turn.completed` 会让无人值守任务一直停住。接入进程必须按 RPC `id` 回应或明确拒绝，识别订阅快照和增量中的待处理交互，无法安全自动处理时记录阻塞原因并停止该阶段。不可把发送回执当作完成。协议 `session/close` 会删除产品会话；正常收尾应关闭进程资源并保留会话历史。
 - 本机审查的 ZCode 版本仍支持 `session/send`，但其源码已将它标为兼容旧客户端的入口，主路径转向 `v4/command` 的 `sendText`。当前未接路由的原型只验证旧协议的事件和生命周期；正式绑定需核对并优先验证 v4 的模型选择、回执、交互与完成事件，或明确锁定已验证版本。
 - [ZCode v4 命令 schema](https://github.com/zai-org/ZCode/blob/main/packages/shared/src/zcode-protocol-v4/command.ts)允许每条 `sendText` 显式提交 `{providerId,modelId,options.reasoningLevel}`；[执行入口](https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/commands/handlers/session-flow.ts)把它固定到本次输入。因此 Zero 应按任务阶段逐条固定模型，并核对实际回合事件。`createSession.config` 应用失败时[会退回会话默认配置](https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/commands/handlers/session-mgmt.ts)，不能只凭创建会话成功或 ACK 宣称指定模型已执行。以上是上游源码行为，仍须在本机已安装版本做隔离验证。
-- 本机桌面包内置的 CLI 版本为 0.16.9，未加入 PATH；只读核对发现同版本源码的 legacy `session/create` 与 v4 `sendText` 共用 app-server 会话。原型可先用 legacy 创建会话与事件游标、v4 每回合显式选模型，按 `commandId`/`inputId` 对齐 `turn.completed`。这个混合桥尚未启动本机 app-server 验证，不能注册为可用绑定。v4 `stop` 应带当前观测到的 `expectedForegroundExecutionId`，防止迟到的停止命令误杀下一回合。
+- 本机桌面包内置的 CLI 版本为 0.16.9，未加入 PATH；只读核对发现同版本源码的 legacy `session/create` 与 v4 `sendText` 共用 app-server 会话。现有桥用 legacy 创建会话与事件游标、v4 每回合显式选模型，按 `commandId`/`inputId` 对齐 `turn.completed`，并以 fake peer 测试。这条路径尚未通过本机现有桌面提供方的真实 nonce 验证，不能注册为可用绑定。v4 `stop` 带当前观测到的 `expectedForegroundExecutionId`，防止迟到的停止命令误杀下一回合。
 - ZCode 的反向交互包含权限请求和 AskUserQuestion；[同版本交互注册表](https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/interaction-registry.ts)默认会在 AskUserQuestion 到期时自动接受空答案。Zero 独占的 app-server 进程必须先确认 `workspace/updateInteractionPreferences(false)` 生效，并对 `session/requestRuntimePreferences` 明确返回关闭自动收口；该 workspace 命令只改变当前进程的运行偏好，不写用户持久设置。订阅 ACK 后必须等待匹配的 `v4/conversation/frame` 快照，再检查 `pendingInteractions` 及后续 `state.updated` 增量。发现交互时停止该回合并记录阻塞，不能自动允许写入或代填答案；缺少当前 `foregroundExecutionId` 时不可发送无保护的 legacy `session/stop`，需将会话隔离到进程退出并确认工作树状态。
 - `sendText.payload.modelSelection` 单独使用会让该选择进入会话状态；要让每个任务回合独立选 GLM/DeepSeek 且不改变会话默认值，必须加 `modelExecution: {selectionScope: 'execution'}`。0.16.9 源码中这一范围跳过 `setSessionModelSelection` 与 `persistRuntimeModelSelection`。Zero 还应设 `memoryExtraction: 'skip'` 关闭本轮自动 Project Memory 提取，设 `subagents: {foregroundModel: 'submission', background: 'deny'}` 让前景子 Agent 继承本轮模型并阻止脱离父回合的后台子 Agent；这些字段不能被解释为禁止所有用户数据写入。真实模型执行及模型身份仍需冒烟测试，成功但没有实际模型回报时只标记 `selector_only`。
 - Codex 审核的源码快照已在本地 FakeCodex 测试验证路径和字节一致性，真实 Codex CLI 的阅读能力与质量仍需实测；若大项目超过快照边界，需要设计受限按需读取通道，而不能静默遗漏文件。

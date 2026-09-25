@@ -7,8 +7,12 @@ import type { RunRequest, RunResult } from '../domain/types.js';
 import type { ModelBinding } from '../adapters/types.js';
 import type { DshAdapter } from '../adapters/dsh.js';
 import type { ZCodeAdapter } from '../adapters/zcode.js';
+import type { ZCodeProtocolPeer } from '../adapters/zcode-protocol-session.js';
+import type { ZCodeAppServerAdapterConfig } from '../adapters/zcode-app-server-adapter.js';
+import type { ZCodeAppServerPeerOptions } from '../adapters/zcode-app-server-peer.js';
+import { ZCodeAppServerAdapter } from '../adapters/zcode-app-server-adapter.js';
 import { ConfigStore } from './config-store.js';
-import { runDshBindingVerification, runZCodeBindingVerification } from './main.js';
+import { runDshBindingVerification, runZCodeBindingVerification, runZCodeDesktopBindingVerification } from './main.js';
 
 const model = { id: 'deepseek-main', provider: 'deepseek-official', modelId: 'deepseek-flash' };
 
@@ -195,6 +199,136 @@ test('ZCode enrollment rejects unsupported modes, outside paths and incorrect mo
     await writeFile(join(f.configDir, '.zcode', 'cli', 'config.json'), JSON.stringify({ model: { main: 'zai/glm-5.3' } }), 'utf8');
     await assert.rejects(runZCodeBindingVerification(zcodeModel.id, f.configDir, 'build', { config: f.config, dataRoot: f.root, createAdapter }), /must select exactly zai\/glm-5/);
     assert.equal(constructed, false);
+    assert.equal(await readFile(f.config.path, 'utf8'), f.initialBytes);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+function fakeDesktopProbe(version: () => string, observedArgs: string[]) {
+  return (config: ZCodeAppServerAdapterConfig) => {
+    assert.deepEqual(config.bindings, [], 'desktop enrollment must probe with no configured bindings');
+    return new ZCodeAppServerAdapter({
+      ...config,
+      runProbeCommand: async args => {
+        observedArgs.push(args.join(' '));
+        if (args.length !== 1 || !['--version', '--help'].includes(args[0]!)) return { code: 1, stdout: '', stderr: '' };
+        return args[0] === '--version'
+          ? { code: 0, stdout: version(), stderr: '' }
+          : { code: 0, stdout: 'ZCode app-server', stderr: '' };
+      },
+    });
+  };
+}
+
+function fakeDesktopPeer(responseOverride?: string, closeError?: Error) {
+  let inputId = '';
+  let response = '';
+  let eventRead = false;
+  let closeCount = 0;
+  const peer: ZCodeProtocolPeer = {
+    async request(method, params) {
+      if (method === 'session/create') return {
+        session: { sessionId: 'fake-desktop-session' },
+        settings: { model: { available: [{ ref: { providerId: zcodeModel.provider, modelId: zcodeModel.modelId } }] } },
+      };
+      if (method === 'v4/command') {
+        const payload = params.payload as Record<string, unknown>;
+        if (params.type === 'sendText') {
+          inputId = String(params.commandId);
+          const prompt = String(payload.text);
+          const nonce = /ZERO_ZCODE_DESKTOP_BINDING_VERIFIED_[A-Za-z0-9-]+/.exec(prompt)?.[0];
+          assert.ok(nonce, 'session prompt must contain a cryptographic nonce');
+          response = responseOverride ?? nonce;
+          return { commandId: params.commandId, status: 'accepted', result: { type: 'inputAccepted', inputId, delivery: 'startNow' } };
+        }
+      }
+      if (method === 'session/events') {
+        assert.equal(params.afterSeq, 0);
+        if (eventRead) return { events: [] };
+        eventRead = true;
+        return { events: [
+          { seq: 1, type: 'turn.started', turnId: 'fake-turn', payload: { inputId, foregroundExecutionId: 'fake-execution' } },
+          { seq: 2, type: 'turn.completed', turnId: 'fake-turn', payload: { resultType: 'success', response } },
+        ] };
+      }
+      throw new Error(`Unexpected fake protocol method ${method}`);
+    },
+    async readPendingInteractions() { return []; },
+    async close() { closeCount++; if (closeError) throw closeError; },
+  };
+  return { peer, get closeCount() { return closeCount; } };
+}
+
+function desktopEnrollmentOptions(f: Awaited<ReturnType<typeof zcodeFixture>>, overrides: {
+  peer?: ReturnType<typeof fakeDesktopPeer>;
+  version?: () => string;
+} = {}) {
+  const peer = overrides.peer ?? fakeDesktopPeer();
+  const version = overrides.version ?? (() => 'zcode-desktop-test-2');
+  const probeArgs: string[] = [];
+  return {
+    config: f.config,
+    dataRoot: f.root,
+    zcodeEntry: join(f.root, 'zcode.js'),
+    createAdapter: fakeDesktopProbe(version, probeArgs),
+    launchPeer: async (options: ZCodeAppServerPeerOptions) => {
+      assert.equal(options.entry, join(f.root, 'zcode.js'));
+      assert.equal(options.profileMode, 'existing-desktop');
+      assert.ok(options.taskWorktree.startsWith(join(f.root, 'verification')));
+      return peer.peer;
+    },
+    peer,
+    probeArgs,
+  };
+}
+
+test('ZCode existing-desktop enrollment proves exact nonce, closes peer and replaces binding only after both empty-binding probes', async () => {
+  const f = await zcodeFixture();
+  const options = desktopEnrollmentOptions(f);
+  try {
+    await runZCodeDesktopBindingVerification(zcodeModel.id, options);
+    assert.equal(options.peer.closeCount, 1);
+    assert.deepEqual(options.probeArgs, ['--version', '--help', '--version', '--help']);
+    const config = await f.config.read();
+    assert.deepEqual(config.bindings.find(item => item.harness === 'zcode' && item.model.id === zcodeModel.id), {
+      harness: 'zcode', model: zcodeModel, selector: 'app_server_existing_desktop', verified: true,
+      verificationSource: 'smoke_test', verifiedCliVersion: 'zcode-desktop-test-2',
+      verificationEvidence: {
+        kind: 'selector_only', providerId: zcodeModel.provider, modelId: zcodeModel.modelId,
+        cliVersion: 'zcode-desktop-test-2', verifiedAt: config.verifications['zcode:glm-main']?.verifiedAt,
+      }, reasoningEfforts: [],
+    });
+    assert.equal(config.verifications['zcode:glm-main']?.level, 'selector_only');
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('ZCode existing-desktop enrollment rejects a bad nonce without changing config', async () => {
+  const f = await zcodeFixture();
+  const options = desktopEnrollmentOptions(f, { peer: fakeDesktopPeer('wrong nonce') });
+  try {
+    await assert.rejects(runZCodeDesktopBindingVerification(zcodeModel.id, options), /nonce verification failed/);
+    assert.equal(options.peer.closeCount, 1);
+    assert.equal(await readFile(f.config.path, 'utf8'), f.initialBytes);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('ZCode existing-desktop enrollment rejects failed peer close and preserves prior binding bytes', async () => {
+  const f = await zcodeFixture();
+  const options = desktopEnrollmentOptions(f, { peer: fakeDesktopPeer(undefined, new Error('exit was not confirmed')) });
+  try {
+    await assert.rejects(runZCodeDesktopBindingVerification(zcodeModel.id, options));
+    assert.equal(options.peer.closeCount, 1);
+    assert.equal(await readFile(f.config.path, 'utf8'), f.initialBytes);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('ZCode existing-desktop enrollment rejects a post-session CLI version change', async () => {
+  const f = await zcodeFixture();
+  let probeCount = 0;
+  const options = desktopEnrollmentOptions(f, { version: () => (++probeCount === 1 ? 'zcode-desktop-test-2' : 'zcode-desktop-test-3') });
+  try {
+    await assert.rejects(runZCodeDesktopBindingVerification(zcodeModel.id, options), /probe changed/);
+    assert.equal(probeCount, 2);
+    assert.equal(options.peer.closeCount, 1);
     assert.equal(await readFile(f.config.path, 'utf8'), f.initialBytes);
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });

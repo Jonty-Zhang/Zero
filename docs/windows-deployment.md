@@ -1,6 +1,6 @@
 # Windows 无人值守部署
 
-本方案使用 Windows Task Scheduler 在系统启动时运行 Zero 服务。安装脚本默认只显示配置并退出；只有明确传入 `-Install` 才会注册任务。卸载仅移除计划任务，保留数据库、配置、worktree、报告和日志。
+本方案使用 Windows Task Scheduler 在系统启动时运行 Zero 服务。安装脚本默认只显示配置并退出；只有明确传入 `-Install` 才会注册任务。安装需要显式提供已构建的原生 guardian 可执行文件绝对路径。卸载仅移除计划任务，保留数据库、配置、worktree、报告和日志。
 
 ## 运行账户与凭据
 
@@ -26,11 +26,15 @@ node .\dist\cli.js help
 
 安装脚本要求 Node.js 24 或更高版本，并要求 `dist\cli.js` 已构建。`-NodePath` 可显式指定 `node.exe` 的绝对路径；建议使用机器范围安装位置，例如 `C:\Program Files\nodejs\node.exe`。计划任务不依赖交互式终端里的当前目录或 PATH 来启动 Node。任务动作使用 Windows PowerShell 的 `RemoteSigned` 策略，不会覆盖机器策略；本地 `run-zero.ps1` 必须可按本机策略执行。如果从带有 Internet Zone 标记的 ZIP 或浏览器下载目录运行，先审阅文件来源，并按组织签名/解锁流程处理；不要把执行策略改成全局 `Unrestricted` 或 `Bypass`。
 
+`native\windows-guardian\guardian.cpp` 需由可信的 Windows C++ 构建环境编译，并将生成的 `guardian.exe` 放在发布目录中。公开 CI 会保留通过进程树测试的 `zero-windows-guardian` 构建产物；安装时用 `-GuardianPath` 指向其绝对路径。脚本仅检查路径、`.exe` 扩展名和 PE 文件头，**不验证代码签名或构建来源**。示例发布位置为 `C:\Program Files\Zero\native\windows-guardian\guardian.exe`。
+
 先执行 dry run 查看路径，不会注册任务或写系统配置：
 
 ```powershell
 .\scripts\install-windows-task.ps1 -Account 'COMPUTER\zero-runner'
 ```
+
+Dry run 会显示规范化后的 Zero 数据目录和锁 ID 长度，不会注册任务。锁 ID 是规范化绝对数据目录（分隔符统一、去掉末尾分隔符、按 Windows 不区分大小写规则转小写）的 UTF-8 SHA-256 小写十六进制值，长度固定为 64；guardian 的 `--lock-id` 参数不包含原始数据目录。
 
 ## 安装
 
@@ -41,6 +45,7 @@ node .\dist\cli.js help
   -Install `
   -Account 'COMPUTER\zero-runner' `
   -NodePath 'C:\Program Files\nodejs\node.exe' `
+  -GuardianPath 'C:\Program Files\Zero\native\windows-guardian\guardian.exe' `
   -CodexExe (Join-Path $env:USERPROFILE 'AppData\Local\Programs\Codex\codex.exe') `
   -DshEntry '<absolute path to the DSH JavaScript CLI entry>' `
   -ZcodeEntry '<absolute path to the ZCode JavaScript CLI entry>' `
@@ -52,11 +57,14 @@ node .\dist\cli.js help
 
 脚本先检查任务名不存在、Node 版本、账户 SID、管理员组和目录位置，再通过系统凭据对话框取得密码并注册一个有限权限的开机任务。它不会立即启动服务。默认配置如下：
 
+任务动作的可执行文件是 `guardian.exe` 本身，Task Scheduler 会跟踪 guardian 进程。guardian 在自身 Job 之外运行，直接创建其受监督子进程 `powershell.exe -File run-zero.ps1`；PowerShell 随后启动 Node。guardian 使用上述数据目录哈希作为 `--lock-id`，阻止同一账户、同一数据目录的重复服务实例。Task Scheduler 动作参数仍会包含部署路径和可选无凭据代理 URL；不要在代理 URL 或路径中放凭据。代理值不会由安装脚本的 dry run 或运行日志打印。
+
 | 设置 | 默认值或行为 |
 |---|---|
 | 触发器 | 系统启动时 |
 | 任务账户 | 必须显式指定，且是当前登录的标准账户 |
 | Node.js | 已验证的 Node.js 24+ 绝对路径 |
+| Guardian | 必须通过 `-GuardianPath` 指定已构建的 guardian.exe 绝对路径；脚本检查 PE 文件头 |
 | Codex CLI | 可选；用 `-CodexExe` 指定绝对 `codex.exe` 路径，启动器会设置 `ZERO_CODEX_EXE` |
 | DSH CLI | 可选；用 `-DshEntry` 指定绝对 `.js`、`.mjs` 或 `.cjs` CLI 入口，启动器会设置 `ZERO_DSH_ENTRY`。该路径会作为任务动作参数保存在 Task Scheduler 中；不要把凭据或其他秘密放进路径或参数。未指定时保留任务进程环境中已有的 `ZERO_DSH_ENTRY`。 |
 | ZCode CLI | 可选；用 `-ZcodeEntry` 指定绝对 `.js`、`.mjs` 或 `.cjs` CLI 入口，启动器会设置 `ZERO_ZCODE_ENTRY`。该路径同样保存在 Task Scheduler 动作参数中，不应包含凭据。 |

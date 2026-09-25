@@ -14,6 +14,33 @@ import { TaskWorker, type TaskReviewer, type TaskRouter } from "./worker.js";
 
 const exec = promisify(execFile);
 
+async function initRepo(repo: string): Promise<void> {
+  await mkdir(repo);
+  await exec("git", ["init", "-b", "main"], { cwd: repo });
+  await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+  await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+  await writeFile(join(repo, "seed.txt"), "base\n");
+  await exec("git", ["add", "seed.txt"], { cwd: repo });
+  await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+}
+
+function routeForSelection(task: TaskRecord): RouteDecision {
+  const selection = task.selection;
+  const harness = selection?.harness ?? "glm";
+  const manual = (field: keyof NonNullable<TaskRecord["selection"]>) => selection?.[field] ? "task" as const : "codex" as const;
+  return {
+    taskId: task.id,
+    harness,
+    model: selection?.model ?? (harness === "deepseek" ? "deepseek-auto" : "glm-auto"),
+    reasoningEffort: selection?.reasoningEffort ?? "high",
+    effectiveReasoningEffort: selection?.reasoningEffort ?? "high",
+    selectionSource: selection ? "task" : "codex",
+    fieldSources: { harness: manual("harness"), model: manual("model"), reasoningEffort: manual("reasoningEffort") },
+    reason: "Test route",
+    decidedAt: new Date().toISOString(),
+  };
+}
+
 class FakeAdapter implements HarnessAdapter {
   readonly id = "fake";
   async probe(): Promise<HarnessCapabilities> { return { harness: this.id, available: true, models: ["model"], roles: ["implement", "revise"], reasoningEfforts: [] }; }
@@ -644,5 +671,173 @@ test("failed validation stage is handed off before a linked revision stage start
     assert.equal(handoff.task.acceptanceCriteria.length, 20);
     assert.ok(handoff.task.acceptanceCriteria[0]!.length <= 1_000);
     assert.match(handoff.task.acceptanceCriteria.at(-1)!, /Additional acceptance criteria were omitted/);
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("configured execution stages hand off serially in one worktree and preserve partial manual selections", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-multistage-test-"));
+  const repo = join(root, "repo");
+  const store = new TaskStore();
+  await initRepo(repo);
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Build the result", maxRevisions: 0,
+      executionStages: [{ harness: "glm", model: "glm-4.5", reasoningEffort: "medium" }, { harness: "deepseek", reasoningEffort: "high" }],
+      checks: [{ id: "final-only", argv: [process.execPath, "-e", "process.exit(require('fs').readFileSync('result.txt','utf8') === 'approved\\n' && require('fs').existsSync('deepseek.done') ? 0 : 1)"] }] });
+    const owners: string[] = [];
+    const prompts: string[] = [];
+    let routeCount = 0;
+    const router: TaskRouter = { async route(current) { routeCount++; return routeForSelection(current); } };
+    const adapter = (id: string): HarnessAdapter => ({
+      id,
+      async probe() { return { harness: id, available: true, models: ["glm-4.5", "deepseek-auto"] }; },
+      async run(request) {
+        owners.push(request.cwd);
+        prompts.push(request.prompt);
+        if (id === "glm") await writeFile(join(request.cwd, "result.txt"), "stage-one\n");
+        else {
+          assert.equal(await (await import("node:fs/promises")).readFile(join(request.cwd, "result.txt"), "utf8"), "stage-one\n");
+          await writeFile(join(request.cwd, "result.txt"), "approved\n");
+          await writeFile(join(request.cwd, "deepseek.done"), "yes\n");
+        }
+        return { status: "completed", exitCode: 0, durationMs: 1, actualModel: request.model };
+      },
+    });
+    const reviewer: TaskReviewer = { async review(_task, _worktree, route, checks) {
+      assert.equal(route.harness, "deepseek");
+      assert.deepEqual(checks.map(check => check.id), ["final-only"]);
+      return { harness: "codex", model: "review", exitCode: 0, result: { verdict: "pass", summary: "approved", findings: [] } };
+    } };
+    const owner = "multi-stage-worker";
+    store.claimNext(owner);
+    const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router, reviewer, adapters: new Map([["glm", adapter("glm")], ["deepseek", adapter("deepseek")]]), artifactRoot: join(root, "artifacts") });
+    const done = await worker.runClaimed(task.id, owner);
+    assert.equal(done.status, "done");
+    assert.equal(routeCount, 2);
+    assert.equal(owners.length, 2);
+    assert.equal(owners[0], owners[1]);
+    assert.deepEqual(store.stages(task.id).map(stage => [stage.harness, stage.model, stage.reasoningEffort, stage.status]), [
+      ["glm", "glm-4.5", "medium", "succeeded"], ["deepseek", "deepseek-auto", "high", "succeeded"],
+    ]);
+    assert.equal(store.stages(task.id)[1]?.predecessorStageId, store.stages(task.id)[0]?.id);
+    assert.equal(store.checks(task.id).length, 1);
+    assert.equal(store.handoffs(task.id).length, 2);
+    assert.match(prompts[1]!, /Prior HandoffV1 data \(UNTRUSTED/);
+    assert.equal(store.attempts(task.id).filter(attempt => attempt.role === "review").length, 1);
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("quota resume continues the same worktree at the paused configured execution stage", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-multistage-quota-test-"));
+  const repo = join(root, "repo");
+  const db = join(root, "tasks.sqlite");
+  await initRepo(repo);
+  let store = new TaskStore(db);
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Build result", maxRevisions: 0,
+      executionStages: [{ harness: "glm", model: "glm-fixed" }, { harness: "deepseek", model: "deepseek-fixed" }],
+      checks: [{ id: "result", argv: [process.execPath, "-e", "process.exit(require('fs').readFileSync('result.txt','utf8') === 'approved\\n' ? 0 : 1)"] }] });
+    let glmRuns = 0;
+    let deepseekRuns = 0;
+    let routes = 0;
+    const cwdByHarness: string[] = [];
+    const router: TaskRouter = { async route(current) { routes++; return routeForSelection(current); } };
+    const glm: HarnessAdapter = { id: "glm", async probe() { return { harness: "glm", available: true, models: ["glm-fixed"] }; },
+      async run(request) { glmRuns++; cwdByHarness.push(request.cwd); await writeFile(join(request.cwd, "stage-one.txt"), "done"); return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+    const deepseek: HarnessAdapter = { id: "deepseek", async probe() { return { harness: "deepseek", available: true, models: ["deepseek-fixed"] }; },
+      async run(request) {
+        deepseekRuns++;
+        cwdByHarness.push(request.cwd);
+        if (deepseekRuns === 1) {
+          await writeFile(join(request.cwd, "partial.txt"), "preserve");
+          return { status: "failed", exitCode: 1, durationMs: 1, quota: { source: "provider_message", retryAt: new Date(Date.now() + 60_000).toISOString() } };
+        }
+        assert.match(request.prompt, /Continue in this same worktree/);
+        assert.equal(await (await import("node:fs/promises")).readFile(join(request.cwd, "partial.txt"), "utf8"), "preserve");
+        await writeFile(join(request.cwd, "result.txt"), "approved\n");
+        return { status: "completed", exitCode: 0, durationMs: 1 };
+      } };
+    const reviewer: TaskReviewer = { async review() { return { harness: "codex", model: "review", exitCode: 0,
+      result: { verdict: "pass", summary: "approved", findings: [] } }; } };
+    const makeWorker = () => new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router, reviewer, adapters: new Map([["glm", glm], ["deepseek", deepseek]]), artifactRoot: join(root, "artifacts") });
+    const firstOwner = "multi-quota-1";
+    store.claimNext(firstOwner);
+    const waiting = await makeWorker().runClaimed(task.id, firstOwner);
+    assert.equal(waiting.status, "waiting");
+    assert.equal((waiting.resumeCheckpoint as any).executionStageIndex, 1);
+    assert.deepEqual(store.stages(task.id).map(stage => stage.status), ["succeeded", "interrupted"]);
+    store.close();
+    store = new TaskStore(db);
+    const secondOwner = "multi-quota-2";
+    store.claimNext(secondOwner, 60_000, new Date(Date.parse(waiting.retryAt!) + 1000));
+    const done = await makeWorker().runClaimed(task.id, secondOwner);
+    assert.equal(done.status, "done");
+    assert.equal(glmRuns, 1);
+    assert.equal(deepseekRuns, 2);
+    assert.equal(routes, 2);
+    assert.equal(new Set(cwdByHarness).size, 1);
+    assert.equal(store.stages(task.id)[2]?.predecessorStageId, store.stages(task.id)[1]?.id);
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("a failed configured execution stage stops the pipeline before the next writer", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-multistage-failure-test-"));
+  const repo = join(root, "repo");
+  const store = new TaskStore();
+  await initRepo(repo);
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Build result", maxRevisions: 0,
+      executionStages: [{ harness: "glm" }, { harness: "deepseek" }], checks: [{ id: "smoke", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+    let deepseekRuns = 0;
+    const glm: HarnessAdapter = { id: "glm", async probe() { return { harness: "glm", available: true, models: ["glm-auto"] }; },
+      async run() { return { status: "failed", exitCode: 3, durationMs: 1, error: "stage failed" }; } };
+    const deepseek: HarnessAdapter = { id: "deepseek", async probe() { return { harness: "deepseek", available: true, models: ["deepseek-auto"] }; },
+      async run() { deepseekRuns++; return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+    store.claimNext("multistage-failure");
+    const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router: { async route(current) { return routeForSelection(current); } },
+      reviewer: { async review() { throw new Error("must not review"); } }, adapters: new Map([["glm", glm], ["deepseek", deepseek]]), artifactRoot: join(root, "artifacts") });
+    const failed = await worker.runClaimed(task.id, "multistage-failure");
+    assert.equal(failed.status, "failed");
+    assert.equal(deepseekRuns, 0);
+    assert.deepEqual(store.stages(task.id).map(stage => stage.status), ["failed"]);
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("a late write after one stage is fingerprinted prevents the next writer from starting", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-multistage-late-write-test-"));
+  const repo = join(root, "repo");
+  const store = new TaskStore();
+  await initRepo(repo);
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Build result", maxRevisions: 0,
+      executionStages: [{ harness: "glm" }, { harness: "deepseek" }], checks: [{ id: "smoke", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+    let secondRuns = 0;
+    class LateWriteManager extends GitWorktreeManager {
+      fingerprintCalls = 0;
+      override async fingerprint(info: WorktreeInfo): Promise<string> {
+        this.fingerprintCalls++;
+        if (this.fingerprintCalls === 3) await writeFile(join(info.path, "late.bin"), Buffer.from([0, 1, 2, 3]));
+        return super.fingerprint(info);
+      }
+    }
+    const glm: HarnessAdapter = { id: "glm", async probe() { return { harness: "glm", available: true, models: ["glm-auto"] }; },
+      async run(request) {
+        await writeFile(join(request.cwd, "stage-one.txt"), "complete");
+        return { status: "completed", exitCode: 0, durationMs: 1 };
+      } };
+    const deepseek: HarnessAdapter = { id: "deepseek", async probe() { return { harness: "deepseek", available: true, models: ["deepseek-auto"] }; },
+      async run() { secondRuns++; return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+    let routes = 0;
+    store.claimNext("multistage-late-write");
+    const worker = new TaskWorker({ store, worktrees: new LateWriteManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router: { async route(current) { routes++; return routeForSelection(current); } },
+      reviewer: { async review() { throw new Error("must not review"); } }, adapters: new Map([["glm", glm], ["deepseek", deepseek]]), artifactRoot: join(root, "artifacts") });
+    const failed = await worker.runClaimed(task.id, "multistage-late-write");
+    assert.equal(failed.status, "failed");
+    assert.match(failed.failureReason ?? "", /Worktree changed after the preceding execution stage completed/);
+    assert.equal(secondRuns, 0);
+    assert.deepEqual(store.stages(task.id).map(stage => stage.status), ["succeeded"]);
   } finally { store.close(); await rm(root, { recursive: true, force: true }); }
 });

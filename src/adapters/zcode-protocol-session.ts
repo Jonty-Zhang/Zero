@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { classifyQuota, type QuotaSignal } from '../core/quota.js';
 
 /**
  * Experimental, deliberately unbound ZCode app-server bridge.
@@ -35,6 +36,17 @@ export interface ZCodeProtocolSessionResult {
   requestedModel: ZCodeProtocolModel;
   modelVerification: 'selector_only';
   status: 'completed';
+}
+
+/** Internal signal raised only for a classified provider turn.failed event. */
+export class ZCodeQuotaError extends Error {
+  readonly quota: QuotaSignal;
+
+  constructor(quota: QuotaSignal) {
+    super('ZCode model usage limit reached');
+    this.name = 'ZCodeQuotaError';
+    this.quota = quota;
+  }
 }
 
 const METHODS = {
@@ -250,7 +262,10 @@ export async function runZCodeProtocolSession(
           const failure = payload?.error && typeof payload.error === 'object' && !Array.isArray(payload.error)
             ? asRecord(payload.error)
             : undefined;
-          throw new Error(nonEmptyString(failure?.message) ?? 'ZCode model turn failed');
+          const failureMessage = nonEmptyString(failure?.message);
+          const quota = failureMessage ? classifyQuota(failureMessage) : undefined;
+          if (quota) throw new ZCodeQuotaError(quota);
+          throw new Error(failureMessage ?? 'ZCode model turn failed');
         }
         if (event.type === 'turn.completed') {
           turnTerminal = true;
@@ -269,6 +284,9 @@ export async function runZCodeProtocolSession(
       await delay(request.pollIntervalMs ?? 250, request.signal);
     }
   } catch (error) {
+    // Preserve the typed quota signal for the adapter. The finally block below
+    // must still close the peer successfully before this can reach the caller.
+    if (error instanceof ZCodeQuotaError && turnTerminal) throw error;
     let message = safeErrorMessage(error);
     if (sent && !turnTerminal) {
       const stopError = await stop();
