@@ -375,6 +375,15 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
     assert.equal(store.checks(task.id).length, 2);
     assert.equal(store.reviewPackages(task.id).length, 2);
     assert.deepEqual(store.reviewPackages(task.id).map(item => item.expectedCheckIds), [["result-check"], ["result-check"]]);
+    const packageVerdicts = store.packageReviewVerdicts(task.id);
+    assert.equal(packageVerdicts.length, 2);
+    assert.deepEqual(packageVerdicts.map(item => item.packageId), store.reviewPackages(task.id).map(item => item.id));
+    assert.ok(packageVerdicts.every(verdict => {
+      const attempt = attempts.find(candidate => candidate.id === verdict.attemptId);
+      return attempt?.status === "succeeded" && attempt.model === "review-model"
+        && attempt.metadata?.packageId === verdict.packageId
+        && attempt.metadata?.generationId === verdict.generationId;
+    }));
     assert.deepEqual(checkRunsFor(store, task.id).map(item => item.status), ["completed", "completed"]);
     assert.ok(checkRunsFor(store, task.id).every(item => store.checkRunResults(item.id).every(check => check.status === "passed")));
     const executionStages = store.stages(task.id);
@@ -494,6 +503,35 @@ test("review package creation failure closes the check run and never calls Revie
     assert.match(checkRuns[0]?.terminalReason ?? "", /Review package creation failed/);
     assert.deepEqual(store.checkRunResults(checkRuns[0]!.id).map(check => check.id), ["passed-check"]);
   } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("review snapshot mutation and failed reviewer process never persist a passing verdict", async () => {
+  for (const scenario of ["mutated-snapshot", "failed-process"] as const) {
+    const root = await mkdtemp(join(process.cwd(), `.zero-worker-review-integrity-${scenario}-`));
+    const repo = join(root, "repo");
+    const store = new TaskStore();
+    try {
+      await initRepo(repo);
+      const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create result.txt", maxRevisions: 0,
+        checks: [{ id: "pass", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+      const owner = `review-integrity-${scenario}`;
+      assert.equal(store.claimNext(owner)?.id, task.id);
+      const adapter: HarnessAdapter = { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+        async run(request) { await writeFile(join(request.cwd, "result.txt"), "approved\n"); return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+      const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")), testRunner: new TestRunner(),
+        router: { async route(current) { return routeFor(current); } },
+        reviewer: { async review(_task, worktree) {
+          if (scenario === "mutated-snapshot") await writeFile(join(worktree.path, "result.txt"), "changed after review snapshot\n");
+          return { harness: "codex", model: "review-model", exitCode: scenario === "failed-process" ? 1 : 0,
+            result: { verdict: "pass", summary: "pass", findings: [] } };
+        } }, adapters: new Map([["fake", adapter]]), artifactRoot: join(root, "artifacts") });
+      const result = await worker.runClaimed(task.id, owner);
+      assert.equal(result.status, "failed");
+      assert.equal(store.packageReviewVerdicts(task.id).length, 0);
+      assert.equal(store.reviews(task.id).length, 0);
+      assert.equal(store.attempts(task.id).find(item => item.role === "review")?.status, "failed");
+    } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  }
 });
 
 test("ambiguous post-add failure retains intent and quarantines without a second claim", async () => {
@@ -1091,6 +1129,12 @@ test("Codex allocation and review quota pauses resume at their exact stages", as
     assert.equal(store.checkRuns(task.id).length, 1);
     assert.equal(store.checkRuns(task.id)[0]?.status, "completed");
     assert.equal(store.reviewPackages(task.id).length, 1, "review quota resume reuses the sealed package and does not rerun checks");
+    const verdicts = store.packageReviewVerdicts(task.id);
+    assert.equal(verdicts.length, 1);
+    assert.equal(verdicts[0]?.packageId, store.reviewPackages(task.id)[0]?.id);
+    const reviewAttempt = store.attempts(task.id).find(attempt => attempt.id === verdicts[0]?.attemptId);
+    assert.equal(reviewAttempt?.status, "succeeded");
+    assert.equal(reviewAttempt?.model, "review");
   } finally { store.close(); await rm(root, { recursive: true, force: true }); }
 });
 

@@ -98,6 +98,29 @@ export interface ReviewPackageRecord {
   createdAt: string;
 }
 
+export interface PackageReviewVerdictRecord {
+  id: string;
+  taskId: string;
+  packageId: string;
+  attemptId: string;
+  generationId: string;
+  snapshot: CheckRunSnapshot;
+  result: ReviewResult;
+  createdAt: string;
+}
+
+export interface FinishPackageReviewInput {
+  packageId: string;
+  attemptId: string;
+  owner: string;
+  generationId: string;
+  recheckedSnapshot: CheckRunSnapshot;
+  result: ReviewResult;
+  /** Final process/artifact fields from the completed review attempt. */
+  attemptResult?: Pick<Partial<Attempt>, "exitCode" | "stdoutPath" | "stderrPath" | "resultPath" | "error" | "model" | "reasoningEffort" | "metadata">;
+  processStartId?: string;
+}
+
 export interface StartCheckRunInput {
   taskId: string;
   owner: string;
@@ -225,6 +248,15 @@ export class TaskStore {
       CREATE INDEX IF NOT EXISTS review_packages_task_created ON review_packages(task_id, created_at, id);
       CREATE TRIGGER IF NOT EXISTS review_packages_no_update BEFORE UPDATE ON review_packages BEGIN SELECT RAISE(ABORT,'review packages are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS review_packages_no_delete BEFORE DELETE ON review_packages BEGIN SELECT RAISE(ABORT,'review packages are immutable'); END;
+      CREATE TABLE IF NOT EXISTS review_verdicts (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), package_id TEXT NOT NULL REFERENCES review_packages(id),
+        attempt_id TEXT NOT NULL REFERENCES attempts(id), generation_id TEXT NOT NULL REFERENCES startup_generations(id),
+        snapshot TEXT NOT NULL, result TEXT NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(package_id,attempt_id,generation_id)
+      );
+      CREATE INDEX IF NOT EXISTS review_verdicts_task_created ON review_verdicts(task_id, created_at, id);
+      CREATE TRIGGER IF NOT EXISTS review_verdicts_no_update BEFORE UPDATE ON review_verdicts BEGIN SELECT RAISE(ABORT,'review verdicts are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS review_verdicts_no_delete BEFORE DELETE ON review_verdicts BEGIN SELECT RAISE(ABORT,'review verdicts are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS check_run_results_no_update BEFORE UPDATE ON check_run_results BEGIN SELECT RAISE(ABORT,'check results are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS check_run_results_no_delete BEFORE DELETE ON check_run_results BEGIN SELECT RAISE(ABORT,'check results are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS check_run_results_only_while_running BEFORE INSERT ON check_run_results
@@ -629,6 +661,15 @@ export class TaskStore {
         WHERE id=? AND status='recovery_required' AND revision_count=0 AND claim_generation_id=?`)
         .run(at, owner, expires, at, this.#startupGeneration.id, taskId, task.claim_generation_id);
       if (Number(changed.changes) !== 1) return;
+      const staleCheckRuns = this.#db.prepare("SELECT id FROM check_runs WHERE task_id=? AND generation_id=? AND status='running' ORDER BY created_at,id")
+        .all(taskId, task.claim_generation_id) as Array<{ id: string }>;
+      const terminalReason = `abandoned during execution recovery checkpoint ${checkpointId}`;
+      this.#db.prepare(`UPDATE check_runs SET status='abandoned',terminal_reason=?
+        WHERE task_id=? AND generation_id=? AND status='running'`).run(terminalReason, taskId, task.claim_generation_id);
+      for (const run of staleCheckRuns) {
+        this.#event(taskId, "check_run.closed", { checkRunId: run.id, status: "abandoned", reason: terminalReason,
+          recoveryCheckpointId: checkpointId }, at);
+      }
       this.#db.prepare(`UPDATE worktree_creations SET lease_owner=?,observed=?,fingerprint=?,created_at=? WHERE task_id=? AND status='created'`)
         .run(owner, observedJson, input.identity.fingerprint, at, taskId);
       this.#db.prepare(`INSERT INTO execution_recovery_checkpoints(task_id,status,payload,updated_at) VALUES(?,'claimed',?,?)
@@ -1132,6 +1173,97 @@ export class TaskStore {
     return (this.#db.prepare("SELECT result FROM reviews WHERE task_id=? ORDER BY id").all(taskId) as { result: string }[]).map(row => JSON.parse(row.result) as ReviewResult);
   }
 
+  /** Atomically completes a package-bound reviewer attempt and persists immutable review evidence. */
+  finishPackageReview(input: FinishPackageReviewInput): PackageReviewVerdictRecord {
+    const createdAt = new Date().toISOString();
+    const verdictId = randomUUID();
+    this.#transaction(() => {
+      const pkg = this.#db.prepare(`SELECT p.*,c.status AS check_run_status FROM review_packages p
+        JOIN check_runs c ON c.id=p.check_run_id WHERE p.id=?`).get(input.packageId) as Record<string, unknown> | undefined;
+      if (!pkg || pkg.check_run_status !== "completed") throw new Error("Review requires a current package with a completed check run");
+      const latest = this.#db.prepare("SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
+        .get(String(pkg.task_id)) as { id: string } | undefined;
+      if (!latest || latest.id !== input.packageId) throw new Error("Review package is not current for the task");
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id FROM tasks WHERE id=?")
+        .get(String(pkg.task_id)) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null } | undefined;
+      const expiresAt = task?.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
+      if (!task || task.status !== "reviewing" || task.lease_owner !== input.owner || task.claim_generation_id !== input.generationId ||
+          !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        throw new Error(`Task is not reviewing under live owner ${input.owner} and generation ${input.generationId}`);
+      }
+      const attempt = this.#db.prepare("SELECT * FROM attempts WHERE id=? AND task_id=?")
+        .get(input.attemptId, String(pkg.task_id)) as Record<string, unknown> | undefined;
+      if (!attempt || attempt.status !== "running" || attempt.role !== "review" || attempt.harness !== "codex") {
+        throw new Error("Package review requires a running codex review attempt for this task");
+      }
+      if (input.attemptResult?.exitCode !== undefined && input.attemptResult.exitCode !== 0) {
+        throw new Error("A successful package review attempt must have exit code 0");
+      }
+      if (typeof input.attemptResult?.error === "string" && input.attemptResult.error.trim()) {
+        throw new Error("A successful package review attempt cannot have an error");
+      }
+      for (const [label, existing, supplied] of [
+        ["model", attempt.model, input.attemptResult?.model],
+        ["reasoning effort", attempt.reasoning_effort, input.attemptResult?.reasoningEffort],
+      ] as Array<[string, unknown, string | undefined]>) {
+        if (supplied !== undefined && existing !== null && existing !== supplied) {
+          throw new Error(`Attempt result ${label} conflicts with the created review attempt`);
+        }
+      }
+      const metadata = attempt.metadata ? JSON.parse(String(attempt.metadata)) as Record<string, unknown> : {};
+      if (metadata.packageId !== input.packageId || metadata.generationId !== input.generationId) {
+        throw new Error("Review attempt metadata does not bind the current package and generation");
+      }
+      const stageId = attempt.stage_id as string | null;
+      if (stageId) {
+        const stage = this.#db.prepare("SELECT task_id,role,status,generation_id,process_start_id FROM stages WHERE id=?")
+          .get(stageId) as { task_id: string; role: string; status: string; generation_id: string | null; process_start_id: string } | undefined;
+        if (!stage || stage.task_id !== pkg.task_id || stage.role !== "review" || stage.status !== "running" ||
+            stage.generation_id !== input.generationId || stage.process_start_id !== input.processStartId) {
+          throw new Error("Review attempt belongs to a stale review stage generation");
+        }
+      }
+      if (!isValidReviewResult(input.result)) throw new Error("Invalid structured review result");
+      const snapshot = JSON.parse(String(pkg.snapshot)) as CheckRunSnapshot;
+      if (!sameSnapshot(snapshot, input.recheckedSnapshot)) throw new Error("Review snapshot does not match the current review package snapshot");
+      const suppliedMetadata = input.attemptResult?.metadata ?? {};
+      if (suppliedMetadata.packageId !== undefined && suppliedMetadata.packageId !== input.packageId ||
+          suppliedMetadata.generationId !== undefined && suppliedMetadata.generationId !== input.generationId) {
+        throw new Error("Review completion metadata conflicts with its package or generation binding");
+      }
+      const completedMetadata = { ...metadata, ...suppliedMetadata, packageId: input.packageId,
+        generationId: input.generationId, reviewResult: input.result };
+      const changed = this.#db.prepare(`UPDATE attempts SET status='succeeded',finished_at=?,exit_code=?,stdout_path=?,stderr_path=?,
+        result_path=?,error=?,model=COALESCE(?,model),reasoning_effort=COALESCE(?,reasoning_effort),metadata=? WHERE id=? AND status='running'`).run(createdAt, input.attemptResult?.exitCode ?? 0,
+        input.attemptResult?.stdoutPath ?? null, input.attemptResult?.stderrPath ?? null,
+        input.attemptResult?.resultPath ?? input.result.rawPath ?? null, input.attemptResult?.error ?? null,
+        input.attemptResult?.model ?? null, input.attemptResult?.reasoningEffort ?? null,
+        JSON.stringify(completedMetadata), input.attemptId);
+      if (Number(changed.changes) !== 1) throw new Error(`Attempt ${input.attemptId} is not running`);
+      const completedAttempt = this.#attempt(this.#db.prepare("SELECT * FROM attempts WHERE id=?").get(input.attemptId) as Record<string, unknown>);
+      this.#db.prepare("UPDATE tasks SET active_attempt_id=NULL WHERE id=? AND active_attempt_id=?").run(String(pkg.task_id), input.attemptId);
+      this.#db.prepare("INSERT INTO reviews(task_id,attempt_id,at,result) VALUES(?,?,?,?)")
+        .run(String(pkg.task_id), input.attemptId, createdAt, JSON.stringify(input.result));
+      this.#db.prepare(`INSERT INTO review_verdicts(id,task_id,package_id,attempt_id,generation_id,snapshot,result,created_at)
+        VALUES(?,?,?,?,?,?,?,?)`).run(verdictId, String(pkg.task_id), input.packageId, input.attemptId, input.generationId,
+        JSON.stringify(snapshot), JSON.stringify(input.result), createdAt);
+      this.#event(String(pkg.task_id), "review.finished", { attemptId: input.attemptId, packageId: input.packageId,
+        generationId: input.generationId, result: input.result }, createdAt);
+      this.#event(String(pkg.task_id), "attempt.finished", { attempt: completedAttempt }, createdAt);
+    });
+    return this.getPackageReviewVerdict(verdictId)!;
+  }
+
+  getPackageReviewVerdict(id: string): PackageReviewVerdictRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM review_verdicts WHERE id=?").get(id) as Record<string, unknown> | undefined;
+    return row ? this.#packageReviewVerdict(row) : undefined;
+  }
+
+  packageReviewVerdicts(taskId: string): PackageReviewVerdictRecord[] {
+    return (this.#db.prepare("SELECT * FROM review_verdicts WHERE task_id=? ORDER BY created_at,id").all(taskId) as Record<string, unknown>[])
+      .map(row => this.#packageReviewVerdict(row));
+  }
+
   /** Starts a durable check set tied to the live claim, successful execution attempt, and current route. */
   startCheckRun(input: StartCheckRunInput): CheckRunRecord {
     this.#validateReviewEvidence(input.snapshot, input.route, input.expectedCheckIds, input.checkDefinitionHash);
@@ -1300,7 +1432,7 @@ export class TaskStore {
   }
 
   reviewPackages(taskId: string): ReviewPackageRecord[] {
-    return (this.#db.prepare("SELECT * FROM review_packages WHERE task_id=? ORDER BY created_at,id").all(taskId) as Record<string, unknown>[])
+    return (this.#db.prepare("SELECT * FROM review_packages WHERE task_id=? ORDER BY rowid").all(taskId) as Record<string, unknown>[])
       .map(row => this.#reviewPackage(row));
   }
 
@@ -1313,8 +1445,8 @@ export class TaskStore {
       throw new Error("Review diff hash does not match the persisted diff bytes");
     }
     if (!SHA256_PATTERN.test(checkDefinitionHash)) throw new Error("Check definition hash must be a SHA-256 digest");
-    if (!Array.isArray(expectedCheckIds) || expectedCheckIds.some(id => typeof id !== "string" || !id.trim()) || new Set(expectedCheckIds).size !== expectedCheckIds.length) {
-      throw new Error("Expected check IDs must be unique nonempty strings");
+    if (!Array.isArray(expectedCheckIds) || expectedCheckIds.length === 0 || expectedCheckIds.some(id => typeof id !== "string" || !id.trim()) || new Set(expectedCheckIds).size !== expectedCheckIds.length) {
+      throw new Error("Expected check IDs must be a nonempty list of unique nonempty strings");
     }
     const routeBytes = Buffer.byteLength(JSON.stringify(route), "utf8");
     if (routeBytes > 65_536 || Buffer.byteLength(JSON.stringify(expectedCheckIds), "utf8") > 65_536) {
@@ -1347,6 +1479,12 @@ export class TaskStore {
       route: JSON.parse(String(row.route)) as RouteDecision, branchRef: String(row.branch_ref),
       snapshot: JSON.parse(String(row.snapshot)) as CheckRunSnapshot, checkDefinitionHash: String(row.check_definition_hash),
       expectedCheckIds: JSON.parse(String(row.expected_check_ids)) as string[], createdAt: String(row.created_at) };
+  }
+
+  #packageReviewVerdict(row: Record<string, unknown>): PackageReviewVerdictRecord {
+    return { id: String(row.id), taskId: String(row.task_id), packageId: String(row.package_id), attemptId: String(row.attempt_id),
+      generationId: String(row.generation_id), snapshot: JSON.parse(String(row.snapshot)) as CheckRunSnapshot,
+      result: JSON.parse(String(row.result)) as ReviewResult, createdAt: String(row.created_at) };
   }
 
   events(taskId: string): TaskEvent[] {
@@ -1410,4 +1548,17 @@ export class TaskStore {
     }
     return { ...handoff, id: row.id, byteLength: row.payload_bytes };
   }
+}
+
+function isValidReviewResult(value: ReviewResult): boolean {
+  if (!value || !["pass", "changes_requested", "blocked"].includes(value.verdict) ||
+      typeof value.summary !== "string" || !value.summary.trim() || !Array.isArray(value.findings)) return false;
+  const validFindings = value.findings.every(finding => Boolean(finding) &&
+    ["critical", "high", "medium", "low"].includes(finding.severity) &&
+    typeof finding.evidence === "string" && finding.evidence.trim().length > 0 &&
+    typeof finding.requestedChange === "string" && finding.requestedChange.trim().length > 0 &&
+    (finding.file === undefined || typeof finding.file === "string") &&
+    (finding.line === undefined || Number.isSafeInteger(finding.line)));
+  return validFindings && (value.verdict !== "pass" || value.findings.length === 0) &&
+    (value.verdict !== "changes_requested" || value.findings.length > 0);
 }

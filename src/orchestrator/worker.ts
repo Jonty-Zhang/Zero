@@ -17,6 +17,7 @@ import type {
 } from "../domain/types.js";
 import { GitWorktreeManager, type WorktreeCreationEvidence, type WorktreeCreationPlan, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
+import type { CheckRunSnapshot, ReviewPackageRecord } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
 import { HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
@@ -34,6 +35,8 @@ interface WorkerCheckpoint {
   finalChecks?: CheckResult[];
   /** The exact Git tree on which the passing checks ran before a quota-paused review. */
   checksSnapshot?: Pick<WorktreeReviewSnapshot, "fingerprint" | "diffHash" | "treeId">;
+  /** Immutable package whose passing checks authorized a quota-paused review. */
+  reviewPackageId?: string;
   /** Preserve an ordinary-crash recovery boundary if a later quota pause interrupts it. */
   executionRecovery?: boolean;
   firstRecoveredExecution?: boolean;
@@ -210,6 +213,8 @@ export class TaskWorker {
     let finalChecks: CheckResult[] = [];
     let finalCheckAttemptId: string | undefined;
     let checksSnapshot: ReviewSnapshotIdentity | undefined;
+    let reviewPackageId: string | undefined;
+    let legacyReviewCheckpoint = false;
     let continuingExecution = false;
     let executionRecovery = false;
     let firstRecoveredExecution = false;
@@ -289,6 +294,8 @@ export class TaskWorker {
         finalRoute = checkpoint.finalRoute;
         finalChecks = checkpoint.finalChecks ?? [];
         checksSnapshot = checkpoint.checksSnapshot;
+        reviewPackageId = checkpoint.reviewPackageId;
+        legacyReviewCheckpoint = stage === "review" && !reviewPackageId;
         continuingExecution = stage === "execute";
         if (stage !== "route" && !finalRoute) throw new Error("Quota checkpoint has no execution route");
         if (!Number.isSafeInteger(executionStageIndex) || executionStageIndex < 0
@@ -567,6 +574,7 @@ export class TaskWorker {
           });
           finalChecks = this.#options.store.checkRunResults(sealed.checkRun.id);
           checksSnapshot = reviewSnapshotIdentity(sealed.reviewPackage.snapshot);
+          reviewPackageId = sealed.reviewPackage.id;
           activeCheckRunId = undefined;
         } catch (error) {
           try {
@@ -583,7 +591,7 @@ export class TaskWorker {
         this.#assertNotCancelled(active);
         // Backward-compatible recovery for old quota checkpoints without a
         // checks snapshot: re-run checks and bind the fresh results to this tree.
-        if (!checksSnapshot) {
+        if (!checksSnapshot || legacyReviewCheckpoint) {
           checksSnapshot = reviewSnapshotIdentity(await this.#options.worktrees.prepareReview(worktree));
           const resumedChecks = await this.#options.testRunner.run(requiredChecks, worktree.path, { signal: active.controller.signal });
           finalChecks = resumedChecks;
@@ -611,14 +619,29 @@ export class TaskWorker {
           throw new Error("Worktree changed after validation checks; their results do not apply to the reviewed tree");
         }
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
-        const reviewAttempt = this.#options.store.createAttempt(taskId, "review", { owner, harness: "codex" });
+        const generationId = task.claimGenerationId;
+        if (!generationId) throw new Error("Task claim has no startup generation; durable review evidence cannot be recorded");
+        const reviewBranch = await this.#options.worktrees.readTaskBranchHead(worktree);
+        const reviewPackage = reviewPackageId ? this.#requireCurrentReviewPackage({
+          taskId, packageId: reviewPackageId, route, checks: finalChecks, requiredChecks,
+          snapshot: reviewSnapshot, baseCommit: worktree.baseCommit, branchRef: reviewBranch.ref, branchHead: reviewBranch.head,
+        }) : undefined;
+        if (!reviewPackage && !legacyReviewCheckpoint) {
+          throw new Error("Current review has no sealed package; refusing to persist a passing verdict");
+        }
+        const reviewAttempt = this.#options.store.createAttempt(taskId, "review", {
+          owner, harness: "codex",
+          ...(reviewPackage ? { metadata: { packageId: reviewPackage.id, generationId } } : {}),
+        });
         activeAttempt = reviewAttempt;
         active.adapter = this.#options.adapters.get("codex");
         active.attempt = reviewAttempt;
         this.#assertNotCancelled(active);
         const review = await this.#options.reviewer.review(task, worktree, route, finalChecks, reviewSnapshot.diff, { attemptId: reviewAttempt.id });
         const reviewAfter = await this.#options.worktrees.captureReviewSnapshot(worktree);
-        if (!sameReviewSnapshot(reviewSnapshot, reviewAfter)) {
+        const branchAfterReview = await this.#options.worktrees.readTaskBranchHead(worktree);
+        if (!sameFullReviewSnapshot(reviewSnapshot, reviewAfter)
+          || branchAfterReview.ref !== reviewBranch.ref || branchAfterReview.head !== reviewBranch.head) {
           this.#options.store.finishAttempt(reviewAttempt.id, { status: "failed", exitCode: review.exitCode,
             stdoutPath: review.stdoutPath, stderrPath: review.stderrPath, resultPath: review.eventsPath,
             model: review.model, reasoningEffort: review.reasoningEffort,
@@ -634,14 +657,35 @@ export class TaskWorker {
           activeAttempt = undefined;
           throw new Error("Codex Reviewer failed or returned an invalid verdict");
         }
-        this.#options.store.saveReview(taskId, review.result, reviewAttempt.id);
-        this.#options.store.finishAttempt(reviewAttempt.id, {
-          status: "succeeded", exitCode: review.exitCode, harness: review.harness,
-          model: review.model, reasoningEffort: review.reasoningEffort,
-          stdoutPath: review.stdoutPath,
-          stderrPath: review.stderrPath,
-          resultPath: review.eventsPath,
-        });
+        if (reviewPackage) {
+          this.#options.store.finishPackageReview({
+            packageId: reviewPackage.id,
+            attemptId: reviewAttempt.id,
+            owner,
+            generationId,
+            recheckedSnapshot: { baseCommit: worktree.baseCommit, preHead: reviewBranch.head, ...reviewAfter },
+            result: review.result,
+            attemptResult: {
+              exitCode: review.exitCode,
+              stdoutPath: review.stdoutPath,
+              stderrPath: review.stderrPath,
+              resultPath: review.eventsPath,
+              model: review.model,
+              reasoningEffort: review.reasoningEffort,
+            },
+          });
+        } else {
+          // Legacy quota checkpoints predate sealed packages. Keep them resumable,
+          // but their verdicts remain outside immutable package evidence.
+          this.#options.store.saveReview(taskId, review.result, reviewAttempt.id);
+          this.#options.store.finishAttempt(reviewAttempt.id, {
+            status: "succeeded", exitCode: review.exitCode, harness: review.harness,
+            model: review.model, reasoningEffort: review.reasoningEffort,
+            stdoutPath: review.stdoutPath,
+            stderrPath: review.stderrPath,
+            resultPath: review.eventsPath,
+          });
+        }
         activeAttempt = undefined;
         active.adapter = undefined;
         active.attempt = undefined;
@@ -762,6 +806,7 @@ export class TaskWorker {
             ...(finalRoute ? { finalRoute } : {}),
             ...(stage === "review" ? { finalChecks } : {}),
             ...(stage === "review" && checksSnapshot ? { checksSnapshot } : {}),
+            ...(stage === "review" && reviewPackageId ? { reviewPackageId } : {}),
           };
           const retryAt = quotaRetryAt(task.quotaRetryCount ?? 0, { source: error.retryAt ? "provider_message" : "fallback", retryAt: error.retryAt });
           task = this.#options.store.pauseForQuota(taskId, owner, { retryAt, checkpoint: { ...checkpoint }, reason: errorMessage,
@@ -807,6 +852,48 @@ export class TaskWorker {
       try { await active.adapter.cancel?.(taskId, active.attempt.id); } catch { /* the worker still observes the abort flag */ }
     }
     return true;
+  }
+
+  #requireCurrentReviewPackage(input: {
+    taskId: string;
+    packageId: string;
+    route: RouteDecision;
+    checks: CheckResult[];
+    requiredChecks: CheckDefinition[];
+    snapshot: WorktreeReviewSnapshot;
+    baseCommit: string;
+    branchRef: string;
+    branchHead: string;
+  }): ReviewPackageRecord {
+    const latest = this.#options.store.reviewPackages(input.taskId).at(-1);
+    const pkg = this.#options.store.getReviewPackage(input.packageId);
+    if (!pkg || !latest || latest.id !== pkg.id || pkg.id !== input.packageId) {
+      throw new Error("Quota review checkpoint does not reference the latest sealed review package");
+    }
+    const checkRun = this.#options.store.getCheckRun(pkg.checkRunId);
+    const expectedCheckIds = input.requiredChecks.map(check => check.id);
+    const checkDefinitionHash = createHash("sha256").update(JSON.stringify(input.requiredChecks), "utf8").digest("hex");
+    const packageChecks = this.#options.store.checkRunResults(pkg.checkRunId);
+    if (!checkRun || checkRun.status !== "completed"
+      || pkg.taskId !== input.taskId
+      || JSON.stringify(pkg.route) !== JSON.stringify(input.route)
+      || JSON.stringify(pkg.expectedCheckIds) !== JSON.stringify(expectedCheckIds)
+      || pkg.checkDefinitionHash !== checkDefinitionHash
+      || JSON.stringify(packageChecks) !== JSON.stringify(input.checks)) {
+      throw new Error("Quota review package route or passing checks do not match the current review");
+    }
+    if (pkg.branchRef !== input.branchRef || pkg.snapshot.preHead !== input.branchHead) {
+      throw new Error("Task branch no longer matches the sealed review package");
+    }
+    const current: CheckRunSnapshot = {
+      baseCommit: input.baseCommit,
+      preHead: input.branchHead,
+      ...input.snapshot,
+    };
+    if (!samePackageSnapshot(pkg.snapshot, current)) {
+      throw new Error("Current Git snapshot does not match the sealed review package");
+    }
+    return pkg;
   }
 
   #assertNotCancelled(active: { controller: AbortController; cancelRequested: boolean }): void {
@@ -1125,6 +1212,22 @@ function sameReviewSnapshot(left: ReviewSnapshotIdentity, right: ReviewSnapshotI
   return left.fingerprint === right.fingerprint
     && left.treeId === right.treeId
     && left.diffHash === right.diffHash;
+}
+
+function sameFullReviewSnapshot(left: WorktreeReviewSnapshot, right: WorktreeReviewSnapshot): boolean {
+  return left.fingerprint === right.fingerprint
+    && left.treeId === right.treeId
+    && left.diffHash === right.diffHash
+    && left.diff === right.diff;
+}
+
+function samePackageSnapshot(left: CheckRunSnapshot, right: CheckRunSnapshot): boolean {
+  return left.baseCommit === right.baseCommit
+    && left.preHead === right.preHead
+    && left.treeId === right.treeId
+    && left.fingerprint === right.fingerprint
+    && left.diffHash === right.diffHash
+    && left.diff === right.diff;
 }
 
 function taskRecordReference(taskId: string, message: string): string {

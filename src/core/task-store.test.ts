@@ -29,8 +29,8 @@ test("file-backed task store reopens with WAL and FULL synchronous mode", async 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-function reviewFixture(checks = [{ id: "unit", argv: ["node", "test.js"] }], leaseMs = 60_000) {
-  const store = new TaskStore();
+function reviewFixture(checks = [{ id: "unit", argv: ["node", "test.js"] }], leaseMs = 60_000, path = ":memory:") {
+  const store = new TaskStore(path);
   const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "review package", checks }, "review_package_store_test");
   const owner = "review-worker";
   const claimed = store.claimNext(owner, leaseMs)!;
@@ -97,6 +97,106 @@ test("durable check run creates a review package and reviewing transition atomic
   } finally { f.store.close(); }
 });
 
+function completeReviewPackage(f: ReturnType<typeof reviewFixture>) {
+  const run = f.store.startCheckRun(f.input);
+  f.store.recordCheckResult(run.id, { owner: f.owner, generationId: f.generationId }, f.result("unit"));
+  f.store.finishStage(f.stage.id, f.owner, "process-1", "succeeded", "fingerprint");
+  return f.store.completeCheckRun(run.id, { owner: f.owner, generationId: f.generationId }, f.snapshot).reviewPackage;
+}
+
+function startBoundReviewAttempt(f: ReturnType<typeof reviewFixture>, packageId: string) {
+  return f.store.createAttempt(f.task.id, "review", { owner: f.owner, harness: "codex",
+    metadata: { packageId, generationId: f.generationId } });
+}
+
+test("package review atomically finishes a bound codex attempt and persists legacy and immutable verdict evidence", () => {
+  const f = reviewFixture();
+  try {
+    const pkg = completeReviewPackage(f);
+    const attempt = startBoundReviewAttempt(f, pkg.id);
+    const result = { verdict: "pass" as const, summary: "All acceptance criteria are met.", findings: [], rawPath: "review.json" };
+    const verdict = f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner,
+      generationId: f.generationId, recheckedSnapshot: f.snapshot, result,
+      attemptResult: { exitCode: 0, stdoutPath: "review.stdout.log", stderrPath: "review.stderr.log", model: "gpt-review",
+        reasoningEffort: "high", metadata: { reviewerModel: "codex-model" } } });
+    assert.equal(verdict.packageId, pkg.id);
+    assert.equal(verdict.attemptId, attempt.id);
+    assert.equal(verdict.generationId, f.generationId);
+    assert.deepEqual(verdict.snapshot, pkg.snapshot);
+    assert.deepEqual(verdict.result, result);
+    assert.deepEqual(f.store.reviews(f.task.id), [result]);
+    assert.deepEqual(f.store.packageReviewVerdicts(f.task.id), [verdict]);
+    const finishedAttempt = f.store.attempts(f.task.id).find(item => item.id === attempt.id)!;
+    assert.equal(finishedAttempt.status, "succeeded");
+    assert.equal(finishedAttempt.exitCode, 0);
+    assert.equal(finishedAttempt.stdoutPath, "review.stdout.log");
+    assert.equal(finishedAttempt.resultPath, "review.json");
+    assert.equal(finishedAttempt.model, "gpt-review");
+    assert.equal(finishedAttempt.reasoningEffort, "high");
+    assert.equal(finishedAttempt.metadata?.packageId, pkg.id);
+    assert.equal(finishedAttempt.metadata?.generationId, f.generationId);
+    assert.ok(f.store.events(f.task.id).some(event => event.type === "review.finished"));
+  } finally { f.store.close(); }
+});
+
+test("invalid snapshot, malformed result, and stale lease leave package review attempt running without evidence", async () => {
+  const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 200);
+  try {
+    const pkg = completeReviewPackage(f);
+    const attempt = startBoundReviewAttempt(f, pkg.id);
+    const valid = { verdict: "pass" as const, summary: "Clean.", findings: [] };
+    assert.throws(() => f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner,
+      generationId: f.generationId, recheckedSnapshot: f.snapshot, result: valid, attemptResult: { exitCode: 1 } }), /exit code 0/);
+    assert.throws(() => f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner,
+      generationId: f.generationId, recheckedSnapshot: f.snapshot, result: valid, attemptResult: { error: "review process failed" } }), /cannot have an error/);
+    assert.throws(() => f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner,
+      generationId: f.generationId, recheckedSnapshot: { ...f.snapshot, treeId: "changed" }, result: valid }), /snapshot/);
+    assert.throws(() => f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner,
+      generationId: f.generationId, recheckedSnapshot: f.snapshot,
+      result: { verdict: "pass", summary: "Looks good", findings: [{ severity: "high", evidence: "issue", requestedChange: "fix" }] } }), /Invalid structured/);
+    await new Promise(resolve => setTimeout(resolve, 220));
+    assert.throws(() => f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner,
+      generationId: f.generationId, recheckedSnapshot: f.snapshot, result: valid }), /live owner/);
+    assert.equal(f.store.attempts(f.task.id).find(item => item.id === attempt.id)?.status, "running");
+    assert.deepEqual(f.store.reviews(f.task.id), []);
+    assert.deepEqual(f.store.packageReviewVerdicts(f.task.id), []);
+  } finally { f.store.close(); }
+});
+
+test("a verdict cannot be recorded for a package superseded by a newer package", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-latest-package-"));
+  const path = join(root, "tasks.sqlite");
+  const f = reviewFixture(undefined, 60_000, path);
+  try {
+    const pkg = completeReviewPackage(f);
+    const attempt = startBoundReviewAttempt(f, pkg.id);
+    const db = new DatabaseSync(path);
+    try {
+      const run = f.store.checkRuns(f.task.id)[0]!;
+      const newerRunId = "newer-check-run";
+      db.prepare(`INSERT INTO check_runs(id,task_id,generation_id,owner,execution_attempt_id,execution_stage_id,route_attempt_id,
+        route,branch_ref,snapshot,check_definition_hash,expected_check_ids,status,created_at,completed_at)
+        SELECT ?,task_id,generation_id,owner,execution_attempt_id,execution_stage_id,route_attempt_id,route,branch_ref,snapshot,
+        check_definition_hash,expected_check_ids,'completed',?,? FROM check_runs WHERE id=?`)
+        .run(newerRunId, "2999-01-01T00:00:00.000Z", "2999-01-01T00:00:00.000Z", run.id);
+      db.prepare(`INSERT INTO review_packages(id,task_id,check_run_id,execution_attempt_id,execution_stage_id,route_attempt_id,
+        route,branch_ref,snapshot,check_definition_hash,expected_check_ids,created_at)
+        SELECT 'newer-review-package',task_id,?,execution_attempt_id,execution_stage_id,route_attempt_id,route,branch_ref,snapshot,
+        check_definition_hash,expected_check_ids,'2999-01-01T00:00:00.000Z' FROM review_packages WHERE id=?`)
+        .run(newerRunId, pkg.id);
+    } finally { db.close(); }
+    assert.throws(() => f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner,
+      generationId: f.generationId, recheckedSnapshot: f.snapshot,
+      result: { verdict: "pass", summary: "Pass", findings: [] } }), /not current/);
+    assert.equal(f.store.attempts(f.task.id).find(item => item.id === attempt.id)?.status, "running");
+    assert.deepEqual(f.store.reviews(f.task.id), []);
+    assert.deepEqual(f.store.packageReviewVerdicts(f.task.id), []);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("check run rejects inconsistent diff and submitted check-definition hashes", () => {
   const f = reviewFixture();
   try {
@@ -104,6 +204,15 @@ test("check run rejects inconsistent diff and submitted check-definition hashes"
     assert.throws(() => f.store.startCheckRun({ ...f.input, snapshot: { ...f.snapshot, diff: null as unknown as string } }), /diff must be a string/);
     assert.throws(() => f.store.startCheckRun({ ...f.input, checkDefinitionHash: "0".repeat(64) }), /submitted task checks/);
     assert.equal(f.store.get(f.task.id)?.status, "running");
+  } finally { f.store.close(); }
+});
+
+test("check run rejects an empty required-check set", () => {
+  const f = reviewFixture([]);
+  try {
+    assert.throws(() => f.store.startCheckRun(f.input), /nonempty list/);
+    assert.equal(f.store.get(f.task.id)?.status, "running");
+    assert.deepEqual(f.store.checkRuns(f.task.id), []);
   } finally { f.store.close(); }
 });
 
@@ -205,6 +314,7 @@ test("legacy databases gain additive review evidence tables without rewriting ch
     assert.ok(tables.some(table => table.name === "check_runs"));
     assert.ok(tables.some(table => table.name === "check_run_results"));
     assert.ok(tables.some(table => table.name === "review_packages"));
+    assert.ok(tables.some(table => table.name === "review_verdicts"));
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });
@@ -622,7 +732,8 @@ test("ordinary execution recovery requires fresh identity, claims atomically, an
   const newGeneration = "22222222222222222222222222222222";
   let store = new TaskStore(path, { id: oldGeneration, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
   try {
-    const task = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "resume ordinary work" }, "execution_recovery_positive");
+    const checks = [{ id: "unit", argv: ["node", "test.js"] }, { id: "lint", argv: ["node", "lint.js"] }];
+    const task = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "resume ordinary work", checks }, "execution_recovery_positive");
     store.claimNext("old-owner");
     store.saveRoute({ taskId: task.id, harness: "codex", model: "old-model", selectionSource: "codex",
       reason: "pre-crash route", decidedAt: new Date().toISOString() });
@@ -632,8 +743,29 @@ test("ordinary execution recovery requires fresh identity, claims atomically, an
     const observed = { info: { taskId: task.id, repoPath: plan.repoPath, path: plan.path, branch: plan.branch, baseCommit: plan.baseCommit },
       commonGitDir: plan.commonGitDir, head: plan.baseCommit, fingerprint: "b".repeat(64) };
     store.completeWorktreeCreation(task.id, "old-owner", observed, "b".repeat(64));
-    const oldAttempt = store.createAttempt(task.id, "implement", { owner: "old-owner" });
+    const route: import("../domain/types.js").RouteDecision = { taskId: task.id, harness: "zcode", model: "model-x",
+      selectionSource: "codex", reason: "recovery test", decidedAt: new Date().toISOString() };
+    const routeAttempt = store.createAttempt(task.id, "route", { owner: "old-owner", harness: "codex" });
+    store.finishAttempt(routeAttempt.id, { status: "succeeded", metadata: { decision: route } });
+    store.saveRoute(route);
+    const stage = store.createStage(task.id, { role: "implement", processStartId: "recovery-process", harness: "zcode", model: "model-x" });
+    store.startStage(stage.id, "old-owner", "recovery-process");
+    const executionAttempt = store.createAttempt(task.id, "implement", { owner: "old-owner", stageId: stage.id, harness: "zcode", model: "model-x" });
+    store.finishAttempt(executionAttempt.id, { status: "succeeded" }, { owner: "old-owner", processStartId: "recovery-process" });
+    const diff = "diff --git a/a b/a\n+change\n";
+    const snapshot = { baseCommit: plan.baseCommit, preHead: plan.baseCommit, treeId: "tree", fingerprint: "fingerprint",
+      diffHash: createHash("sha256").update(diff, "utf8").digest("hex"), diff };
+    const checkRun = store.startCheckRun({ taskId: task.id, owner: "old-owner", generationId: oldGeneration,
+      executionAttemptId: executionAttempt.id, executionStageId: stage.id, routeAttemptId: routeAttempt.id, route,
+      branchRef: `refs/heads/zero/${task.id}`, snapshot,
+      checkDefinitionHash: createHash("sha256").update(JSON.stringify(checks), "utf8").digest("hex"), expectedCheckIds: checks.map(check => check.id) });
+    store.recordCheckResult(checkRun.id, { owner: "old-owner", generationId: oldGeneration },
+      { id: "unit", argv: ["node", "test.js"], status: "passed", exitCode: 0, durationMs: 1 });
+    const interruptedAttempt = store.createAttempt(task.id, "implement", { owner: "old-owner" });
     assert.deepEqual(store.recoverExpired(new Date(Date.now() + 120_000)), [task.id]);
+    assert.equal(store.getCheckRun(checkRun.id)?.status, "running");
+    assert.deepEqual(store.getCheckRun(checkRun.id)?.snapshot, snapshot);
+    assert.equal(store.checkRunResults(checkRun.id).length, 1);
     store.close();
 
     store = new TaskStore(path, { id: newGeneration, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
@@ -653,6 +785,7 @@ test("ordinary execution recovery requires fresh identity, claims atomically, an
     assert.equal(claimed?.status, "running");
     assert.equal(claimed?.claimGenerationId, newGeneration);
     assert.equal(claimed?.leaseOwner, "new-owner");
+    assert.equal(store.getCheckRun(checkRun.id)?.status, "abandoned");
     assert.equal(store.getRoute(task.id), undefined);
     const freshBackdatedRoute = { taskId: task.id, harness: "zcode", model: "fresh-model", selectionSource: "codex" as const,
       reason: "rerouted after recovery", decidedAt: "2000-01-01T00:00:00.000Z" };
@@ -661,13 +794,22 @@ test("ordinary execution recovery requires fresh identity, claims atomically, an
     const checkpoint = store.executionRecoveryCheckpoint(task.id)!;
     assert.equal(checkpoint.kind, "execution_recovery");
     assert.equal(checkpoint.sourceGenerationId, oldGeneration);
+    assert.equal(store.getCheckRun(checkRun.id)?.terminalReason, `abandoned during execution recovery checkpoint ${checkpoint.id}`);
     assert.equal((checkpoint.freshIdentity as { fingerprint: string }).fingerprint, "c".repeat(64));
     assert.equal(((checkpoint.source as { worktreeCreation: { fingerprint: string } }).worktreeCreation).fingerprint, "b".repeat(64));
-    assert.equal(((checkpoint.source as { historyBoundary: { attemptSequence: number } }).historyBoundary).attemptSequence, 1);
-    assert.equal(store.attempts(task.id).find(attempt => attempt.id === oldAttempt.id)?.status, "interrupted");
+    assert.equal(((checkpoint.source as { historyBoundary: { attemptSequence: number } }).historyBoundary).attemptSequence, 3);
+    assert.equal(store.attempts(task.id).find(attempt => attempt.id === interruptedAttempt.id)?.status, "interrupted");
+    const closedRunEvents = store.events(task.id).filter(event => event.type === "check_run.closed" &&
+      (event.payload as { checkRunId?: string } | undefined)?.checkRunId === checkRun.id);
+    assert.equal(closedRunEvents.length, 1);
+    assert.equal((closedRunEvents[0]?.payload as { recoveryCheckpointId?: string }).recoveryCheckpointId,
+      (store.events(task.id).find(event => event.type === "task.execution_recovery_claimed")?.payload as { checkpointId?: string }).checkpointId);
     assert.equal(store.claimExecutionRecovery(task.id, "racer", {
       identity: { checkedAt: new Date().toISOString(), observed: freshObserved, fingerprint: "c".repeat(64) },
     }), undefined);
+    assert.equal(store.getCheckRun(checkRun.id)?.status, "abandoned");
+    assert.equal(store.events(task.id).filter(event => event.type === "check_run.closed" &&
+      (event.payload as { checkRunId?: string } | undefined)?.checkRunId === checkRun.id).length, 1);
     const quarantined = store.quarantineClaimedExecutionRecovery(task.id, "new-owner", "post-claim worktree identity changed");
     assert.equal(quarantined.status, "recovery_required");
     assert.equal(quarantined.recoveryEvidence?.kind, "execution_recovery_quarantine");
