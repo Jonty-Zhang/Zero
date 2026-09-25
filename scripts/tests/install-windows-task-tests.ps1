@@ -37,17 +37,9 @@ function Test-WindowsTaskTriggerObjects {
     Assert-True ($null -ne $startup -and $null -ne $watchdog) 'Task Scheduler must construct both startup and watchdog triggers.'
     Assert-True ([string]$watchdog.Repetition.Interval -match '^PT5M$') 'Watchdog repetition interval must serialize as five minutes.'
     $durationText = [string]$watchdog.Repetition.Duration
-    if (-not $durationText) { throw 'Watchdog repetition duration was empty.' }
-    try {
-        $duration = if ($durationText.StartsWith('P')) {
-            [System.Xml.XmlConvert]::ToTimeSpan($durationText)
-        }
-        else {
-            [TimeSpan]::Parse($durationText, [Globalization.CultureInfo]::InvariantCulture)
-        }
-    }
-    catch { throw "Task Scheduler could not serialize the maximum watchdog duration: $durationText" }
-    Assert-True ($duration.TotalDays -gt (365 * 1000)) 'Watchdog repetition duration must remain effectively indefinite.'
+    if ($durationText -notmatch '^P(?<days>\d+)DT') { throw "Watchdog repetition duration did not serialize as an ISO day duration: $durationText" }
+    $durationDays = [Int64]::Parse($Matches.days, [Globalization.CultureInfo]::InvariantCulture)
+    Assert-True ($durationDays -gt (365 * 1000)) 'Watchdog repetition duration must remain effectively indefinite.'
     Assert-True ([string]$settings.MultipleInstances -match '^(IgnoreNew|2)$') 'Task settings must preserve IgnoreNew.'
     Assert-True ([string]$settings.RestartCount -eq '3') 'Task settings must preserve the bounded fast-restart policy.'
 }
