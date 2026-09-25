@@ -1,10 +1,10 @@
 # 普通崩溃自动续跑：下一切片
 
-状态：实现设计，2026-09-25。范围是确认旧 writer 已退出之后，Zero 如何安全地继续原任务；不代表 guardian 已在目标电脑安装或经真实重启验收。额度等待仍走现有 quota checkpoint，不纳入本切片。
+状态：迭代 A 已实现；迭代 B 仍是设计，2026-09-26。本文区分已实现边界与后续方案。不代表 guardian 已在目标电脑安装或经真实重启验收。额度等待仍走独立 quota checkpoint 路径。
 
 ## 决策摘要
 
-下一切片只自动接续**已创建并持久登记的原 worktree**，不尝试重放旧进程的结果。旧 Job 清空且 worktree 身份复核通过后，Zero 对当前文件状态重新取指纹，保留旧 attempt 历史，建立新的 recovery attempt；从新 route / execution 开始，重新跑全部检查和审核。只有数据库中已持久化、且能和 Git 当前状态逐项核对的提交意图可以被幂等收尾。无法确定阶段或证据不匹配时继续停在 `recovery_required`。
+迭代 A 已开放一个窄恢复路径：仅接续**已创建并持久登记的原 worktree**，不重放旧进程结果。必须证明紧邻前代 guardian 已确认旧 Job 清空，并复核 worktree 身份、Git 注册、允许路径和新鲜 fingerprint。Zero 保留旧 attempt 历史、建立恢复检查点，之后从新的 route / execution 开始，重跑所有配置检查和 Codex review。任何身份/路径不匹配、review/commit/report 边界或缺少 lineage 的任务继续停在 `recovery_required`。本版本没有可幂等收尾的持久 commit intent；这属于迭代 B。
 
 这只保证“旧 writer 不再并发、同一任务在同一 worktree 上重新执行全部门禁”，不保证旧模型动作可撤销、外部副作用可去重，也不恢复旧 session。第一版限定为**没有开始过审核/提交、`executionStages` 至多一个阶段、revision 为 0**的任务；多阶段接力、revision 中断和已有 review/commit 状态先隔离。
 
@@ -14,9 +14,9 @@
 
 环境变量可以由同一 Windows 账户伪造，因此历史 `evidence_kind='guardian_env_assertion'` 和 `predecessor_drained=true` **不能单独视为恢复凭据**。当前 guardian 在旧 Job 清空后保留本会话的命名映射，记录代际及 guardian/直属子进程的 PID 和创建时间；Node 通过随包 helper 的 `--verify-startup` 核对这些值及新 Job 成员身份。只有成功的启动核验写入 `guardian_startup_verified`。这不是抵御同账户恶意篡改的安全边界：同账户本来就能运行/修改本地程序和 SQLite；本功能针对崩溃后的误接管与并发 writer。
 
-本切片只记录可审查的 SQLite 代际关联，不开放任务自动重放。构造当前代时，在 `BEGIN IMMEDIATE` 事务内读取紧邻上一条 generation；仅当本代与上一代均为 `guardian_startup_verified`，本代 `predecessor_drained=1` 且 `lock_id` 一致时，才写入 `predecessor_generation_id`。空库、旧 `guardian_env_assertion` 行（即使 `member_verified=1`）、非 guardian 启动或 lock 不匹配都保持 NULL。`currentStartupProvesGenerationDrained(id)` 只根据本代证明、精确 predecessor ID 和被指向记录的证据类型与 lock 一致性返回真假；sequence、lease 和环境值本身不能替代 predecessor ID。
+在 `BEGIN IMMEDIATE` 事务内读取紧邻上一条 generation；仅当本代与上一代均为 `guardian_startup_verified`，本代 `predecessor_drained=1` 且 `lock_id` 一致时，才写入 `predecessor_generation_id`。空库、旧 `guardian_env_assertion` 行（即使 `member_verified=1`）、非 guardian 启动或 lock 不匹配都保持 NULL。`currentStartupProvesGenerationDrained(id)` 只根据本代证明、精确 predecessor ID 和被指向记录的证据类型与 lock 一致性返回真假；sequence、lease 和环境值本身不能替代 predecessor ID。该 lineage 现用于迭代 A 的恢复授权。
 
-该关联和只读查询不是防同账户篡改的认证机制。能写入 Zero 数据目录的同一账户也能编辑 SQLite 行并改变查询结果。当前实现不消费此查询来接续任务，也不改变任何恢复状态机。
+该关联不是防同账户篡改的认证机制。能写入 Zero 数据目录的同一账户也能编辑 SQLite 行并改变查询结果；它针对崩溃误接管和并发 writer，不针对本机同账户恶意行为。
 
 只有满足以下全部条件，已有 worktree 才进入恢复候选：
 
@@ -32,10 +32,10 @@
 |---|---|---|---|
 | claim 后、worktree 创建意图前 | claim generation、协议版本；没有 creation/attempt/stage/route/check/review 行 | 现有实现可在新鲜确认 worktree 路径不存在后重新排队；这是写入前重入 | 不得将 generation env 本身当作身份认证。升级前协议或存在任一写证据时不得走此捷径 |
 | creation intent 后、created 记录前 | `worktree_creations` 的 plan；外部 `git worktree add` 可能已部分或完整生效 | 不自动继续或删除；隔离，要求检查 Git 注册与路径 | intent 没有完成观察值/fingerprint，不能判断命令是否完成 |
-| `created` 后、route 前 | repo/common dir/path/branch/base、创建时观察值和 fingerprint | 若上述身份复核通过、当前树可重测，可以新建 route attempt | 当前实现对所有已有 worktree 拒绝自动复用；没有 recovery baseline/intent |
-| route 中或 route 返回后 | route attempt；route row 仅按 task 保存，无 attempt FK；保存 route 与 finish attempt 是两个事务 | route 可重跑，且不沿用含糊的最后 route；创建新 attempt | 旧 route 不能可靠归属到成功 attempt，也不能与输入树、配置/绑定版本成对核验 |
-| execution 前/中/返回后 | stage 有 UUID `processStartId`、generation、input fingerprint；attempt 有状态；显式完成后才有 output fingerprint/handoff | 旧 Job 清空并重测 worktree 后，允许在同一 worktree 开一个新的 execution stage/attempt；把现存树视为不可信上下文，之后全跑 checks/review | UUID 不是 OS 身份；中断 stage 没 output fingerprint。不能把未终结 attempt 或模型叙述算作已完成，也不能复用旧 session |
-| checks 准备/执行/结果写入 | checks 在运行前会 `git add -A` 并取得 tree/fingerprint/diff hash，但该快照仅在内存；check rows 分条写入 | 第一切片将 checks 视为不确定，重启新的 execution 后重新跑全部 checks | 当前没有持久 check intent、snapshot ID、定义/config hash、整组完成 marker；不能只从部分旧 check rows 推断通过，也不能直接恢复到 review |
+| `created` 后、route 前 | repo/common dir/path/branch/base、创建时观察值和 fingerprint | 迭代 A 已实现：满足下述窄范围时复核 Git 注册与身份，重测 fingerprint 并从新 route 起跑 | identity/path、allowedPaths、HEAD 或 lineage 不匹配时隔离；Git 忽略的 build/cache 文件不纳入 fingerprint，可能残留并影响命令 |
+| route 中或 route 返回后 | route attempt；route row 仅按 task 保存，无 attempt FK；保存 route 与 finish attempt 是两个事务 | 迭代 A 会在新 route 之后重做 execution、全部 checks 和 review，不沿用旧 route 作为权威 | route/check/review 旧记录只作为历史背景；尚无 phase intent 的逐阶段原子审计 |
+| execution 前/中/返回后 | stage 有 UUID `processStartId`、generation、input fingerprint；attempt 有状态；显式完成后才有 output fingerprint/handoff | 迭代 A 已实现：旧 Job 清空、身份复核并新 claim 后，在同一 worktree 创建新的 execution attempt；旧树和输出按不可信上下文处理 | UUID 不是 OS 身份；不复用旧 session 或旧模型输出作为完成证据；仍不保证外部副作用可撤销/去重 |
+| checks 准备/执行/结果写入 | checks 在运行前会 `git add -A` 并取得 tree/fingerprint/diff hash，但该快照仅在内存；check rows 分条写入 | 迭代 A 不恢复部分 checks：从新的 execution 后重跑全部配置检查和 review | 不能只从部分旧 check rows 推断通过，也不能直接恢复到 review；忽略的 build/cache residue 可能影响检查但不进入 Git fingerprint/diff |
 | review 准备/调用/结果保存 | review snapshot 仅在内存；review result 保存时只关联 attempt ID，snapshot 未落 SQLite | 第一切片不自动接续已进入 `reviewing` 的 task；隔离 | 旧 verdict 没有与 tree/diff/check evidence 的 durable binding。即使 result row 存在也必须丢弃并重新审核 |
 | commit 前/中/后 | `commit()` 以本进程内的 reviewed snapshot 验证；SQLite 没有 commit intent、pre-HEAD、reviewed tree 或 result commit | 当前均隔离。第二迭代可在补齐持久意图后按精确 Git 证据幂等收尾 | 不能从 HEAD 有新 commit、review pass 或报告文件推断可以 DONE |
 | report 临时文件/rename/DONE 之间 | report 先写临时文件再 rename，随后 worker 再验 commit，最后 SQLite transition 到 done；读报告以 SQLite status 覆盖 | SQLite `done` 才是完成权威；未 done 的 task 不得因 report 出现而补 DONE | 无持久 report intent/hash；崩溃后不能证明报告对应当前 DB/Git evidence |
@@ -81,18 +81,19 @@ report intent 在 commit 成功后、文件写入前持久化：report schema、
 
 ## 两个小迭代
 
-### 迭代 A：只恢复执行前/执行中的单阶段任务
+### 迭代 A：已实现，限于执行前/执行中的单阶段任务
 
-实现者可直接按以下范围动手：
+实现要点：
 
-1. 增加协议版本化的 phase intent / recovery record 表（或等价 additive 列），至少覆盖 route、execution、checks、review、commit、report 的 `started/completed` 意图；不重写现有 attempt 历史。
-2. 恢复 gate 要求 guardian 启动关联、前代 Job 清空证据、worktree creation 完成记录和 repo/common-dir/path/branch/base/HEAD 核验。env 只用于诊断关联，不得单独授权自动重入。缺任何一项都保留 `recovery_required`。
-3. 自动恢复仅限 `running` 的 route/execution/check 歧义窗口、revision=0、单 execution stage、尚无 review/commit/report intent 的任务。验证 worktree 当前 fingerprint 后，从**新 route + 新 execution attempt**起跑。checks、review 全部重跑；旧 review 不适用；阶段输出、handoff/日志仅是非权威背景。原 task ID/worktree 不变，revision budget 不增加。
-4. 对于 `reviewing` 和一切 commit/report 窗口保持隔离。若执行器无法确认受监督启动来源，整个迭代退化为隔离，不做普通崩溃自动重入。
+1. 使用 additive SQLite `execution_recovery_checkpoints` 保存恢复检查点；旧 attempt/stage/event 历史保留。检查点状态记录 claim、quarantine、inspection required、quota/终态禁用，以及再次崩溃后的 supersede lineage。
+2. 候选必须有当前协议 lease-expiry 证据、前态 `running`、revision 0、最多一个 execution stage、完整且 HEAD 仍为 base commit 的已创建 worktree 记录，并由当前 guardian 证明任务 claim 所属的紧邻前代已清空。已有 review、commit/report 证据、额度 pause、多阶段或旧 protocol 均不符合候选条件。
+3. Worker 重新打开已登记 worktree，核对 repo/common-dir/path/branch/base/HEAD、Git worktree 注册、changed paths 与 `allowedPaths`，并测量 fresh fingerprint。SQLite 事务原子写入恢复检查点和新 lease；启动模型前再次核对 fingerprint 和身份。只有通过后才从新 route、新 execution attempt 开始；旧 route/check/output/review 不会充当通过证据，所有配置检查和 review 会重跑。
+4. 本地 commit（含 HEAD 不再是预期 base）、身份/path/allowedPaths 不匹配、lineage 缺失、inspection evidence 不足或恢复后身份再次变化都会留在 `recovery_required`。正常 quota pause 使用原有独立 checkpoint，不会变成 crash replay；终态会禁用 crash recovery checkpoint。
+5. 没有逐阶段 phase-intent 表，也不逐一恢复 route、check、review、commit 或 report。整个 route/execution/check 不确定窗口按一个安全边界处理；review 和 commit/report 窗口继续隔离。恢复使用原 task/worktree，不恢复 Harness session，不保证外部副作用可撤销或去重。
 
-故障注入：在 route intent 前、route call 后/route save 前后、execution intent/attempt/spawn 前后/写文件后、check prepare 前/中/部分结果后分别强制结束 guardian 或整个 Job；新 guardian 必须等 Job 空，再启动恢复。断言：没有第二旧 writer；task/worktree ID 不变；新 attempt ID 与旧不同；route/execution 按范围重做；checks/review 必须新执行；部分旧 check、所有旧 review 不能使任务 DONE；tree/repo/branch 不匹配、旧版本 DB、缺 guardian lineage、证据缺失时停在 `recovery_required`。还要测同账户设置伪造 `ZERO_GUARDIAN_*` 不能单独通过自动恢复 gate，以及 lease 先未过期、随后由运行时扫描隔离的情况。
+自动化测试覆盖迭代 A 的主要恢复 gate、worktree 身份变化、重试 lineage、重新 route/execution/check/review 和隔离边界。该改动的 CI 结果需在提交后确认。目标电脑上的 guardian/计划任务重启及真实 Harness 故障注入仍未完成，不能据此宣称实机无人值守验收。迭代 B 的 review/commit/report 故障注入尚待实现。
 
-### 迭代 B：加入 snapshot-bound review 和 commit/report 收尾
+### 迭代 B：待实现 snapshot-bound review 和 commit/report 收尾
 
 持久化并绑定 check run、review package、commit intent、report intent/hash。启用两类额外重入：
 

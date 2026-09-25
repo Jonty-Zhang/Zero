@@ -347,6 +347,13 @@ test("additive recovery migration preserves existing SQLite task rows", async ()
     assert.equal(store.get("legacy_active")?.recoveryEvidence?.claimProtocolVersion, null);
     assert.deepEqual(store.listLeaseExpiryRecoveryCandidates(), []);
     assert.throws(() => store.requeuePreWriteIntentLeaseExpiry("legacy_active", { kind: "worktree_absent", checkedAt: new Date().toISOString() }), /not an eligible lease-expiry/);
+    const migrated = new DatabaseSync(path);
+    try {
+      const checkpointTable = migrated.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_recovery_checkpoints'").get();
+      assert.ok(checkpointTable);
+      assert.equal(migrated.prepare("SELECT COUNT(*) AS count FROM execution_recovery_checkpoints").get() &&
+        (migrated.prepare("SELECT COUNT(*) AS count FROM execution_recovery_checkpoints").get() as { count: number }).count, 0);
+    } finally { migrated.close(); }
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });
@@ -425,4 +432,250 @@ test("quota pause survives store restart and is claimable only at its persisted 
     store.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("ordinary execution recovery requires fresh identity, claims atomically, and checkpoints interrupted evidence", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-execution-recovery-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "a".repeat(64);
+  const oldGeneration = "11111111111111111111111111111111";
+  const newGeneration = "22222222222222222222222222222222";
+  let store = new TaskStore(path, { id: oldGeneration, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const task = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "resume ordinary work" }, "execution_recovery_positive");
+    store.claimNext("old-owner");
+    store.saveRoute({ taskId: task.id, harness: "codex", model: "old-model", selectionSource: "codex",
+      reason: "pre-crash route", decidedAt: new Date().toISOString() });
+    const plan = { taskId: task.id, repoPath: "C:/repo", commonGitDir: "C:/repo/.git", worktreeRoot: "C:/worktrees", path: `C:/worktrees/${task.id}`,
+      branch: `zero/${task.id}`, baseCommit: "a".repeat(40) };
+    store.recordWorktreeCreationIntent(task.id, "old-owner", plan);
+    const observed = { info: { taskId: task.id, repoPath: plan.repoPath, path: plan.path, branch: plan.branch, baseCommit: plan.baseCommit },
+      commonGitDir: plan.commonGitDir, head: plan.baseCommit, fingerprint: "b".repeat(64) };
+    store.completeWorktreeCreation(task.id, "old-owner", observed, "b".repeat(64));
+    const oldAttempt = store.createAttempt(task.id, "implement", { owner: "old-owner" });
+    assert.deepEqual(store.recoverExpired(new Date(Date.now() + 120_000)), [task.id]);
+    store.close();
+
+    store = new TaskStore(path, { id: newGeneration, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    assert.equal(store.currentStartupProvesGenerationDrained(oldGeneration), true);
+    assert.deepEqual(store.listExecutionRecoveryCandidates().map(candidate => candidate.id), [task.id]);
+    assert.throws(() => store.claimExecutionRecovery(task.id, "new-owner", { identity: { checkedAt: new Date(Date.now() - 10_000).toISOString(), observed, fingerprint: "c".repeat(64) } }), /Fresh worktree identity/);
+    const claimedAt = new Date();
+    const freshObserved = { ...observed, fingerprint: "c".repeat(64) };
+    assert.throws(() => store.claimExecutionRecovery(task.id, "new-owner", {
+      now: claimedAt, identity: { checkedAt: claimedAt.toISOString(), observed: { ...freshObserved, commonGitDir: "C:/foreign/.git" }, fingerprint: "c".repeat(64) },
+    }), /does not match persisted creation identity/);
+    assert.equal(store.get(task.id)?.status, "recovery_required");
+    const claimed = store.claimExecutionRecovery(task.id, "new-owner", {
+      now: claimedAt, leaseMs: 90_000,
+      identity: { checkedAt: claimedAt.toISOString(), observed: freshObserved, fingerprint: "c".repeat(64) },
+    });
+    assert.equal(claimed?.status, "running");
+    assert.equal(claimed?.claimGenerationId, newGeneration);
+    assert.equal(claimed?.leaseOwner, "new-owner");
+    assert.equal(store.getRoute(task.id), undefined);
+    const freshBackdatedRoute = { taskId: task.id, harness: "zcode", model: "fresh-model", selectionSource: "codex" as const,
+      reason: "rerouted after recovery", decidedAt: "2000-01-01T00:00:00.000Z" };
+    store.saveRoute(freshBackdatedRoute);
+    assert.deepEqual(store.getRoute(task.id), freshBackdatedRoute);
+    const checkpoint = store.executionRecoveryCheckpoint(task.id)!;
+    assert.equal(checkpoint.kind, "execution_recovery");
+    assert.equal(checkpoint.sourceGenerationId, oldGeneration);
+    assert.equal((checkpoint.freshIdentity as { fingerprint: string }).fingerprint, "c".repeat(64));
+    assert.equal(((checkpoint.source as { worktreeCreation: { fingerprint: string } }).worktreeCreation).fingerprint, "b".repeat(64));
+    assert.equal(((checkpoint.source as { historyBoundary: { attemptSequence: number } }).historyBoundary).attemptSequence, 1);
+    assert.equal(store.attempts(task.id).find(attempt => attempt.id === oldAttempt.id)?.status, "interrupted");
+    assert.equal(store.claimExecutionRecovery(task.id, "racer", {
+      identity: { checkedAt: new Date().toISOString(), observed: freshObserved, fingerprint: "c".repeat(64) },
+    }), undefined);
+    const quarantined = store.quarantineClaimedExecutionRecovery(task.id, "new-owner", "post-claim worktree identity changed");
+    assert.equal(quarantined.status, "recovery_required");
+    assert.equal(quarantined.recoveryEvidence?.kind, "execution_recovery_quarantine");
+    assert.equal(store.executionRecoveryCheckpoint(task.id), undefined);
+    assert.deepEqual(store.listExecutionRecoveryCandidates(), []);
+    assert.equal(store.events(task.id).some(event => event.type === "task.execution_recovery_quarantined"), true);
+    assert.equal(store.events(task.id).some(event => event.type === "task.execution_recovery_claimed"), true);
+    assert.equal(store.events(task.id).some(event => event.type === "task.transition" && (event.payload as { to?: string } | undefined)?.to === "failed"), false);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("execution recovery quarantines legacy, multi-stage, review, quota, and identity-mismatched evidence", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-execution-recovery-deny-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "c".repeat(64);
+  const oldGeneration = "33333333333333333333333333333333";
+  const newGeneration = "44444444444444444444444444444444";
+  let store = new TaskStore(path, { id: oldGeneration, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const ids = ["no_worktree", "intent_only", "multi_stage", "review", "quota", "mismatch", "report", "inspect"];
+    const tasks = new Map<string, string>();
+    for (const name of ids) {
+      const task = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: name,
+        ...(name === "multi_stage" ? { executionStages: [{ harness: "codex" }, { harness: "zcode" }] } : {}) }, `recover_${name}`);
+      tasks.set(name, task.id);
+      store.claimNext(`old-${name}`);
+      if (name !== "no_worktree") {
+        const plan = { taskId: task.id, repoPath: "C:/repo", commonGitDir: "C:/repo/.git", worktreeRoot: "C:/worktrees", path: `C:/worktrees/${task.id}`,
+          branch: `zero/${task.id}`, baseCommit: "d".repeat(40) };
+        store.recordWorktreeCreationIntent(task.id, `old-${name}`, plan);
+        if (name !== "intent_only") {
+          const observed = { info: { taskId: task.id, repoPath: plan.repoPath, path: plan.path, branch: plan.branch, baseCommit: plan.baseCommit },
+            commonGitDir: plan.commonGitDir, head: plan.baseCommit, fingerprint: "e".repeat(64) };
+          store.completeWorktreeCreation(task.id, `old-${name}`, observed, "e".repeat(64));
+        }
+      }
+    }
+    for (const id of tasks.values()) store.recoverExpired(new Date(Date.now() + 120_000));
+    store.close();
+    store = new TaskStore(path, { id: newGeneration, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const editor = new DatabaseSync(path);
+    try {
+      const reviewId = tasks.get("review")!;
+      editor.prepare("INSERT INTO reviews(task_id,at,result) VALUES(?,?,?)").run(reviewId, new Date().toISOString(), JSON.stringify({ approved: true }));
+      const quotaId = tasks.get("quota")!;
+      editor.prepare("INSERT INTO quota_pauses(task_id,retry_at,retry_count,checkpoint,reason,source) VALUES(?,?,?,?,?,?)")
+        .run(quotaId, new Date(Date.now() + 60_000).toISOString(), 1, "{}", "paused", "fallback");
+      const reportId = tasks.get("report")!;
+      editor.prepare("INSERT INTO events(task_id,type,at,payload) VALUES(?,?,?,?)").run(reportId, "task.report_saved", new Date().toISOString(), "{}");
+      const mismatchId = tasks.get("mismatch")!;
+      const row = editor.prepare("SELECT recovery_evidence FROM tasks WHERE id=?").get(mismatchId) as { recovery_evidence: string };
+      const evidence = JSON.parse(row.recovery_evidence) as Record<string, unknown>;
+      editor.prepare("UPDATE tasks SET recovery_evidence=? WHERE id=?").run(JSON.stringify({ ...evidence, claimGenerationId: oldGeneration.replace(/^3/, "5") }), mismatchId);
+    } finally { editor.close(); }
+    assert.deepEqual(store.listExecutionRecoveryCandidates().map(candidate => candidate.id), [tasks.get("inspect")]);
+    const rejected = store.rejectExecutionRecoveryInspection(tasks.get("inspect")!, "persisted worktree identity mismatch", new Date().toISOString());
+    assert.equal(rejected.status, "recovery_required");
+    assert.equal(store.listExecutionRecoveryCandidates().length, 0);
+    assert.equal(store.executionRecoveryCheckpoint(tasks.get("inspect")!), undefined);
+    assert.equal(store.events(tasks.get("inspect")!).some(event => event.type === "task.execution_recovery_inspection_required"), true);
+    for (const id of tasks.values()) {
+      assert.equal(store.claimExecutionRecovery(id, "cannot-claim", { identity: { checkedAt: new Date().toISOString(),
+        observed: { info: { taskId: id, repoPath: "C:/repo", path: `C:/worktrees/${id}`, branch: `zero/${id}`, baseCommit: "d".repeat(40) }, commonGitDir: "C:/repo/.git", head: "d".repeat(40) },
+        fingerprint: "e".repeat(64) } }), undefined);
+    }
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a second expired recovery generation supersedes the old checkpoint without authorizing stale lineage", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-execution-recovery-repeat-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "f".repeat(64);
+  const firstGeneration = "55555555555555555555555555555555";
+  const recoveryGeneration = "66666666666666666666666666666666";
+  const nextGeneration = "77777777777777777777777777777777";
+  let store = new TaskStore(path, { id: firstGeneration, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const task = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "repeat" }, "execution_recovery_repeat");
+    store.claimNext("first-owner");
+    const plan = { taskId: task.id, repoPath: "C:/repo", commonGitDir: "C:/repo/.git", worktreeRoot: "C:/worktrees", path: `C:/worktrees/${task.id}`,
+      branch: `zero/${task.id}`, baseCommit: "1".repeat(40) };
+    store.recordWorktreeCreationIntent(task.id, "first-owner", plan);
+    const observed = { info: { taskId: task.id, repoPath: plan.repoPath, path: plan.path, branch: plan.branch, baseCommit: plan.baseCommit },
+      commonGitDir: plan.commonGitDir, head: plan.baseCommit, fingerprint: "2".repeat(64) };
+    store.completeWorktreeCreation(task.id, "first-owner", observed, "2".repeat(64));
+    store.recoverExpired(new Date(Date.now() + 120_000));
+    store.close();
+
+    store = new TaskStore(path, { id: recoveryGeneration, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const freshAt = new Date();
+    store.claimExecutionRecovery(task.id, "recovery-owner", { now: freshAt, identity: { checkedAt: freshAt.toISOString(), observed, fingerprint: "2".repeat(64) } });
+    store.close();
+
+    store = new TaskStore(path, { id: nextGeneration, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    assert.deepEqual(store.recoverExpired(new Date(Date.now() + 120_000)), [task.id]);
+    const newEvidence = store.get(task.id)?.recoveryEvidence as Record<string, unknown>;
+    assert.equal(newEvidence.claimGenerationId, recoveryGeneration);
+    assert.equal((newEvidence.priorExecutionRecoveryCheckpoint as { sourceGenerationId: string }).sourceGenerationId, firstGeneration);
+    assert.deepEqual(store.listExecutionRecoveryCandidates().map(candidate => candidate.id), [task.id]);
+    const latestAt = new Date();
+    const latest = store.claimExecutionRecovery(task.id, "latest-owner", { now: latestAt, identity: { checkedAt: latestAt.toISOString(), observed, fingerprint: "2".repeat(64) } });
+    assert.equal(latest?.claimGenerationId, nextGeneration);
+    assert.equal((store.executionRecoveryCheckpoint(task.id)?.sourceGenerationId), recoveryGeneration);
+    store.pauseForQuota(task.id, "latest-owner", { retryAt: new Date(Date.now() + 60_000).toISOString(), reason: "provider quota",
+      checkpoint: { stage: "implementation" }, source: "fallback" });
+    assert.equal(store.get(task.id)?.status, "waiting");
+    assert.equal(store.executionRecoveryCheckpoint(task.id), undefined);
+    store.transition(task.id, "waiting", "failed", { reason: "terminal test" });
+    const db = new DatabaseSync(path);
+    try {
+      const checkpointRow = db.prepare("SELECT status FROM execution_recovery_checkpoints WHERE task_id=?").get(task.id) as { status: string };
+      assert.equal(checkpointRow.status, "disabled");
+    } finally { db.close(); }
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent startup generations yield at most one SQLite execution recovery writer", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-execution-recovery-concurrent-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "9".repeat(64);
+  const sourceGeneration = "88888888888888888888888888888888";
+  const seed = new TaskStore(path, { id: sourceGeneration, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  const task = seed.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "concurrent resume" }, "execution_recovery_concurrent");
+  seed.claimNext("source-owner");
+  const plan = { taskId: task.id, repoPath: "C:/repo", commonGitDir: "C:/repo/.git", worktreeRoot: "C:/worktrees", path: `C:/worktrees/${task.id}`,
+    branch: `zero/${task.id}`, baseCommit: "a".repeat(40) };
+  seed.recordWorktreeCreationIntent(task.id, "source-owner", plan);
+  const observed = { info: { taskId: task.id, repoPath: plan.repoPath, path: plan.path, branch: plan.branch, baseCommit: plan.baseCommit },
+    commonGitDir: plan.commonGitDir, head: plan.baseCommit, fingerprint: "b".repeat(64) };
+  seed.completeWorktreeCreation(task.id, "source-owner", observed, "b".repeat(64));
+  seed.recoverExpired(new Date(Date.now() + 120_000));
+  seed.close();
+
+  const workerSource = `
+    const { parentPort, workerData } = require('node:worker_threads');
+    (async () => {
+      let store;
+      try {
+        const { TaskStore } = await import(workerData.moduleUrl);
+        store = new TaskStore(workerData.path, { id: workerData.generationId, lockId: workerData.lockId, predecessorDrained: true, evidenceKind: 'guardian_startup_verified' });
+        const barrier = new Int32Array(workerData.barrier);
+        Atomics.add(barrier, 0, 1);
+        Atomics.notify(barrier, 0);
+        while (Atomics.load(barrier, 0) < 2) Atomics.wait(barrier, 0, Atomics.load(barrier, 0), 10000);
+        const now = new Date();
+        const claimed = store.claimExecutionRecovery(workerData.taskId, workerData.owner, {
+          now, identity: { checkedAt: now.toISOString(), observed: workerData.observed, fingerprint: workerData.fingerprint }
+        });
+        parentPort.postMessage({ owner: workerData.owner, claimed: Boolean(claimed), status: store.get(workerData.taskId)?.status });
+      } catch (error) { parentPort.postMessage({ error: error instanceof Error ? error.message : String(error) }); }
+      finally { store?.close(); }
+    })();
+  `;
+  const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const moduleUrl = new URL("./task-store.js", import.meta.url).href;
+  const start = (generationId: string, owner: string) => new Promise<{ owner: string; claimed: boolean; status: string }>((resolve, reject) => {
+    const worker = new Worker(workerSource, { eval: true, workerData: { moduleUrl, path, taskId: task.id, lockId,
+      generationId, owner, observed, fingerprint: "c".repeat(64), barrier } });
+    let result: { owner: string; claimed: boolean; status: string } | undefined;
+    worker.once("message", value => { if (value?.error) reject(new Error(value.error)); else result = value; });
+    worker.once("error", reject);
+    worker.once("exit", code => {
+      if (code !== 0) reject(new Error(`recovery worker exited with code ${code}`));
+      else if (!result) reject(new Error("recovery worker exited without a result"));
+      else resolve(result);
+    });
+  });
+  try {
+    const outcomes = await Promise.all([
+      start("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "recovery-racer-a"),
+      start("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "recovery-racer-b"),
+    ]);
+    assert.equal(outcomes.filter(outcome => outcome.claimed).length, 1);
+    assert.equal(outcomes.filter(outcome => outcome.status === "running").length, 1);
+    const check = new TaskStore(path);
+    try {
+      assert.equal(check.get(task.id)?.status, "running");
+      assert.ok(["recovery-racer-a", "recovery-racer-b"].includes(check.get(task.id)?.leaseOwner ?? ""));
+      assert.equal(check.executionRecoveryCheckpoint(task.id)?.kind, "execution_recovery");
+    } finally { check.close(); }
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

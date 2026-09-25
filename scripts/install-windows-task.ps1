@@ -229,13 +229,19 @@ try {
         '"' + $argument + '"'
     }
     $action = New-ScheduledTaskAction -Execute $GuardianPath -Argument ($quotedGuardianArguments -join ' ') -WorkingDirectory $resolvedInstallDir
-    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $startupTrigger = New-ScheduledTaskTrigger -AtStartup
+    # The startup trigger covers boot; this repeating time trigger recovers a
+    # clean service exit and failures beyond Task Scheduler's bounded restart
+    # count. IgnoreNew below makes each tick a no-op while Zero is still up.
+    $watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::MaxValue)
+    $triggers = @($startupTrigger, $watchdogTrigger)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
 
     $passwordBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($credential.Password)
     $passwordPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr)
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers -Settings $settings `
         -User $Account -Password $passwordPlain -RunLevel Limited `
         -Description 'Zero local task execution service. Runs as a standard user at system startup.' | Out-Null
 

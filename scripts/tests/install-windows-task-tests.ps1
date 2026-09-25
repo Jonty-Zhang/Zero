@@ -25,6 +25,33 @@ function Assert-InstallerFailure([hashtable]$Parameters, [string]$ExpectedMessag
     throw "Installer unexpectedly accepted input that should fail: $ExpectedMessage"
 }
 
+function Test-WindowsTaskTriggerObjects {
+    # These cmdlets only create local CIM trigger/settings objects. Do not
+    # register, start, stop, or modify any task on the machine running CI.
+    $startup = New-ScheduledTaskTrigger -AtStartup
+    $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::MaxValue)
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+    Assert-True ($null -ne $startup -and $null -ne $watchdog) 'Task Scheduler must construct both startup and watchdog triggers.'
+    Assert-True ([string]$watchdog.Repetition.Interval -match '^PT5M$') 'Watchdog repetition interval must serialize as five minutes.'
+    $durationText = [string]$watchdog.Repetition.Duration
+    if (-not $durationText) { throw 'Watchdog repetition duration was empty.' }
+    try {
+        $duration = if ($durationText.StartsWith('P')) {
+            [System.Xml.XmlConvert]::ToTimeSpan($durationText)
+        }
+        else {
+            [TimeSpan]::Parse($durationText, [Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    catch { throw "Task Scheduler could not serialize the maximum watchdog duration: $durationText" }
+    Assert-True ($duration.TotalDays -gt (365 * 1000)) 'Watchdog repetition duration must remain effectively indefinite.'
+    Assert-True ([string]$settings.MultipleInstances -match '^(IgnoreNew|2)$') 'Task settings must preserve IgnoreNew.'
+    Assert-True ([string]$settings.RestartCount -eq '3') 'Task settings must preserve the bounded fast-restart policy.'
+}
+
 $script:InstallerPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'install-windows-task.ps1'
 $script:UninstallerPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'uninstall-windows-task.ps1'
 $resolvedGuardian = (Resolve-Path -LiteralPath $GuardianPath -ErrorAction Stop).Path
@@ -62,6 +89,14 @@ try {
     Assert-Equal (Resolve-TaskAccount $explicitAccount) $explicitAccount 'An explicitly configured task account must be preserved.'
     $installerSource = Get-Content -LiteralPath $script:InstallerPath -Raw
     Assert-True ($installerSource -match 'if \(\$Install\) \{ \$Account = Resolve-TaskAccount \$Account \}') 'Install flow must resolve the account before registration.'
+    Assert-True ($installerSource -match '\$startupTrigger = New-ScheduledTaskTrigger -AtStartup') 'Installer must retain the boot-time startup trigger.'
+    Assert-True ($installerSource -match '\$watchdogTrigger = New-ScheduledTaskTrigger -Once -At \(Get-Date\)\.AddMinutes\(5\)') 'Installer must create a delayed watchdog trigger.'
+    Assert-True ($installerSource -match '-RepetitionInterval \(New-TimeSpan -Minutes 5\) -RepetitionDuration \(\[TimeSpan\]::MaxValue\)') 'Watchdog trigger must repeat every five minutes indefinitely.'
+    Assert-True ($installerSource -match '\$triggers = @\(\$startupTrigger, \$watchdogTrigger\)') 'Both startup and watchdog triggers must be registered.'
+    Assert-True ($installerSource -match 'Register-ScheduledTask -TaskName \$TaskName -Action \$action -Trigger \$triggers') 'Registration must pass both configured triggers to Task Scheduler.'
+    Assert-True ($installerSource -match '-MultipleInstances IgnoreNew') 'Watchdog ticks must not start duplicate guardian processes while Zero is already running.'
+    Assert-True ($installerSource -match '-RestartCount 3 -RestartInterval') 'The short bounded restart policy must remain enabled alongside the watchdog.'
+    Test-WindowsTaskTriggerObjects
     $nsiSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'installer\zero.nsi') -Raw
     Assert-True ($nsiSource -match 'CreateShortcut "\$SMPROGRAMS\\Zero\\Configure Zero Background Service\.lnk"[\s\S]*?-Install -InstallDir') 'NSIS registration shortcut must call install without constructing an account name.'
     Assert-True ($nsiSource -notmatch 'Configure Zero Background Service[\s\S]{0,500}-Account') 'NSIS shortcut must not pass an account parameter.'

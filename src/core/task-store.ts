@@ -134,6 +134,11 @@ export class TaskStore {
         status TEXT NOT NULL CHECK(status IN ('intent','created')), plan TEXT NOT NULL,
         intent_at TEXT NOT NULL, observed TEXT, fingerprint TEXT, created_at TEXT
       );
+      CREATE TABLE IF NOT EXISTS execution_recovery_checkpoints (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id), status TEXT NOT NULL
+          CHECK(status IN ('claimed','quarantined','inspection_required','disabled','superseded')),
+        payload TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
     `);
     // Additive, idempotent migration: old attempts remain valid with a NULL stage_id.
     // Existing databases are not rebuilt or rewritten.
@@ -387,7 +392,10 @@ export class TaskStore {
       const changed = this.#db.prepare(sql).run(...args);
       if (Number(changed.changes) !== 1) throw new Error(`Task ${id} state transition rejected (expected ${expectedList.join("|")})`);
       if (next === "failed" && options.reason) this.#db.prepare("UPDATE tasks SET failure_reason=? WHERE id=?").run(options.reason, id);
-      if (next === "done" || next === "failed") this.#db.prepare("DELETE FROM quota_pauses WHERE task_id=?").run(id);
+      if (next === "done" || next === "failed") {
+        this.#db.prepare("DELETE FROM quota_pauses WHERE task_id=?").run(id);
+        this.#disableExecutionRecoveryCheckpoint(id, at, `terminal:${next}`);
+      }
       this.#event(id, "task.transition", { from: expectedList, to: next, reason: options.reason }, at);
     });
     const task = this.get(id);
@@ -401,6 +409,194 @@ export class TaskStore {
       if (task.recoveryEvidence?.kind !== "lease_expiry" || task.recoveryEvidence.claimProtocolVersion !== 2) return false;
       return !this.#hasPersistedWriteEvidence(task.id);
     });
+  }
+
+  /** Strict candidates for the first ordinary-crash resume path. No filesystem work is done here. */
+  listExecutionRecoveryCandidates(): TaskRecord[] {
+    return this.list("recovery_required").filter(task => this.#executionRecoveryEligibility(task.id));
+  }
+
+  #executionRecoveryEligibility(taskId: string): boolean {
+    const row = this.#db.prepare(`SELECT t.status,t.revision_count,t.claim_generation_id,t.payload,t.recovery_evidence,t.lease_owner,t.lease_expires_at
+      FROM tasks t WHERE t.id=?`).get(taskId) as {
+        status: TaskStatus; revision_count: number; claim_generation_id: string | null; payload: string; recovery_evidence: string | null;
+        lease_owner: string | null; lease_expires_at: string | null;
+      } | undefined;
+    if (!row || row.status !== "recovery_required" || row.lease_owner !== null || row.lease_expires_at !== null ||
+        row.revision_count !== 0 || !row.recovery_evidence || !row.claim_generation_id) return false;
+    let evidence: Record<string, unknown>;
+    let payload: { executionStages?: unknown };
+    try { evidence = JSON.parse(row.recovery_evidence) as Record<string, unknown>; payload = JSON.parse(row.payload) as { executionStages?: unknown }; }
+    catch { return false; }
+    if (evidence.kind !== "lease_expiry" || evidence.claimProtocolVersion !== 2 || evidence.previousStatus !== "running" ||
+        evidence.claimGenerationId !== row.claim_generation_id || !this.currentStartupProvesGenerationDrained(row.claim_generation_id)) return false;
+    if (payload.executionStages !== undefined && (!Array.isArray(payload.executionStages) || payload.executionStages.length > 1)) return false;
+    if (this.#db.prepare("SELECT 1 FROM quota_pauses WHERE task_id=?").get(taskId)) return false;
+    const checkpoint = this.#db.prepare("SELECT status,payload FROM execution_recovery_checkpoints WHERE task_id=?").get(taskId) as { status: string; payload: string } | undefined;
+    if (checkpoint) {
+      if (checkpoint.status !== "superseded") return false;
+      const prior = JSON.parse(checkpoint.payload) as Record<string, unknown>;
+      if (prior.claimedGenerationId !== row.claim_generation_id || prior.supersededBySourceGenerationId !== row.claim_generation_id) return false;
+    }
+    const worktree = this.#db.prepare("SELECT status,plan,observed,fingerprint FROM worktree_creations WHERE task_id=?").get(taskId) as {
+      status: string; plan: string; observed: string | null; fingerprint: string | null;
+    } | undefined;
+    if (!worktree || worktree.status !== "created" || !worktree.plan || !worktree.observed || !worktree.fingerprint ||
+        !/^[a-f0-9]{64}$/i.test(worktree.fingerprint)) return false;
+    try {
+      const plan = JSON.parse(worktree.plan) as Record<string, unknown>;
+      const observed = JSON.parse(worktree.observed) as { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown };
+      if (!plan || Array.isArray(plan) || typeof plan !== "object" || plan.taskId !== taskId || !observed || Array.isArray(observed) || typeof observed !== "object" ||
+          !observed.info || Array.isArray(observed.info) || typeof observed.info !== "object" ||
+          !["repoPath", "path", "branch", "baseCommit"].every(key => plan[key] === observed.info![key]) ||
+          plan.commonGitDir !== observed.commonGitDir || observed.head !== plan.baseCommit) return false;
+    } catch { return false; }
+    if (this.#db.prepare("SELECT 1 FROM attempts WHERE task_id=? AND role='review' LIMIT 1").get(taskId) ||
+        this.#db.prepare("SELECT 1 FROM stages WHERE task_id=? AND role='review' LIMIT 1").get(taskId) ||
+        this.#db.prepare("SELECT 1 FROM reviews WHERE task_id=? LIMIT 1").get(taskId) ||
+        this.#db.prepare("SELECT 1 FROM events WHERE task_id=? AND (lower(type) LIKE '%review%' OR lower(type) LIKE '%report%' OR lower(type) LIKE '%commit%') LIMIT 1").get(taskId)) return false;
+    return true;
+  }
+
+  /** Atomically claims a proven-drained ordinary execution and records its durable recovery boundary. */
+  claimExecutionRecovery(taskId: string, owner: string, input: {
+    leaseMs?: number; now?: Date; identity: { checkedAt: string; observed: unknown; fingerprint: string };
+  }): TaskRecord | undefined {
+    if (!owner || !input || !input.identity || !/^[a-f0-9]{64}$/i.test(input.identity.fingerprint)) throw new Error("owner and valid fresh worktree identity are required");
+    const now = input.now ?? new Date();
+    const leaseMs = input.leaseMs ?? 60_000;
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || !Number.isFinite(leaseMs) || leaseMs <= 0) throw new Error("valid now and positive leaseMs are required");
+    this.#assertFreshRecoveryCheck(input.identity.checkedAt, now);
+    const observedJson = JSON.stringify(input.identity.observed);
+    if (!observedJson || observedJson === "null" || Buffer.byteLength(observedJson) > 65_536) throw new Error("Fresh observed worktree identity must be non-empty and at most 64 KiB");
+    const at = now.toISOString();
+    const expires = new Date(now.getTime() + leaseMs).toISOString();
+    let claimed = false;
+    this.#transaction(() => {
+      if (!this.#executionRecoveryEligibility(taskId)) return;
+      const task = this.#db.prepare("SELECT recovery_reason,recovery_evidence,claim_generation_id,revision_count,payload FROM tasks WHERE id=?").get(taskId) as {
+        recovery_reason: string | null; recovery_evidence: string; claim_generation_id: string; revision_count: number; payload: string;
+      };
+      const worktree = this.#db.prepare("SELECT * FROM worktree_creations WHERE task_id=?").get(taskId) as {
+        task_id: string; lease_owner: string; status: string; plan: string; intent_at: string; observed: string; fingerprint: string; created_at: string;
+      };
+      const savedObserved = JSON.parse(worktree.observed) as { info?: Record<string, unknown>; commonGitDir?: unknown };
+      const freshObserved = input.identity.observed as { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown };
+      const savedInfo = savedObserved.info;
+      const freshInfo = freshObserved?.info;
+      if (!savedInfo || !freshInfo || !["taskId", "repoPath", "path", "branch", "baseCommit"].every(key => savedInfo[key] === freshInfo[key]) ||
+          savedObserved.commonGitDir !== freshObserved.commonGitDir || freshObserved.head !== freshInfo.baseCommit) {
+        throw new Error("Fresh worktree identity does not match persisted creation identity or contains a commit");
+      }
+      const history = this.#db.prepare(`SELECT COALESCE(MAX(e.id),0) AS event_id,
+          COALESCE((SELECT MAX(sequence) FROM attempts WHERE task_id=?),0) AS attempt_sequence,
+          COALESCE((SELECT MAX(sequence) FROM stages WHERE task_id=?),0) AS stage_sequence,
+          COALESCE((SELECT COUNT(*) FROM routes WHERE task_id=?),0) AS route_count,
+          COALESCE((SELECT COUNT(*) FROM checks WHERE task_id=?),0) AS check_count,
+          COALESCE((SELECT COUNT(*) FROM handoffs WHERE task_id=?),0) AS handoff_count
+        FROM events e WHERE e.task_id=?`).get(taskId, taskId, taskId, taskId, taskId, taskId) as {
+          event_id: number; attempt_sequence: number; stage_sequence: number; route_count: number; check_count: number; handoff_count: number;
+        };
+      const creationEvent = this.#db.prepare("SELECT id FROM events WHERE task_id=? AND type='worktree.created' ORDER BY id LIMIT 1").get(taskId) as { id: number } | undefined;
+      const checkpointId = randomUUID();
+      const source = {
+        recoveryReason: task.recovery_reason, recoveryEvidence: JSON.parse(task.recovery_evidence),
+        worktreeCreation: { taskId: worktree.task_id, leaseOwner: worktree.lease_owner, status: worktree.status,
+          plan: JSON.parse(worktree.plan), intentAt: worktree.intent_at, observed: JSON.parse(worktree.observed),
+          fingerprint: worktree.fingerprint, createdAt: worktree.created_at, sourceEventId: creationEvent?.id },
+        historyBoundary: { throughEventId: history.event_id, attemptSequence: history.attempt_sequence,
+          stageSequence: history.stage_sequence, routeCount: history.route_count, checkCount: history.check_count,
+          handoffCount: history.handoff_count },
+      };
+      const checkpoint = { id: checkpointId, schemaVersion: 1, kind: "execution_recovery", sourceGenerationId: task.claim_generation_id,
+        source, freshIdentity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint,
+          creationFingerprint: worktree.fingerprint },
+        claimedGenerationId: this.#startupGeneration.id, owner, leaseExpiresAt: expires, claimedAt: at };
+      const checkpointJson = JSON.stringify(checkpoint);
+      if (Buffer.byteLength(checkpointJson) > 65_536) throw new Error("Execution recovery checkpoint exceeds 64 KiB");
+      const changed = this.#db.prepare(`UPDATE tasks SET status='running',updated_at=?,lease_owner=?,lease_expires_at=?,heartbeat_at=?,active_attempt_id=NULL,
+        lease_protocol_version=2,claim_generation_id=?,recovery_reason=NULL,recovery_evidence=NULL
+        WHERE id=? AND status='recovery_required' AND revision_count=0 AND claim_generation_id=?`)
+        .run(at, owner, expires, at, this.#startupGeneration.id, taskId, task.claim_generation_id);
+      if (Number(changed.changes) !== 1) return;
+      this.#db.prepare(`UPDATE worktree_creations SET lease_owner=?,observed=?,fingerprint=?,created_at=? WHERE task_id=? AND status='created'`)
+        .run(owner, observedJson, input.identity.fingerprint, at, taskId);
+      this.#db.prepare(`INSERT INTO execution_recovery_checkpoints(task_id,status,payload,updated_at) VALUES(?,'claimed',?,?)
+        ON CONFLICT(task_id) DO UPDATE SET status='claimed',payload=excluded.payload,updated_at=excluded.updated_at`).run(taskId, checkpointJson, at);
+      this.#event(taskId, "task.execution_recovery_claimed", { checkpointId, sourceGenerationId: task.claim_generation_id,
+        generationId: this.#startupGeneration.id, owner, claimedAt: at, fingerprint: input.identity.fingerprint,
+        sourceHistoryThroughEventId: history.event_id, sourceWorktreeCreatedEventId: creationEvent?.id }, at);
+      this.#event(taskId, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2, generationId: this.#startupGeneration.id, recovery: true }, at);
+      claimed = true;
+    });
+    return claimed ? this.get(taskId) : undefined;
+  }
+
+  /** After a claimed identity fails a second check, return to quarantine with the checkpoint intact. */
+  quarantineClaimedExecutionRecovery(taskId: string, owner: string, reason: string): TaskRecord {
+    if (!reason.trim()) throw new Error("recovery quarantine reason is required");
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const row = this.#db.prepare("SELECT status,lease_owner,recovery_evidence FROM tasks WHERE id=?").get(taskId) as {
+        status: TaskStatus; lease_owner: string | null; recovery_evidence: string | null;
+      } | undefined;
+      const checkpoint = this.#db.prepare("SELECT payload,status FROM execution_recovery_checkpoints WHERE task_id=?").get(taskId) as { payload: string; status: string } | undefined;
+      if (!row || row.status !== "running" || row.lease_owner !== owner || !checkpoint || checkpoint.status !== "claimed") throw new Error(`Task ${taskId} has no claimed execution recovery for ${owner}`);
+      const checkpointPayload = JSON.parse(checkpoint.payload) as Record<string, unknown>;
+      const source = checkpointPayload.source as Record<string, unknown>;
+      const evidence = source.recoveryEvidence as Record<string, unknown>;
+      const quarantine = { kind: "execution_recovery_quarantine", claimProtocolVersion: 2, previousStatus: "running",
+        claimGenerationId: checkpointPayload.claimedGenerationId, sourceRecoveryEvidence: evidence, quarantineReason: reason,
+        quarantinedAfterClaimAt: at, recoveryCheckpoint: "execution_recovery" };
+      const changed = this.#db.prepare(`UPDATE tasks SET status='recovery_required',updated_at=?,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,
+        recovery_reason=?,recovery_evidence=? WHERE id=? AND status='running' AND lease_owner=?`)
+        .run(at, reason, JSON.stringify(quarantine), taskId, owner);
+      if (Number(changed.changes) !== 1) throw new Error(`Task ${taskId} recovery quarantine was rejected`);
+      this.#db.prepare("UPDATE execution_recovery_checkpoints SET status='quarantined',updated_at=? WHERE task_id=?").run(at, taskId);
+      this.#event(taskId, "task.execution_recovery_quarantined", { reason, checkpointId: checkpointPayload.id,
+        sourceGenerationId: checkpointPayload.sourceGenerationId, generationId: checkpointPayload.claimedGenerationId }, at);
+    });
+    return this.get(taskId)!;
+  }
+
+  /** Persist a single pre-claim exclusion for a durable identity mismatch; transient I/O failures must not call this. */
+  rejectExecutionRecoveryInspection(taskId: string, reason: string, checkedAt: string): TaskRecord {
+    if (!reason.trim()) throw new Error("inspection rejection reason is required");
+    this.#assertFreshRecoveryCheck(checkedAt, new Date());
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      if (!this.#executionRecoveryEligibility(taskId)) throw new Error(`Task ${taskId} is not an eligible lease-expiry execution recovery`);
+      const row = this.#db.prepare("SELECT recovery_evidence,claim_generation_id FROM tasks WHERE id=?").get(taskId) as { recovery_evidence: string; claim_generation_id: string };
+      const payload = { schemaVersion: 1, kind: "execution_recovery_inspection_rejected", sourceGenerationId: row.claim_generation_id,
+        sourceRecoveryEvidence: JSON.parse(row.recovery_evidence), reason, checkedAt, recordedAt: at };
+      this.#db.prepare("INSERT INTO execution_recovery_checkpoints(task_id,status,payload,updated_at) VALUES(?,'inspection_required',?,?)")
+        .run(taskId, JSON.stringify(payload), at);
+      this.#event(taskId, "task.execution_recovery_inspection_required", payload, at);
+    });
+    return this.get(taskId)!;
+  }
+
+  executionRecoveryCheckpoint(taskId: string): Record<string, unknown> | undefined {
+    const row = this.#db.prepare(`SELECT c.payload,t.status,t.lease_owner,t.claim_generation_id FROM execution_recovery_checkpoints c
+      JOIN tasks t ON t.id=c.task_id WHERE c.task_id=? AND c.status='claimed'`).get(taskId) as {
+        payload: string; status: TaskStatus; lease_owner: string | null; claim_generation_id: string | null;
+      } | undefined;
+    if (!row || row.status !== "running" || !row.lease_owner || !row.claim_generation_id) return undefined;
+    const payload = JSON.parse(row.payload) as Record<string, unknown>;
+    return payload.owner === row.lease_owner && payload.claimedGenerationId === row.claim_generation_id ? payload : undefined;
+  }
+
+  #assertFreshRecoveryCheck(checkedAt: string, now: Date): void {
+    const checked = Date.parse(checkedAt);
+    if (!Number.isFinite(checked) || checked > now.getTime() + 5_000 || now.getTime() - checked > 5_000) throw new Error("Fresh worktree identity evidence is required");
+  }
+
+  #disableExecutionRecoveryCheckpoint(taskId: string, at: string, reason: string): void {
+    const row = this.#db.prepare("SELECT payload FROM execution_recovery_checkpoints WHERE task_id=?").get(taskId) as { payload: string } | undefined;
+    if (!row) return;
+    const payload = JSON.parse(row.payload) as Record<string, unknown>;
+    this.#db.prepare("UPDATE execution_recovery_checkpoints SET status='disabled',payload=?,updated_at=? WHERE task_id=?")
+      .run(JSON.stringify({ ...payload, disabledAt: at, disabledReason: reason }), at, taskId);
   }
 
   #hasPersistedWriteEvidence(taskId: string): boolean {
@@ -462,6 +658,7 @@ export class TaskStore {
         ON CONFLICT(task_id) DO UPDATE SET retry_at=excluded.retry_at,retry_count=excluded.retry_count,checkpoint=excluded.checkpoint,reason=excluded.reason,source=excluded.source`)
         .run(taskId, retryAt.toISOString(), count, JSON.stringify(input.checkpoint), input.reason, input.source ?? "fallback");
       this.#db.prepare(`UPDATE tasks SET status='waiting',updated_at=?,failure_reason=?,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,active_attempt_id=NULL WHERE id=?`).run(at, input.reason, taskId);
+      this.#disableExecutionRecoveryCheckpoint(taskId, at, "quota_waiting");
       this.#event(taskId, "task.quota_waiting", { retryAt: retryAt.toISOString(), retryCount: count, checkpoint: input.checkpoint, source: input.source ?? "fallback", reason: input.reason }, at);
     });
     return this.get(taskId)!;
@@ -501,10 +698,25 @@ export class TaskStore {
         const runningAttempts = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? AND status='running'").all(row.id) as Array<{ id: string }>;
         const runningStages = this.#db.prepare("SELECT id,process_start_id,generation_id FROM stages WHERE task_id=? AND status='running'").all(row.id) as Array<{ id: string; process_start_id: string; generation_id: string | null }>;
         const reason = "Task lease expired while execution was active; inspect the worker process and task worktree before any retry.";
-        const evidence = { kind: "lease_expiry", claimProtocolVersion: row.lease_protocol_version, previousStatus: row.status, leaseOwner: row.lease_owner, leaseExpiresAt: row.lease_expires_at,
+        let evidence: Record<string, unknown> = { kind: "lease_expiry", claimProtocolVersion: row.lease_protocol_version, previousStatus: row.status, leaseOwner: row.lease_owner, leaseExpiresAt: row.lease_expires_at,
           heartbeatAt: row.heartbeat_at, activeAttemptId: row.active_attempt_id, claimGenerationId: row.claim_generation_id,
           runningAttemptIds: runningAttempts.map(attempt => attempt.id),
           runningStages: runningStages.map(stage => ({ id: stage.id, processStartId: stage.process_start_id, generationId: stage.generation_id })) };
+        const priorRecovery = this.#db.prepare("SELECT status,payload FROM execution_recovery_checkpoints WHERE task_id=?").get(row.id) as { status: string; payload: string } | undefined;
+        if (priorRecovery?.status === "claimed") {
+          const priorCheckpoint = JSON.parse(priorRecovery.payload) as Record<string, unknown>;
+          if (priorCheckpoint.claimedGenerationId === row.claim_generation_id) {
+            const archivedEvent = this.#db.prepare("SELECT id FROM events WHERE task_id=? AND type='task.execution_recovery_claimed' ORDER BY id DESC LIMIT 1").get(row.id) as { id: number } | undefined;
+            evidence = { ...evidence, priorExecutionRecoveryCheckpoint: {
+              checkpointId: priorCheckpoint.id,
+              sourceGenerationId: priorCheckpoint.sourceGenerationId, claimedGenerationId: priorCheckpoint.claimedGenerationId,
+              claimedAt: priorCheckpoint.claimedAt, archivedEventId: archivedEvent?.id,
+            } };
+            const superseded = { ...priorCheckpoint, supersededBySourceGenerationId: row.claim_generation_id, supersededAt: at };
+            this.#db.prepare("UPDATE execution_recovery_checkpoints SET status='superseded',payload=?,updated_at=? WHERE task_id=? AND status='claimed'")
+              .run(JSON.stringify(superseded), at, row.id);
+          }
+        }
         this.#db.prepare(`UPDATE tasks SET status='recovery_required', updated_at=?, lease_owner=NULL, lease_expires_at=NULL,
           heartbeat_at=NULL, active_attempt_id=NULL, recovery_reason=?, recovery_evidence=? WHERE id=?`)
           .run(at, reason, JSON.stringify(evidence), row.id);
@@ -777,6 +989,9 @@ export class TaskStore {
   }
 
   getRoute(taskId: string): RouteDecision | undefined {
+    const routeEvent = this.#db.prepare("SELECT id FROM events WHERE task_id=? AND type='route.decided' ORDER BY id DESC LIMIT 1").get(taskId) as { id: number } | undefined;
+    const recoveryEvent = this.#db.prepare("SELECT id FROM events WHERE task_id=? AND type='task.execution_recovery_claimed' ORDER BY id DESC LIMIT 1").get(taskId) as { id: number } | undefined;
+    if (recoveryEvent && (!routeEvent || recoveryEvent.id > routeEvent.id)) return undefined;
     const row = this.#db.prepare("SELECT decision FROM routes WHERE task_id=? ORDER BY id DESC LIMIT 1").get(taskId) as { decision: string } | undefined;
     return row ? JSON.parse(row.decision) as RouteDecision : undefined;
   }

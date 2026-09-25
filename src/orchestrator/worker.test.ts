@@ -24,6 +24,242 @@ async function initRepo(repo: string): Promise<void> {
   await exec("git", ["commit", "-m", "seed"], { cwd: repo });
 }
 
+function guardianGeneration(id: string) {
+  return { id, lockId: "d".repeat(64), predecessorDrained: true, evidenceKind: "guardian_startup_verified" as const };
+}
+
+test("ordinary execution crash resumes only with fresh attempts, checks, route, and review", async () => {
+  for (const crashPoint of ["route", "execution", "partial-checks"] as const) {
+    const root = await mkdtemp(join(process.cwd(), `.zero-worker-crash-recovery-${crashPoint}-`));
+    const repo = join(root, "repo");
+    const db = join(root, "tasks.sqlite");
+    const worktreeRoot = join(root, "worktrees");
+    const artifacts = join(root, "artifacts");
+    await initRepo(repo);
+    let store = new TaskStore(db, guardianGeneration("a".repeat(32)));
+    try {
+      const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Finish result.txt", maxRevisions: 0,
+        checks: [{ id: "fresh-check", argv: [process.execPath, "-e", "process.exit(require('node:fs').readFileSync('result.txt','utf8') === 'approved\\n' ? 0 : 1)"] }] }, `crash_${crashPoint}`);
+      const oldOwner = `old-${crashPoint}`;
+      assert.equal(store.claimNext(oldOwner)?.id, task.id);
+      const worktrees = new GitWorktreeManager(worktreeRoot);
+      const plan = await worktrees.prepareCreatePlan(task.id, repo, "main");
+      store.recordWorktreeCreationIntent(task.id, oldOwner, plan);
+      const created = await worktrees.executePlan(plan);
+      store.completeWorktreeCreation(task.id, oldOwner, created, created.fingerprint);
+
+      const oldRoute = { ...routeFor(task), reason: `stale ${crashPoint} route` };
+      if (crashPoint === "route") {
+        const routeAttempt = store.createAttempt(task.id, "route", { owner: oldOwner, harness: "codex" });
+        store.saveRoute(oldRoute);
+        assert.equal(routeAttempt.status, "running");
+      } else {
+        const processStartId = `old-process-${crashPoint}`;
+        const oldStage = store.createStage(task.id, { role: "implement", harness: "fake", model: "model", processStartId });
+        store.startStage(oldStage.id, oldOwner, processStartId);
+        const oldAttempt = store.createAttempt(task.id, "implement", { owner: oldOwner, stageId: oldStage.id, harness: "fake", model: "model" });
+        store.saveRoute(oldRoute);
+        await writeFile(join(plan.path, "partial.txt"), "interrupted writer output\n");
+        if (crashPoint === "partial-checks") {
+          store.saveCheck(task.id, { id: "stale-partial-check", argv: [], status: "passed", exitCode: 0, durationMs: 1 }, oldAttempt.id);
+        }
+      }
+      assert.deepEqual(store.recoverExpired(new Date(Date.now() + 120_000)), [task.id]);
+      assert.equal(store.get(task.id)?.status, "recovery_required");
+      const oldWorktreePath = plan.path;
+      store.close();
+
+      store = new TaskStore(db, guardianGeneration("b".repeat(32)));
+      let routeCalls = 0;
+      let runCalls = 0;
+      let reviewCalls = 0;
+      const adapter: HarnessAdapter = {
+        id: "fake",
+        async probe() { return { harness: "fake", available: true, models: ["model"], roles: ["implement"] }; },
+        async run(request) {
+          runCalls++;
+          assert.equal(request.taskId, task.id);
+          assert.equal(request.cwd, oldWorktreePath);
+          await writeFile(join(request.cwd, "result.txt"), "approved\n");
+          return { status: "completed", exitCode: 0, requestedModel: request.model, actualModel: request.model, durationMs: 1 };
+        },
+      };
+      const router: TaskRouter = { async route(current) { routeCalls++; return routeFor(current); } };
+      const reviewer: TaskReviewer = { async review(_current, worktree, route, checks) {
+        reviewCalls++;
+        assert.equal(worktree.taskId, task.id);
+        assert.equal(worktree.path, oldWorktreePath);
+        assert.equal(route.taskId, task.id);
+        assert.deepEqual(checks.map(check => check.id), ["fresh-check"]);
+        assert.ok(checks.every(check => check.status === "passed"));
+        return { harness: "codex", model: "review", exitCode: 0,
+          result: { verdict: "pass", summary: "Fresh recovery checks passed", findings: [] } };
+      } };
+      const options = { store, worktrees: new GitWorktreeManager(worktreeRoot), testRunner: new TestRunner({ logDirectory: join(artifacts, "checks") }),
+        router, reviewer, adapters: new Map([["fake", adapter]]), artifactRoot: artifacts };
+      const [resultA, resultB] = await Promise.all([
+        new TaskWorker(options).runNext("recovery-a"),
+        new TaskWorker(options).runNext("recovery-b"),
+      ]);
+      const done = resultA?.status === "done" ? resultA : resultB;
+      assert.equal(done?.id, task.id);
+      assert.equal(done?.status, "done");
+      assert.equal(Number(resultA?.id === task.id) + Number(resultB?.id === task.id), 1, "only one worker may claim the recovered task");
+      assert.equal(routeCalls, 1, "the old route must not be reused");
+      assert.equal(runCalls, 1, "the previous writer must not be replayed concurrently");
+      assert.equal(reviewCalls, 1, "recovery requires a fresh review");
+      const attempts = store.attempts(task.id);
+      const newImplement = attempts.filter(attempt => attempt.role === "implement" && attempt.status === "succeeded");
+      assert.equal(newImplement.length, 1);
+      assert.ok(!newImplement.some(attempt => attempt.id === store.attempts(task.id).find(item => item.status === "interrupted")?.id));
+      const stages = store.stages(task.id).filter(stage => stage.role === "implement");
+      assert.equal(stages.at(-1)?.predecessorStageId, undefined, "the interrupted stage must not become a handoff predecessor");
+      const report = await new TaskWorker(options).readReport(task.id);
+      assert.deepEqual(report?.checks.map(check => check.id), ["fresh-check"]);
+      assert.ok(report?.historicalChecks?.every(item => item.result.id !== "fresh-check" || item.attemptId !== attempts.find(attempt => attempt.role === "implement" && attempt.status === "succeeded")?.id));
+      assert.ok(report?.historicalRouteDecisions?.some(route => route.reason === `stale ${crashPoint} route`));
+      if (crashPoint === "partial-checks") {
+        assert.ok(report?.historicalChecks?.some(item => item.result.id === "stale-partial-check"));
+      }
+    } finally {
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("ordinary crash recovery quarantines changed worktrees and waits for a guardian drain proof", async () => {
+  for (const scenario of ["changed-worktree", "unproved-generation"] as const) {
+    const root = await mkdtemp(join(process.cwd(), `.zero-worker-recovery-reject-${scenario}-`));
+    const repo = join(root, "repo");
+    const db = join(root, "tasks.sqlite");
+    const worktreeRoot = join(root, "worktrees");
+    await initRepo(repo);
+    let store = new TaskStore(db, guardianGeneration("c".repeat(32)));
+    try {
+      const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Do not reuse unproved output", maxRevisions: 0,
+        checks: [{ id: "fresh", argv: [process.execPath, "-e", "process.exit(0)"] }] }, `reject_${scenario}`);
+      const oldOwner = `old-${scenario}`;
+      store.claimNext(oldOwner);
+      const worktrees = new GitWorktreeManager(worktreeRoot);
+      const plan = await worktrees.prepareCreatePlan(task.id, repo, "main");
+      store.recordWorktreeCreationIntent(task.id, oldOwner, plan);
+      const created = await worktrees.executePlan(plan);
+      store.completeWorktreeCreation(task.id, oldOwner, created, created.fingerprint);
+      const oldAttempt = store.createAttempt(task.id, "route", { owner: oldOwner, harness: "codex" });
+      assert.equal(oldAttempt.status, "running");
+      assert.deepEqual(store.recoverExpired(new Date(Date.now() + 120_000)), [task.id]);
+      if (scenario === "changed-worktree") {
+        await writeFile(join(plan.path, "unreviewed.txt"), "unexpected commit\n");
+        await exec("git", ["add", "unreviewed.txt"], { cwd: plan.path });
+        await exec("git", ["commit", "-m", "unreviewed prior output"], { cwd: plan.path });
+      }
+      store.close();
+
+      store = scenario === "changed-worktree"
+        ? new TaskStore(db, guardianGeneration("e".repeat(32)))
+        : new TaskStore(db, { id: "f".repeat(32), predecessorDrained: false, evidenceKind: "unguarded" });
+      let routeCalls = 0;
+      let runCalls = 0;
+      const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(worktreeRoot), testRunner: new TestRunner(),
+        router: { async route(current) { routeCalls++; return routeFor(current); } },
+        reviewer: { async review() { throw new Error("recovery must not reach review"); } },
+        adapters: new Map([["fake", { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+          async run() { runCalls++; return { status: "completed", exitCode: 0, durationMs: 1 }; } }]]), artifactRoot: join(root, "artifacts") });
+      assert.equal(await worker.runNext(`new-${scenario}`), undefined);
+      assert.equal(routeCalls, 0);
+      assert.equal(runCalls, 0);
+      assert.equal(store.get(task.id)?.status, "recovery_required");
+      if (scenario === "changed-worktree") {
+        assert.equal(store.executionRecoveryCheckpoint(task.id), undefined);
+        assert.equal(store.events(task.id).filter(event => event.type === "task.execution_recovery_inspection_required").length, 1);
+      } else {
+        assert.equal(store.executionRecoveryCheckpoint(task.id), undefined);
+      }
+    } finally {
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("quota pause during recovered routing preserves crash recovery lineage and report evidence", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-recovery-quota-test-"));
+  const repo = join(root, "repo");
+  const db = join(root, "tasks.sqlite");
+  const worktreeRoot = join(root, "worktrees");
+  const artifacts = join(root, "artifacts");
+  await initRepo(repo);
+  let store = new TaskStore(db, guardianGeneration("1".repeat(32)));
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Finish result.txt", maxRevisions: 0,
+      checks: [{ id: "fresh-check", argv: [process.execPath, "-e", "process.exit(require('node:fs').readFileSync('result.txt','utf8') === 'approved\\n' ? 0 : 1)"] }] }, "recovery_then_quota");
+    const oldOwner = "old-quota-worker";
+    store.claimNext(oldOwner);
+    const worktrees = new GitWorktreeManager(worktreeRoot);
+    const plan = await worktrees.prepareCreatePlan(task.id, repo, "main");
+    store.recordWorktreeCreationIntent(task.id, oldOwner, plan);
+    const created = await worktrees.executePlan(plan);
+    store.completeWorktreeCreation(task.id, oldOwner, created, created.fingerprint);
+    const oldAttempt = store.createAttempt(task.id, "route", { owner: oldOwner, harness: "codex" });
+    store.saveRoute({ ...routeFor(task), reason: "historical pre-crash route" });
+    store.saveCheck(task.id, { id: "stale-partial-check", argv: [], status: "failed", exitCode: 1, durationMs: 2 }, oldAttempt.id);
+    assert.deepEqual(store.recoverExpired(new Date(Date.now() + 120_000)), [task.id]);
+    store.close();
+
+    store = new TaskStore(db, guardianGeneration("2".repeat(32)));
+    const prompts: string[] = [];
+    let routeCalls = 0;
+    let reviewCalls = 0;
+    let firstRoute = true;
+    const router: TaskRouter = { async route(current) {
+      routeCalls++;
+      if (firstRoute) { firstRoute = false; throw new QuotaLimitError("router usage limit"); }
+      return routeFor(current);
+    } };
+    const adapter: HarnessAdapter = { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+      async run(request) { prompts.push(request.prompt); await writeFile(join(request.cwd, "result.txt"), "approved\n");
+        return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+    const reviewer: TaskReviewer = { async review(_task, worktree, _route, checks) {
+      reviewCalls++;
+      assert.equal(worktree.path, plan.path);
+      assert.deepEqual(checks.map(check => check.id), ["fresh-check"]);
+      return { harness: "codex", model: "review", exitCode: 0,
+        result: { verdict: "pass", summary: "Fresh checks passed", findings: [] } };
+    } };
+    const workerOptions = { store, worktrees: new GitWorktreeManager(worktreeRoot), testRunner: new TestRunner({ logDirectory: join(artifacts, "checks") }),
+      router, reviewer, adapters: new Map([["fake", adapter]]), artifactRoot: artifacts };
+    const waiting = await new TaskWorker(workerOptions).runNext("recovery-quota-worker");
+    assert.equal(waiting?.status, "waiting");
+    assert.ok(waiting?.resumeCheckpoint);
+    assert.equal((waiting?.resumeCheckpoint as Record<string, unknown>).executionRecovery, true);
+    assert.equal((waiting?.resumeCheckpoint as Record<string, unknown>).firstRecoveredExecution, true);
+    store.close();
+
+    store = new TaskStore(db, guardianGeneration("3".repeat(32)));
+    const resumedOwner = "quota-resume-worker";
+    const claimed = store.claimNext(resumedOwner, 60_000, new Date(Date.parse(waiting!.retryAt!) + 1_000));
+    assert.equal(claimed?.id, task.id);
+    const resumedOptions = { ...workerOptions, store };
+    const done = await new TaskWorker(resumedOptions).runClaimed(task.id, resumedOwner);
+    assert.equal(done.status, "done");
+    assert.equal(routeCalls, 2, "the quota resume performs a fresh route after the interrupted route attempt");
+    assert.equal(reviewCalls, 1);
+    assert.match(prompts[0]!, /incomplete edits from an interrupted earlier writer/);
+    const implementationStages = store.stages(task.id).filter(stage => stage.role === "implement");
+    assert.equal(implementationStages.length, 1);
+    assert.equal(implementationStages[0]?.predecessorStageId, undefined);
+    const report = await new TaskWorker(resumedOptions).readReport(task.id);
+    assert.deepEqual(report?.checks.map(check => check.id), ["fresh-check"]);
+    assert.ok(report?.historicalChecks?.some(item => item.result.id === "stale-partial-check"));
+    assert.ok(report?.historicalRouteDecisions?.some(route => route.reason === "historical pre-crash route"));
+    assert.equal(report?.routeDecisions.length, 1);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function routeForSelection(task: TaskRecord): RouteDecision {
   const selection = task.selection;
   const harness = selection?.harness ?? "glm";

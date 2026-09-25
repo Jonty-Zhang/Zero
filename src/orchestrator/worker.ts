@@ -15,7 +15,7 @@ import type {
   TaskRecord,
   TaskStatus,
 } from "../domain/types.js";
-import { GitWorktreeManager, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
+import { GitWorktreeManager, type WorktreeCreationEvidence, type WorktreeCreationPlan, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
@@ -34,6 +34,9 @@ interface WorkerCheckpoint {
   finalChecks?: CheckResult[];
   /** The exact Git tree on which the passing checks ran before a quota-paused review. */
   checksSnapshot?: Pick<WorktreeReviewSnapshot, "fingerprint" | "diffHash" | "treeId">;
+  /** Preserve an ordinary-crash recovery boundary if a later quota pause interrupts it. */
+  executionRecovery?: boolean;
+  firstRecoveredExecution?: boolean;
 }
 
 export interface RouteContext {
@@ -88,6 +91,10 @@ export interface TaskReport {
   baseCommit?: string;
   resultCommit?: string;
   routeDecisions: RouteDecision[];
+  /** Pre-recovery and superseded check evidence retained for audit, never current validation. */
+  historicalChecks?: Array<{ attemptId?: string; result: CheckResult }>;
+  historicalRouteDecisions?: RouteDecision[];
+  recoveryBoundaryEventId?: number;
   attempts: Attempt[];
   /** Optional for backwards compatibility with previously archived schemaVersion 1 reports. */
   stages?: StageRecord[];
@@ -127,6 +134,50 @@ export class TaskWorker {
         // A database evidence race keeps this task quarantined without blocking other claims.
       }
     }
+    // Ordinary writer crashes are recoverable only after the guardian-backed
+    // startup generation has proved the prior writer generation drained.
+    for (const candidate of this.#options.store.listExecutionRecoveryCandidates()) {
+      const priorGeneration = candidate.claimGenerationId;
+      if (!priorGeneration || !this.#options.store.currentStartupProvesGenerationDrained(priorGeneration)) continue;
+      try {
+        const priorAttempts = this.#options.store.attempts(candidate.id);
+        if (candidate.revisionCount !== 0 || (candidate.executionStages?.length ?? 1) !== 1
+          || priorAttempts.some(attempt => attempt.role === "review")
+          || this.#options.store.reviews(candidate.id).length > 0) {
+          await this.#options.store.rejectExecutionRecoveryInspection(candidate.id,
+            "Task is outside the automatic single-stage, pre-review execution recovery boundary", new Date().toISOString());
+          continue;
+        }
+        const creation = this.#options.store.getWorktreeCreation(candidate.id);
+        if (!creation || creation.status !== "created" || !creation.plan || !creation.observed) {
+          await this.#options.store.rejectExecutionRecoveryInspection(candidate.id,
+            "Persisted worktree creation evidence is incomplete", new Date().toISOString());
+          continue;
+        }
+        const plan = creation.plan as WorktreeCreationPlan;
+        const originalEvidence = creation.observed as WorktreeCreationEvidence;
+        if (!await this.#options.worktrees.exists(candidate.id)) {
+          await this.#options.store.rejectExecutionRecoveryInspection(candidate.id,
+            "Task worktree is missing despite persisted creation evidence", new Date().toISOString());
+          continue;
+        }
+        const reopened = await this.#options.worktrees.reopenFromEvidence(plan, originalEvidence);
+        this.#assertAllowedPaths(candidate, await this.#options.worktrees.changedPaths(reopened.info));
+        const claimed = this.#options.store.claimExecutionRecovery(candidate.id, owner, {
+          leaseMs: this.#options.leaseMs,
+          identity: { checkedAt: new Date().toISOString(), observed: reopened, fingerprint: reopened.fingerprint },
+        });
+        if (!claimed) continue;
+        return this.runClaimed(claimed.id, owner);
+      } catch (error) {
+        if (isPermanentRecoveryIdentityFailure(error)) {
+          try {
+            this.#options.store.rejectExecutionRecoveryInspection(candidate.id, errorText(error), new Date().toISOString());
+          } catch { /* concurrent recovery or changed evidence remains quarantined */ }
+        }
+        // Transient filesystem or Git I/O leaves the recovery candidate intact.
+      }
+    }
     const task = this.#options.store.claimNext(owner, this.#options.leaseMs);
     if (!task) return undefined;
     return this.runClaimed(task.id, owner);
@@ -156,8 +207,12 @@ export class TaskWorker {
     let revisionBrief = task.prompt;
     let finalRoute: RouteDecision | undefined;
     let finalChecks: CheckResult[] = [];
+    let finalCheckAttemptId: string | undefined;
     let checksSnapshot: ReviewSnapshotIdentity | undefined;
     let continuingExecution = false;
+    let executionRecovery = false;
+    let firstRecoveredExecution = false;
+    let recoveryCheckpoint: Record<string, unknown> | undefined;
     const interval = setInterval(() => {
       try {
         if (!this.#options.store.heartbeat(taskId, owner, this.#options.leaseMs)) {
@@ -175,12 +230,51 @@ export class TaskWorker {
 
     try {
       const priorAttempts = this.#options.store.attempts(taskId);
-      const checkpoint = parseCheckpoint(task.resumeCheckpoint);
+      recoveryCheckpoint = this.#options.store.executionRecoveryCheckpoint(taskId);
+      const claimedExecutionRecovery = recoveryCheckpoint !== undefined;
+      const checkpoint = claimedExecutionRecovery ? undefined : parseCheckpoint(task.resumeCheckpoint);
+      executionRecovery = claimedExecutionRecovery || checkpoint?.executionRecovery === true;
+      firstRecoveredExecution = claimedExecutionRecovery || checkpoint?.firstRecoveredExecution === true;
       this.#assertNotCancelled(active);
-      if (priorAttempts.some(attempt => attempt.status === "interrupted")) {
+      const recoveryQuotaContinuation = checkpoint?.executionRecovery === true
+        && this.#options.store.events(taskId).some(event => event.type === "task.execution_recovery_claimed");
+      if (!claimedExecutionRecovery && !recoveryQuotaContinuation && priorAttempts.some(attempt => attempt.status === "interrupted")) {
         throw new Error("An earlier attempt was interrupted; inspect its process, artifacts, and worktree before retrying");
       }
-      if (checkpoint) {
+      if (claimedExecutionRecovery) {
+        try {
+          const creation = this.#options.store.getWorktreeCreation(taskId);
+          const expectedIdentity = recoveryCheckpoint?.freshIdentity as { fingerprint?: unknown } | undefined;
+          if (!creation || creation.status !== "created" || !creation.plan || !creation.observed
+          || !expectedIdentity || typeof expectedIdentity.fingerprint !== "string"
+            || task.revisionCount !== 0 || (task.executionStages?.length ?? 1) !== 1
+            || this.#options.store.reviews(taskId).length > 0
+            || priorAttempts.some(attempt => attempt.role === "review")) {
+            throw new Error("Claimed execution recovery no longer meets the single-stage, pre-review recovery boundary");
+          }
+          const reopened = await this.#options.worktrees.reopenFromEvidence(
+            creation.plan as WorktreeCreationPlan, creation.observed as WorktreeCreationEvidence);
+          if (reopened.fingerprint !== expectedIdentity.fingerprint) {
+            throw new Error("Worktree fingerprint changed after the execution recovery claim");
+          }
+          this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(reopened.info));
+          worktree = reopened.info;
+          baseCommit = reopened.info.baseCommit;
+          finalRoute = undefined;
+          finalChecks = [];
+          checksSnapshot = undefined;
+          stage = "route";
+          revision = 0;
+          executionStageIndex = 0;
+          revisionBrief = task.prompt;
+        } catch (error) {
+          try {
+            return this.#options.store.quarantineClaimedExecutionRecovery(taskId, owner, errorText(error));
+          } catch {
+            throw error;
+          }
+        }
+      } else if (checkpoint) {
         if (task.revisionCount !== checkpoint.revision) throw new Error("Quota checkpoint revision does not match the task record");
         if (!await this.#options.worktrees.exists(taskId)) throw new Error("Quota checkpoint worktree is missing");
         worktree = await this.#options.worktrees.reopen(taskId, task.repoPath, checkpoint.baseCommit);
@@ -278,7 +372,10 @@ export class TaskWorker {
         if (!adapter) throw new Error(`No HarnessAdapter is registered for ${route.harness}`);
         const role = revision === 0 ? "implement" : "revise";
         const inputFingerprint = await this.#options.worktrees.fingerprint(worktree);
-        const previousExecutionStage = this.#options.store.stages(taskId).filter(item => item.role === "implement" || item.role === "revise").at(-1);
+        const isFirstRecoveredStage = firstRecoveredExecution;
+        const previousExecutionStage = isFirstRecoveredStage
+          ? undefined
+          : this.#options.store.stages(taskId).filter(item => item.role === "implement" || item.role === "revise").at(-1);
         if (executionStageIndex > 0 && (!previousExecutionStage
           || (!continuingExecution && previousExecutionStage.status !== "succeeded")
           || !previousExecutionStage.outputFingerprint || previousExecutionStage.outputFingerprint !== inputFingerprint)) {
@@ -299,6 +396,7 @@ export class TaskWorker {
           inputFingerprint,
         });
         executionStage = this.#options.store.startStage(pendingStage.id, owner, processStartId);
+        if (executionRecovery) firstRecoveredExecution = false;
         executionChecks = [];
         const attempt = this.#options.store.createAttempt(taskId, role, {
           owner, stageId: executionStage.id, harness: route.harness, model: route.model,
@@ -319,6 +417,8 @@ export class TaskWorker {
           cwd: worktree.path,
           prompt: [
             executionBrief,
+            ...(isFirstRecoveredStage && revision === 0 && executionStageIndex === 0
+              ? ["The checkout may contain incomplete edits from an interrupted earlier writer. Inspect the current changes, preserve correct work, and finish the task from this state. The earlier attempt did not complete or pass review."] : []),
             ...(continuingExecution ? ["Zero paused this attempt after a verified provider usage limit. Continue in this same worktree. Inspect the existing changes first, preserve correct work, and complete the task."] : []),
             ...(priorHandoffContext ? [priorHandoffContext] : []),
           ].join("\n\n"),
@@ -370,6 +470,7 @@ export class TaskWorker {
         checksSnapshot = reviewSnapshotIdentity(await this.#options.worktrees.prepareReview(worktree));
         const checks = await this.#options.testRunner.run(requiredChecks, worktree.path, { signal: active.controller.signal });
         for (const check of checks) this.#options.store.saveCheck(taskId, check, attempt.id);
+        finalCheckAttemptId = attempt.id;
         this.#assertNotCancelled(active);
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
         let checksAfter: WorktreeReviewSnapshot | undefined;
@@ -434,6 +535,7 @@ export class TaskWorker {
             .filter(item => item.stageId && executionStageIds.has(item.stageId))
             .at(-1)?.id;
           for (const check of resumedChecks) this.#options.store.saveCheck(taskId, check, executionAttemptId);
+          finalCheckAttemptId = executionAttemptId;
           this.#assertNotCancelled(active);
           let checksAfter: WorktreeReviewSnapshot;
           try {
@@ -509,7 +611,8 @@ export class TaskWorker {
         await this.#options.worktrees.verifyReviewedCommit(worktree, resultCommit, reviewSnapshot);
         // Archive all evidence before the irreversible DONE transition. The DB remains authoritative
         // if a crash occurs here; readReport overlays the live state when serving the artifact.
-        await this.#writeReport(taskId, "done", { task, baseCommit, resultCommit, diff });
+        await this.#writeReport(taskId, "done", { task, baseCommit, resultCommit, diff, checks: finalChecks,
+          authoritativeCheckAttemptId: finalCheckAttemptId });
         this.#assertNotCancelled(active);
         this.#assertLease(taskId, owner, () => leaseLost);
         await this.#options.worktrees.verifyReviewedCommit(worktree, resultCommit, reviewSnapshot);
@@ -589,6 +692,7 @@ export class TaskWorker {
             revision,
             executionStageIndex,
             revisionBrief,
+            ...(executionRecovery ? { executionRecovery: true, firstRecoveredExecution } : {}),
             ...(finalRoute ? { finalRoute } : {}),
             ...(stage === "review" ? { finalChecks } : {}),
             ...(stage === "review" && checksSnapshot ? { checksSnapshot } : {}),
@@ -597,7 +701,8 @@ export class TaskWorker {
           task = this.#options.store.pauseForQuota(taskId, owner, { retryAt, checkpoint: { ...checkpoint }, reason: errorMessage,
             source: error.retryAt ? "provider_message" : "fallback" });
           try {
-            await this.#writeReport(taskId, "waiting", { task, baseCommit, error: errorMessage, diff: await this.#options.worktrees.diff(worktree) });
+            await this.#writeReport(taskId, "waiting", { task, baseCommit, error: errorMessage, diff: await this.#options.worktrees.diff(worktree),
+              checks: finalChecks, authoritativeCheckAttemptId: finalCheckAttemptId });
           } catch { /* SQLite retains the waiting state and checkpoint. */ }
           return task;
         } catch (pauseError) {
@@ -613,7 +718,8 @@ export class TaskWorker {
       if (!markedDone) {
         try {
           const diff = worktree ? await this.#options.worktrees.diff(worktree) : undefined;
-          await this.#writeReport(taskId, "failed", { task: this.#options.store.get(taskId) ?? task, baseCommit, resultCommit, error: errorMessage, diff });
+          await this.#writeReport(taskId, "failed", { task: this.#options.store.get(taskId) ?? task, baseCommit, resultCommit, error: errorMessage, diff,
+            checks: finalChecks, authoritativeCheckAttemptId: finalCheckAttemptId });
         } catch { /* the task failure remains in SQLite if artifact storage is unavailable */ }
       }
       return this.#options.store.get(taskId) ?? task;
@@ -846,6 +952,7 @@ export class TaskWorker {
 
   async #writeReport(taskId: string, finalStatus: TaskReport["finalStatus"], values: {
     task: TaskRecord; baseCommit?: string; resultCommit?: string; error?: string; diff?: string;
+    checks?: CheckResult[]; authoritativeCheckAttemptId?: string;
   }): Promise<void> {
     const root = resolve(this.#options.artifactRoot);
     const directory = this.#artifactDirectory(taskId);
@@ -858,6 +965,26 @@ export class TaskWorker {
       diffPath = resolve(directory, "result.diff");
       await writeFile(diffPath, values.diff, "utf8");
     }
+    const taskEvents = this.#options.store.events(taskId);
+    const recoveryBoundary = taskEvents.filter(event => event.type === "task.execution_recovery_claimed").at(-1);
+    const routeEvents = taskEvents.filter(event => event.type === "route.decided");
+    const routeDecisions = routeEvents.map(event => event.payload?.decision as RouteDecision);
+    const historicalRouteDecisions = recoveryBoundary
+      ? routeEvents.filter(event => event.id <= recoveryBoundary.id).map(event => event.payload?.decision as RouteDecision) : [];
+    const currentRouteDecisions = recoveryBoundary
+      ? routeEvents.filter(event => event.id > recoveryBoundary.id).map(event => event.payload?.decision as RouteDecision) : routeDecisions;
+    const checkEvents = taskEvents.filter(event => event.type === "check.finished").map(event => ({
+      eventId: event.id,
+      attemptId: typeof event.payload?.attemptId === "string" ? event.payload.attemptId : undefined,
+      result: event.payload?.result as CheckResult,
+    })).filter(item => item.result && typeof item.result.id === "string");
+    const authoritativeCheckAttemptId = values.authoritativeCheckAttemptId ?? (recoveryBoundary
+      ? checkEvents.filter(item => item.eventId > recoveryBoundary.id).at(-1)?.attemptId : undefined);
+    const historicalChecks = recoveryBoundary
+      ? checkEvents.filter(item => item.attemptId !== authoritativeCheckAttemptId).map(({ attemptId, result }) => ({ attemptId, result })) : [];
+    const reportChecks = recoveryBoundary
+      ? values.checks ?? checkEvents.filter(item => item.attemptId === authoritativeCheckAttemptId).map(item => item.result)
+      : this.#options.store.checks(taskId);
     const report: TaskReport = {
       schemaVersion: 1,
       taskId,
@@ -867,11 +994,12 @@ export class TaskWorker {
       task: values.task,
       baseCommit: values.baseCommit,
       resultCommit: values.resultCommit,
-      routeDecisions: this.#options.store.events(taskId).filter(event => event.type === "route.decided").map(event => event.payload?.decision as RouteDecision),
+      routeDecisions: currentRouteDecisions,
+      ...(recoveryBoundary ? { historicalRouteDecisions, historicalChecks, recoveryBoundaryEventId: recoveryBoundary.id } : {}),
       attempts: this.#options.store.attempts(taskId),
       stages: this.#options.store.stages(taskId),
       handoffs: this.#options.store.handoffs(taskId),
-      checks: this.#options.store.checks(taskId),
+      checks: reportChecks,
       reviews: this.#options.store.reviews(taskId),
       diffPath,
       error: values.error,
@@ -909,6 +1037,16 @@ export class TaskWorker {
 }
 
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+
+function isPermanentRecoveryIdentityFailure(error: unknown): boolean {
+  const message = errorText(error);
+  if (/Persisted worktree creation evidence is incomplete|Task worktree is missing despite persisted creation evidence|outside the automatic single-stage|outside its allowedPaths|Changed files outside allowedPaths|Unsafe allowedPaths pattern|Persisted worktree evidence does not match|Fresh worktree identity does not match persisted creation identity|Invalid persisted worktree creation evidence|Invalid persisted worktree creation plan|Worktree root changed since creation|Task worktree path changed since creation|Repository path changed since creation|Repository identity changed since creation|Repository Git common directory changed since creation|Checkpoint path is not the planned task worktree|Checkpoint worktree belongs to a different Git common directory|Task worktree HEAD changed while reopening|Worktree registration is missing, ambiguous, or has an unexpected branch identity|Worktree registration does not match the task worktree HEAD and branch|Worktree fingerprint changed after the execution recovery claim|Planned base commit is (?:missing|no longer available)|Git returned an invalid task worktree HEAD|Cannot fingerprint index entry|Worktree fingerprint exceeds|Unsafe Git path in worktree fingerprint|Worktree metadata path does not match task id|Task worktree Git metadata is not a regular linked-worktree file|Refusing symlink|Worktree path already exists|outside its allowed paths|Task wrote outside/i.test(message)) return true;
+  // `merge-base --is-ancestor` returns exit 1 deterministically when the task
+  // worktree no longer descends from its persisted base; other Git failures can
+  // be transient I/O and must remain retryable.
+  return Boolean(error && typeof error === "object" && (error as { code?: unknown }).code === 1
+    && /merge-base --is-ancestor/.test(String((error as { cmd?: unknown }).cmd ?? "")));
+}
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
 type ReviewSnapshotIdentity = Pick<WorktreeReviewSnapshot, "fingerprint" | "diffHash" | "treeId">;
@@ -950,6 +1088,11 @@ function parseCheckpoint(raw: Record<string, unknown> | undefined): WorkerCheckp
     || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0
     || typeof raw.revisionBrief !== "string" || !raw.revisionBrief.trim()) {
     throw new Error("Invalid quota resume checkpoint");
+  }
+  if ((raw.executionRecovery !== undefined && typeof raw.executionRecovery !== "boolean")
+    || (raw.firstRecoveredExecution !== undefined && typeof raw.firstRecoveredExecution !== "boolean")
+    || (raw.firstRecoveredExecution === true && raw.executionRecovery !== true)) {
+    throw new Error("Invalid quota recovery lineage");
   }
   if (raw.finalRoute !== undefined && (!raw.finalRoute || typeof raw.finalRoute !== "object")) throw new Error("Invalid checkpoint route");
   if (raw.finalChecks !== undefined && !Array.isArray(raw.finalChecks)) throw new Error("Invalid checkpoint checks");
