@@ -13,10 +13,11 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 - Codex、DeepSeek Harness（DSH）和 ZCode 适配器。存在适配器不代表 Harness/模型组合已可用于路由：Zero 要求先验证绑定。DSH 和隔离式 ZCode CLI 绑定使用 Zero 自有配置档。现有桌面 ZCode `app-server` 适配器及 `verify-binding zcode-desktop` 流程已通过 mock 测试；实时接入尚未成功，因此该路由尚未验证，也不会用于任务路由。验证边界见[服务端配置](src/server/README.md)。
 - 每个任务使用独立 Git worktree，运行配置的验证命令，限制返工次数，并归档包含执行、测试、审核和 Git 证据的报告。成功任务的分支保留在源代码仓库中；Zero 不会自动合并或推送分支。
 - 有序 `executionStages` 已通过核心、HTTP API 和 CLI 的 `--stages-file` 选项实现，会在同一个任务 worktree 中串行执行。每个阶段会记录关联尝试、工作树指纹，以及由 Zero 实测事实构成的版本化交接单；报告收录这些阶段记录。
-- 对已验证的模型使用额度限制提供 `waiting` 状态、持久检查点和定时重试。额度恢复已通过 mock 测试，包括服务重启后的恢复；尚未观察到真实提供方额度限制事件。普通崩溃发生时，Zero 会定期将租约过期的活动任务转为 `recovery_required`，保存租约及被中断尝试/阶段的证据。租约过期不能证明旧进程已停止，因此不会自动重试；请先检查 worker 进程和任务 worktree，再决定如何继续。
+- 对已验证的模型使用额度限制提供 `waiting` 状态、持久检查点和定时重试。额度恢复已通过 mock 测试，包括服务重启后的恢复；尚未观察到真实提供方额度限制事件。普通崩溃发生时，Zero 会定期将租约过期的活动任务隔离为 `recovery_required`。当前协议下刚领取且尚无 Git 或执行意图的任务，在确认 worktree 不存在后可自动重新排队；已中断的工作仍需检查，因为租约过期不能证明旧进程已停止。
 - 崩溃恢复的当前边界和后续设计见[崩溃恢复设计](docs/crash-recovery-design.md)。
 - 创建 worktree 前会持久记录目标仓库、分支、路径和基点；`git worktree add` 成功后再记录实测身份与指纹。创建结果不确定时保留这些证据并等待检查。
 - 原生 Windows 进程 guardian 已在 CI 中通过构建和进程包含测试；目标机器部署及启动测试仍未验证。详见 [Windows 部署](docs/windows-deployment.md)。
+- Windows 发布目录脚本可打包已构建的服务、界面、CLI、固定 Node 运行时与 guardian，并生成文件哈希清单。[单应用交付方案](docs/windows-app-packaging.md)采用 NSIS 安装包；安装包与目标机器验收尚未完成。
 
 ## 尚属设计或待验证的目标
 

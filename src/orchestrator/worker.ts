@@ -110,6 +110,21 @@ export class TaskWorker {
     // Lease expiry is not proof that a prior child process stopped. Quarantine
     // expired active work before considering any new claim.
     this.#options.store.recoverExpired();
+    for (const candidate of this.#options.store.listLeaseExpiryRecoveryCandidates()) {
+      let worktreeExists: boolean;
+      try {
+        worktreeExists = await this.#options.worktrees.exists(candidate.id);
+      } catch {
+        // Filesystem uncertainty keeps the quarantine intact.
+        continue;
+      }
+      if (worktreeExists) continue;
+      try {
+        this.#options.store.requeuePreWriteIntentLeaseExpiry(candidate.id, { kind: "worktree_absent", checkedAt: new Date().toISOString() });
+      } catch {
+        // A database evidence race keeps this task quarantined without blocking other claims.
+      }
+    }
     const task = this.#options.store.claimNext(owner, this.#options.leaseMs);
     if (!task) return undefined;
     return this.runClaimed(task.id, owner);

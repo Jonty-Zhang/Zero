@@ -20,11 +20,34 @@ test("expired active lease requires inspection and retains interrupted attempt e
     assert.equal(store.get(task.id)?.status, "recovery_required");
     assert.equal(store.attempts(task.id)[0]?.status, "interrupted");
     assert.equal(store.get(task.id)?.activeAttemptId, undefined);
+    assert.equal(store.get(task.id)?.recoveryEvidence?.kind, "lease_expiry");
     assert.ok(store.events(task.id).some(e => e.type === "task.lease_expired"));
     assert.equal(store.get(task.id)?.recoveryEvidence?.activeAttemptId, attempt.id);
     assert.match(store.get(task.id)?.recoveryReason ?? "", /lease expired/);
     assert.equal(store.claimNext("worker-c"), undefined);
+    assert.throws(() => store.requeuePreWriteIntentLeaseExpiry(task.id, { kind: "worktree_absent", checkedAt: new Date().toISOString() }), /persisted work evidence/);
     assert.equal(attempt.id, store.attempts(task.id)[0]?.id);
+  } finally { store.close(); }
+});
+
+test("lease expiry with no write intent can be requeued only through the guarded evidence path", () => {
+  const store = new TaskStore();
+  try {
+    const task = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "make a change" }, "prewrite_requeue");
+    store.claimNext("worker-a", 1000, new Date("2026-01-01T00:00:00.000Z"));
+    assert.deepEqual(store.recoverExpired(new Date("2026-01-01T00:00:02.000Z")), [task.id]);
+    assert.equal(store.get(task.id)?.recoveryEvidence?.claimProtocolVersion, 2);
+    assert.deepEqual(store.listLeaseExpiryRecoveryCandidates().map(candidate => candidate.id), [task.id]);
+    assert.throws(() => store.transition(task.id, "recovery_required", "pending"), /Illegal task state transition/);
+    assert.throws(() => store.requeuePreWriteIntentLeaseExpiry(task.id, { kind: "worktree_absent", checkedAt: new Date(Date.now() - 60_000).toISOString() }), /Fresh worktree absence/);
+    const requeued = store.requeuePreWriteIntentLeaseExpiry(task.id, { kind: "worktree_absent", checkedAt: new Date().toISOString() });
+    assert.equal(requeued.status, "pending");
+    assert.equal(requeued.recoveryEvidence, undefined);
+    assert.ok(store.events(task.id).some(event => event.type === "task.requeued_pre_write_intent"));
+    assert.throws(() => store.recordWorktreeCreationIntent(task.id, "worker-a", { path: "C:/worktrees/prewrite_requeue" }), /not actively leased/);
+    store.claimNext("worker-b");
+    assert.throws(() => store.recordWorktreeCreationIntent(task.id, "worker-a", { path: "C:/worktrees/prewrite_requeue" }), /not actively leased/);
+    assert.doesNotThrow(() => store.recordWorktreeCreationIntent(task.id, "worker-b", { path: "C:/worktrees/prewrite_requeue" }));
   } finally { store.close(); }
 });
 
@@ -62,6 +85,7 @@ test("worktree creation intent survives ambiguous failure and successful creatio
     assert.equal(store.getWorktreeCreation(failed.id)?.status, "intent");
     assert.equal(quarantined.status, "recovery_required");
     assert.equal(store.claimNext("worker-b"), undefined);
+    assert.throws(() => store.requeuePreWriteIntentLeaseExpiry(failed.id, { kind: "worktree_absent", checkedAt: new Date().toISOString() }), /not an eligible lease-expiry/);
 
     const succeeded = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "create" }, "intent_success");
     store.claimNext("worker-c");
@@ -90,6 +114,10 @@ test("additive recovery migration preserves existing SQLite task rows", async ()
   )`);
   legacy.prepare("INSERT INTO tasks(id,status,created_at,updated_at,payload) VALUES(?,?,?,?,?)")
     .run("legacy_task", "pending", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", JSON.stringify({ repoPath: ".", baseRef: "main", prompt: "preserve me" }));
+  legacy.prepare("INSERT INTO tasks(id,status,created_at,updated_at,payload,lease_owner,lease_expires_at,heartbeat_at) VALUES(?,?,?,?,?,?,?,?)")
+    .run("legacy_active", "running", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z",
+      JSON.stringify({ repoPath: ".", baseRef: "main", prompt: "may have written without an intent" }),
+      "old-binary-worker", "2026-01-01T00:00:01.000Z", "2026-01-01T00:00:00.000Z");
   legacy.close();
   const store = new TaskStore(path);
   try {
@@ -97,6 +125,11 @@ test("additive recovery migration preserves existing SQLite task rows", async ()
     assert.equal(existing?.status, "pending");
     assert.equal(existing?.prompt, "preserve me");
     assert.equal(existing?.recoveryReason, undefined);
+    assert.deepEqual(store.recoverExpired(new Date("2026-01-01T00:00:02.000Z")), ["legacy_active"]);
+    assert.equal(store.get("legacy_active")?.status, "recovery_required");
+    assert.equal(store.get("legacy_active")?.recoveryEvidence?.claimProtocolVersion, null);
+    assert.deepEqual(store.listLeaseExpiryRecoveryCandidates(), []);
+    assert.throws(() => store.requeuePreWriteIntentLeaseExpiry("legacy_active", { kind: "worktree_absent", checkedAt: new Date().toISOString() }), /not an eligible lease-expiry/);
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });

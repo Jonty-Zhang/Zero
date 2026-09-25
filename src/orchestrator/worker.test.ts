@@ -436,6 +436,99 @@ test("periodic worker scan quarantines expired task with existing worktree befor
   }
 });
 
+test("worker reclaims an expired pre-intent lease after restart when its worktree is absent", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-prewrite-recovery-test-"));
+  const repo = join(root, "repo");
+  const db = join(root, "tasks.sqlite");
+  await initRepo(repo);
+  let store = new TaskStore(db);
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "recover and finish", maxRevisions: 0,
+      checks: [{ id: "ok", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+    const claimedAt = new Date("2026-01-01T00:00:00.000Z");
+    store.claimNext("old-worker", 60_000, claimedAt);
+    store.close();
+
+    // A service restart before the lease expiry leaves the active task alone.
+    store = new TaskStore(db);
+    assert.deepEqual(store.recoverExpired(new Date("2026-01-01T00:00:30.000Z")), []);
+    assert.equal(store.get(task.id)?.status, "running");
+    store.close();
+
+    // The next process observes the now-expired lease, quarantines it, checks the absent path,
+    // and only then lets the normal claim path create the one authorized writer.
+    store = new TaskStore(db);
+    let executions = 0;
+    const adapter: HarnessAdapter = { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+      async run(request) { executions++; await writeFile(join(request.cwd, "result.txt"), "approved\n"); return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+    const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router: { async route(current) { return routeFor(current); } },
+      reviewer: { async review() { return { harness: "codex", model: "review", exitCode: 0,
+        result: { verdict: "pass", summary: "approved", findings: [] } }; } },
+      adapters: new Map([["fake", adapter]]), artifactRoot: join(root, "artifacts") });
+    const result = await worker.runNext("new-worker");
+    assert.equal(result?.status, "done");
+    assert.equal(executions, 1);
+    assert.equal(store.attempts(task.id).filter(attempt => attempt.role === "implement").length, 1);
+    assert.equal(store.events(task.id).filter(event => event.type === "task.requeued_pre_write_intent").length, 1);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("worker keeps a lease-expiry quarantine when a creation intent exists without a path", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-intent-quarantine-test-"));
+  const store = new TaskStore();
+  try {
+    const task = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "do not replay" }, "intent_quarantine");
+    const oldOwner = "old-worker";
+    const claimedAt = new Date();
+    store.claimNext(oldOwner, 1000, claimedAt);
+    store.recordWorktreeCreationIntent(task.id, oldOwner, { taskId: task.id, path: join(root, "worktrees", task.id) });
+    assert.deepEqual(store.recoverExpired(new Date(claimedAt.getTime() + 2000)), [task.id]);
+    assert.throws(() => store.recordWorktreeCreationIntent(task.id, oldOwner, { path: "second-writer" }), /not actively leased/);
+    const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router: { async route(current) { return routeFor(current); } },
+      reviewer: { async review() { throw new Error("must not review"); } },
+      adapters: new Map([["fake", new FakeAdapter()]]), artifactRoot: join(root, "artifacts") });
+    assert.equal(await worker.runNext("new-worker"), undefined);
+    assert.equal(store.get(task.id)?.status, "recovery_required");
+    assert.equal(store.claimNext("another-worker"), undefined);
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("an unsafe expired task cannot block the worker from claiming unrelated pending work", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-recovery-scheduler-test-"));
+  const repo = join(root, "repo");
+  const store = new TaskStore();
+  await initRepo(repo);
+  try {
+    const unsafe = store.submit({ repoPath: repo, baseRef: "main", prompt: "interrupted before retry", checks: [] }, "unsafe_expired");
+    const claimedAt = new Date();
+    store.claimNext("old-worker", 1000, claimedAt);
+    store.createAttempt(unsafe.id, "implement", { owner: "old-worker" });
+    assert.deepEqual(store.recoverExpired(new Date(claimedAt.getTime() + 2000)), [unsafe.id]);
+
+    const pending = store.submit({ repoPath: repo, baseRef: "main", prompt: "continue other work", maxRevisions: 0,
+      checks: [{ id: "ok", argv: [process.execPath, "-e", "process.exit(0)"] }] }, "unrelated_pending");
+    let executions = 0;
+    const adapter: HarnessAdapter = { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+      async run(request) { executions++; await writeFile(join(request.cwd, "result.txt"), "approved\n"); return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+    const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router: { async route(current) { return routeFor(current); } },
+      reviewer: { async review() { return { harness: "codex", model: "review", exitCode: 0,
+        result: { verdict: "pass", summary: "approved", findings: [] } }; } },
+      adapters: new Map([["fake", adapter]]), artifactRoot: join(root, "artifacts") });
+    const result = await worker.runNext("new-worker");
+    assert.equal(result?.id, pending.id);
+    assert.equal(result?.status, "done");
+    assert.equal(executions, 1);
+    assert.equal(store.get(unsafe.id)?.status, "recovery_required");
+    assert.equal(store.attempts(unsafe.id)[0]?.status, "interrupted");
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test("quota pause survives service restart and resumes partial work without consuming a revision", async () => {
   const root = await mkdtemp(join(process.cwd(), ".zero-worker-quota-test-"));
   const repo = join(root, "repo");

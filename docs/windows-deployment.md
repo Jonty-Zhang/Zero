@@ -57,7 +57,7 @@ Dry run 会显示规范化后的 Zero 数据目录和锁 ID 长度，不会注�
 
 脚本先检查任务名不存在、Node 版本、账户 SID、管理员组和目录位置，再通过系统凭据对话框取得密码并注册一个有限权限的开机任务。它不会立即启动服务。默认配置如下：
 
-任务动作的可执行文件是 `guardian.exe` 本身，Task Scheduler 会跟踪 guardian 进程。guardian 在自身 Job 之外运行，直接创建其受监督子进程 `powershell.exe -File run-zero.ps1`；PowerShell 随后启动 Node。guardian 使用上述数据目录哈希作为 `--lock-id`，阻止同一账户、同一数据目录的重复服务实例。Task Scheduler 动作参数仍会包含部署路径和可选无凭据代理 URL；不要在代理 URL 或路径中放凭据。代理值不会由安装脚本的 dry run 或运行日志打印。
+任务动作的可执行文件是 `guardian.exe` 本身，Task Scheduler 会跟踪 guardian 进程。guardian 在自身 Job 之外运行，直接创建其受监督子进程 `powershell.exe -File run-zero.ps1`；PowerShell 随后启动 Node。guardian 使用上述数据目录哈希作为 `--lock-id`，持有同一账户、同一数据目录的命名互斥锁。继任 guardian 会先等待旧命名 Job 的活动进程清零，再启动 Zero；此行为已有 CI 测试，尚未在目标机器开机验收。Job 只覆盖实际加入其中的进程，详细限制见[guardian 说明](../native/windows-guardian/README.md)。Task Scheduler 动作参数仍会包含部署路径和可选无凭据代理 URL；不要在代理 URL 或路径中放凭据。代理值不会由安装脚本的 dry run 或运行日志打印。
 
 | 设置 | 默认值或行为 |
 |---|---|

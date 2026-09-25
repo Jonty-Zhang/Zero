@@ -25,6 +25,7 @@ type TaskRow = {
   failure_reason: string | null; active_attempt_id: string | null;
   retry_at?: string | null;
   recovery_reason?: string | null; recovery_evidence?: string | null;
+  lease_protocol_version?: number | null;
 };
 type StageRow = Record<string, unknown>;
 type HandoffRow = { id: string; task_id: string; stage_id: string; attempt_id: string; schema_version: number; created_at: string; payload: string; payload_bytes: number };
@@ -57,7 +58,7 @@ export class TaskStore {
         payload TEXT NOT NULL, revision_count INTEGER NOT NULL DEFAULT 0,
         lease_owner TEXT, lease_expires_at TEXT, heartbeat_at TEXT,
         failure_reason TEXT, active_attempt_id TEXT,
-        recovery_reason TEXT, recovery_evidence TEXT
+        recovery_reason TEXT, recovery_evidence TEXT, lease_protocol_version INTEGER
       );
       CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status, created_at);
       CREATE TABLE IF NOT EXISTS events (
@@ -125,6 +126,7 @@ export class TaskStore {
     const taskColumns = this.#db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     if (!taskColumns.some(column => column.name === "recovery_reason")) this.#db.exec("ALTER TABLE tasks ADD COLUMN recovery_reason TEXT");
     if (!taskColumns.some(column => column.name === "recovery_evidence")) this.#db.exec("ALTER TABLE tasks ADD COLUMN recovery_evidence TEXT");
+    if (!taskColumns.some(column => column.name === "lease_protocol_version")) this.#db.exec("ALTER TABLE tasks ADD COLUMN lease_protocol_version INTEGER");
     this.#db.exec("CREATE INDEX IF NOT EXISTS attempts_stage_sequence ON attempts(stage_id, sequence)");
   }
 
@@ -195,10 +197,10 @@ export class TaskStore {
       const row = this.#db.prepare(`SELECT id FROM tasks WHERE status='pending' OR (status='waiting' AND id IN
         (SELECT task_id FROM quota_pauses WHERE retry_at<=?)) ORDER BY created_at, id LIMIT 1`).get(at) as { id: string } | undefined;
       if (!row) { this.#db.exec("COMMIT"); return undefined; }
-      const result = this.#db.prepare(`UPDATE tasks SET status='running', updated_at=?, lease_owner=?, lease_expires_at=?, heartbeat_at=?
+      const result = this.#db.prepare(`UPDATE tasks SET status='running', updated_at=?, lease_owner=?, lease_expires_at=?, heartbeat_at=?, lease_protocol_version=2
         WHERE id=? AND status IN ('pending','waiting')`).run(at, owner, expires, at, row.id);
       if (Number(result.changes) !== 1) { this.#db.exec("ROLLBACK"); return undefined; }
-      this.#event(row.id, "task.claimed", { owner, leaseExpiresAt: expires }, at);
+      this.#event(row.id, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2 }, at);
       this.#db.exec("COMMIT");
       return this.get(row.id);
     } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
@@ -300,6 +302,54 @@ export class TaskStore {
     return task;
   }
 
+  /** List lease-expiry quarantines that may be eligible for the pre-write recovery gate. */
+  listLeaseExpiryRecoveryCandidates(): TaskRecord[] {
+    return this.list("recovery_required").filter(task => {
+      if (task.recoveryEvidence?.kind !== "lease_expiry" || task.recoveryEvidence.claimProtocolVersion !== 2) return false;
+      return !this.#hasPersistedWriteEvidence(task.id);
+    });
+  }
+
+  #hasPersistedWriteEvidence(taskId: string): boolean {
+    return Boolean(
+      this.#db.prepare("SELECT 1 AS found FROM worktree_creations WHERE task_id=? LIMIT 1").get(taskId)
+      || this.#db.prepare("SELECT 1 AS found FROM attempts WHERE task_id=? LIMIT 1").get(taskId)
+      || this.#db.prepare("SELECT 1 AS found FROM stages WHERE task_id=? LIMIT 1").get(taskId)
+      || this.#db.prepare("SELECT 1 AS found FROM routes WHERE task_id=? LIMIT 1").get(taskId)
+      || this.#db.prepare("SELECT 1 AS found FROM checks WHERE task_id=? LIMIT 1").get(taskId)
+      || this.#db.prepare("SELECT 1 AS found FROM reviews WHERE task_id=? LIMIT 1").get(taskId)
+    );
+  }
+
+  /**
+   * Requeue only a lease-expiry quarantine whose task has no persisted write intent or
+   * execution evidence. The caller must have freshly established that the worktree
+   * path is absent; all database facts are rechecked atomically here.
+   */
+  requeuePreWriteIntentLeaseExpiry(taskId: string, filesystemEvidence: { kind: "worktree_absent"; checkedAt: string }): TaskRecord {
+    const checkedAt = filesystemEvidence?.kind === "worktree_absent" ? Date.parse(filesystemEvidence.checkedAt) : Number.NaN;
+    const nowMs = Date.now();
+    if (!Number.isFinite(checkedAt) || checkedAt > nowMs + 5_000 || nowMs - checkedAt > 5_000) {
+      throw new Error("Fresh worktree absence evidence is required");
+    }
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const task = this.#db.prepare("SELECT status,recovery_evidence FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; recovery_evidence: string | null } | undefined;
+      const recoveryEvidence = task?.recovery_evidence ? JSON.parse(task.recovery_evidence) as Record<string, unknown> : undefined;
+      if (!task || task.status !== "recovery_required" || recoveryEvidence?.kind !== "lease_expiry" || recoveryEvidence.claimProtocolVersion !== 2) {
+        throw new Error(`Task ${taskId} is not an eligible lease-expiry recovery quarantine`);
+      }
+      if (this.#hasPersistedWriteEvidence(taskId)) {
+        throw new Error(`Task ${taskId} has persisted work evidence and cannot be automatically requeued`);
+      }
+      const changed = this.#db.prepare(`UPDATE tasks SET status='pending',updated_at=?,recovery_reason=NULL,recovery_evidence=NULL,lease_protocol_version=NULL
+        WHERE id=? AND status='recovery_required'`).run(at, taskId);
+      if (Number(changed.changes) !== 1) throw new Error(`Task ${taskId} recovery requeue was rejected`);
+      this.#event(taskId, "task.requeued_pre_write_intent", { recoveryEvidence, filesystemEvidence }, at);
+    });
+    return this.get(taskId)!;
+  }
+
   fail(id: string, expected: TaskStatus | TaskStatus[], reason: string, owner?: string): TaskRecord {
     const task = this.transition(id, expected, "failed", { owner, clearLease: true, reason });
     return { ...task, failureReason: reason };
@@ -350,15 +400,15 @@ export class TaskStore {
     const at = now.toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const rows = this.#db.prepare(`SELECT id,status,lease_owner,lease_expires_at,heartbeat_at,active_attempt_id FROM tasks
+      const rows = this.#db.prepare(`SELECT id,status,lease_owner,lease_expires_at,heartbeat_at,active_attempt_id,lease_protocol_version FROM tasks
         WHERE status IN ('running','reviewing','revision') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`).all(at) as Array<{
-          id: string; status: TaskStatus; lease_owner: string | null; lease_expires_at: string; heartbeat_at: string | null; active_attempt_id: string | null;
+          id: string; status: TaskStatus; lease_owner: string | null; lease_expires_at: string; heartbeat_at: string | null; active_attempt_id: string | null; lease_protocol_version: number | null;
         }>;
       for (const row of rows) {
         const runningAttempts = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? AND status='running'").all(row.id) as Array<{ id: string }>;
         const runningStages = this.#db.prepare("SELECT id,process_start_id FROM stages WHERE task_id=? AND status='running'").all(row.id) as Array<{ id: string; process_start_id: string }>;
         const reason = "Task lease expired while execution was active; inspect the worker process and task worktree before any retry.";
-        const evidence = { previousStatus: row.status, leaseOwner: row.lease_owner, leaseExpiresAt: row.lease_expires_at,
+        const evidence = { kind: "lease_expiry", claimProtocolVersion: row.lease_protocol_version, previousStatus: row.status, leaseOwner: row.lease_owner, leaseExpiresAt: row.lease_expires_at,
           heartbeatAt: row.heartbeat_at, activeAttemptId: row.active_attempt_id,
           runningAttemptIds: runningAttempts.map(attempt => attempt.id),
           runningStages: runningStages.map(stage => ({ id: stage.id, processStartId: stage.process_start_id })) };
