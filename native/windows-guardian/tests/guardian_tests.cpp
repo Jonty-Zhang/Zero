@@ -12,6 +12,14 @@
 #include <vector>
 
 namespace {
+bool IsGeneration(const std::wstring& value) {
+  if (value.size() != 32) return false;
+  for (wchar_t c : value) {
+    if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) return false;
+  }
+  return true;
+}
+
 std::wstring ModulePath() {
   std::vector<wchar_t> buffer(32768);
   const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
@@ -78,6 +86,23 @@ DWORD InvokeVerifier(const std::wstring& guardian, const std::wstring& lock_id,
                      DWORD process_id) {
   const std::wstring command = Quote(guardian) + L" --verify-member --lock-id " +
       Quote(lock_id) + L" --pid " + std::to_wstring(process_id);
+  PROCESS_INFORMATION process{};
+  if (!Start(command, &process)) return MAXDWORD;
+  const bool exited = WaitForExit(process.hProcess, 5000);
+  DWORD exit_code = MAXDWORD;
+  if (exited) GetExitCodeProcess(process.hProcess, &exit_code);
+  else TerminateProcess(process.hProcess, 1);
+  WaitForSingleObject(process.hProcess, INFINITE);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return exit_code;
+}
+
+DWORD InvokeStartupVerifier(const std::wstring& guardian, const std::wstring& lock_id,
+                            const std::wstring& generation, DWORD process_id) {
+  const std::wstring command = Quote(guardian) + L" --verify-startup --lock-id " +
+      Quote(lock_id) + L" --generation " + Quote(generation) + L" --pid " +
+      std::to_wstring(process_id);
   PROCESS_INFORMATION process{};
   if (!Start(command, &process)) return MAXDWORD;
   const bool exited = WaitForExit(process.hProcess, 5000);
@@ -194,6 +219,66 @@ int RunMemberVerification(const std::wstring& guardian,
   CloseHandle(invalid.hThread);
   CloseHandle(invalid.hProcess);
   if (!invalid_exited || invalid_code == 0) return Fail("member verifier accepted invalid arguments");
+  return 0;
+}
+
+int RunStartupAttestation(const std::wstring& guardian,
+                          const std::wstring& test_exe) {
+  const std::wstring report_name = TempPath(L".startup.txt");
+  if (report_name.empty()) return Fail("could not allocate startup report name");
+  const std::wstring lock_id = L"startup-proof-" + std::to_wstring(GetCurrentProcessId());
+  const std::wstring command = Quote(guardian) + L" --lock-id " + lock_id + L" -- " +
+      Quote(test_exe) + L" --helper-verify-startup " + Quote(guardian) + L" " +
+      lock_id + L" " + Quote(report_name);
+  PROCESS_INFORMATION process{};
+  if (!Start(command, &process)) return Fail("could not start startup-proof guardian");
+  const bool exited = WaitForExit(process.hProcess, 15000);
+  DWORD exit_code = 1;
+  if (exited) GetExitCodeProcess(process.hProcess, &exit_code);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  DWORD child_pid = 0;
+  std::wstring generation;
+  if (std::filesystem::exists(report_name)) {
+    std::wifstream input{std::filesystem::path(report_name)};
+    input >> generation >> child_pid;
+  }
+  DeleteFileW(report_name.c_str());
+  if (!exited || exit_code != 0 || !IsGeneration(generation) || child_pid == 0) {
+    return Fail("direct child startup attestation did not pass its scenarios");
+  }
+  if (InvokeStartupVerifier(guardian, lock_id, generation, child_pid) == 0) {
+    return Fail("startup verifier accepted a child after its guardian exited");
+  }
+
+  // A same-user mapping that predates this guardian must never be adopted as proof.
+  const std::wstring sid = CurrentUserSidString();
+  if (sid.empty()) return Fail("could not resolve SID for spoof mapping test");
+  const std::wstring spoof_lock = L"startup-spoof-" + std::to_wstring(GetCurrentProcessId());
+  const std::wstring mapping_name = L"Local\\ZeroGuardianStartup_" + sid + L"_" + spoof_lock;
+  HANDLE spoof = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                   0, 4096, mapping_name.c_str());
+  if (spoof == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (spoof) CloseHandle(spoof);
+    return Fail("could not create preexisting spoof mapping");
+  }
+  const std::wstring spoof_report = TempPath(L".spoof.txt");
+  const std::wstring spoof_command = Quote(guardian) + L" --lock-id " + spoof_lock + L" -- " +
+      Quote(test_exe) + L" --helper-report-generation " + Quote(spoof_report);
+  PROCESS_INFORMATION spoof_process{};
+  const bool spoof_started = Start(spoof_command, &spoof_process);
+  DWORD spoof_exit = 0;
+  const bool spoof_exited = spoof_started && WaitForExit(spoof_process.hProcess, 10000);
+  if (spoof_exited) GetExitCodeProcess(spoof_process.hProcess, &spoof_exit);
+  if (spoof_started) {
+    if (!spoof_exited) TerminateProcess(spoof_process.hProcess, 1);
+    WaitForSingleObject(spoof_process.hProcess, INFINITE);
+    CloseHandle(spoof_process.hThread);
+    CloseHandle(spoof_process.hProcess);
+  }
+  CloseHandle(spoof);
+  DeleteFileW(spoof_report.c_str());
+  if (!spoof_exited || spoof_exit == 0) return Fail("guardian adopted a preexisting spoof mapping");
   return 0;
 }
 
@@ -427,6 +512,32 @@ int wmain(int argc, wchar_t** argv) {
     if (InvokeVerifier(guardian, lock_id, MAXDWORD) == 0) return 91;
     return 0;
   }
+  if (argc >= 5 && wcscmp(argv[1], L"--helper-verify-startup") == 0) {
+    const std::wstring guardian(argv[2]);
+    const std::wstring lock_id(argv[3]);
+    const std::wstring report_name(argv[4]);
+    const wchar_t* generation_value = _wgetenv(L"ZERO_GUARDIAN_GENERATION");
+    if (generation_value == nullptr) return 92;
+    const std::wstring generation(generation_value);
+    if (!IsGeneration(generation) ||
+        InvokeStartupVerifier(guardian, lock_id, generation, GetCurrentProcessId()) != 0) return 93;
+
+    const std::wstring self = ModulePath();
+    PROCESS_INFORMATION leaf{};
+    if (!Start(Quote(self) + L" --helper-leaf", &leaf)) return 94;
+    const DWORD leaf_pid = leaf.dwProcessId;
+    CloseHandle(leaf.hThread);
+    CloseHandle(leaf.hProcess);
+    if (InvokeStartupVerifier(guardian, lock_id, generation, leaf_pid) == 0) return 95;
+    std::wstring wrong_generation = generation;
+    wrong_generation[0] = wrong_generation[0] == L'0' ? L'1' : L'0';
+    if (InvokeStartupVerifier(guardian, lock_id, wrong_generation,
+                              GetCurrentProcessId()) == 0) return 96;
+    if (InvokeStartupVerifier(guardian, lock_id, generation, leaf_pid + 1000000) == 0) return 97;
+    std::wofstream output{std::filesystem::path(report_name)};
+    output << generation << L"\n" << GetCurrentProcessId() << L"\n";
+    return output ? 0 : 98;
+  }
   if (argc >= 3 && wcscmp(argv[1], L"--helper-report-wait") == 0) {
     std::ofstream output{std::filesystem::path(argv[2])};
     output << GetCurrentProcessId() << "\n";
@@ -487,6 +598,7 @@ int wmain(int argc, wchar_t** argv) {
   if (RunNormalExit(guardian, test_exe) != 0) return 1;
   if (RunGenerationEnvironment(guardian, test_exe) != 0) return 1;
   if (RunMemberVerification(guardian, test_exe) != 0) return 1;
+  if (RunStartupAttestation(guardian, test_exe) != 0) return 1;
   if (RunDuplicateLock(guardian, test_exe) != 0) return 1;
   if (RunForcedTreeCleanup(guardian, test_exe) != 0) return 1;
   if (RunSuccessorWaitsForPreviousTree(guardian, test_exe) != 0) return 1;

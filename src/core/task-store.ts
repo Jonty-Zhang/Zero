@@ -46,8 +46,7 @@ export interface StartupGenerationAttestation {
   id: string;
   lockId?: string;
   predecessorDrained: boolean;
-  memberVerified?: boolean;
-  evidenceKind: "guardian_env_assertion" | "unguarded" | "rejected_lock_id" | "invalid_attestation" | "guardian_member_unverified";
+  evidenceKind: "guardian_startup_verified" | "guardian_startup_unverified" | "guardian_env_assertion" | "unguarded" | "rejected_lock_id" | "invalid_attestation";
 }
 
 export interface StartupGenerationRecord extends StartupGenerationAttestation {
@@ -166,36 +165,32 @@ export class TaskStore {
     this.#db.exec("CREATE INDEX IF NOT EXISTS attempts_stage_sequence ON attempts(stage_id, sequence)");
     const attestation = startupAttestation ?? { id: randomUUID(), predecessorDrained: false, evidenceKind: "unguarded" as const };
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(attestation.id) || typeof attestation.predecessorDrained !== "boolean" ||
-        !["guardian_env_assertion", "unguarded", "rejected_lock_id", "invalid_attestation", "guardian_member_unverified"].includes(attestation.evidenceKind) ||
+        !["guardian_startup_verified", "guardian_startup_unverified", "guardian_env_assertion", "unguarded", "rejected_lock_id", "invalid_attestation"].includes(attestation.evidenceKind) ||
         (attestation.lockId !== undefined && !/^[a-f0-9]{64}$/.test(attestation.lockId))) {
       throw new Error("Invalid startup generation attestation");
     }
-    if (attestation.predecessorDrained && (attestation.evidenceKind !== "guardian_env_assertion" || attestation.memberVerified !== true || !/^[a-f0-9]{64}$/.test(attestation.lockId ?? ""))) {
-      throw new Error("A drained predecessor requires matching guardian lock and Job membership assertions");
+    if (attestation.predecessorDrained && (attestation.evidenceKind !== "guardian_startup_verified" || !/^[a-f0-9]{32}$/.test(attestation.id) || !/^[a-f0-9]{64}$/.test(attestation.lockId ?? ""))) {
+      throw new Error("A drained predecessor requires a guardian startup proof, generation, and matching lock ID");
     }
-    if (attestation.memberVerified === true && (attestation.evidenceKind !== "guardian_env_assertion" ||
+    if (attestation.evidenceKind === "guardian_startup_verified" && (!attestation.predecessorDrained ||
         !/^[a-f0-9]{32}$/.test(attestation.id) || !/^[a-f0-9]{64}$/.test(attestation.lockId ?? ""))) {
-      throw new Error("Verified Job membership requires a guardian generation and lock ID");
-    }
-    if (attestation.evidenceKind === "guardian_env_assertion" && (!attestation.predecessorDrained || attestation.memberVerified !== true ||
-        !/^[a-f0-9]{32}$/.test(attestation.id) || !/^[a-f0-9]{64}$/.test(attestation.lockId ?? ""))) {
-      throw new Error("Guardian startup assertions require generation, lock, drained predecessor, and Job membership");
+      throw new Error("Guardian startup proofs require generation, lock, and a drained predecessor");
     }
     const startedAt = new Date().toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const sequence = Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0)+1 AS n FROM startup_generations").get() as { n: number }).n);
-      const previous = this.#db.prepare(`SELECT id,lock_id,member_verified,evidence_kind FROM startup_generations
-        ORDER BY sequence DESC LIMIT 1`).get() as { id: string; lock_id: string | null; member_verified: number; evidence_kind: string } | undefined;
-      const currentIsGuardianVerified = attestation.memberVerified === true && attestation.predecessorDrained === true &&
-        attestation.evidenceKind === "guardian_env_assertion" && /^[a-f0-9]{64}$/.test(attestation.lockId ?? "");
-      const predecessorGenerationId = currentIsGuardianVerified && previous && previous.member_verified === 1 &&
-        previous.evidence_kind === "guardian_env_assertion" && previous.lock_id === attestation.lockId
+      const previous = this.#db.prepare(`SELECT id,lock_id,evidence_kind FROM startup_generations
+        ORDER BY sequence DESC LIMIT 1`).get() as { id: string; lock_id: string | null; evidence_kind: string } | undefined;
+      const currentIsGuardianVerified = attestation.predecessorDrained === true &&
+        attestation.evidenceKind === "guardian_startup_verified" && /^[a-f0-9]{64}$/.test(attestation.lockId ?? "");
+      const predecessorGenerationId = currentIsGuardianVerified && previous &&
+        previous.evidence_kind === "guardian_startup_verified" && previous.lock_id === attestation.lockId
         ? previous.id
         : undefined;
       this.#db.prepare(`INSERT INTO startup_generations(id,sequence,lock_id,predecessor_drained,member_verified,evidence_kind,predecessor_generation_id,started_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(attestation.id, sequence, attestation.lockId ?? null,
-        attestation.predecessorDrained ? 1 : 0, attestation.memberVerified === true ? 1 : 0, attestation.evidenceKind, predecessorGenerationId ?? null, startedAt);
+        attestation.predecessorDrained ? 1 : 0, 0, attestation.evidenceKind, predecessorGenerationId ?? null, startedAt);
       this.#db.exec("COMMIT");
       this.#startupGeneration = { ...attestation, sequence, predecessorGenerationId, startedAt };
     } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
@@ -204,29 +199,27 @@ export class TaskStore {
   startupGeneration(): StartupGenerationRecord { return { ...this.#startupGeneration }; }
 
   /**
-   * Returns true only when this startup's persisted guardian assertion directly names the requested
+   * Returns true only when this startup's persisted guardian proof directly names the requested
    * generation as its predecessor. This is a SQLite lineage check, not protection from same-account edits.
    */
   currentStartupProvesGenerationDrained(generationId: string): boolean {
     if (!generationId) return false;
-    const row = this.#db.prepare(`SELECT current.member_verified AS current_member_verified,
-        current.predecessor_drained AS current_predecessor_drained,
+    const row = this.#db.prepare(`SELECT current.predecessor_drained AS current_predecessor_drained,
         current.evidence_kind AS current_evidence_kind,
         current.lock_id AS current_lock_id,
         current.predecessor_generation_id AS predecessor_generation_id,
-        previous.id AS previous_id, previous.member_verified AS previous_member_verified,
-        previous.evidence_kind AS previous_evidence_kind, previous.lock_id AS previous_lock_id
+        previous.id AS previous_id, previous.evidence_kind AS previous_evidence_kind, previous.lock_id AS previous_lock_id
       FROM startup_generations AS current
       LEFT JOIN startup_generations AS previous ON previous.id = current.predecessor_generation_id
       WHERE current.id = ?`).get(this.#startupGeneration.id) as {
-        current_member_verified: number; current_predecessor_drained: number; current_evidence_kind: string;
+        current_predecessor_drained: number; current_evidence_kind: string;
         current_lock_id: string | null; predecessor_generation_id: string | null; previous_id: string | null;
-        previous_member_verified: number | null; previous_evidence_kind: string | null; previous_lock_id: string | null;
+        previous_evidence_kind: string | null; previous_lock_id: string | null;
       } | undefined;
-    return Boolean(row && row.current_member_verified === 1 && row.current_predecessor_drained === 1 &&
-      row.current_evidence_kind === "guardian_env_assertion" && row.current_lock_id &&
+    return Boolean(row && row.current_predecessor_drained === 1 &&
+      row.current_evidence_kind === "guardian_startup_verified" && row.current_lock_id &&
       row.predecessor_generation_id === generationId && row.previous_id === generationId &&
-      row.previous_member_verified === 1 && row.previous_evidence_kind === "guardian_env_assertion" &&
+      row.previous_evidence_kind === "guardian_startup_verified" &&
       row.previous_lock_id === row.current_lock_id);
   }
 

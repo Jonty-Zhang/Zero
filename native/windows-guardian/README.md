@@ -22,19 +22,50 @@ SQLite that guardian.exe was the sender. They exist to correlate normal
 guardian launches and catch configuration mistakes, and they do not authorize
 replaying execution or review work.
 
+`guardian.exe --verify-startup --lock-id <lock-id> --generation <32-hex>
+--pid <pid>` adds an OS-backed startup prerequisite. After the predecessor Job
+has drained, the guardian creates a pagefile mapping named
+`Local\ZeroGuardianStartup_<sid>_<lock-id>`. It fails closed if that name
+already exists. Once the direct child is created suspended and assigned to the
+new Job, the guardian publishes a versioned record containing the generated
+generation, its own PID and process creation time, and the direct child's PID
+and process creation time, then resumes the child. The guardian retains the
+mapping handle until it exits. Verification checks the requested generation
+and PID against the record, confirms both exact process instances are live,
+and confirms the recorded child is a member of the named Job. Descendants fail
+because their PIDs are not the recorded direct child PID. After guardian exit,
+the mapping disappears and startup verification fails.
+
+The mapping uses the `Local` namespace because the guardian and its child share
+an interactive session. Microsoft documents that creating a `Global` file
+mapping outside Session 0 requires `SeCreateGlobalPrivilege`; the existing
+`Global` mutex and Job continue to provide cross-session serialization and
+containment. The mapping's default DACL is the current user's default DACL.
+This proves the normal guardian launch ordering and exact child identity against
+accidental or unprivileged mismatches. It does not defend against malicious
+software running as the same account, which can create or alter equivalent
+named objects or modify the package.
+
+The API behavior follows Microsoft's documentation for
+[kernel object namespaces](https://learn.microsoft.com/en-us/windows/win32/termserv/kernel-object-namespaces),
+[named file mapping creation](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-createfilemappingw),
+[opening a file mapping](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-openfilemappingw),
+[viewing a file mapping](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile),
+and [process creation times](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes).
+
 `guardian.exe --verify-member --lock-id <lock-id> --pid <pid>` is a read-only
 membership query. It derives the same per-user named Job, opens it for query,
 opens the target PID with limited query rights, and calls `IsProcessInJob` on
 that process handle. It exits 0 only when the target is a member; malformed
 arguments, a missing Job, an inaccessible PID, and a non-member all fail
-closed. Zero invokes this mode through the fixed absolute
-`guardian/guardian.exe` path in its installed package, rejects symlinked path
-components, does not search `PATH`, and checks its own PID before recording
-`member_verified`.
-This confirms current OS Job membership for that PID, while the lock ID and
-generation still come from environment assertions. Same-account software that
-can alter the installed package or create equivalent named objects is outside
-this check's threat boundary.
+closed. This remains a diagnostic helper and does not prove startup order or
+direct-child identity. Zero now invokes `--verify-startup` through the fixed
+absolute `guardian/guardian.exe` path in its installed package, rejects
+symlinked path components, and does not search `PATH`. Historical
+`guardian_env_assertion` and `member_verified` records remain readable but do
+not authorize a new predecessor link. Same-account software that can alter
+the installed package or create equivalent named objects is outside this
+check's threat boundary.
 
 The ordering matters: `KILL_ON_JOB_CLOSE` acts when the last Job handle closes.
 The successor must not open the previous Job before the previous guardian exits,

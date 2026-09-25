@@ -142,6 +142,84 @@ export class GitWorktreeManager {
     return info;
   }
 
+  /**
+   * Reopens a task worktree from its persisted creation plan and observed evidence.
+   * The original fingerprint is validated as evidence metadata, then a fresh one
+   * is computed after Git identity and ancestry have been checked.
+   */
+  async reopenFromEvidence(plan: WorktreeCreationPlan, evidence: WorktreeCreationEvidence): Promise<WorktreeCreationEvidence> {
+    this.#assertTaskId(plan.taskId);
+    if (!evidence || !evidence.info || !/^[a-f0-9]{64}$/.test(evidence.fingerprint)
+      || !/^[a-fA-F0-9]{40,64}$/.test(evidence.head)) {
+      throw new Error("Invalid persisted worktree creation evidence");
+    }
+    if (evidence.info.taskId !== plan.taskId || evidence.info.repoPath !== plan.repoPath
+      || evidence.info.path !== plan.path || evidence.info.branch !== plan.branch
+      || evidence.info.baseCommit !== plan.baseCommit || evidence.commonGitDir !== plan.commonGitDir
+      || evidence.head.toLowerCase() !== plan.baseCommit.toLowerCase()) {
+      throw new Error("Persisted worktree evidence does not match its creation plan");
+    }
+    if (plan.branch !== `zero/${plan.taskId}` || !/^[a-fA-F0-9]{40,64}$/.test(plan.baseCommit)) {
+      throw new Error("Invalid persisted worktree creation plan");
+    }
+
+    const root = await realpath(this.#root);
+    if (root !== plan.worktreeRoot || root !== this.#root) throw new Error("Worktree root changed since creation");
+    const rootStat = await lstat(this.#root);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("Refusing symlink or non-directory worktree root");
+    const path = resolve(root, plan.taskId);
+    this.#assertInside(root, plan.path);
+    if (plan.path !== path) throw new Error("Worktree path does not match its planned task id");
+    const pathStat = await lstat(path);
+    if (pathStat.isSymbolicLink() || !pathStat.isDirectory()) throw new Error("Refusing symlink or non-directory task worktree path");
+    if (await realpath(path) !== plan.path) throw new Error("Task worktree path changed since creation");
+    const dotGitStat = await lstat(resolve(path, ".git"));
+    if (dotGitStat.isSymbolicLink() || !dotGitStat.isFile()) throw new Error("Task worktree Git metadata is not a regular linked-worktree file");
+
+    const repo = await realpath(plan.repoPath);
+    if (repo !== plan.repoPath) throw new Error("Repository path changed since creation");
+    const { stdout: repoTop } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: repo, windowsHide: true });
+    if (await realpath(repoTop.trim()) !== plan.repoPath) throw new Error("Repository identity changed since creation");
+    const { stdout: commonOutput } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo, windowsHide: true });
+    const commonGitDir = await realpath(commonOutput.trim());
+    if (commonGitDir !== plan.commonGitDir) throw new Error("Repository Git common directory changed since creation");
+
+    const [worktreeTop, worktreeCommon, headResult, baseResult, registeredResult] = await Promise.all([
+      execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: path, windowsHide: true }),
+      execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: path, windowsHide: true }),
+      execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: path, windowsHide: true }),
+      execFileAsync("git", ["rev-parse", "--verify", `${plan.baseCommit}^{commit}`], { cwd: repo, windowsHide: true }),
+      execFileAsync("git", ["worktree", "list", "--porcelain", "-z"], { cwd: repo, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }),
+    ]);
+    if (await realpath(worktreeTop.stdout.trim()) !== plan.path) throw new Error("Checkpoint path is not the planned task worktree");
+    if (await realpath(worktreeCommon.stdout.trim()) !== plan.commonGitDir) throw new Error("Checkpoint worktree belongs to a different Git common directory");
+    if (baseResult.stdout.trim().toLowerCase() !== plan.baseCommit.toLowerCase()) throw new Error("Planned base commit is missing");
+    const head = headResult.stdout.trim();
+    if (!/^[a-fA-F0-9]{40,64}$/.test(head)) throw new Error("Git returned an invalid task worktree HEAD");
+
+    const entries = parseWorktreePorcelain(registeredResult.stdout);
+    const pathEntries = entries.filter(entry => entry.worktree && resolve(entry.worktree) === plan.path);
+    const branchEntries = entries.filter(entry => entry.branch === `refs/heads/${plan.branch}`);
+    if (pathEntries.length !== 1 || branchEntries.length !== 1 || pathEntries[0] !== branchEntries[0]) {
+      throw new Error("Git worktree registration is missing, ambiguous, or has an unexpected branch identity");
+    }
+    const registered = pathEntries[0]!;
+    if (registered.head?.toLowerCase() !== head.toLowerCase() || registered.detached || registered.bare || registered.prunable) {
+      throw new Error("Git worktree registration does not match the task worktree HEAD and branch");
+    }
+    await execFileAsync("git", ["merge-base", "--is-ancestor", plan.baseCommit, head], { cwd: path, windowsHide: true });
+
+    const info: WorktreeInfo = {
+      taskId: plan.taskId, repoPath: plan.repoPath, path: plan.path, branch: plan.branch, baseCommit: plan.baseCommit,
+    };
+    const fingerprint = await this.fingerprint(info);
+    const { stdout: finalHead } = await execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: path, windowsHide: true });
+    if (finalHead.trim().toLowerCase() !== head.toLowerCase()) {
+      throw new Error("Task worktree HEAD changed while reopening from persisted evidence");
+    }
+    return { info, commonGitDir: plan.commonGitDir, head, fingerprint };
+  }
+
   async diff(info: WorktreeInfo): Promise<string> {
     await this.#validateInfo(info);
     await this.#ensureTaskBranch(info);
@@ -526,6 +604,40 @@ export class GitWorktreeManager {
 
 function hash(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function parseWorktreePorcelain(value: string): Array<{
+  worktree?: string;
+  head?: string;
+  branch?: string;
+  detached: boolean;
+  bare: boolean;
+  prunable: boolean;
+}> {
+  const entries: Array<{ worktree?: string; head?: string; branch?: string; detached: boolean; bare: boolean; prunable: boolean }> = [];
+  let current: { worktree?: string; head?: string; branch?: string; detached: boolean; bare: boolean; prunable: boolean } | undefined;
+  for (const field of value.split("\0")) {
+    if (!field) {
+      if (current) entries.push(current);
+      current = undefined;
+      continue;
+    }
+    current ??= { detached: false, bare: false, prunable: false };
+    const separator = field.indexOf(" ");
+    const key = separator < 0 ? field : field.slice(0, separator);
+    const content = separator < 0 ? "" : field.slice(separator + 1);
+    if (key === "worktree") current.worktree = content;
+    else if (key === "HEAD") current.head = content;
+    else if (key === "branch") current.branch = content;
+    else if (key === "detached") current.detached = true;
+    else if (key === "bare") current.bare = true;
+    else if (key === "prunable") current.prunable = true;
+  }
+  if (current) entries.push(current);
+  if (!entries.length || entries.some(entry => !entry.worktree || !entry.head)) {
+    throw new Error("Git returned an incomplete worktree registration list");
+  }
+  return entries;
 }
 
 function readNameStatusPaths(value: string): string[] {

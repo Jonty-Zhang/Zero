@@ -5,7 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { GitWorktreeManager, WORKTREE_FINGERPRINT_MAX_FILE_BYTES } from "./git-worktree.js";
+import { GitWorktreeManager, WORKTREE_FINGERPRINT_MAX_FILE_BYTES, type WorktreeInfo } from "./git-worktree.js";
 
 const exec = promisify(execFile);
 
@@ -59,6 +59,86 @@ test("worktree creation plan rejects path or repository identity drift before Gi
     await assert.rejects(manager.executePlan({ ...plan, commonGitDir: join(root, "other.git") }), /Git common directory changed/);
     await assert.equal(await manager.exists("plan_drift"), false);
     await assert.rejects(exec("git", ["show-ref", "--verify", "refs/heads/zero/plan_drift"], { cwd: repo }));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("reopenFromEvidence verifies registered identity and returns a fresh fingerprint", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-git-reopen-evidence-test-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const manager = new GitWorktreeManager(join(root, "worktrees"));
+    const plan = await manager.prepareCreatePlan("reopen_task", repo, "main");
+    const evidence = await manager.executePlan(plan);
+
+    await writeFile(join(plan.path, "seed.txt"), "resumed work\n");
+    const reopened = await manager.reopenFromEvidence(plan, evidence);
+    assert.equal(reopened.info.path, plan.path);
+    assert.equal(reopened.head, evidence.head);
+    assert.match(reopened.fingerprint, /^[a-f0-9]{64}$/);
+    assert.notEqual(reopened.fingerprint, evidence.fingerprint);
+    assert.equal((await manager.fingerprint(reopened.info)), reopened.fingerprint);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("reopenFromEvidence fails closed on persisted and registered identity tampering", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-git-reopen-tamper-test-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const manager = new GitWorktreeManager(join(root, "worktrees"));
+    const plan = await manager.prepareCreatePlan("tamper_task", repo, "main");
+    const evidence = await manager.executePlan(plan);
+
+    await assert.rejects(manager.reopenFromEvidence({ ...plan, path: join(root, "wrong-path") }, evidence), /does not match its creation plan|does not match its planned task id/);
+    await assert.rejects(manager.reopenFromEvidence(plan, { ...evidence, info: { ...evidence.info, branch: "zero/other" } }), /does not match its creation plan/);
+    await assert.rejects(manager.reopenFromEvidence(plan, { ...evidence, commonGitDir: join(root, "other.git") }), /does not match its creation plan/);
+
+    await exec("git", ["branch", "-m", "zero/tamper_task", "renamed-task-branch"], { cwd: plan.path });
+    await assert.rejects(manager.reopenFromEvidence(plan, evidence), /registration is missing, ambiguous, or has an unexpected branch identity/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("reopenFromEvidence rejects HEAD changes during fresh fingerprinting", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-git-reopen-race-test-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  class HeadChangingManager extends GitWorktreeManager {
+    changeHeadAfterFingerprint = false;
+    override async fingerprint(info: WorktreeInfo): Promise<string> {
+      const fingerprint = await super.fingerprint(info);
+      if (this.changeHeadAfterFingerprint) {
+        this.changeHeadAfterFingerprint = false;
+        await exec("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "race commit"], { cwd: info.path });
+      }
+      return fingerprint;
+    }
+  }
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const manager = new HeadChangingManager(join(root, "worktrees"));
+    const plan = await manager.prepareCreatePlan("head_race", repo, "main");
+    const evidence = await manager.executePlan(plan);
+    manager.changeHeadAfterFingerprint = true;
+
+    await assert.rejects(manager.reopenFromEvidence(plan, evidence), /HEAD changed while reopening/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

@@ -75,7 +75,7 @@ test("restart before lease expiry preserves active work and later scan quarantin
 
 test("startup generation is attached to claims and stage starts without enabling replay", () => {
   const generationId = "0123456789abcdef0123456789abcdef";
-  const store = new TaskStore(":memory:", { id: generationId, lockId: "a".repeat(64), predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+  const store = new TaskStore(":memory:", { id: generationId, lockId: "a".repeat(64), predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
   try {
     const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "lineage" }, "generation_test");
     const claimed = store.claimNext("lineage-worker");
@@ -90,10 +90,15 @@ test("startup generation is attached to claims and stage starts without enabling
   } finally { store.close(); }
 });
 
-test("startup generation cannot mark predecessor drained without guardian assertion", () => {
+test("startup generation cannot mark predecessor drained without guardian startup proof", () => {
   assert.throws(() => new TaskStore(":memory:", {
-    id: "invalid-generation", lockId: "a".repeat(64), predecessorDrained: true, memberVerified: false, evidenceKind: "guardian_env_assertion",
-  }), /drained predecessor requires matching guardian lock and Job membership assertions/);
+    id: "invalid-generation", lockId: "a".repeat(64), predecessorDrained: true, evidenceKind: "guardian_env_assertion",
+  }), /drained predecessor requires a guardian startup proof/);
+  const memberOnly = new TaskStore(":memory:", { id: "member-only", lockId: "a".repeat(64), predecessorDrained: false, evidenceKind: "guardian_env_assertion" });
+  try {
+    assert.equal(memberOnly.startupGeneration().predecessorDrained, false);
+    assert.equal(memberOnly.currentStartupProvesGenerationDrained("member-only"), false);
+  } finally { memberOnly.close(); }
   const store = new TaskStore(":memory:", { id: "unguarded-generation", predecessorDrained: false, evidenceKind: "unguarded" });
   try {
     assert.equal(store.startupGeneration().predecessorDrained, false);
@@ -105,7 +110,7 @@ test("startup generation lineage survives reopening an existing database", async
   const root = await mkdtemp(join(process.cwd(), ".zero-startup-generation-"));
   const path = join(root, "tasks.sqlite");
   const generationId = "abcdefabcdefabcdefabcdefabcdefab";
-  let store = new TaskStore(path, { id: generationId, lockId: "b".repeat(64), predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+  let store = new TaskStore(path, { id: generationId, lockId: "b".repeat(64), predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
   const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "persist lineage" }, "generation_persist_test");
   store.claimNext("persist-worker");
   const stage = store.createStage(task.id, { role: "implement", processStartId: "persist-process" });
@@ -131,12 +136,12 @@ test("a verified drained startup directly links only the immediately previous ve
   const lockId = "d".repeat(64);
   const firstId = "11111111111111111111111111111111";
   const secondId = "22222222222222222222222222222222";
-  let store = new TaskStore(path, { id: firstId, lockId, predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+  let store = new TaskStore(path, { id: firstId, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
   try {
     assert.equal(store.startupGeneration().predecessorGenerationId, undefined);
     assert.equal(store.currentStartupProvesGenerationDrained(firstId), false);
     store.close();
-    store = new TaskStore(path, { id: secondId, lockId, predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+    store = new TaskStore(path, { id: secondId, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
     assert.equal(store.startupGeneration().sequence, 2);
     assert.equal(store.startupGeneration().predecessorGenerationId, firstId);
     assert.equal(store.currentStartupProvesGenerationDrained(firstId), true);
@@ -151,10 +156,10 @@ test("unguarded, unverified, empty and lock-mismatched startup generations never
   const lockA = "a".repeat(64);
   const lockB = "b".repeat(64);
   const id = (digit: string) => digit.repeat(32);
-  let store = new TaskStore(path, { id: id("1"), lockId: lockA, predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+  let store = new TaskStore(path, { id: id("1"), lockId: lockA, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
   try {
     store.close();
-    store = new TaskStore(path, { id: id("2"), lockId: lockB, predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+    store = new TaskStore(path, { id: id("2"), lockId: lockB, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
     assert.equal(store.startupGeneration().predecessorGenerationId, undefined);
     assert.equal(store.currentStartupProvesGenerationDrained(id("1")), false);
     store.close();
@@ -163,7 +168,7 @@ test("unguarded, unverified, empty and lock-mismatched startup generations never
     assert.equal(store.currentStartupProvesGenerationDrained(id("2")), false);
   } finally { store.close(); await rm(root, { recursive: true, force: true }); }
 
-  const empty = new TaskStore(":memory:", { id: id("3"), lockId: lockA, predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+  const empty = new TaskStore(":memory:", { id: id("3"), lockId: lockA, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
   try {
     assert.equal(empty.startupGeneration().sequence, 1);
     assert.equal(empty.startupGeneration().predecessorGenerationId, undefined);
@@ -177,18 +182,18 @@ test("legacy generations default to unverified and cannot become a direct predec
   const legacy = new DatabaseSync(path);
   legacy.exec(`CREATE TABLE startup_generations (
     id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE, lock_id TEXT, predecessor_drained INTEGER NOT NULL,
-    evidence_kind TEXT NOT NULL, predecessor_generation_id TEXT, started_at TEXT NOT NULL
+    member_verified INTEGER NOT NULL DEFAULT 0, evidence_kind TEXT NOT NULL, predecessor_generation_id TEXT, started_at TEXT NOT NULL
   )`);
-  legacy.prepare(`INSERT INTO startup_generations(id,sequence,lock_id,predecessor_drained,evidence_kind,started_at)
-    VALUES(?,?,?,?,?,?)`).run("legacy-generation", 1, "c".repeat(64), 1, "guardian_env_assertion", "2026-01-01T00:00:00.000Z");
+  legacy.prepare(`INSERT INTO startup_generations(id,sequence,lock_id,predecessor_drained,member_verified,evidence_kind,started_at)
+    VALUES(?,?,?,?,?,?,?)`).run("legacy-generation", 1, "c".repeat(64), 1, 1, "guardian_env_assertion", "2026-01-01T00:00:00.000Z");
   legacy.close();
   const currentId = "44444444444444444444444444444444";
-  const store = new TaskStore(path, { id: currentId, lockId: "c".repeat(64), predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+  const store = new TaskStore(path, { id: currentId, lockId: "c".repeat(64), predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
   try {
     const migrated = new DatabaseSync(path);
     try {
       const row = migrated.prepare("SELECT member_verified FROM startup_generations WHERE id='legacy-generation'").get() as { member_verified: number };
-      assert.equal(row.member_verified, 0);
+      assert.equal(row.member_verified, 1);
     } finally { migrated.close(); }
     assert.equal(store.startupGeneration().predecessorGenerationId, undefined);
     assert.equal(store.currentStartupProvesGenerationDrained("legacy-generation"), false);
@@ -203,14 +208,14 @@ test("concurrent guarded generation inserts serialize and link to the adjacent i
   const path = join(root, "lineage.sqlite");
   const lockId = "e".repeat(64);
   const seedId = "55555555555555555555555555555555";
-  const seed = new TaskStore(path, { id: seedId, lockId, predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+  const seed = new TaskStore(path, { id: seedId, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
   seed.close();
   const workerSource = `
     const { parentPort, workerData } = require('node:worker_threads');
     (async () => {
       try {
         const { TaskStore } = await import(workerData.moduleUrl);
-        const store = new TaskStore(workerData.path, { id: workerData.id, lockId: workerData.lockId, predecessorDrained: true, memberVerified: true, evidenceKind: 'guardian_env_assertion' });
+        const store = new TaskStore(workerData.path, { id: workerData.id, lockId: workerData.lockId, predecessorDrained: true, evidenceKind: 'guardian_startup_verified' });
         parentPort.postMessage(store.startupGeneration());
         store.close();
       } catch (error) { parentPort.postMessage({ error: error instanceof Error ? error.message : String(error) }); }
@@ -247,9 +252,9 @@ test("same-account SQLite edits can alter lineage assertions; this API is not an
   const lockId = "f".repeat(64);
   const oldId = "88888888888888888888888888888888";
   const currentId = "99999999999999999999999999999999";
-  let store = new TaskStore(path, { id: oldId, lockId, predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+  let store = new TaskStore(path, { id: oldId, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
   store.close();
-  store = new TaskStore(path, { id: currentId, lockId, predecessorDrained: true, memberVerified: true, evidenceKind: "guardian_env_assertion" });
+  store = new TaskStore(path, { id: currentId, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
   try {
     assert.equal(store.currentStartupProvesGenerationDrained(oldId), true);
     const editor = new DatabaseSync(path);
