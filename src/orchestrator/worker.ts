@@ -32,6 +32,8 @@ interface WorkerCheckpoint {
   revisionBrief: string;
   finalRoute?: RouteDecision;
   finalChecks?: CheckResult[];
+  /** The exact Git tree on which the passing checks ran before a quota-paused review. */
+  checksSnapshot?: Pick<WorktreeReviewSnapshot, "fingerprint" | "diffHash" | "treeId">;
 }
 
 export interface RouteContext {
@@ -154,6 +156,7 @@ export class TaskWorker {
     let revisionBrief = task.prompt;
     let finalRoute: RouteDecision | undefined;
     let finalChecks: CheckResult[] = [];
+    let checksSnapshot: ReviewSnapshotIdentity | undefined;
     let continuingExecution = false;
     const interval = setInterval(() => {
       try {
@@ -190,6 +193,7 @@ export class TaskWorker {
         revisionBrief = checkpoint.revisionBrief;
         finalRoute = checkpoint.finalRoute;
         finalChecks = checkpoint.finalChecks ?? [];
+        checksSnapshot = checkpoint.checksSnapshot;
         continuingExecution = stage === "execute";
         if (stage !== "route" && !finalRoute) throw new Error("Quota checkpoint has no execution route");
         if (!Number.isSafeInteger(executionStageIndex) || executionStageIndex < 0
@@ -361,12 +365,30 @@ export class TaskWorker {
           continue;
         }
 
+        // Freeze the staged Git tree before checks run. Passing results apply to
+        // this tree only; a check that writes into the checkout invalidates them.
+        checksSnapshot = reviewSnapshotIdentity(await this.#options.worktrees.prepareReview(worktree));
         const checks = await this.#options.testRunner.run(requiredChecks, worktree.path, { signal: active.controller.signal });
-        finalChecks = checks;
-        executionChecks = checks;
         for (const check of checks) this.#options.store.saveCheck(taskId, check, attempt.id);
         this.#assertNotCancelled(active);
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+        let checksAfter: WorktreeReviewSnapshot | undefined;
+        let checkTreeError: string | undefined;
+        try {
+          checksAfter = await this.#options.worktrees.captureReviewSnapshot(worktree);
+        } catch (error) {
+          checkTreeError = errorText(error);
+        }
+        if (checkTreeError || !checksAfter || !sameReviewSnapshot(checksSnapshot, checksAfter)) {
+          const integrityCheck: CheckResult = {
+            id: "__zero_worktree_integrity__", argv: [], status: "failed", exitCode: null, durationMs: 0,
+            error: `Worktree changed while validation checks ran${checkTreeError ? `: ${checkTreeError}` : "; their results do not apply to the final tree"}`,
+          };
+          checks.push(integrityCheck);
+          this.#options.store.saveCheck(taskId, integrityCheck, attempt.id);
+        }
+        finalChecks = checks;
+        executionChecks = checks;
         const failedChecks = checks.filter(check => check.status !== "passed");
         if (failedChecks.length) {
           await this.#finishExecutionStage({
@@ -399,7 +421,34 @@ export class TaskWorker {
         if (stage !== "review") throw new Error("Worker has no resumable stage");
         if (task.status === "running") task = this.#options.store.transition(taskId, "running", "reviewing", { owner, reason: "resuming quota-paused review" });
         this.#assertNotCancelled(active);
-        const reviewSnapshot = await this.#options.worktrees.prepareReview(worktree);
+        // Backward-compatible recovery for old quota checkpoints without a
+        // checks snapshot: re-run checks and bind the fresh results to this tree.
+        if (!checksSnapshot) {
+          checksSnapshot = reviewSnapshotIdentity(await this.#options.worktrees.prepareReview(worktree));
+          const resumedChecks = await this.#options.testRunner.run(requiredChecks, worktree.path, { signal: active.controller.signal });
+          finalChecks = resumedChecks;
+          const executionStageIds = new Set(this.#options.store.stages(taskId)
+            .filter(item => item.role === "implement" || item.role === "revise")
+            .map(item => item.id));
+          const executionAttemptId = this.#options.store.attempts(taskId)
+            .filter(item => item.stageId && executionStageIds.has(item.stageId))
+            .at(-1)?.id;
+          for (const check of resumedChecks) this.#options.store.saveCheck(taskId, check, executionAttemptId);
+          this.#assertNotCancelled(active);
+          let checksAfter: WorktreeReviewSnapshot;
+          try {
+            checksAfter = await this.#options.worktrees.captureReviewSnapshot(worktree);
+          } catch (error) {
+            throw new Error(`Worktree changed while resumed validation checks ran: ${errorText(error)}`, { cause: error });
+          }
+          if (!sameReviewSnapshot(checksSnapshot, checksAfter)) throw new Error("Worktree changed while resumed validation checks ran; their results do not apply to the final tree");
+          const failedChecks = resumedChecks.filter(check => check.status !== "passed");
+          if (failedChecks.length) throw new Error(`Validation failed after quota resume: ${failedChecks.map(check => check.id).join(", ")}`);
+        }
+        const reviewSnapshot = await this.#options.worktrees.captureReviewSnapshot(worktree);
+        if (!sameReviewSnapshot(checksSnapshot, reviewSnapshot)) {
+          throw new Error("Worktree changed after validation checks; their results do not apply to the reviewed tree");
+        }
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
         const reviewAttempt = this.#options.store.createAttempt(taskId, "review", { owner, harness: "codex" });
         activeAttempt = reviewAttempt;
@@ -526,6 +575,12 @@ export class TaskWorker {
           if (finalizedExecutionFingerprint && finalizedExecutionFingerprint !== checkpointFingerprint) {
             throw new Error("Worktree changed after the interrupted execution stage was archived; quota resume is unsafe");
           }
+          if (stage === "review") {
+            const currentReviewSnapshot = await this.#options.worktrees.captureReviewSnapshot(worktree);
+            if (!checksSnapshot || !sameReviewSnapshot(checksSnapshot, currentReviewSnapshot)) {
+              throw new Error("Worktree changed after validation checks; quota-paused review cannot resume safely");
+            }
+          }
           const checkpoint: WorkerCheckpoint = {
             version: 1,
             stage,
@@ -536,6 +591,7 @@ export class TaskWorker {
             revisionBrief,
             ...(finalRoute ? { finalRoute } : {}),
             ...(stage === "review" ? { finalChecks } : {}),
+            ...(stage === "review" && checksSnapshot ? { checksSnapshot } : {}),
           };
           const retryAt = quotaRetryAt(task.quotaRetryCount ?? 0, { source: error.retryAt ? "provider_message" : "fallback", retryAt: error.retryAt });
           task = this.#options.store.pauseForQuota(taskId, owner, { retryAt, checkpoint: { ...checkpoint }, reason: errorMessage,
@@ -614,7 +670,7 @@ export class TaskWorker {
 
   #revisionBrief(task: TaskRecord, failed: CheckResult[], review: ReviewResult | undefined, revision: number): string {
     const chunks = [task.prompt, `\n\nZero revision ${revision} requested. Preserve the original task and address all evidence below.`];
-    if (failed.length) chunks.push(`Failed checks:\n${failed.map(item => `- ${item.id}: status=${item.status}; exitCode=${String(item.exitCode)}`).join("\n")}`);
+    if (failed.length) chunks.push(`Failed checks:\n${failed.map(item => `- ${item.id}: status=${item.status}; exitCode=${String(item.exitCode)}${item.error ? `; error=${item.error.slice(0, 500)}` : ""}`).join("\n")}`);
     if (review) chunks.push(`Reviewer verdict: ${review.verdict}\n${review.summary}\n${review.findings.map(item => `- ${item.severity}${item.file ? ` ${item.file}${item.line ? `:${item.line}` : ""}` : ""}: ${item.evidence} Required change: ${item.requestedChange}`).join("\n")}`);
     if (task.acceptanceCriteria?.length) chunks.push(`Acceptance criteria:\n${task.acceptanceCriteria.map(item => `- ${item}`).join("\n")}`);
     return chunks.join("\n");
@@ -855,7 +911,13 @@ export class TaskWorker {
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
-function sameReviewSnapshot(left: WorktreeReviewSnapshot, right: WorktreeReviewSnapshot): boolean {
+type ReviewSnapshotIdentity = Pick<WorktreeReviewSnapshot, "fingerprint" | "diffHash" | "treeId">;
+
+function reviewSnapshotIdentity(snapshot: WorktreeReviewSnapshot): ReviewSnapshotIdentity {
+  return { fingerprint: snapshot.fingerprint, diffHash: snapshot.diffHash, treeId: snapshot.treeId };
+}
+
+function sameReviewSnapshot(left: ReviewSnapshotIdentity, right: ReviewSnapshotIdentity): boolean {
   return left.fingerprint === right.fingerprint
     && left.treeId === right.treeId
     && left.diffHash === right.diffHash;
@@ -891,6 +953,18 @@ function parseCheckpoint(raw: Record<string, unknown> | undefined): WorkerCheckp
   }
   if (raw.finalRoute !== undefined && (!raw.finalRoute || typeof raw.finalRoute !== "object")) throw new Error("Invalid checkpoint route");
   if (raw.finalChecks !== undefined && !Array.isArray(raw.finalChecks)) throw new Error("Invalid checkpoint checks");
+  if (raw.checksSnapshot !== undefined) {
+    const snapshot = raw.checksSnapshot;
+    if (!snapshot || typeof snapshot !== "object"
+      || typeof (snapshot as Record<string, unknown>).fingerprint !== "string"
+      || !/^[a-fA-F0-9]{64}$/.test(String((snapshot as Record<string, unknown>).fingerprint))
+      || typeof (snapshot as Record<string, unknown>).diffHash !== "string"
+      || !/^[a-fA-F0-9]{64}$/.test(String((snapshot as Record<string, unknown>).diffHash))
+      || typeof (snapshot as Record<string, unknown>).treeId !== "string"
+      || !/^[a-fA-F0-9]{40,64}$/.test(String((snapshot as Record<string, unknown>).treeId))) {
+      throw new Error("Invalid checkpoint validation snapshot");
+    }
+  }
   if (raw.executionStageIndex !== undefined && (!Number.isSafeInteger(raw.executionStageIndex) || Number(raw.executionStageIndex) < 0)) {
     throw new Error("Invalid checkpoint execution stage index");
   }

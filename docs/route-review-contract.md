@@ -39,7 +39,7 @@ Zero 检查 JSON 结构、候选 ID、已锁定字段、effort 是否受该 bind
 
 ## 审核输入与输出
 
-审核一定是新的 Codex 会话，不复用分配或执行上下文。输入包括原始任务、验收条件、base commit、完整 diff（含新增文件）、机器检查结果和执行摘要。Reviewer 的 sandbox 为只读；Zero 在审核前后比较 Git 状态，若发生任何写入则审核无效并记录故障。
+审核一定是新的 Codex 会话，不复用分配或执行上下文。输入包括原始任务、验收条件、base commit、完整 diff（含新增文件）、机器检查结果和执行摘要。Zero 先固定暂存 Git tree，再运行全部检查；检查后和审核前均重新核对 tree、diff 哈希及工作树指纹。检查命令造成非忽略工作树变化时，记录完整性检查失败并进入有限返工，不能把旧检查结果用于新 tree。额度等待的审核检查点也保存该快照身份；缺少身份的旧检查点必须重新运行检查。Reviewer 的 sandbox 为只读；Zero 在审核前后比较 Git 状态，若发生任何写入则审核无效并记录故障。
 
 ```json
 {
@@ -70,4 +70,5 @@ Reviewer 的 Harness 固定 `codex`。模型与思考强度可在 Zero 中手动
 - 用户锁定 `high`，该 binding 仅支持 `low|medium`：任务提交/路由即报配置错误。
 - Codex 输出不存在的 `bindingId`、不支持的 effort、格式错误或空理由：拒绝。
 - 测试失败但 Codex reviewer 输出 `pass`：仍进入返工或失败，不能 DONE。
+- 检查命令报告通过但修改了待审 tree：完整性检查失败；不能依据旧检查结果进入审核或 DONE。
 - Reviewer 输出 `pass` 但进程非零退出：不能 DONE。
