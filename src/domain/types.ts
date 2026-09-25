@@ -70,6 +70,8 @@ export interface TaskRecord extends TaskSubmission {
   leaseOwner?: string;
   leaseExpiresAt?: string;
   heartbeatAt?: string;
+  /** Startup lineage that acquired the task lease. */
+  claimGenerationId?: string;
   failureReason?: string;
   /** Why automatic execution stopped after an expired lease. */
   recoveryReason?: string;
@@ -124,6 +126,8 @@ export interface StageRecord {
   bindingVersion?: string;
   configHash?: string;
   processStartId: string;
+  /** Startup lineage that began this stage. */
+  generationId?: string;
   inputFingerprint?: string;
   outputFingerprint?: string;
   error?: string;

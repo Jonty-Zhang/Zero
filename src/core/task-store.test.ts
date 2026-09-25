@@ -72,6 +72,58 @@ test("restart before lease expiry preserves active work and later scan quarantin
   }
 });
 
+test("startup generation is attached to claims and stage starts without enabling replay", () => {
+  const generationId = "0123456789abcdef0123456789abcdef";
+  const store = new TaskStore(":memory:", { id: generationId, lockId: "a".repeat(64), predecessorDrained: true, evidenceKind: "guardian_env_assertion" });
+  try {
+    const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "lineage" }, "generation_test");
+    const claimed = store.claimNext("lineage-worker");
+    assert.equal(claimed?.claimGenerationId, generationId);
+    const claimEvent = store.events(task.id).find(event => event.type === "task.claimed");
+    assert.equal((claimEvent?.payload as { generationId?: string } | undefined)?.generationId, generationId);
+    const stage = store.createStage(task.id, { role: "implement", processStartId: "process-1" });
+    const started = store.startStage(stage.id, "lineage-worker", "process-1");
+    assert.equal(started.generationId, generationId);
+    assert.equal(store.startupGeneration().predecessorDrained, true);
+    assert.equal(store.get(task.id)?.status, "running");
+  } finally { store.close(); }
+});
+
+test("startup generation cannot mark predecessor drained without guardian assertion", () => {
+  assert.throws(() => new TaskStore(":memory:", {
+    id: "invalid-generation", lockId: "a".repeat(64), predecessorDrained: true, evidenceKind: "unguarded",
+  }), /drained predecessor requires a matching guardian lock assertion/);
+  const store = new TaskStore(":memory:", { id: "unguarded-generation", predecessorDrained: false, evidenceKind: "unguarded" });
+  try {
+    assert.equal(store.startupGeneration().predecessorDrained, false);
+    assert.equal(store.startupGeneration().evidenceKind, "unguarded");
+  } finally { store.close(); }
+});
+
+test("startup generation lineage survives reopening an existing database", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-startup-generation-"));
+  const path = join(root, "tasks.sqlite");
+  const generationId = "abcdefabcdefabcdefabcdefabcdefab";
+  let store = new TaskStore(path, { id: generationId, lockId: "b".repeat(64), predecessorDrained: true, evidenceKind: "guardian_env_assertion" });
+  const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "persist lineage" }, "generation_persist_test");
+  store.claimNext("persist-worker");
+  const stage = store.createStage(task.id, { role: "implement", processStartId: "persist-process" });
+  store.startStage(stage.id, "persist-worker", "persist-process");
+  store.close();
+  try {
+    store = new TaskStore(path);
+    assert.equal(store.startupGeneration().sequence, 2);
+    assert.equal(store.startupGeneration().predecessorGenerationId, undefined);
+    assert.equal(store.get(task.id)?.claimGenerationId, generationId);
+    assert.equal(store.stages(task.id)[0]?.generationId, generationId);
+    assert.equal(store.events(task.id).find(event => event.type === "task.claimed")?.payload &&
+      (store.events(task.id).find(event => event.type === "task.claimed")?.payload as { generationId?: string }).generationId, generationId);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("worktree creation intent survives ambiguous failure and successful creation records observed identity", () => {
   const store = new TaskStore();
   try {
@@ -121,6 +173,7 @@ test("additive recovery migration preserves existing SQLite task rows", async ()
   legacy.close();
   const store = new TaskStore(path);
   try {
+    assert.equal(store.get("legacy_task")?.claimGenerationId, undefined);
     const existing = store.get("legacy_task");
     assert.equal(existing?.status, "pending");
     assert.equal(existing?.prompt, "preserve me");

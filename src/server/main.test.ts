@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { startupGenerationAttestation } from './main.js';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -13,6 +15,37 @@ import type { ZCodeAppServerPeerOptions } from '../adapters/zcode-app-server-pee
 import { ZCodeAppServerAdapter } from '../adapters/zcode-app-server-adapter.js';
 import { ConfigStore } from './config-store.js';
 import { runDshBindingVerification, runZCodeBindingVerification, runZCodeDesktopBindingVerification } from './main.js';
+
+test('guardian startup lineage is accepted only for a matching normalized data-directory lock ID', () => {
+  const id = '0123456789abcdef0123456789abcdef';
+  const hash = (path: string) => createHash('sha256').update(path.toLowerCase(), 'utf8').digest('hex');
+  const env = { ZERO_GUARDIAN_LOCK_ID: hash('c:\\zerodata'), ZERO_GUARDIAN_GENERATION: id,
+    ZERO_GUARDIAN_PREDECESSOR_DRAINED: '1' };
+  assert.deepEqual(startupGenerationAttestation('C:/ZeroData/', env, 'win32'), {
+    id, lockId: env.ZERO_GUARDIAN_LOCK_ID, predecessorDrained: true, evidenceKind: 'guardian_env_assertion',
+  });
+  const mismatched = startupGenerationAttestation('C:/OtherData', env, 'win32');
+  assert.equal(mismatched.predecessorDrained, false);
+  assert.equal(mismatched.evidenceKind, 'rejected_lock_id');
+  const unguarded = startupGenerationAttestation('C:/ZeroData', {}, 'win32');
+  assert.equal(unguarded.predecessorDrained, false);
+  assert.equal(unguarded.evidenceKind, 'unguarded');
+});
+
+test('guardian startup lock normalization preserves drive and UNC roots', () => {
+  const lockId = (path: string) => createHash('sha256').update(path.toLowerCase(), 'utf8').digest('hex');
+  for (const [input, canonical] of ([
+    ['C:/', 'c:\\'],
+    ['\\\\server\\share\\', '\\\\server\\share\\'],
+    ['\\\\server\\share\\Zero\\', '\\\\server\\share\\zero'],
+  ] as Array<[string, string]>)) {
+    const evidence = startupGenerationAttestation(input, {
+      ZERO_GUARDIAN_LOCK_ID: lockId(canonical), ZERO_GUARDIAN_GENERATION: 'abcdefabcdefabcdefabcdefabcdefab',
+      ZERO_GUARDIAN_PREDECESSOR_DRAINED: '1',
+    }, 'win32');
+    assert.equal(evidence.evidenceKind, 'guardian_env_assertion');
+  }
+});
 
 const model = { id: 'deepseek-main', provider: 'deepseek-official', modelId: 'deepseek-flash' };
 

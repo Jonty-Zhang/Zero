@@ -125,6 +125,35 @@ int RunNormalExit(const std::wstring& guardian, const std::wstring& test_exe) {
   return 0;
 }
 
+int RunGenerationEnvironment(const std::wstring& guardian, const std::wstring& test_exe) {
+  const std::wstring report_name = TempPath(L".generation.txt");
+  if (report_name.empty()) return Fail("could not allocate generation report name");
+  const std::wstring lock_id = L"generation-env";
+  const std::wstring command = Quote(guardian) + L" --lock-id " + lock_id + L" -- " +
+      Quote(test_exe) + L" --helper-report-generation " + Quote(report_name);
+  PROCESS_INFORMATION process{};
+  if (!Start(command, &process)) return Fail("could not start generation guardian");
+  const bool exited = WaitForExit(process.hProcess, 15000);
+  DWORD exit_code = 1;
+  if (exited) GetExitCodeProcess(process.hProcess, &exit_code);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  std::string lock;
+  std::string generation;
+  std::string drained;
+  if (std::filesystem::exists(report_name)) {
+    std::ifstream input{std::filesystem::path(report_name)};
+    input >> lock >> generation >> drained;
+  }
+  DeleteFileW(report_name.c_str());
+  const bool valid_generation = generation.size() == 32 &&
+      generation.find_first_not_of("0123456789abcdef") == std::string::npos;
+  if (!exited || exit_code != 0 || lock != "generation-env" || !valid_generation || drained != "1") {
+    return Fail("guardian child did not receive valid startup lineage assertions");
+  }
+  return 0;
+}
+
 int RunForcedTreeCleanup(const std::wstring& guardian,
                          const std::wstring& test_exe) {
   const std::wstring report_name = TempPath(L".txt");
@@ -276,7 +305,7 @@ int RunSuccessorWaitsForPreviousTree(const std::wstring& guardian,
   }
 
   const std::wstring successor_command = Quote(guardian) + L" --lock-id " + lock_id + L" -- " +
-      Quote(test_exe) + L" --helper-report-exit " + Quote(launch_name);
+      Quote(test_exe) + L" --helper-report-generation " + Quote(launch_name);
   PROCESS_INFORMATION successor{};
   if (!Start(successor_command, &successor)) {
     SignalFile(release_name);
@@ -308,6 +337,13 @@ int RunSuccessorWaitsForPreviousTree(const std::wstring& guardian,
   const bool successor_exited = WaitForExit(successor.hProcess, 15000);
   DWORD successor_code = 1;
   if (successor_exited) GetExitCodeProcess(successor.hProcess, &successor_code);
+  std::string observed_lock;
+  std::string observed_generation;
+  std::string observed_drained;
+  if (std::filesystem::exists(launch_name)) {
+    std::ifstream input{std::filesystem::path(launch_name)};
+    input >> observed_lock >> observed_generation >> observed_drained;
+  }
   CloseHandle(child);
   CloseHandle(grandchild);
   CloseHandle(successor.hThread);
@@ -315,7 +351,10 @@ int RunSuccessorWaitsForPreviousTree(const std::wstring& guardian,
   DeleteFileW(report_name.c_str());
   DeleteFileW(release_name.c_str());
   DeleteFileW(launch_name.c_str());
-  if (!old_tree_stopped || !launched || !successor_exited || successor_code != 0) {
+  const bool valid_generation = observed_generation.size() == 32 &&
+      observed_generation.find_first_not_of("0123456789abcdef") == std::string::npos;
+  if (!old_tree_stopped || !launched || !successor_exited || successor_code != 0 ||
+      observed_lock != std::string(lock_id.begin(), lock_id.end()) || !valid_generation || observed_drained != "1") {
     return Fail("successor did not launch after the prior tree became empty");
   }
   return 0;
@@ -325,6 +364,15 @@ int RunSuccessorWaitsForPreviousTree(const std::wstring& guardian,
 int wmain(int argc, wchar_t** argv) {
   if (argc >= 3 && wcscmp(argv[1], L"--helper-exit") == 0) {
     return _wtoi(argv[2]);
+  }
+  if (argc >= 3 && wcscmp(argv[1], L"--helper-report-generation") == 0) {
+    const wchar_t* lock = _wgetenv(L"ZERO_GUARDIAN_LOCK_ID");
+    const wchar_t* generation = _wgetenv(L"ZERO_GUARDIAN_GENERATION");
+    const wchar_t* drained = _wgetenv(L"ZERO_GUARDIAN_PREDECESSOR_DRAINED");
+    if (!lock || !generation || !drained) return 86;
+    std::wofstream output{std::filesystem::path(argv[2])};
+    output << lock << L"\n" << generation << L"\n" << drained << L"\n";
+    return output ? 0 : 87;
   }
   if (argc >= 3 && wcscmp(argv[1], L"--helper-report-wait") == 0) {
     std::ofstream output{std::filesystem::path(argv[2])};
@@ -384,6 +432,7 @@ int wmain(int argc, wchar_t** argv) {
   const std::wstring test_exe = ModulePath();
   if (test_exe.empty()) return Fail("could not resolve test executable path");
   if (RunNormalExit(guardian, test_exe) != 0) return 1;
+  if (RunGenerationEnvironment(guardian, test_exe) != 0) return 1;
   if (RunDuplicateLock(guardian, test_exe) != 0) return 1;
   if (RunForcedTreeCleanup(guardian, test_exe) != 0) return 1;
   if (RunSuccessorWaitsForPreviousTree(guardian, test_exe) != 0) return 1;

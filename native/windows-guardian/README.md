@@ -6,6 +6,21 @@ count reaches zero. It then closes the prior Job handle and creates a fresh
 named Job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The child starts suspended,
 is assigned to the new Job, and resumes only after assignment succeeds.
 
+After the mutex is owned and the prior named Job query completes successfully,
+the guardian passes `ZERO_GUARDIAN_LOCK_ID`, a fresh 128-bit hexadecimal
+`ZERO_GUARDIAN_GENERATION`, and `ZERO_GUARDIAN_PREDECESSOR_DRAINED=1` to its
+child. A missing prior Job is treated as an empty predecessor under the same
+mutex check. Zero verifies that the lock ID is the SHA-256 of its normalized
+data directory before recording the startup lineage, then attaches that
+generation to task claims and started stages. If those values are absent,
+incomplete, or mismatched, Zero records the startup as unguarded or rejected.
+
+These inherited variables are assertions, not authentication. A process
+running as the same Windows account can set them itself; they do not prove to
+SQLite that guardian.exe was the sender. They exist to correlate normal
+guardian launches and catch configuration mistakes, and they do not authorize
+replaying execution or review work.
+
 The ordering matters: `KILL_ON_JOB_CLOSE` acts when the last Job handle closes.
 The successor must not open the previous Job before the previous guardian exits,
 because an early handle would keep that old Job alive and postpone last-handle

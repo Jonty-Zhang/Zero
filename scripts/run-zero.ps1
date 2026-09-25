@@ -66,6 +66,8 @@ if ([int]$Matches[1] -lt 24) { throw "Zero requires Node.js 24 or later; found $
 New-Item -ItemType Directory -Path $resolvedDataDir -Force | Out-Null
 New-Item -ItemType Directory -Path $resolvedLogDir -Force | Out-Null
 $env:ZERO_DATA_DIR = $resolvedDataDir
+# Preserve guardian lineage variables inherited from guardian.exe. Node validates
+# their lock ID against this resolved data path before recording the assertion.
 $env:ZERO_HOST = '127.0.0.1'
 $env:ZERO_PORT = [string]$Port
 

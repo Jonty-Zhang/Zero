@@ -26,6 +26,7 @@ type TaskRow = {
   retry_at?: string | null;
   recovery_reason?: string | null; recovery_evidence?: string | null;
   lease_protocol_version?: number | null;
+  claim_generation_id?: string | null;
 };
 type StageRow = Record<string, unknown>;
 type HandoffRow = { id: string; task_id: string; stage_id: string; attempt_id: string; schema_version: number; created_at: string; payload: string; payload_bytes: number };
@@ -41,14 +42,28 @@ export interface WorktreeCreationRecord {
   createdAt?: string;
 }
 
+export interface StartupGenerationAttestation {
+  id: string;
+  lockId?: string;
+  predecessorDrained: boolean;
+  evidenceKind: "guardian_env_assertion" | "unguarded" | "rejected_lock_id" | "invalid_attestation";
+}
+
+export interface StartupGenerationRecord extends StartupGenerationAttestation {
+  sequence: number;
+  startedAt: string;
+  predecessorGenerationId?: string;
+}
+
 const encode = (v: unknown): Json => v === undefined ? null : JSON.stringify(v);
 const decode = <T>(v: string | null): T | undefined => v === null ? undefined : JSON.parse(v) as T;
 
 /** SQLite-backed source of truth. Methods are synchronous and each state change is transactional. */
 export class TaskStore {
   readonly #db: DatabaseSync;
+  readonly #startupGeneration: StartupGenerationRecord;
 
-  constructor(path = ":memory:") {
+  constructor(path = ":memory:", startupAttestation?: StartupGenerationAttestation) {
     this.#db = new DatabaseSync(path);
     this.#db.exec(`
       PRAGMA journal_mode = WAL;
@@ -58,7 +73,12 @@ export class TaskStore {
         payload TEXT NOT NULL, revision_count INTEGER NOT NULL DEFAULT 0,
         lease_owner TEXT, lease_expires_at TEXT, heartbeat_at TEXT,
         failure_reason TEXT, active_attempt_id TEXT,
-        recovery_reason TEXT, recovery_evidence TEXT, lease_protocol_version INTEGER
+        recovery_reason TEXT, recovery_evidence TEXT, lease_protocol_version INTEGER,
+        claim_generation_id TEXT REFERENCES startup_generations(id)
+      );
+      CREATE TABLE IF NOT EXISTS startup_generations (
+        id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE, lock_id TEXT, predecessor_drained INTEGER NOT NULL CHECK(predecessor_drained IN (0,1)),
+        evidence_kind TEXT NOT NULL, predecessor_generation_id TEXT REFERENCES startup_generations(id), started_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status, created_at);
       CREATE TABLE IF NOT EXISTS events (
@@ -77,7 +97,7 @@ export class TaskStore {
         role TEXT NOT NULL CHECK(role IN ('implement','revise','review','route')),
         status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed','interrupted')),
         predecessor_stage_id TEXT REFERENCES stages(id), harness TEXT, harness_version TEXT, model TEXT, reasoning_effort TEXT,
-        binding_version TEXT, config_hash TEXT, process_start_id TEXT NOT NULL,
+        binding_version TEXT, config_hash TEXT, process_start_id TEXT NOT NULL, generation_id TEXT REFERENCES startup_generations(id),
         input_fingerprint TEXT, output_fingerprint TEXT, error TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
         UNIQUE(task_id, sequence)
       );
@@ -127,8 +147,42 @@ export class TaskStore {
     if (!taskColumns.some(column => column.name === "recovery_reason")) this.#db.exec("ALTER TABLE tasks ADD COLUMN recovery_reason TEXT");
     if (!taskColumns.some(column => column.name === "recovery_evidence")) this.#db.exec("ALTER TABLE tasks ADD COLUMN recovery_evidence TEXT");
     if (!taskColumns.some(column => column.name === "lease_protocol_version")) this.#db.exec("ALTER TABLE tasks ADD COLUMN lease_protocol_version INTEGER");
+    if (!taskColumns.some(column => column.name === "claim_generation_id")) this.#db.exec("ALTER TABLE tasks ADD COLUMN claim_generation_id TEXT REFERENCES startup_generations(id)");
+    const stageColumnsAfterMigration = this.#db.prepare("PRAGMA table_info(stages)").all() as Array<{ name: string }>;
+    if (!stageColumnsAfterMigration.some(column => column.name === "generation_id")) this.#db.exec("ALTER TABLE stages ADD COLUMN generation_id TEXT REFERENCES startup_generations(id)");
+    const generationColumns = this.#db.prepare("PRAGMA table_info(startup_generations)").all() as Array<{ name: string }>;
+    if (!generationColumns.some(column => column.name === "sequence")) {
+      this.#db.exec("ALTER TABLE startup_generations ADD COLUMN sequence INTEGER");
+      this.#db.exec("UPDATE startup_generations SET sequence=rowid WHERE sequence IS NULL");
+      this.#db.exec("CREATE UNIQUE INDEX IF NOT EXISTS startup_generations_sequence ON startup_generations(sequence)");
+    }
     this.#db.exec("CREATE INDEX IF NOT EXISTS attempts_stage_sequence ON attempts(stage_id, sequence)");
+    const attestation = startupAttestation ?? { id: randomUUID(), predecessorDrained: false, evidenceKind: "unguarded" as const };
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(attestation.id) || typeof attestation.predecessorDrained !== "boolean" ||
+        !["guardian_env_assertion", "unguarded", "rejected_lock_id", "invalid_attestation"].includes(attestation.evidenceKind) ||
+        (attestation.lockId !== undefined && !/^[a-f0-9]{64}$/.test(attestation.lockId))) {
+      throw new Error("Invalid startup generation attestation");
+    }
+    if (attestation.predecessorDrained && (attestation.evidenceKind !== "guardian_env_assertion" || !/^[a-f0-9]{64}$/.test(attestation.lockId ?? ""))) {
+      throw new Error("A drained predecessor requires a matching guardian lock assertion");
+    }
+    if (attestation.evidenceKind === "guardian_env_assertion" && (!attestation.predecessorDrained ||
+        !/^[a-f0-9]{32}$/.test(attestation.id) || !/^[a-f0-9]{64}$/.test(attestation.lockId ?? ""))) {
+      throw new Error("Guardian startup assertions require a generation ID, lock ID, and drained predecessor");
+    }
+    const startedAt = new Date().toISOString();
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const sequence = Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0)+1 AS n FROM startup_generations").get() as { n: number }).n);
+      this.#db.prepare(`INSERT INTO startup_generations(id,sequence,lock_id,predecessor_drained,evidence_kind,predecessor_generation_id,started_at)
+        VALUES(?,?,?,?,?,NULL,?)`).run(attestation.id, sequence, attestation.lockId ?? null,
+        attestation.predecessorDrained ? 1 : 0, attestation.evidenceKind, startedAt);
+      this.#db.exec("COMMIT");
+      this.#startupGeneration = { ...attestation, sequence, predecessorGenerationId: undefined, startedAt };
+    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
   }
+
+  startupGeneration(): StartupGenerationRecord { return { ...this.#startupGeneration }; }
 
   close(): void { this.#db.close(); }
 
@@ -197,10 +251,10 @@ export class TaskStore {
       const row = this.#db.prepare(`SELECT id FROM tasks WHERE status='pending' OR (status='waiting' AND id IN
         (SELECT task_id FROM quota_pauses WHERE retry_at<=?)) ORDER BY created_at, id LIMIT 1`).get(at) as { id: string } | undefined;
       if (!row) { this.#db.exec("COMMIT"); return undefined; }
-      const result = this.#db.prepare(`UPDATE tasks SET status='running', updated_at=?, lease_owner=?, lease_expires_at=?, heartbeat_at=?, lease_protocol_version=2
-        WHERE id=? AND status IN ('pending','waiting')`).run(at, owner, expires, at, row.id);
+      const result = this.#db.prepare(`UPDATE tasks SET status='running', updated_at=?, lease_owner=?, lease_expires_at=?, heartbeat_at=?, lease_protocol_version=2, claim_generation_id=?
+        WHERE id=? AND status IN ('pending','waiting')`).run(at, owner, expires, at, this.#startupGeneration.id, row.id);
       if (Number(result.changes) !== 1) { this.#db.exec("ROLLBACK"); return undefined; }
-      this.#event(row.id, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2 }, at);
+      this.#event(row.id, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2, generationId: this.#startupGeneration.id }, at);
       this.#db.exec("COMMIT");
       return this.get(row.id);
     } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
@@ -400,18 +454,18 @@ export class TaskStore {
     const at = now.toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const rows = this.#db.prepare(`SELECT id,status,lease_owner,lease_expires_at,heartbeat_at,active_attempt_id,lease_protocol_version FROM tasks
+      const rows = this.#db.prepare(`SELECT id,status,lease_owner,lease_expires_at,heartbeat_at,active_attempt_id,lease_protocol_version,claim_generation_id FROM tasks
         WHERE status IN ('running','reviewing','revision') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`).all(at) as Array<{
-          id: string; status: TaskStatus; lease_owner: string | null; lease_expires_at: string; heartbeat_at: string | null; active_attempt_id: string | null; lease_protocol_version: number | null;
+          id: string; status: TaskStatus; lease_owner: string | null; lease_expires_at: string; heartbeat_at: string | null; active_attempt_id: string | null; lease_protocol_version: number | null; claim_generation_id: string | null;
         }>;
       for (const row of rows) {
         const runningAttempts = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? AND status='running'").all(row.id) as Array<{ id: string }>;
-        const runningStages = this.#db.prepare("SELECT id,process_start_id FROM stages WHERE task_id=? AND status='running'").all(row.id) as Array<{ id: string; process_start_id: string }>;
+        const runningStages = this.#db.prepare("SELECT id,process_start_id,generation_id FROM stages WHERE task_id=? AND status='running'").all(row.id) as Array<{ id: string; process_start_id: string; generation_id: string | null }>;
         const reason = "Task lease expired while execution was active; inspect the worker process and task worktree before any retry.";
         const evidence = { kind: "lease_expiry", claimProtocolVersion: row.lease_protocol_version, previousStatus: row.status, leaseOwner: row.lease_owner, leaseExpiresAt: row.lease_expires_at,
-          heartbeatAt: row.heartbeat_at, activeAttemptId: row.active_attempt_id,
+          heartbeatAt: row.heartbeat_at, activeAttemptId: row.active_attempt_id, claimGenerationId: row.claim_generation_id,
           runningAttemptIds: runningAttempts.map(attempt => attempt.id),
-          runningStages: runningStages.map(stage => ({ id: stage.id, processStartId: stage.process_start_id })) };
+          runningStages: runningStages.map(stage => ({ id: stage.id, processStartId: stage.process_start_id, generationId: stage.generation_id })) };
         this.#db.prepare(`UPDATE tasks SET status='recovery_required', updated_at=?, lease_owner=NULL, lease_expires_at=NULL,
           heartbeat_at=NULL, active_attempt_id=NULL, recovery_reason=?, recovery_evidence=? WHERE id=?`)
           .run(at, reason, JSON.stringify(evidence), row.id);
@@ -499,10 +553,11 @@ export class TaskStore {
         }
       }
       const startedAt = new Date().toISOString();
-      const changed = this.#db.prepare("UPDATE stages SET status='running',started_at=? WHERE id=? AND status='pending' AND process_start_id=?")
-        .run(startedAt, stageId, processStartId);
+      const claim = this.#db.prepare("SELECT claim_generation_id FROM tasks WHERE id=?").get(stage.taskId) as { claim_generation_id: string | null };
+      const changed = this.#db.prepare("UPDATE stages SET status='running',started_at=?,generation_id=? WHERE id=? AND status='pending' AND process_start_id=?")
+        .run(startedAt, claim.claim_generation_id, stageId, processStartId);
       if (Number(changed.changes) !== 1) throw new Error(`Stage ${stageId} is not pending`);
-      this.#event(stage.taskId, "stage.started", { stageId, processStartId }, startedAt);
+      this.#event(stage.taskId, "stage.started", { stageId, processStartId, generationId: claim.claim_generation_id ?? undefined }, startedAt);
       return this.getStage(stageId)!;
     });
   }
@@ -727,6 +782,7 @@ export class TaskStore {
     return { ...(JSON.parse(row.payload) as TaskSubmission), id: row.id, status: row.status, createdAt: row.created_at,
       updatedAt: row.updated_at, revisionCount: row.revision_count, leaseOwner: row.lease_owner ?? undefined,
       leaseExpiresAt: row.lease_expires_at ?? undefined, heartbeatAt: row.heartbeat_at ?? undefined,
+      claimGenerationId: row.claim_generation_id ?? undefined,
       failureReason: row.failure_reason ?? undefined, activeAttemptId: row.active_attempt_id ?? undefined,
       recoveryReason: row.recovery_reason ?? undefined,
       recoveryEvidence: row.recovery_evidence ? JSON.parse(row.recovery_evidence) as Record<string, unknown> : undefined,
@@ -756,6 +812,7 @@ export class TaskStore {
       bindingVersion: row.binding_version as string | null ?? undefined,
       configHash: row.config_hash as string | null ?? undefined,
       processStartId: String(row.process_start_id),
+      generationId: row.generation_id as string | null ?? undefined,
       inputFingerprint: row.input_fingerprint as string | null ?? undefined,
       outputFingerprint: row.output_fingerprint as string | null ?? undefined,
       error: row.error as string | null ?? undefined,

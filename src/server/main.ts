@@ -2,7 +2,8 @@ import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs
 import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ModelBinding, ModelConfig, ReasoningEffort } from '../adapters/types.js';
 import { ZCodeAppServerAdapter } from '../adapters/zcode-app-server-adapter.js';
@@ -13,6 +14,7 @@ import { runZCodeProtocolSession } from '../adapters/zcode-protocol-session.js';
 import type { ZCodeProtocolPeer, ZCodeProtocolSessionResult } from '../adapters/zcode-protocol-session.js';
 import { GitWorktreeManager } from '../core/git-worktree.js';
 import { TaskStore } from '../core/task-store.js';
+import type { StartupGenerationAttestation } from '../core/task-store.js';
 import { TestRunner } from '../core/test-runner.js';
 import { TaskRouter } from '../orchestrator/router.js';
 import { TaskReviewer } from '../orchestrator/reviewer.js';
@@ -28,6 +30,26 @@ const dataRoot = resolve(process.env.ZERO_DATA_DIR || (process.platform === 'win
   ? resolve(process.env.LOCALAPPDATA || resolve(homedir(), 'AppData/Local'), 'Zero')
   : resolve(homedir(), '.local/share/zero')));
 const allowedHost = (host: string) => host === '127.0.0.1' || host === 'localhost' || host === '::1';
+
+/** Guardian environment values are lineage assertions, not authentication against the same Windows account. */
+export function startupGenerationAttestation(dataDir: string, env: NodeJS.ProcessEnv = process.env, platform = process.platform): StartupGenerationAttestation {
+  const lockId = env.ZERO_GUARDIAN_LOCK_ID;
+  const generation = env.ZERO_GUARDIAN_GENERATION;
+  const drained = env.ZERO_GUARDIAN_PREDECESSOR_DRAINED;
+  if (!lockId && !generation && !drained) return { id: randomUUID(), predecessorDrained: false, evidenceKind: 'unguarded' };
+  const normalized = win32.resolve(dataDir).replace(/\//g, '\\').toLowerCase();
+  const root = win32.parse(normalized).root.toLowerCase();
+  const withoutTrailingSeparators = normalized.length > root.length ? normalized.replace(/[\\/]+$/, '') : normalized;
+  const expectedLockId = createHash('sha256').update(withoutTrailingSeparators, 'utf8').digest('hex');
+  if (platform !== 'win32' || !/^[a-f0-9]{64}$/.test(lockId ?? '') || lockId !== expectedLockId) {
+    return { id: randomUUID(), lockId: /^[a-f0-9]{64}$/.test(lockId ?? '') ? lockId : undefined,
+      predecessorDrained: false, evidenceKind: 'rejected_lock_id' };
+  }
+  if (!/^[a-f0-9]{32}$/.test(generation ?? '') || drained !== '1') {
+    return { id: randomUUID(), lockId, predecessorDrained: false, evidenceKind: 'invalid_attestation' };
+  }
+  return { id: generation!, lockId: lockId!, predecessorDrained: true, evidenceKind: 'guardian_env_assertion' };
+}
 
 export async function startZeroServer(options: { host?: string; port?: number } = {}) {
   const host = options.host ?? process.env.ZERO_HOST ?? '127.0.0.1';
@@ -45,7 +67,10 @@ export async function startZeroServer(options: { host?: string; port?: number } 
   // must never erase the other selector's enrollment record.
   const versionChanges = await config.invalidateVersionMismatches({ codex: startupProbes[0].version, dsh: startupProbes[1].version });
   if (versionChanges.length) console.warn(`[zero] Harness version changed; removed stale model/effort verification(s): ${versionChanges.join(', ')}. Re-run zero verify-binding.`);
-  const store = new TaskStore(resolve(dataRoot, 'tasks.sqlite'));
+  const generation = startupGenerationAttestation(dataRoot);
+  const store = new TaskStore(resolve(dataRoot, 'tasks.sqlite'), generation);
+  if (generation.evidenceKind === 'rejected_lock_id') console.warn('[zero] Ignored guardian startup assertion because its lock ID does not match ZERO_DATA_DIR.');
+  else if (generation.evidenceKind === 'invalid_attestation') console.warn('[zero] Ignored incomplete guardian startup assertion.');
   const worktrees = new GitWorktreeManager(resolve(dataRoot, 'worktrees'));
   const testRunner = new TestRunner({ logDirectory: resolve(dataRoot, 'artifacts/checks') });
   const codex = adapters.codex!;

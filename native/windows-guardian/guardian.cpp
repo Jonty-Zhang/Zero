@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <wincrypt.h>
 #include <sddl.h>
 
 #include <cwchar>
@@ -85,6 +86,24 @@ std::wstring CurrentUserSidString() {
   return result;
 }
 
+bool CreateGenerationId(std::wstring* result) {
+  HCRYPTPROV provider = 0;
+  if (!CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_FULL,
+                            CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) return false;
+  unsigned char bytes[16]{};
+  const BOOL generated = CryptGenRandom(provider, sizeof(bytes), bytes);
+  CryptReleaseContext(provider, 0);
+  if (!generated) return false;
+  constexpr wchar_t hex[] = L"0123456789abcdef";
+  result->clear();
+  result->reserve(32);
+  for (unsigned char byte : bytes) {
+    result->push_back(hex[byte >> 4]);
+    result->push_back(hex[byte & 0x0f]);
+  }
+  return true;
+}
+
 DWORD WaitForJobToBecomeEmpty(HANDLE job) {
   for (;;) {
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
@@ -146,6 +165,18 @@ int wmain(int argc, wchar_t** argv) {
   // old Job handle open before the old guardian exits suppresses last-handle
   // KILL_ON_JOB_CLOSE behavior.
   if (WaitForPreviousJobToBecomeEmpty(job_name) != ERROR_SUCCESS) {
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    return static_cast<int>(kFailure);
+  }
+
+  // These child variables describe the successful mutex + prior-Job check above.
+  // They are lineage assertions, not a secret or proof against the same account.
+  std::wstring generation;
+  if (!CreateGenerationId(&generation) ||
+      !SetEnvironmentVariableW(L"ZERO_GUARDIAN_LOCK_ID", argv[2]) ||
+      !SetEnvironmentVariableW(L"ZERO_GUARDIAN_GENERATION", generation.c_str()) ||
+      !SetEnvironmentVariableW(L"ZERO_GUARDIAN_PREDECESSOR_DRAINED", L"1")) {
     ReleaseMutex(mutex);
     CloseHandle(mutex);
     return static_cast<int>(kFailure);
