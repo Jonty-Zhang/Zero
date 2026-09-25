@@ -67,6 +67,7 @@ export class TaskStore {
   constructor(path = ":memory:", startupAttestation?: StartupGenerationAttestation) {
     this.#db = new DatabaseSync(path);
     this.#db.exec(`
+      PRAGMA busy_timeout = 5000;
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS tasks (
@@ -184,15 +185,50 @@ export class TaskStore {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const sequence = Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0)+1 AS n FROM startup_generations").get() as { n: number }).n);
+      const previous = this.#db.prepare(`SELECT id,lock_id,member_verified,evidence_kind FROM startup_generations
+        ORDER BY sequence DESC LIMIT 1`).get() as { id: string; lock_id: string | null; member_verified: number; evidence_kind: string } | undefined;
+      const currentIsGuardianVerified = attestation.memberVerified === true && attestation.predecessorDrained === true &&
+        attestation.evidenceKind === "guardian_env_assertion" && /^[a-f0-9]{64}$/.test(attestation.lockId ?? "");
+      const predecessorGenerationId = currentIsGuardianVerified && previous && previous.member_verified === 1 &&
+        previous.evidence_kind === "guardian_env_assertion" && previous.lock_id === attestation.lockId
+        ? previous.id
+        : undefined;
       this.#db.prepare(`INSERT INTO startup_generations(id,sequence,lock_id,predecessor_drained,member_verified,evidence_kind,predecessor_generation_id,started_at)
-        VALUES(?,?,?,?,?,?,NULL,?)`).run(attestation.id, sequence, attestation.lockId ?? null,
-        attestation.predecessorDrained ? 1 : 0, attestation.memberVerified === true ? 1 : 0, attestation.evidenceKind, startedAt);
+        VALUES(?,?,?,?,?,?,?,?)`).run(attestation.id, sequence, attestation.lockId ?? null,
+        attestation.predecessorDrained ? 1 : 0, attestation.memberVerified === true ? 1 : 0, attestation.evidenceKind, predecessorGenerationId ?? null, startedAt);
       this.#db.exec("COMMIT");
-      this.#startupGeneration = { ...attestation, sequence, predecessorGenerationId: undefined, startedAt };
+      this.#startupGeneration = { ...attestation, sequence, predecessorGenerationId, startedAt };
     } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
   }
 
   startupGeneration(): StartupGenerationRecord { return { ...this.#startupGeneration }; }
+
+  /**
+   * Returns true only when this startup's persisted guardian assertion directly names the requested
+   * generation as its predecessor. This is a SQLite lineage check, not protection from same-account edits.
+   */
+  currentStartupProvesGenerationDrained(generationId: string): boolean {
+    if (!generationId) return false;
+    const row = this.#db.prepare(`SELECT current.member_verified AS current_member_verified,
+        current.predecessor_drained AS current_predecessor_drained,
+        current.evidence_kind AS current_evidence_kind,
+        current.lock_id AS current_lock_id,
+        current.predecessor_generation_id AS predecessor_generation_id,
+        previous.id AS previous_id, previous.member_verified AS previous_member_verified,
+        previous.evidence_kind AS previous_evidence_kind, previous.lock_id AS previous_lock_id
+      FROM startup_generations AS current
+      LEFT JOIN startup_generations AS previous ON previous.id = current.predecessor_generation_id
+      WHERE current.id = ?`).get(this.#startupGeneration.id) as {
+        current_member_verified: number; current_predecessor_drained: number; current_evidence_kind: string;
+        current_lock_id: string | null; predecessor_generation_id: string | null; previous_id: string | null;
+        previous_member_verified: number | null; previous_evidence_kind: string | null; previous_lock_id: string | null;
+      } | undefined;
+    return Boolean(row && row.current_member_verified === 1 && row.current_predecessor_drained === 1 &&
+      row.current_evidence_kind === "guardian_env_assertion" && row.current_lock_id &&
+      row.predecessor_generation_id === generationId && row.previous_id === generationId &&
+      row.previous_member_verified === 1 && row.previous_evidence_kind === "guardian_env_assertion" &&
+      row.previous_lock_id === row.current_lock_id);
+  }
 
   close(): void { this.#db.close(); }
 

@@ -14,6 +14,10 @@
 
 环境变量可以由同一 Windows 账户伪造，因此 `evidence_kind='guardian_env_assertion'` 和 `predecessor_drained=true` **不能单独视为认证凭据**。实现恢复前必须确认受支持的启动路径确实由 guardian 承载，并且 Node 获得的 predecessor-drained 结论来自该受监督启动流程，而不是仅接受可复制的 env。可用 guardian 到子进程的继承句柄/本地 IPC 握手绑定启动代际；若无法在运行时建立可信的 guardian 启动关联，则自动续跑 gate 关闭，任务保留 `recovery_required`。这不是抵御同账户恶意篡改的安全边界：同账户本来就能运行/修改本地程序和 SQLite；本功能针对崩溃后的误接管与并发 writer。
 
+本切片只记录可审查的 SQLite 代际关联，不开放任务自动重放。构造当前代时，在 `BEGIN IMMEDIATE` 事务内读取紧邻上一条 generation；仅当本代 `member_verified=1`、`predecessor_drained=1`、`evidence_kind='guardian_env_assertion'`，且上一代 `member_verified=1`、证据类型相同、`lock_id` 一致时，才写入 `predecessor_generation_id`。空库、旧迁移（新增 `member_verified` 默认为 0）、非 guardian 启动或 lock 不匹配都保持 NULL。`currentStartupProvesGenerationDrained(id)` 只根据本代持久化的 verified/drained 断言、guardian evidence、精确 predecessor ID 和被指向记录的 verified/evidence/lock 一致性返回真假；sequence、lease 和环境值本身不能替代 predecessor ID。
+
+该关联和只读查询不是防同账户篡改的认证机制。能写入 Zero 数据目录的同一账户也能编辑 SQLite 行并改变查询结果；恢复授权仍需后续 guardian 到 Node 的可信 IPC/继承句柄证明。当前实现不消费此查询来接续任务，也不改变任何恢复状态机。
+
 只有满足以下全部条件，已有 worktree 才进入恢复候选：
 
 1. 本代由受支持 guardian 启动；数据目录 lock ID 匹配；guardian 已在获得 mutex 后确认 predecessor Job 清空。无法取得该证据时不自动恢复。
