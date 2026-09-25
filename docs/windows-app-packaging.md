@@ -14,13 +14,13 @@ CI 先构建并运行 `scripts/verify-windows-release.mjs`，成功后才调用 
 
 安装器采用 NSIS MUI2。脚本使用官方文档说明的 `RequestExecutionLevel user` 和 `SetShellVarContext current`：前者要求普通用户权限，后者把开始菜单快捷方式限定在当前用户。相关文档：[RequestExecutionLevel](https://nsis.sourceforge.io/Reference/RequestExecutionLevel)、[SetShellVarContext](https://nsis.sourceforge.io/Reference/SetShellVarContext)、[NSIS 下载页](https://nsis.sourceforge.io/Download)、[NSIS 许可证](https://nsis.sourceforge.io/Docs/AppendixI.html)。
 
-CI 固定下载 SourceForge 上游的 NSIS 3.10 安装程序：`https://downloads.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe`，并校验 SHA-256 `4313d352e0dafd1f22b6517126a655cae3b444fa758d2845eddfbe72f24f7bdd`。此哈希来自 Npackd 的 NSIS 3.10 包元数据（[记录](https://www.npackd.org/p/net.sourceforge.nsis/3.10)），不是 NSIS 上游发布的签名校验清单。因此它能使 CI 对固定字节做完整性检查，但不是上游签名证明；不得据此宣称编译器供应链已获签名认证。目标用户电脑不会下载或执行 NSIS、PowerShell 远程脚本或其他构建工具。安装器本身也尚未签名。
+CI 固定使用 `windows-2022` GitHub-hosted runner，并定位镜像预装的 NSIS 编译器。工作流运行 `makensis.exe /VERSION`，只接受 `3.10`，然后再构建安装器。GitHub 的 [Windows Server 2022 runner image inventory](https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md)列出 NSIS 3.10。此方案信任 GitHub runner image 的构建与交付；版本检查确认编译器报告的版本，但不校验可执行文件哈希或签名。镜像内容会随 GitHub 更新；若不再提供 NSIS 3.10，CI 会失败关闭，需审查后再更新版本门槛。目标用户电脑不会下载或执行 NSIS、PowerShell 远程脚本或其他构建工具。安装器本身也尚未签名。
 
 ## CI 与本地构建
 
 Windows CI 会生成并保留两个可下载产物：未签名的 release stage，以及 `zero-windows-installer-unsigned` 安装器。安装器 smoke 测试在 runner 的进程环境中把 `HOME`、`APPDATA`、`LOCALAPPDATA` 指向临时目录，先检查 runner 当前 Windows 用户配置中没有既有 Zero 安装/任务/数据，再进行静默安装与卸载。测试检查已安装文件和开始菜单入口、没有隐式注册计划任务、卸载移除程序文件及保留运行数据标记；测试结束清理它创建的标记和环境目录。GitHub hosted Windows runner 是一次性环境；若出现任何预存 Zero 状态，测试会失败并停止操作。
 
-本地 Windows 构建命令（先按 release-staging 文档完成 Node 与 guardian 产物）：
+本地 Windows 构建命令（先按 release-staging 文档完成 Node 与 guardian 产物，并自行提供 NSIS 3.10 `makensis.exe`）：
 
 ```powershell
 node .\scripts\verify-windows-release.mjs --stage-dir (Join-Path (Get-Location) 'release-stage')
