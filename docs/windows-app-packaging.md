@@ -2,7 +2,7 @@
 
 状态：实施方向；安装包尚未构建或在目标机器验收。
 
-当前已有 `scripts/stage-windows-release.mjs`，从显式指定的 Windows `node.exe`、Node 发行版 `LICENSE`、经过测试的 `guardian.exe` 和已构建的 Zero 运行文件制作发布目录与 SHA-256 清单。公开 CI 对它运行非安装测试并保留**未签名、非安装包**的发布目录产物。脚本要求输出目录位于 Zero 工作区内且为空，不收录本地配置、数据库、日志、测试文件或 Harness 凭据。
+当前已有 `scripts/stage-windows-release.mjs`，从显式指定的 Windows `node.exe`、Node 发行版 `LICENSE`、经过测试的 `guardian.exe` 和已构建的 Zero 运行文件制作发布目录与 SHA-256 清单。`scripts/verify-windows-release.mjs` 独立核对清单、拒绝额外文件，并用包内 Node 启动包内 Zero CLI。公开 CI 运行这些非安装测试并保留**未签名、非安装包**的发布目录产物。脚本要求输出目录位于 Zero 工作区内且为空，不收录本地配置、数据库、日志、测试文件或 Harness 凭据。
 
 ## 决定
 
@@ -36,6 +36,7 @@ node .\scripts\stage-windows-release.mjs `
   --node-license '<absolute path to that Node distribution LICENSE>' `
   --guardian-exe '<absolute path to tested guardian.exe>' `
   --output-dir '<empty directory under this workspace>'
+node .\scripts\verify-windows-release.mjs --stage-dir '<that staged directory>'
 ```
 
 构建清单可设置 `SOURCE_DATE_EPOCH` 固定生成时间；清单中的每个文件都有相对路径、字节数与 SHA-256。Node 和 guardian 路径必须是可执行 PE 文件；这项格式检查不是代码签名或来源证明。正式发布仍需钉住 Node 发行版哈希、签名安装包与 guardian，并在干净机器上验收。

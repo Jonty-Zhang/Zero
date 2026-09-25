@@ -79,6 +79,9 @@ jobs:
           node --test scripts/tests/stage-windows-release.test.mjs
           $releaseDir = Join-Path (Get-Location) 'release-stage'
           node scripts/stage-windows-release.mjs --node-exe $nodeExe --node-license $nodeLicense --guardian-exe (Resolve-Path .\guardian.exe).Path --output-dir $releaseDir
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release staging failed' }
+          node scripts/verify-windows-release.mjs --stage-dir $releaseDir
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release verification failed' }
       - name: Retain unsigned Windows release staging files
         uses: actions/upload-artifact@v4
         with:

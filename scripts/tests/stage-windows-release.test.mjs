@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const script = join(workspace, 'scripts', 'stage-windows-release.mjs');
+const verifier = join(workspace, 'scripts', 'verify-windows-release.mjs');
 
 function withinWorkspace(path) {
   const rel = relative(workspace, path);
@@ -50,6 +51,25 @@ test('Windows release staging copies only explicit runtime inputs and hashes eve
       assert.equal(bytes.length, file.size);
       assert.equal(createHash('sha256').update(bytes).digest('hex'), file.sha256);
     }
+    const verified = spawnSync(process.execPath, [verifier, '--stage-dir', output],
+      { cwd: workspace, encoding: 'utf8', windowsHide: true });
+    assert.equal(verified.status, 0, verified.stderr);
+    assert.match(verified.stdout, /bundled Zero CLI/);
+
+    const cli = join(output, 'dist', 'cli.js');
+    const originalCli = readFileSync(cli);
+    writeFileSync(cli, `${originalCli.toString('utf8')}\n// tampered\n`);
+    const tampered = spawnSync(process.execPath, [verifier, '--stage-dir', output],
+      { cwd: workspace, encoding: 'utf8', windowsHide: true });
+    assert.notEqual(tampered.status, 0);
+    assert.match(tampered.stderr, /size mismatch|hash mismatch/);
+    writeFileSync(cli, originalCli);
+
+    writeFileSync(join(output, 'unexpected.txt'), 'unlisted');
+    const unlisted = spawnSync(process.execPath, [verifier, '--stage-dir', output],
+      { cwd: workspace, encoding: 'utf8', windowsHide: true });
+    assert.notEqual(unlisted.status, 0);
+    assert.match(unlisted.stderr, /unlisted file/);
     const second = spawnSync(process.execPath, [script, '--node-exe', process.execPath,
       '--node-license', nodeLicense, '--guardian-exe', guardian, '--output-dir', output],
     { cwd: workspace, encoding: 'utf8', windowsHide: true });
