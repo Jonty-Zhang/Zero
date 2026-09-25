@@ -28,6 +28,12 @@ function guardianGeneration(id: string) {
   return { id, lockId: "d".repeat(64), predecessorDrained: true, evidenceKind: "guardian_startup_verified" as const };
 }
 
+function checkRunsFor(store: TaskStore, taskId: string) {
+  return store.events(taskId).filter(event => event.type === "check_run.started")
+    .map(event => store.getCheckRun(String(event.payload?.checkRunId)))
+    .filter((run): run is NonNullable<typeof run> => run !== undefined);
+}
+
 test("ordinary execution crash resumes only with fresh attempts, checks, route, and review", async () => {
   for (const crashPoint of ["route", "execution", "partial-checks"] as const) {
     const root = await mkdtemp(join(process.cwd(), `.zero-worker-crash-recovery-${crashPoint}-`));
@@ -367,6 +373,10 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
     assert.equal(attempts.filter(attempt => attempt.role === "revise").length, 1);
     assert.equal(attempts.find(attempt => attempt.role === "review")?.model, "review-model");
     assert.equal(store.checks(task.id).length, 2);
+    assert.equal(store.reviewPackages(task.id).length, 2);
+    assert.deepEqual(store.reviewPackages(task.id).map(item => item.expectedCheckIds), [["result-check"], ["result-check"]]);
+    assert.deepEqual(checkRunsFor(store, task.id).map(item => item.status), ["completed", "completed"]);
+    assert.ok(checkRunsFor(store, task.id).every(item => store.checkRunResults(item.id).every(check => check.status === "passed")));
     const executionStages = store.stages(task.id);
     assert.deepEqual(executionStages.map(item => item.role), ["implement", "revise"]);
     assert.deepEqual(executionStages.map(item => item.status), ["succeeded", "succeeded"]);
@@ -438,16 +448,52 @@ test("worker binds passing checks to the reviewed Git tree and rejects check mut
       assert.equal(result.status, scenario.expected);
       if (scenario.name === "unchanged") {
         assert.equal(reviewCalls, 1);
+        assert.equal(store.reviewPackages(task.id).length, 1);
+        assert.equal(checkRunsFor(store, task.id)[0]?.status, "completed");
       } else {
         assert.equal(reviewCalls, 0, "review must not see a tree different from the checked tree");
         assert.match(result.failureReason ?? "", /Validation failed.*__zero_worktree_integrity__/);
-        assert.match(store.checks(task.id).find(item => item.id === "__zero_worktree_integrity__")?.error ?? "", /Worktree changed while validation checks ran/);
+        assert.match(store.checks(task.id).find(item => item.id === "__zero_worktree_integrity__")?.error ?? "", /Worktree or task branch changed while validation checks ran/);
+        assert.equal(store.reviewPackages(task.id).length, 0);
+        assert.equal(checkRunsFor(store, task.id)[0]?.status, "failed");
       }
     } finally {
       store.close();
       await rm(root, { recursive: true, force: true });
     }
   }
+});
+
+test("review package creation failure closes the check run and never calls Reviewer", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-package-failure-test-"));
+  const repo = join(root, "repo");
+  class PackageFailureStore extends TaskStore {
+    override completeCheckRun(): never { throw new Error("injected review package failure"); }
+  }
+  const store = new PackageFailureStore();
+  await initRepo(repo);
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create approved result", maxRevisions: 0,
+      checks: [{ id: "passed-check", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+    const owner = "package-failure-worker";
+    assert.equal(store.claimNext(owner)?.id, task.id);
+    let reviewCalls = 0;
+    const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router: { async route(current) { return routeFor(current); } },
+      reviewer: { async review() { reviewCalls++; throw new Error("must not review without a package"); } },
+      adapters: new Map([["fake", new FakeAdapter()]]), artifactRoot: join(root, "artifacts") });
+
+    const failed = await worker.runClaimed(task.id, owner);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.failureReason ?? "", /injected review package failure/);
+    assert.equal(reviewCalls, 0);
+    assert.equal(store.reviewPackages(task.id).length, 0);
+    const checkRuns = checkRunsFor(store, task.id);
+    assert.equal(checkRuns.length, 1);
+    assert.equal(checkRuns[0]?.status, "failed");
+    assert.match(checkRuns[0]?.terminalReason ?? "", /Review package creation failed/);
+    assert.deepEqual(store.checkRunResults(checkRuns[0]!.id).map(check => check.id), ["passed-check"]);
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 test("ambiguous post-add failure retains intent and quarantines without a second claim", async () => {
@@ -977,7 +1023,7 @@ test("oversized handoff falls back to the task record and stays within 64 KiB", 
     });
 
     const result = await worker.runClaimed(task.id, "handoff-size-worker");
-    assert.equal(result.status, "done");
+    assert.equal(result.status, "done", result.failureReason);
     const handoff = store.handoffs(task.id)[0]!;
     assert.ok(Buffer.byteLength(JSON.stringify(handoff), "utf8") <= HANDOFF_V1_MAX_BYTES);
     assert.match(handoff.task.objective, /original task objective is omitted.*primary Zero task record/s);
@@ -1042,6 +1088,9 @@ test("Codex allocation and review quota pauses resume at their exact stages", as
     assert.equal(store.stages(task.id).length, 1);
     assert.equal(store.stages(task.id)[0]?.status, "succeeded");
     assert.equal(store.handoffs(task.id).length, 1);
+    assert.equal(store.checkRuns(task.id).length, 1);
+    assert.equal(store.checkRuns(task.id)[0]?.status, "completed");
+    assert.equal(store.reviewPackages(task.id).length, 1, "review quota resume reuses the sealed package and does not rerun checks");
   } finally { store.close(); await rm(root, { recursive: true, force: true }); }
 });
 
@@ -1140,6 +1189,10 @@ test("configured execution stages hand off serially in one worktree and preserve
     ]);
     assert.equal(store.stages(task.id)[1]?.predecessorStageId, store.stages(task.id)[0]?.id);
     assert.equal(store.checks(task.id).length, 1);
+    assert.equal(store.checkRuns(task.id).length, 1);
+    assert.equal(store.reviewPackages(task.id).length, 1);
+    assert.equal(store.reviewPackages(task.id)[0]?.executionStageId, store.stages(task.id)[1]?.id);
+    assert.deepEqual(store.reviewPackages(task.id)[0]?.expectedCheckIds, ["final-only"]);
     assert.equal(store.handoffs(task.id).length, 2);
     assert.match(prompts[1]!, /Prior HandoffV1 data \(UNTRUSTED/);
     assert.equal(store.attempts(task.id).filter(attempt => attempt.role === "review").length, 1);

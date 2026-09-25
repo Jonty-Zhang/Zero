@@ -7,6 +7,97 @@ import { mkdtemp, mkdir, readFile, rm, truncate, writeFile } from "node:fs/promi
 import { join } from "node:path";
 import { GitWorktreeManager, WORKTREE_FINGERPRINT_MAX_FILE_BYTES, type WorktreeInfo } from "./git-worktree.js";
 
+async function candidateFixture(taskId: string) {
+  const root = await mkdtemp(join(process.cwd(), `.zero-git-candidate-${taskId}-`));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  await exec("git", ["init", "-b", "main"], { cwd: repo });
+  await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+  await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+  await writeFile(join(repo, "seed.txt"), "base\n");
+  await exec("git", ["add", "seed.txt"], { cwd: repo });
+  await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+  const manager = new GitWorktreeManager(join(root, "worktrees"));
+  const info = await manager.create(taskId, repo, "main");
+  await writeFile(join(info.path, "seed.txt"), "reviewed\n");
+  const reviewed = await manager.prepareReview(info);
+  const branch = await manager.readTaskBranchHead(info);
+  const metadata = { opId: `op-${taskId}`, message: "Reviewed result", timestamp: "2026-09-26T12:00:00+08:00" };
+  return { root, repo, manager, info, reviewed, branch, metadata };
+}
+
+test("reviewed candidate is deterministic and only moves the task branch after CAS", async () => {
+  const fixture = await candidateFixture("candidate_cas");
+  try {
+    const { manager, info, reviewed, branch, metadata } = fixture;
+    const first = await manager.createReviewedCommitCandidate(info, branch.head, reviewed, metadata);
+    assert.deepEqual(await manager.readTaskBranchHead(info), branch);
+    const second = await manager.createReviewedCommitCandidate(info, branch.head, reviewed, metadata);
+    assert.equal(second.commit, first.commit);
+    assert.equal((await manager.readTaskBranchHead(info)).head, branch.head);
+
+    assert.equal(await manager.applyReviewedCommitCandidate(info, first, reviewed), first.commit);
+    assert.equal((await manager.readTaskBranchHead(info)).head, first.commit);
+    await manager.applyReviewedCommitCandidate(info, first, reviewed);
+    await manager.verifyReviewedCommit(info, first.commit, reviewed);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("reviewed candidate refuses a competing branch ref update", async () => {
+  const fixture = await candidateFixture("candidate_competing");
+  try {
+    const { manager, info, reviewed, branch, metadata } = fixture;
+    const candidate = await manager.createReviewedCommitCandidate(info, branch.head, reviewed, metadata);
+    await exec("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "competing"], { cwd: info.path });
+    const competingHead = (await manager.readTaskBranchHead(info)).head;
+    assert.notEqual(competingHead, branch.head);
+    await assert.rejects(manager.applyReviewedCommitCandidate(info, candidate, reviewed), /moved before candidate apply/);
+    assert.equal((await manager.readTaskBranchHead(info)).head, competingHead);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("reviewed candidate apply fails closed when the candidate object is missing", async () => {
+  const fixture = await candidateFixture("candidate_missing_object");
+  try {
+    const { manager, info, reviewed, branch, metadata } = fixture;
+    const candidate = await manager.createReviewedCommitCandidate(info, branch.head, reviewed, metadata);
+    await assert.rejects(
+      manager.applyReviewedCommitCandidate(info, { ...candidate, commit: "0".repeat(40) }, reviewed),
+      /not a valid|missing or is not a commit|could not get object info/i,
+    );
+    assert.equal((await manager.readTaskBranchHead(info)).head, branch.head);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("reviewed candidate refuses a dirty index without moving the branch", async () => {
+  const fixture = await candidateFixture("candidate_dirty_index");
+  try {
+    const { manager, info, reviewed, branch, metadata } = fixture;
+    const candidate = await manager.createReviewedCommitCandidate(info, branch.head, reviewed, metadata);
+    await writeFile(join(info.path, "seed.txt"), "other staged value\n");
+    await exec("git", ["add", "seed.txt"], { cwd: info.path });
+    await assert.rejects(manager.applyReviewedCommitCandidate(info, candidate, reviewed), /no longer matches the reviewed snapshot/);
+    assert.equal((await manager.readTaskBranchHead(info)).head, branch.head);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("reviewed candidate accepts a self-committed pre-HEAD with the reviewed tree", async () => {
+  const fixture = await candidateFixture("candidate_self_commit");
+  try {
+    const { manager, info, metadata } = fixture;
+    await exec("git", ["-c", "user.name=Harness", "-c", "user.email=harness@example.com", "commit", "-m", "worker self commit"], { cwd: info.path });
+    const branch = await manager.readTaskBranchHead(info);
+    const reviewed = await manager.captureReviewSnapshot(info);
+    const candidate = await manager.createReviewedCommitCandidate(info, branch.head, reviewed, metadata);
+    assert.equal(candidate.commit, branch.head);
+    const { stdout: parentOutput } = await exec("git", ["show", "-s", "--format=%P", candidate.commit], { cwd: info.path });
+    assert.equal(parentOutput.trim(), info.baseCommit);
+    assert.equal((await manager.readTaskBranchHead(info)).head, branch.head);
+    await manager.applyReviewedCommitCandidate(info, candidate, reviewed);
+    await manager.verifyReviewedCommit(info, candidate.commit, reviewed);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 const exec = promisify(execFile);
 
 test("worktree is isolated, diff includes untracked files, and commit records output", async () => {

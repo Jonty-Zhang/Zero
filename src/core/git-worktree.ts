@@ -46,6 +46,23 @@ export interface WorktreeReviewSnapshot {
   treeId: string;
 }
 
+export interface ReviewedCommitMetadata {
+  /** Stable id for the logical operation, also recorded as a commit trailer. */
+  opId: string;
+  message: string;
+  /** Git date accepted by Git, for example `2026-09-26T12:00:00+08:00`. */
+  timestamp: string;
+}
+
+export interface ReviewedCommitCandidate {
+  branchRef: string;
+  preHead: string;
+  commit: string;
+  treeId: string;
+  diffHash: string;
+  opId: string;
+}
+
 export class GitWorktreeManager {
   readonly #root: string;
 
@@ -252,7 +269,7 @@ export class GitWorktreeManager {
   async prepareReview(info: WorktreeInfo): Promise<WorktreeReviewSnapshot> {
     await this.#validateInfo(info);
     await this.#ensureTaskBranch(info);
-    await execFileAsync("git", ["add", "-A"], { cwd: info.path, windowsHide: true });
+    await execFileAsync("git", ["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "add", "-A"], { cwd: info.path, windowsHide: true });
     return this.captureReviewSnapshot(info);
   }
 
@@ -445,6 +462,113 @@ export class GitWorktreeManager {
     return head;
   }
 
+  /** Read the exact task branch ref and its current commit without changing Git state. */
+  async readTaskBranchHead(info: WorktreeInfo): Promise<{ ref: string; head: string }> {
+    await this.#validateInfo(info);
+    await this.#ensureTaskBranch(info);
+    const ref = `refs/heads/${info.branch}`;
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--verify", `${ref}^{commit}`], { cwd: info.path, windowsHide: true });
+    const head = stdout.trim();
+    if (!/^[a-fA-F0-9]{40,64}$/.test(head)) throw new Error("Git returned an invalid task branch HEAD");
+    return { ref, head };
+  }
+
+  /**
+   * Create a deterministic reviewed commit object without moving the task ref.
+   * The caller must persist the returned candidate before applying it.
+   */
+  async createReviewedCommitCandidate(
+    info: WorktreeInfo,
+    preHead: string,
+    reviewed: WorktreeReviewSnapshot,
+    metadata: ReviewedCommitMetadata,
+  ): Promise<ReviewedCommitCandidate> {
+    await this.#validateInfo(info);
+    await this.#ensureTaskBranch(info);
+    assertReviewSnapshot(reviewed);
+    assertCommitMetadata(metadata);
+    if (!/^[a-fA-F0-9]{40,64}$/.test(preHead)) throw new Error("Invalid candidate pre-HEAD");
+    const { ref, head } = await this.readTaskBranchHead(info);
+    if (head.toLowerCase() !== preHead.toLowerCase()) throw new Error("Task branch changed before candidate creation");
+    const worktreeHead = await this.#head(info);
+    if (worktreeHead.toLowerCase() !== preHead.toLowerCase()) throw new Error("Task worktree HEAD does not match candidate pre-HEAD");
+    await execFileAsync("git", ["merge-base", "--is-ancestor", info.baseCommit, preHead], { cwd: info.path, windowsHide: true });
+    await this.#assertMatchesReview(info, reviewed, "before candidate creation");
+    const diff = await this.#diffTree(info, reviewed.treeId);
+    if (hash(diff) !== reviewed.diffHash) throw new Error("Reviewed tree diff does not match the reviewed snapshot");
+    if (!diff.trim()) {
+      throw new Error("Refusing to create a commit for an empty reviewed change");
+    }
+
+    if ((await this.#headTree(info)).toLowerCase() === reviewed.treeId.toLowerCase()) {
+      const candidate: ReviewedCommitCandidate = {
+        branchRef: ref, preHead, commit: preHead, treeId: reviewed.treeId, diffHash: reviewed.diffHash, opId: metadata.opId,
+      };
+      await this.#verifyCandidate(info, candidate, reviewed);
+      const finalRef = await this.readTaskBranchHead(info);
+      if (finalRef.head.toLowerCase() !== preHead.toLowerCase()) throw new Error("Task branch changed while validating self-committed candidate");
+      return candidate;
+    }
+
+    const message = `${metadata.message}\n\nZero-Operation-Id: ${metadata.opId}\n`;
+    const { stdout } = await execFileAsync("git", [
+      "-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "-c", "i18n.commitEncoding=UTF-8",
+      "commit-tree", reviewed.treeId, "-p", preHead, "-m", message,
+    ], {
+      cwd: info.path,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "Zero",
+        GIT_AUTHOR_EMAIL: "zero@localhost",
+        GIT_COMMITTER_NAME: "Zero",
+        GIT_COMMITTER_EMAIL: "zero@localhost",
+        GIT_AUTHOR_DATE: metadata.timestamp,
+        GIT_COMMITTER_DATE: metadata.timestamp,
+      },
+    });
+    const commit = stdout.trim();
+    if (!/^[a-fA-F0-9]{40,64}$/.test(commit)) throw new Error("Git returned an invalid candidate commit id");
+    const candidate: ReviewedCommitCandidate = {
+      branchRef: ref, preHead, commit, treeId: reviewed.treeId, diffHash: reviewed.diffHash, opId: metadata.opId,
+    };
+    await this.#verifyCandidate(info, candidate, reviewed);
+    const finalRef = await this.readTaskBranchHead(info);
+    if (finalRef.head.toLowerCase() !== preHead.toLowerCase()) throw new Error("Task branch changed while creating commit candidate");
+    return candidate;
+  }
+
+  /** Apply a prepared candidate with a compare-and-swap update of the task branch. */
+  async applyReviewedCommitCandidate(
+    info: WorktreeInfo,
+    candidate: ReviewedCommitCandidate,
+    reviewed: WorktreeReviewSnapshot,
+  ): Promise<string> {
+    await this.#validateInfo(info);
+    await this.#ensureTaskBranch(info);
+    assertReviewSnapshot(reviewed);
+    assertCandidate(candidate, info, reviewed);
+    await this.#verifyCandidate(info, candidate, reviewed);
+    const { ref, head } = await this.readTaskBranchHead(info);
+    if (ref !== candidate.branchRef) throw new Error("Candidate targets an unexpected task branch ref");
+    if (head.toLowerCase() === candidate.commit.toLowerCase()) {
+      await this.#verifyAppliedCandidate(info, candidate, reviewed);
+      return candidate.commit;
+    }
+    if (head.toLowerCase() !== candidate.preHead.toLowerCase()) throw new Error("Task branch moved before candidate apply");
+
+    // Revalidate the approved live snapshot immediately before the only ref mutation.
+    await this.#assertMatchesReview(info, reviewed, "before candidate apply");
+    await this.#verifyCandidate(info, candidate, reviewed);
+    await execFileAsync("git", [
+      "-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "update-ref", candidate.branchRef, candidate.commit, candidate.preHead,
+    ], {
+      cwd: info.path, windowsHide: true,
+    });
+    await this.#verifyAppliedCandidate(info, candidate, reviewed);
+    return candidate.commit;
+  }
+
   /** Final pre-DONE assertion that HEAD and the clean worktree still equal the reviewed commit. */
   async verifyReviewedCommit(info: WorktreeInfo, commit: string, reviewed: WorktreeReviewSnapshot): Promise<void> {
     await this.#validateInfo(info);
@@ -485,7 +609,7 @@ export class GitWorktreeManager {
   }
 
   async #writeTree(info: WorktreeInfo): Promise<string> {
-    const { stdout } = await execFileAsync("git", ["write-tree"], { cwd: info.path, windowsHide: true });
+    const { stdout } = await execFileAsync("git", ["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "write-tree"], { cwd: info.path, windowsHide: true });
     const treeId = stdout.trim();
     if (!/^[a-fA-F0-9]{40,64}$/.test(treeId)) throw new Error("Git returned an invalid staged tree id");
     return treeId;
@@ -496,6 +620,46 @@ export class GitWorktreeManager {
     const treeId = stdout.trim();
     if (!/^[a-fA-F0-9]{40,64}$/.test(treeId)) throw new Error("Git returned an invalid HEAD tree id");
     return treeId;
+  }
+
+  async #head(info: WorktreeInfo): Promise<string> {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: info.path, windowsHide: true });
+    const head = stdout.trim();
+    if (!/^[a-fA-F0-9]{40,64}$/.test(head)) throw new Error("Git returned an invalid worktree HEAD");
+    return head;
+  }
+
+  async #verifyCandidate(info: WorktreeInfo, candidate: ReviewedCommitCandidate, reviewed: WorktreeReviewSnapshot): Promise<void> {
+    const { stdout: objectType } = await execFileAsync("git", ["cat-file", "-t", candidate.commit], { cwd: info.path, windowsHide: true });
+    if (objectType.trim() !== "commit") throw new Error("Reviewed candidate object is missing or is not a commit");
+    const { stdout: details } = await execFileAsync("git", ["show", "-s", "--format=%T%n%P%n%B", candidate.commit], { cwd: info.path, windowsHide: true });
+    const [tree, parents, ...bodyLines] = details.replace(/\r/g, "").split("\n");
+    const selfCommitted = candidate.commit.toLowerCase() === candidate.preHead.toLowerCase();
+    if (tree?.toLowerCase() !== reviewed.treeId.toLowerCase()
+      || (!selfCommitted && parents?.trim().toLowerCase() !== candidate.preHead.toLowerCase())) {
+      throw new Error("Candidate commit does not have the reviewed tree and exact pre-HEAD parent");
+    }
+    const body = bodyLines.join("\n").trimEnd();
+    if (!selfCommitted && !body.endsWith(`Zero-Operation-Id: ${candidate.opId}`)) throw new Error("Candidate commit operation id does not match");
+    await execFileAsync("git", ["merge-base", "--is-ancestor", info.baseCommit, candidate.commit], { cwd: info.path, windowsHide: true });
+    const diff = await this.#diffCommit(info, candidate.commit);
+    if (hash(diff) !== reviewed.diffHash || candidate.diffHash !== reviewed.diffHash) {
+      throw new Error("Candidate commit diff does not match the reviewed snapshot");
+    }
+  }
+
+  async #verifyAppliedCandidate(info: WorktreeInfo, candidate: ReviewedCommitCandidate, reviewed: WorktreeReviewSnapshot): Promise<void> {
+    const { ref, head } = await this.readTaskBranchHead(info);
+    if (ref !== candidate.branchRef || head.toLowerCase() !== candidate.commit.toLowerCase()
+      || (await this.#head(info)).toLowerCase() !== candidate.commit.toLowerCase()) {
+      throw new Error("Task branch did not move to the reviewed candidate");
+    }
+    if ((await this.#headTree(info)).toLowerCase() !== reviewed.treeId.toLowerCase()
+      || (await this.#writeTree(info)).toLowerCase() !== reviewed.treeId.toLowerCase()
+      || hash(await this.#diffCommit(info, candidate.commit)) !== reviewed.diffHash
+      || await this.status(info)) {
+      throw new Error("Applied candidate does not leave a clean worktree matching the reviewed snapshot");
+    }
   }
 
   async #diffTree(info: WorktreeInfo, treeId: string): Promise<string> {
@@ -658,5 +822,23 @@ function assertReviewSnapshot(value: WorktreeReviewSnapshot): void {
     || !/^[a-fA-F0-9]{40,64}$/.test(value.treeId) || typeof value.diff !== "string"
     || hash(value.diff) !== value.diffHash) {
     throw new Error("Invalid reviewed worktree snapshot");
+  }
+}
+
+function assertCommitMetadata(value: ReviewedCommitMetadata): void {
+  if (!value || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value.opId)
+    || typeof value.message !== "string" || !value.message.trim() || value.message.includes("\0")
+    || typeof value.timestamp !== "string" || !value.timestamp.trim() || value.timestamp.includes("\0")) {
+    throw new Error("Invalid reviewed commit metadata");
+  }
+}
+
+function assertCandidate(value: ReviewedCommitCandidate, info: WorktreeInfo, reviewed: WorktreeReviewSnapshot): void {
+  if (!value || value.branchRef !== `refs/heads/${info.branch}`
+    || !/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(value.branchRef)
+    || !/^[a-fA-F0-9]{40,64}$/.test(value.preHead) || !/^[a-fA-F0-9]{40,64}$/.test(value.commit)
+    || value.treeId?.toLowerCase() !== reviewed.treeId.toLowerCase() || value.diffHash !== reviewed.diffHash
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value.opId)) {
+    throw new Error("Invalid reviewed commit candidate");
   }
 }

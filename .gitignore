@@ -16,3 +16,5 @@ reports/
 .env
 .env.*
 !.env.example
+docs/zcode-*.local.md
+docs/crash-recovery-iteration-b-review.md

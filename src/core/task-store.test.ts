@@ -1,11 +1,60 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { TaskStore } from "./task-store.js";
+import { configureTaskStorePragmas, TaskStore } from "./task-store.js";
 import type { TaskSubmission } from "../domain/types.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
+import { createHash } from "node:crypto";
+
+test("file-backed task store reopens with WAL and FULL synchronous mode", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-sqlite-durability-"));
+  const path = join(root, "tasks.sqlite");
+  try {
+    const first = new TaskStore(path);
+    const submitted = first.submit({ repoPath: ".", baseRef: "main", prompt: "persist across reopen" }, "sqlite_durability_reopen");
+    first.close();
+
+    const reopened = new TaskStore(path);
+    assert.equal(reopened.get(submitted.id)?.prompt, submitted.prompt);
+    reopened.close();
+
+    const verification = new DatabaseSync(path);
+    try {
+      configureTaskStorePragmas(verification, path);
+      assert.equal((verification.prepare("PRAGMA journal_mode;").get() as { journal_mode: string }).journal_mode, "wal");
+      assert.equal((verification.prepare("PRAGMA synchronous;").get() as { synchronous: number }).synchronous, 2);
+    } finally { verification.close(); }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+function reviewFixture(checks = [{ id: "unit", argv: ["node", "test.js"] }], leaseMs = 60_000) {
+  const store = new TaskStore();
+  const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "review package", checks }, "review_package_store_test");
+  const owner = "review-worker";
+  const claimed = store.claimNext(owner, leaseMs)!;
+  const generationId = claimed.claimGenerationId!;
+  const route: import("../domain/types.js").RouteDecision = {
+    taskId: task.id, harness: "zcode", model: "model-x", selectionSource: "codex", reason: "test route", decidedAt: new Date().toISOString(),
+  };
+  const routeAttempt = store.createAttempt(task.id, "route", { owner, harness: "codex" });
+  store.finishAttempt(routeAttempt.id, { status: "succeeded", metadata: { decision: route } });
+  store.saveRoute(route);
+  const stage = store.createStage(task.id, { role: "implement", processStartId: "process-1", harness: "zcode", model: "model-x" });
+  store.startStage(stage.id, owner, "process-1");
+  const execution = store.createAttempt(task.id, "implement", { owner, stageId: stage.id, harness: "zcode", model: "model-x" });
+  store.finishAttempt(execution.id, { status: "succeeded" }, { owner, processStartId: "process-1" });
+  const diff = "diff --git a/a b/a\n+change\n";
+  const snapshot = { baseCommit: "base", preHead: "head", treeId: "tree", fingerprint: "fingerprint",
+    diffHash: createHash("sha256").update(diff, "utf8").digest("hex"), diff };
+  const expectedCheckIds = checks.map(check => check.id);
+  const checkDefinitionHash = createHash("sha256").update(JSON.stringify(checks), "utf8").digest("hex");
+  const input = { taskId: task.id, owner, generationId, executionAttemptId: execution.id, executionStageId: stage.id,
+    routeAttemptId: routeAttempt.id, route, branchRef: `refs/heads/zero/${task.id}`, snapshot, checkDefinitionHash, expectedCheckIds };
+  const result = (id: string, status: "passed" | "failed" = "passed") => ({ id, argv: ["node", "test.js"], status, exitCode: status === "passed" ? 0 : 1, durationMs: 10 });
+  return { store, task, owner, generationId, route, routeAttempt, stage, execution, snapshot, input, result };
+}
 
 test("expired active lease requires inspection and retains interrupted attempt evidence", () => {
   const store = new TaskStore();
@@ -29,6 +78,137 @@ test("expired active lease requires inspection and retains interrupted attempt e
     assert.throws(() => store.requeuePreWriteIntentLeaseExpiry(task.id, { kind: "worktree_absent", checkedAt: new Date().toISOString() }), /persisted work evidence/);
     assert.equal(attempt.id, store.attempts(task.id)[0]?.id);
   } finally { store.close(); }
+});
+
+test("durable check run creates a review package and reviewing transition atomically", () => {
+  const f = reviewFixture();
+  try {
+    const run = f.store.startCheckRun(f.input);
+    f.store.recordCheckResult(run.id, { owner: f.owner, generationId: f.generationId }, f.result("unit"));
+    f.store.finishStage(f.stage.id, f.owner, "process-1", "succeeded", "fingerprint");
+    const completed = f.store.completeCheckRun(run.id, { owner: f.owner, generationId: f.generationId }, f.snapshot);
+    assert.equal(completed.checkRun.status, "completed");
+    assert.equal(completed.reviewPackage.checkRunId, run.id);
+    assert.equal(completed.reviewPackage.routeAttemptId, f.routeAttempt.id);
+    assert.equal(completed.reviewPackage.branchRef, `refs/heads/zero/${f.task.id}`);
+    assert.equal(completed.reviewPackage.snapshot.diff, f.snapshot.diff);
+    assert.equal(f.store.get(f.task.id)?.status, "reviewing");
+    assert.equal(f.store.reviewPackages(f.task.id).length, 1);
+  } finally { f.store.close(); }
+});
+
+test("check run rejects inconsistent diff and submitted check-definition hashes", () => {
+  const f = reviewFixture();
+  try {
+    assert.throws(() => f.store.startCheckRun({ ...f.input, snapshot: { ...f.snapshot, diffHash: "0".repeat(64) } }), /diff hash/);
+    assert.throws(() => f.store.startCheckRun({ ...f.input, snapshot: { ...f.snapshot, diff: null as unknown as string } }), /diff must be a string/);
+    assert.throws(() => f.store.startCheckRun({ ...f.input, checkDefinitionHash: "0".repeat(64) }), /submitted task checks/);
+    assert.equal(f.store.get(f.task.id)?.status, "running");
+  } finally { f.store.close(); }
+});
+
+test("check run accepts a 64 KiB Unicode check ID list", () => {
+  const checks = Array.from({ length: 40 }, (_, index) => ({ id: `${"检查🔍".repeat(160)}-${index}`, argv: ["node", "test.js"] }));
+  const f = reviewFixture(checks);
+  try {
+    const run = f.store.startCheckRun(f.input);
+    assert.ok(Buffer.byteLength(JSON.stringify(f.input.expectedCheckIds), "utf8") > 16_384);
+    assert.equal(run.expectedCheckIds.length, 40);
+    for (const check of checks) f.store.recordCheckResult(run.id, { owner: f.owner, generationId: f.generationId }, f.result(check.id));
+    f.store.finishStage(f.stage.id, f.owner, "process-1", "succeeded", "fingerprint");
+    assert.equal(f.store.completeCheckRun(run.id, { owner: f.owner, generationId: f.generationId }, f.snapshot).checkRun.status, "completed");
+  } finally { f.store.close(); }
+});
+
+test("check run rejects wrong generation, duplicate, incomplete, and failed results", () => {
+  const wrongGeneration = reviewFixture();
+  try {
+    const run = wrongGeneration.store.startCheckRun(wrongGeneration.input);
+    assert.throws(() => wrongGeneration.store.recordCheckResult(run.id, { owner: wrongGeneration.owner, generationId: "stale-generation" }, wrongGeneration.result("unit")), /guard/);
+    assert.throws(() => wrongGeneration.store.completeCheckRun(run.id, { owner: wrongGeneration.owner, generationId: "stale-generation" }, wrongGeneration.snapshot), /guard/);
+    wrongGeneration.store.recordCheckResult(run.id, { owner: wrongGeneration.owner, generationId: wrongGeneration.generationId }, wrongGeneration.result("unit"));
+    assert.throws(() => wrongGeneration.store.recordCheckResult(run.id, { owner: wrongGeneration.owner, generationId: wrongGeneration.generationId }, wrongGeneration.result("unit")), /already has a result/);
+    wrongGeneration.store.finishStage(wrongGeneration.stage.id, wrongGeneration.owner, "process-1", "succeeded");
+    assert.doesNotThrow(() => wrongGeneration.store.completeCheckRun(run.id, { owner: wrongGeneration.owner, generationId: wrongGeneration.generationId }, wrongGeneration.snapshot));
+  } finally { wrongGeneration.store.close(); }
+
+  const incomplete = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }, { id: "lint", argv: ["node", "lint.js"] }]);
+  try {
+    const run = incomplete.store.startCheckRun(incomplete.input);
+    incomplete.store.recordCheckResult(run.id, { owner: incomplete.owner, generationId: incomplete.generationId }, incomplete.result("unit"));
+    incomplete.store.finishStage(incomplete.stage.id, incomplete.owner, "process-1", "succeeded");
+    assert.throws(() => incomplete.store.completeCheckRun(run.id, { owner: incomplete.owner, generationId: incomplete.generationId }, incomplete.snapshot), /exactly one result/);
+    assert.equal(incomplete.store.get(incomplete.task.id)?.status, "running");
+    assert.equal(incomplete.store.reviewPackages(incomplete.task.id).length, 0);
+  } finally { incomplete.store.close(); }
+
+  const failed = reviewFixture();
+  try {
+    const run = failed.store.startCheckRun(failed.input);
+    failed.store.recordCheckResult(run.id, { owner: failed.owner, generationId: failed.generationId }, failed.result("unit", "failed"));
+    failed.store.finishStage(failed.stage.id, failed.owner, "process-1", "succeeded");
+    assert.throws(() => failed.store.completeCheckRun(run.id, { owner: failed.owner, generationId: failed.generationId }, failed.snapshot), /must pass/);
+    assert.equal(failed.store.get(failed.task.id)?.status, "running");
+  } finally { failed.store.close(); }
+});
+
+test("check run rejects lease expiry and changed post-check snapshot", async () => {
+  const expired = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 20);
+  try {
+    const run = expired.store.startCheckRun(expired.input);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.throws(() => expired.store.recordCheckResult(run.id, { owner: expired.owner, generationId: expired.generationId }, expired.result("unit")), /live owner/);
+    assert.throws(() => expired.store.finishCheckRun(run.id, { owner: expired.owner, generationId: expired.generationId }, "abandoned", "lease expired"), /live owner/);
+  } finally { expired.store.close(); }
+
+  const changed = reviewFixture();
+  try {
+    const run = changed.store.startCheckRun(changed.input);
+    changed.store.recordCheckResult(run.id, { owner: changed.owner, generationId: changed.generationId }, changed.result("unit"));
+    changed.store.finishStage(changed.stage.id, changed.owner, "process-1", "succeeded");
+    assert.throws(() => changed.store.completeCheckRun(run.id, { owner: changed.owner, generationId: changed.generationId }, { ...changed.snapshot, treeId: "new-tree" }), /snapshot/);
+    assert.equal(changed.store.getCheckRun(run.id)?.status, "running");
+    assert.equal(changed.store.get(changed.task.id)?.status, "running");
+    assert.equal(changed.store.reviewPackages(changed.task.id).length, 0);
+  } finally { changed.store.close(); }
+});
+
+test("unsuccessful check runs can be marked terminal without deleting history", () => {
+  const f = reviewFixture();
+  try {
+    const run = f.store.startCheckRun(f.input);
+    f.store.recordCheckResult(run.id, { owner: f.owner, generationId: f.generationId }, f.result("unit", "failed"));
+    const closed = f.store.finishCheckRun(run.id, { owner: f.owner, generationId: f.generationId }, "failed", "required check failed");
+    assert.equal(closed.status, "failed");
+    assert.equal(f.store.checkRuns(f.task.id)[0]?.status, "failed");
+    assert.deepEqual(f.store.checkRunResults(run.id).map(result => result.status), ["failed"]);
+    assert.throws(() => f.store.recordCheckResult(run.id, { owner: f.owner, generationId: f.generationId }, f.result("unit")), /not running/);
+  } finally { f.store.close(); }
+});
+
+test("legacy databases gain additive review evidence tables without rewriting check history", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-migration-"));
+  const path = join(root, "tasks.sqlite");
+  let store = new TaskStore(path);
+  try {
+    const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "legacy task" }, "legacy_review_schema");
+    store.saveCheck(task.id, { id: "legacy", argv: ["true"], status: "passed", exitCode: 0, durationMs: 1 });
+    store.close();
+    const legacyDb = new DatabaseSync(path);
+    legacyDb.exec("DROP TABLE review_packages; DROP TABLE check_run_results; DROP TABLE check_runs;");
+    legacyDb.close();
+    store = new TaskStore(path);
+    assert.equal(store.checks(task.id)[0]?.id, "legacy");
+    const migratedDb = new DatabaseSync(path);
+    const tables = migratedDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[];
+    migratedDb.close();
+    assert.ok(tables.some(table => table.name === "check_runs"));
+    assert.ok(tables.some(table => table.name === "check_run_results"));
+    assert.ok(tables.some(table => table.name === "review_packages"));
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("lease expiry with no write intent can be requeued only through the guarded evidence path", () => {

@@ -206,6 +206,7 @@ export class TaskWorker {
     let executionStageIndex = 0;
     let revisionBrief = task.prompt;
     let finalRoute: RouteDecision | undefined;
+    let activeCheckRunId: string | undefined;
     let finalChecks: CheckResult[] = [];
     let finalCheckAttemptId: string | undefined;
     let checksSnapshot: ReviewSnapshotIdentity | undefined;
@@ -467,31 +468,66 @@ export class TaskWorker {
 
         // Freeze the staged Git tree before checks run. Passing results apply to
         // this tree only; a check that writes into the checkout invalidates them.
-        checksSnapshot = reviewSnapshotIdentity(await this.#options.worktrees.prepareReview(worktree));
+        const checkSnapshot = await this.#options.worktrees.prepareReview(worktree);
+        checksSnapshot = reviewSnapshotIdentity(checkSnapshot);
+        const branchHead = await this.#options.worktrees.readTaskBranchHead(worktree);
+        const currentRouteAttempt = this.#options.store.attempts(taskId).filter(candidate => candidate.role === "route"
+          && candidate.status === "succeeded" && JSON.stringify(candidate.metadata?.decision) === JSON.stringify(route)).at(-1);
+        const generationId = this.#requireTask(taskId).claimGenerationId;
+        if (!generationId) throw new Error("Task claim has no startup generation; durable validation evidence cannot be recorded");
+        const checkDefinitionHash = createHash("sha256").update(JSON.stringify(requiredChecks), "utf8").digest("hex");
+        if (!currentRouteAttempt) throw new Error("Current execution route has no succeeded route attempt");
+        const checkRun = this.#options.store.startCheckRun({
+          taskId,
+          owner,
+          generationId,
+          executionAttemptId: attempt.id,
+          executionStageId: executionStage.id,
+          routeAttemptId: currentRouteAttempt.id,
+          route,
+          branchRef: branchHead.ref,
+          snapshot: { baseCommit: worktree.baseCommit, preHead: branchHead.head, ...checkSnapshot },
+          checkDefinitionHash,
+          expectedCheckIds: requiredChecks.map(check => check.id),
+        });
+        activeCheckRunId = checkRun.id;
         const checks = await this.#options.testRunner.run(requiredChecks, worktree.path, { signal: active.controller.signal });
-        for (const check of checks) this.#options.store.saveCheck(taskId, check, attempt.id);
+        for (const check of checks) {
+          this.#options.store.recordCheckResult(checkRun.id, { owner, generationId }, check);
+          this.#options.store.saveCheck(taskId, check, attempt.id);
+        }
         finalCheckAttemptId = attempt.id;
         this.#assertNotCancelled(active);
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
         let checksAfter: WorktreeReviewSnapshot | undefined;
         let checkTreeError: string | undefined;
+        let branchAfterChecks: { ref: string; head: string } | undefined;
         try {
           checksAfter = await this.#options.worktrees.captureReviewSnapshot(worktree);
+          branchAfterChecks = await this.#options.worktrees.readTaskBranchHead(worktree);
         } catch (error) {
           checkTreeError = errorText(error);
         }
-        if (checkTreeError || !checksAfter || !sameReviewSnapshot(checksSnapshot, checksAfter)) {
+        if (checkTreeError || !checksAfter || !sameReviewSnapshot(checksSnapshot, checksAfter)
+          || branchAfterChecks?.ref !== branchHead.ref || branchAfterChecks?.head !== branchHead.head) {
           const integrityCheck: CheckResult = {
             id: "__zero_worktree_integrity__", argv: [], status: "failed", exitCode: null, durationMs: 0,
-            error: `Worktree changed while validation checks ran${checkTreeError ? `: ${checkTreeError}` : "; their results do not apply to the final tree"}`,
+            error: `Worktree or task branch changed while validation checks ran${checkTreeError ? `: ${checkTreeError}` : "; their results do not apply to the final tree"}`,
           };
           checks.push(integrityCheck);
           this.#options.store.saveCheck(taskId, integrityCheck, attempt.id);
+          this.#options.store.finishCheckRun(checkRun.id, { owner, generationId }, "failed", integrityCheck.error ?? "Worktree integrity check failed");
+          activeCheckRunId = undefined;
         }
         finalChecks = checks;
         executionChecks = checks;
         const failedChecks = checks.filter(check => check.status !== "passed");
         if (failedChecks.length) {
+          if (activeCheckRunId) {
+            this.#options.store.finishCheckRun(activeCheckRunId, { owner, generationId }, "failed",
+              `Validation checks failed: ${failedChecks.map(check => check.id).join(", ")}`);
+            activeCheckRunId = undefined;
+          }
           await this.#finishExecutionStage({
             task, worktree, stage: executionStage, attempt: executionAttempt, route, owner,
             status: "failed", checks, summary: "Zero observed one or more failed validation checks.",
@@ -516,7 +552,30 @@ export class TaskWorker {
         executionStage = undefined;
         executionAttempt = undefined;
 
-        task = this.#options.store.transition(taskId, "running", "reviewing", { owner, reason: "validation checks passed" });
+        try {
+          const headBeforePackage = await this.#options.worktrees.readTaskBranchHead(worktree);
+          if (headBeforePackage.ref !== branchHead.ref || headBeforePackage.head !== branchHead.head) {
+            throw new Error("Task branch moved after validation; its results cannot be sealed into a review package");
+          }
+          const sealed = this.#options.store.completeCheckRun(checkRun.id, { owner, generationId }, {
+            baseCommit: worktree.baseCommit,
+            preHead: branchHead.head,
+            treeId: checksAfter!.treeId,
+            fingerprint: checksAfter!.fingerprint,
+            diffHash: checksAfter!.diffHash,
+            diff: checksAfter!.diff,
+          });
+          finalChecks = this.#options.store.checkRunResults(sealed.checkRun.id);
+          checksSnapshot = reviewSnapshotIdentity(sealed.reviewPackage.snapshot);
+          activeCheckRunId = undefined;
+        } catch (error) {
+          try {
+            this.#options.store.finishCheckRun(checkRun.id, { owner, generationId }, "failed", `Review package creation failed: ${errorText(error)}`);
+            activeCheckRunId = undefined;
+          } catch { /* the original completion error remains authoritative */ }
+          throw error;
+        }
+        task = this.#requireTask(taskId);
         stage = "review";
         }
         if (stage !== "review") throw new Error("Worker has no resumable stage");
@@ -633,6 +692,13 @@ export class TaskWorker {
         return this.#options.store.get(taskId) ?? task;
       }
       const quotaFailure = error instanceof QuotaLimitError && !cancelled && !leaseLost;
+      if (activeCheckRunId) {
+        try {
+          const generationId = task.claimGenerationId;
+          if (generationId) this.#options.store.finishCheckRun(activeCheckRunId, { owner, generationId }, "failed", errorMessage);
+        } catch { /* a lost lease leaves the durable running check run for recovery inspection */ }
+        activeCheckRunId = undefined;
+      }
       let executionStageFinalizationFailed = false;
       if (activeAttempt) {
         try {

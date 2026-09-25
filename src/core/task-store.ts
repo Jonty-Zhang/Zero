@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type {
   Attempt,
@@ -55,8 +55,92 @@ export interface StartupGenerationRecord extends StartupGenerationAttestation {
   predecessorGenerationId?: string;
 }
 
+export interface CheckRunSnapshot {
+  baseCommit: string;
+  preHead: string;
+  treeId: string;
+  fingerprint: string;
+  diffHash: string;
+  diff: string;
+}
+
+export interface CheckRunRecord {
+  id: string;
+  taskId: string;
+  generationId: string;
+  owner: string;
+  executionAttemptId: string;
+  executionStageId: string;
+  routeAttemptId: string;
+  route: RouteDecision;
+  branchRef: string;
+  snapshot: CheckRunSnapshot;
+  checkDefinitionHash: string;
+  expectedCheckIds: string[];
+  status: "running" | "completed" | "failed" | "abandoned";
+  createdAt: string;
+  completedAt?: string;
+  terminalReason?: string;
+}
+
+export interface ReviewPackageRecord {
+  id: string;
+  taskId: string;
+  checkRunId: string;
+  executionAttemptId: string;
+  executionStageId: string;
+  routeAttemptId: string;
+  route: RouteDecision;
+  branchRef: string;
+  snapshot: CheckRunSnapshot;
+  checkDefinitionHash: string;
+  expectedCheckIds: string[];
+  createdAt: string;
+}
+
+export interface StartCheckRunInput {
+  taskId: string;
+  owner: string;
+  generationId: string;
+  executionAttemptId: string;
+  executionStageId: string;
+  routeAttemptId: string;
+  route: RouteDecision;
+  branchRef: string;
+  snapshot: CheckRunSnapshot;
+  checkDefinitionHash: string;
+  expectedCheckIds: string[];
+}
+
+export interface CheckRunGuard { owner: string; generationId: string; }
+
+const MAX_REVIEW_DIFF_BYTES = 64 * 1024 * 1024;
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+
 const encode = (v: unknown): Json => v === undefined ? null : JSON.stringify(v);
 const decode = <T>(v: string | null): T | undefined => v === null ? undefined : JSON.parse(v) as T;
+const sameStringSet = (left: string[], right: string[]): boolean => left.length === right.length && new Set(left).size === left.length &&
+  new Set(right).size === right.length && left.every(value => right.includes(value));
+const sameSnapshot = (left: CheckRunSnapshot, right: CheckRunSnapshot): boolean =>
+  left.baseCommit === right.baseCommit && left.preHead === right.preHead && left.treeId === right.treeId &&
+  left.fingerprint === right.fingerprint && left.diffHash === right.diffHash && left.diff === right.diff;
+
+/** @internal Set and verify the durability pragmas before a persistent store performs any writes. */
+export function configureTaskStorePragmas(db: DatabaseSync, path: string): void {
+  db.exec("PRAGMA busy_timeout = 5000;");
+  if (path !== ":memory:") {
+    const journalMode = db.prepare("PRAGMA journal_mode = WAL;").get() as { journal_mode?: unknown } | undefined;
+    if (typeof journalMode?.journal_mode !== "string" || journalMode.journal_mode.toLowerCase() !== "wal") {
+      throw new Error("SQLite failed to enable WAL mode for the persistent task store");
+    }
+    db.exec("PRAGMA synchronous = FULL;");
+    const synchronous = db.prepare("PRAGMA synchronous;").get() as { synchronous?: unknown } | undefined;
+    if (Number(synchronous?.synchronous) !== 2) {
+      throw new Error("SQLite failed to enable FULL synchronous mode for the persistent task store");
+    }
+  }
+  db.exec("PRAGMA foreign_keys = ON;");
+}
 
 /** SQLite-backed source of truth. Methods are synchronous and each state change is transactional. */
 export class TaskStore {
@@ -65,10 +149,8 @@ export class TaskStore {
 
   constructor(path = ":memory:", startupAttestation?: StartupGenerationAttestation) {
     this.#db = new DatabaseSync(path);
+    configureTaskStorePragmas(this.#db, path);
     this.#db.exec(`
-      PRAGMA busy_timeout = 5000;
-      PRAGMA journal_mode = WAL;
-      PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         payload TEXT NOT NULL, revision_count INTEGER NOT NULL DEFAULT 0,
@@ -120,6 +202,34 @@ export class TaskStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
         attempt_id TEXT, check_id TEXT NOT NULL, at TEXT NOT NULL, result TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS check_runs (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), generation_id TEXT NOT NULL,
+        owner TEXT NOT NULL, execution_attempt_id TEXT NOT NULL REFERENCES attempts(id),
+        execution_stage_id TEXT NOT NULL REFERENCES stages(id), route_attempt_id TEXT NOT NULL REFERENCES attempts(id),
+        route TEXT NOT NULL, branch_ref TEXT NOT NULL, snapshot TEXT NOT NULL,
+        check_definition_hash TEXT NOT NULL, expected_check_ids TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('running','completed','failed','abandoned')),
+        created_at TEXT NOT NULL, completed_at TEXT, terminal_reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS check_runs_task_created ON check_runs(task_id, created_at, id);
+      CREATE TABLE IF NOT EXISTS check_run_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES check_runs(id),
+        check_id TEXT NOT NULL, at TEXT NOT NULL, result TEXT NOT NULL, UNIQUE(run_id, check_id)
+      );
+      CREATE TABLE IF NOT EXISTS review_packages (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), check_run_id TEXT NOT NULL UNIQUE REFERENCES check_runs(id),
+        execution_attempt_id TEXT NOT NULL REFERENCES attempts(id), execution_stage_id TEXT NOT NULL REFERENCES stages(id),
+        route_attempt_id TEXT NOT NULL REFERENCES attempts(id), route TEXT NOT NULL, branch_ref TEXT NOT NULL,
+        snapshot TEXT NOT NULL, check_definition_hash TEXT NOT NULL, expected_check_ids TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS review_packages_task_created ON review_packages(task_id, created_at, id);
+      CREATE TRIGGER IF NOT EXISTS review_packages_no_update BEFORE UPDATE ON review_packages BEGIN SELECT RAISE(ABORT,'review packages are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS review_packages_no_delete BEFORE DELETE ON review_packages BEGIN SELECT RAISE(ABORT,'review packages are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS check_run_results_no_update BEFORE UPDATE ON check_run_results BEGIN SELECT RAISE(ABORT,'check results are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS check_run_results_no_delete BEFORE DELETE ON check_run_results BEGIN SELECT RAISE(ABORT,'check results are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS check_run_results_only_while_running BEFORE INSERT ON check_run_results
+        WHEN (SELECT status FROM check_runs WHERE id=NEW.run_id)!='running'
+        BEGIN SELECT RAISE(ABORT,'check run is not running'); END;
       CREATE TABLE IF NOT EXISTS reviews (
         id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
         attempt_id TEXT, at TEXT NOT NULL, result TEXT NOT NULL
@@ -1020,6 +1130,223 @@ export class TaskStore {
 
   reviews(taskId: string): ReviewResult[] {
     return (this.#db.prepare("SELECT result FROM reviews WHERE task_id=? ORDER BY id").all(taskId) as { result: string }[]).map(row => JSON.parse(row.result) as ReviewResult);
+  }
+
+  /** Starts a durable check set tied to the live claim, successful execution attempt, and current route. */
+  startCheckRun(input: StartCheckRunInput): CheckRunRecord {
+    this.#validateReviewEvidence(input.snapshot, input.route, input.expectedCheckIds, input.checkDefinitionHash);
+    if (input.route.taskId !== input.taskId) throw new Error("Route decision belongs to a different task");
+    if (input.branchRef !== `refs/heads/zero/${input.taskId}`) throw new Error("Review branch ref must be the exact task branch ref");
+    const diffBytes = Buffer.byteLength(input.snapshot.diff, "utf8");
+    if (diffBytes > MAX_REVIEW_DIFF_BYTES) throw new Error(`Review diff exceeds ${MAX_REVIEW_DIFF_BYTES} bytes`);
+    const id = randomUUID();
+    const createdAt = new Date().toISOString();
+    this.#transaction(() => {
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id,payload FROM tasks WHERE id=?")
+        .get(input.taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null; payload: string } | undefined;
+      this.#assertReviewLease(task, input.owner, input.generationId);
+      const submission = JSON.parse(task!.payload) as TaskSubmission;
+      const definitions = submission.checks ?? [];
+      const expectedDefinitionHash = createHash("sha256").update(JSON.stringify(definitions), "utf8").digest("hex");
+      if (expectedDefinitionHash !== input.checkDefinitionHash) throw new Error("Check definition hash does not match the submitted task checks");
+      if (!sameStringSet(definitions.map(check => check.id), input.expectedCheckIds)) throw new Error("Expected check IDs must exactly match the submitted check definitions");
+      const currentRoute = this.getRoute(input.taskId);
+      if (!currentRoute || JSON.stringify(currentRoute) !== JSON.stringify(input.route)) throw new Error("Route decision is not the current persisted route");
+      const execution = this.#db.prepare("SELECT task_id,stage_id,status,role FROM attempts WHERE id=?")
+        .get(input.executionAttemptId) as { task_id: string; stage_id: string | null; status: string; role: string } | undefined;
+      const stage = this.#db.prepare("SELECT task_id,role,status,generation_id FROM stages WHERE id=?")
+        .get(input.executionStageId) as { task_id: string; role: string; status: string; generation_id: string | null } | undefined;
+      if (!execution || execution.task_id !== input.taskId || execution.stage_id !== input.executionStageId || execution.status !== "succeeded" || !["implement", "revise"].includes(execution.role)) {
+        throw new Error("Check run requires a succeeded execution attempt linked to its stage");
+      }
+      if (!stage || stage.task_id !== input.taskId || !["implement", "revise"].includes(stage.role) || stage.status !== "running" || stage.generation_id !== input.generationId) {
+        throw new Error("Check run requires the current running execution stage");
+      }
+      const routeAttempt = this.#db.prepare("SELECT task_id,role,status,metadata FROM attempts WHERE id=?")
+        .get(input.routeAttemptId) as { task_id: string; role: string; status: string; metadata: string | null } | undefined;
+      const routeMetadata = routeAttempt?.metadata ? JSON.parse(routeAttempt.metadata) as { decision?: RouteDecision } : undefined;
+      if (!routeAttempt || routeAttempt.task_id !== input.taskId || routeAttempt.role !== "route" || routeAttempt.status !== "succeeded" ||
+          !routeMetadata?.decision || JSON.stringify(routeMetadata.decision) !== JSON.stringify(input.route)) {
+        throw new Error("Review package requires a succeeded route attempt matching the current route decision");
+      }
+      const routeJson = JSON.stringify(input.route);
+      if (Buffer.byteLength(routeJson, "utf8") > 65_536 || Buffer.byteLength(JSON.stringify(input.expectedCheckIds), "utf8") > 65_536) {
+        throw new Error("Review route or check ID evidence exceeds the persisted evidence limit");
+      }
+      this.#db.prepare(`INSERT INTO check_runs(id,task_id,generation_id,owner,execution_attempt_id,execution_stage_id,route_attempt_id,
+        route,branch_ref,snapshot,check_definition_hash,expected_check_ids,status,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'running',?)`).run(id, input.taskId, input.generationId, input.owner,
+        input.executionAttemptId, input.executionStageId, input.routeAttemptId, routeJson, input.branchRef,
+        JSON.stringify(input.snapshot), input.checkDefinitionHash, JSON.stringify(input.expectedCheckIds), createdAt);
+      this.#event(input.taskId, "check_run.started", { checkRunId: id, executionAttemptId: input.executionAttemptId,
+        executionStageId: input.executionStageId, generationId: input.generationId, expectedCheckIds: input.expectedCheckIds }, createdAt);
+    });
+    return this.getCheckRun(id)!;
+  }
+
+  /** Appends one result only while the run's exact claim generation still owns a live lease. */
+  recordCheckResult(runId: string, guard: CheckRunGuard, result: CheckResult): void {
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const run = this.#db.prepare("SELECT task_id,generation_id,owner,expected_check_ids,status,execution_stage_id FROM check_runs WHERE id=?")
+        .get(runId) as { task_id: string; generation_id: string; owner: string; expected_check_ids: string; status: string; execution_stage_id: string } | undefined;
+      if (!run || run.status !== "running") throw new Error(`Check run ${runId} is not running`);
+      if (run.owner !== guard.owner || run.generation_id !== guard.generationId) throw new Error("Check result guard does not match the check run owner and generation");
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id FROM tasks WHERE id=?").get(run.task_id) as {
+        status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null;
+      } | undefined;
+      this.#assertReviewLease(task, guard.owner, guard.generationId);
+      const stage = this.#db.prepare("SELECT status FROM stages WHERE id=? AND task_id=?").get(run.execution_stage_id, run.task_id) as { status: string } | undefined;
+      if (!stage || stage.status !== "running") throw new Error("Check results can only be recorded while the execution stage is running");
+      const expected = JSON.parse(run.expected_check_ids) as string[];
+      if (!expected.includes(result.id)) throw new Error(`Unexpected check ID ${result.id}`);
+      if (!result.id || !Array.isArray(result.argv) || !Number.isFinite(result.durationMs) || result.durationMs < 0) throw new Error("Invalid check result");
+      try {
+        this.#db.prepare("INSERT INTO check_run_results(run_id,check_id,at,result) VALUES(?,?,?,?)")
+          .run(runId, result.id, at, JSON.stringify(result));
+      } catch (error) {
+        if (String(error).includes("UNIQUE constraint failed")) throw new Error(`Check ${result.id} already has a result in run ${runId}`);
+        throw error;
+      }
+      this.#event(run.task_id, "check_run.result", { checkRunId: runId, result }, at);
+    });
+  }
+
+  /** Closes an unsuccessful or superseded run while retaining all individual result rows. */
+  finishCheckRun(runId: string, guard: CheckRunGuard, status: "failed" | "abandoned", reason: string): CheckRunRecord {
+    if (!reason.trim()) throw new Error("A terminal check run requires a reason");
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const run = this.#db.prepare("SELECT task_id,generation_id,owner,status FROM check_runs WHERE id=?")
+        .get(runId) as { task_id: string; generation_id: string; owner: string; status: string } | undefined;
+      if (!run || run.status !== "running") throw new Error(`Check run ${runId} is not running`);
+      if (run.owner !== guard.owner || run.generation_id !== guard.generationId) throw new Error("Check run guard does not match its owner and generation");
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id FROM tasks WHERE id=?").get(run.task_id) as {
+        status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null;
+      } | undefined;
+      this.#assertReviewLease(task, guard.owner, guard.generationId);
+      const changed = this.#db.prepare("UPDATE check_runs SET status=?,terminal_reason=? WHERE id=? AND status='running'")
+        .run(status, reason, runId);
+      if (Number(changed.changes) !== 1) throw new Error(`Check run ${runId} changed before it was closed`);
+      this.#event(run.task_id, "check_run.closed", { checkRunId: runId, status, reason }, at);
+    });
+    return this.getCheckRun(runId)!;
+  }
+
+  /** Atomically seals a complete passing run, creates its immutable review package, and enters reviewing. */
+  completeCheckRun(runId: string, guard: CheckRunGuard, recheckedSnapshot: CheckRunSnapshot): { checkRun: CheckRunRecord; reviewPackage: ReviewPackageRecord } {
+    let packageId = "";
+    const completedAt = new Date().toISOString();
+    this.#transaction(() => {
+      const run = this.#db.prepare("SELECT * FROM check_runs WHERE id=?").get(runId) as Record<string, unknown> | undefined;
+      if (!run || run.status !== "running") throw new Error(`Check run ${runId} is not running`);
+      if (run.owner !== guard.owner || run.generation_id !== guard.generationId) throw new Error("Check run guard does not match its owner and generation");
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id,payload FROM tasks WHERE id=?").get(String(run.task_id)) as {
+        status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null; payload: string;
+      } | undefined;
+      this.#assertReviewLease(task, guard.owner, guard.generationId);
+      const stage = this.#db.prepare("SELECT task_id,role,status,generation_id FROM stages WHERE id=?").get(String(run.execution_stage_id)) as {
+        task_id: string; role: string; status: string; generation_id: string | null;
+      } | undefined;
+      if (!stage || stage.task_id !== run.task_id || !["implement", "revise"].includes(stage.role) || stage.status !== "succeeded" || stage.generation_id !== guard.generationId) {
+        throw new Error("Check run can complete only after its linked execution stage succeeds in this generation");
+      }
+      const snapshot = JSON.parse(String(run.snapshot)) as CheckRunSnapshot;
+      if (!sameSnapshot(snapshot, recheckedSnapshot)) throw new Error("Post-check snapshot does not match the check run snapshot");
+      const submission = JSON.parse(task!.payload) as TaskSubmission;
+      const expectedHash = createHash("sha256").update(JSON.stringify(submission.checks ?? []), "utf8").digest("hex");
+      if (expectedHash !== run.check_definition_hash) throw new Error("Check definitions changed after the check run started");
+      const expected = JSON.parse(String(run.expected_check_ids)) as string[];
+      const rows = this.#db.prepare("SELECT check_id,result FROM check_run_results WHERE run_id=? ORDER BY id").all(runId) as { check_id: string; result: string }[];
+      if (rows.length !== expected.length || !sameStringSet(rows.map(row => row.check_id), expected)) throw new Error("Check run does not have exactly one result for every expected check");
+      const results = rows.map(row => JSON.parse(row.result) as CheckResult);
+      if (results.some(result => result.status !== "passed")) throw new Error("Every expected check must pass before a review package can be created");
+      packageId = randomUUID();
+      const updated = this.#db.prepare("UPDATE check_runs SET status='completed',completed_at=? WHERE id=? AND status='running'").run(completedAt, runId);
+      if (Number(updated.changes) !== 1) throw new Error("Check run changed before completion");
+      this.#db.prepare(`INSERT INTO review_packages(id,task_id,check_run_id,execution_attempt_id,execution_stage_id,route_attempt_id,
+        route,branch_ref,snapshot,check_definition_hash,expected_check_ids,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(packageId, String(run.task_id), runId, String(run.execution_attempt_id), String(run.execution_stage_id),
+        String(run.route_attempt_id), String(run.route), String(run.branch_ref), String(run.snapshot), String(run.check_definition_hash), String(run.expected_check_ids), completedAt);
+      const changed = this.#db.prepare(`UPDATE tasks SET status='reviewing',updated_at=?
+        WHERE id=? AND status='running' AND lease_owner=? AND claim_generation_id=? AND lease_expires_at>?`)
+        .run(completedAt, run.task_id, guard.owner, guard.generationId, completedAt);
+      if (Number(changed.changes) !== 1) throw new Error("Task lease or generation changed before review package creation");
+      this.#event(String(run.task_id), "check_run.completed", { checkRunId: runId, reviewPackageId: packageId, results }, completedAt);
+      this.#event(String(run.task_id), "review_package.created", { reviewPackageId: packageId, checkRunId: runId }, completedAt);
+      this.#event(String(run.task_id), "task.transition", { from: ["running"], to: "reviewing", reason: "checks completed with an immutable review package" }, completedAt);
+    });
+    return { checkRun: this.getCheckRun(runId)!, reviewPackage: this.getReviewPackage(packageId)! };
+  }
+
+  getCheckRun(runId: string): CheckRunRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM check_runs WHERE id=?").get(runId) as Record<string, unknown> | undefined;
+    return row ? this.#checkRun(row) : undefined;
+  }
+
+  checkRuns(taskId: string): CheckRunRecord[] {
+    return (this.#db.prepare("SELECT * FROM check_runs WHERE task_id=? ORDER BY created_at,id").all(taskId) as Record<string, unknown>[])
+      .map(row => this.#checkRun(row));
+  }
+
+  checkRunResults(runId: string): CheckResult[] {
+    return (this.#db.prepare("SELECT result FROM check_run_results WHERE run_id=? ORDER BY id").all(runId) as { result: string }[])
+      .map(row => JSON.parse(row.result) as CheckResult);
+  }
+
+  getReviewPackage(packageId: string): ReviewPackageRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM review_packages WHERE id=?").get(packageId) as Record<string, unknown> | undefined;
+    return row ? this.#reviewPackage(row) : undefined;
+  }
+
+  reviewPackages(taskId: string): ReviewPackageRecord[] {
+    return (this.#db.prepare("SELECT * FROM review_packages WHERE task_id=? ORDER BY created_at,id").all(taskId) as Record<string, unknown>[])
+      .map(row => this.#reviewPackage(row));
+  }
+
+  #validateReviewEvidence(snapshot: CheckRunSnapshot, route: RouteDecision, expectedCheckIds: string[], checkDefinitionHash: string): void {
+    if (!snapshot || ![snapshot.baseCommit, snapshot.preHead, snapshot.treeId, snapshot.fingerprint].every(value => typeof value === "string" && value.length > 0)) {
+      throw new Error("Review snapshot requires baseCommit, preHead, treeId, and fingerprint");
+    }
+    if (typeof snapshot.diff !== "string") throw new Error("Review snapshot diff must be a string");
+    if (!SHA256_PATTERN.test(snapshot.diffHash) || createHash("sha256").update(snapshot.diff, "utf8").digest("hex") !== snapshot.diffHash) {
+      throw new Error("Review diff hash does not match the persisted diff bytes");
+    }
+    if (!SHA256_PATTERN.test(checkDefinitionHash)) throw new Error("Check definition hash must be a SHA-256 digest");
+    if (!Array.isArray(expectedCheckIds) || expectedCheckIds.some(id => typeof id !== "string" || !id.trim()) || new Set(expectedCheckIds).size !== expectedCheckIds.length) {
+      throw new Error("Expected check IDs must be unique nonempty strings");
+    }
+    const routeBytes = Buffer.byteLength(JSON.stringify(route), "utf8");
+    if (routeBytes > 65_536 || Buffer.byteLength(JSON.stringify(expectedCheckIds), "utf8") > 65_536) {
+      throw new Error("Review route or check ID evidence exceeds the persisted evidence limit");
+    }
+    if (Buffer.byteLength(snapshot.diff, "utf8") > MAX_REVIEW_DIFF_BYTES) throw new Error(`Review diff exceeds ${MAX_REVIEW_DIFF_BYTES} bytes`);
+  }
+
+  #assertReviewLease(task: { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null } | undefined,
+    owner: string, generationId: string): void {
+    const expiresAt = task?.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
+    if (!task || task.status !== "running" || task.lease_owner !== owner || task.claim_generation_id !== generationId || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      throw new Error(`Task is not running under live owner ${owner} and generation ${generationId}`);
+    }
+  }
+
+  #checkRun(row: Record<string, unknown>): CheckRunRecord {
+    return { id: String(row.id), taskId: String(row.task_id), generationId: String(row.generation_id), owner: String(row.owner),
+      executionAttemptId: String(row.execution_attempt_id), executionStageId: String(row.execution_stage_id), routeAttemptId: String(row.route_attempt_id),
+      route: JSON.parse(String(row.route)) as RouteDecision, branchRef: String(row.branch_ref),
+      snapshot: JSON.parse(String(row.snapshot)) as CheckRunSnapshot, checkDefinitionHash: String(row.check_definition_hash),
+      expectedCheckIds: JSON.parse(String(row.expected_check_ids)) as string[], status: row.status as CheckRunRecord["status"],
+      createdAt: String(row.created_at), completedAt: row.completed_at as string | null ?? undefined,
+      terminalReason: row.terminal_reason as string | null ?? undefined };
+  }
+
+  #reviewPackage(row: Record<string, unknown>): ReviewPackageRecord {
+    return { id: String(row.id), taskId: String(row.task_id), checkRunId: String(row.check_run_id),
+      executionAttemptId: String(row.execution_attempt_id), executionStageId: String(row.execution_stage_id), routeAttemptId: String(row.route_attempt_id),
+      route: JSON.parse(String(row.route)) as RouteDecision, branchRef: String(row.branch_ref),
+      snapshot: JSON.parse(String(row.snapshot)) as CheckRunSnapshot, checkDefinitionHash: String(row.check_definition_hash),
+      expectedCheckIds: JSON.parse(String(row.expected_check_ids)) as string[], createdAt: String(row.created_at) };
   }
 
   events(taskId: string): TaskEvent[] {
