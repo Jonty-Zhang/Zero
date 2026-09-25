@@ -29,6 +29,17 @@ type TaskRow = {
 type StageRow = Record<string, unknown>;
 type HandoffRow = { id: string; task_id: string; stage_id: string; attempt_id: string; schema_version: number; created_at: string; payload: string; payload_bytes: number };
 
+export interface WorktreeCreationRecord {
+  taskId: string;
+  leaseOwner: string;
+  status: "intent" | "created";
+  plan: unknown;
+  intentAt: string;
+  observed?: unknown;
+  fingerprint?: string;
+  createdAt?: string;
+}
+
 const encode = (v: unknown): Json => v === undefined ? null : JSON.stringify(v);
 const decode = <T>(v: string | null): T | undefined => v === null ? undefined : JSON.parse(v) as T;
 
@@ -95,6 +106,11 @@ export class TaskStore {
         retry_count INTEGER NOT NULL DEFAULT 0, checkpoint TEXT NOT NULL, reason TEXT NOT NULL,
         source TEXT NOT NULL DEFAULT 'fallback'
       );
+      CREATE TABLE IF NOT EXISTS worktree_creations (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id), lease_owner TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('intent','created')), plan TEXT NOT NULL,
+        intent_at TEXT NOT NULL, observed TEXT, fingerprint TEXT, created_at TEXT
+      );
     `);
     // Additive, idempotent migration: old attempts remain valid with a NULL stage_id.
     // Existing databases are not rebuilt or rewritten.
@@ -127,6 +143,11 @@ export class TaskStore {
   #hasLiveStageLease(task: { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null }, owner: string, role: StageRole): boolean {
     const expiresAt = task.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
     return task.status === this.#stageTaskStatus(role) && task.lease_owner === owner && Number.isFinite(expiresAt) && expiresAt > Date.now();
+  }
+
+  #hasLiveTaskLease(task: { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null }, owner: string): boolean {
+    const expiresAt = task.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
+    return task.status === "running" && task.lease_owner === owner && Number.isFinite(expiresAt) && expiresAt > Date.now();
   }
 
   submit(submission: TaskSubmission, id: string = randomUUID()): TaskRecord {
@@ -181,6 +202,67 @@ export class TaskStore {
       this.#db.exec("COMMIT");
       return this.get(row.id);
     } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+  }
+
+  /** Store the exact planned Git identity before any worktree-creating Git command runs. */
+  recordWorktreeCreationIntent(taskId: string, owner: string, plan: unknown): WorktreeCreationRecord {
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
+      if (!task || !this.#hasLiveTaskLease(task, owner)) throw new Error(`Task ${taskId} is not actively leased by ${owner}`);
+      const existing = this.#db.prepare("SELECT task_id FROM worktree_creations WHERE task_id=?").get(taskId);
+      if (existing) throw new Error(`Task ${taskId} already has a worktree creation record`);
+      this.#db.prepare("INSERT INTO worktree_creations(task_id,lease_owner,status,plan,intent_at) VALUES(?,?,'intent',?,?)")
+        .run(taskId, owner, encode(plan), at);
+      this.#event(taskId, "worktree.creation_intent", { owner, plan }, at);
+    });
+    return this.getWorktreeCreation(taskId)!;
+  }
+
+  /** Persist observed identity only while the owner still holds the live task lease. */
+  completeWorktreeCreation(taskId: string, owner: string, observed: unknown, fingerprint: string): WorktreeCreationRecord {
+    if (!/^[a-f0-9]{64}$/i.test(fingerprint)) throw new Error("Invalid worktree creation fingerprint");
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
+      if (!task || !this.#hasLiveTaskLease(task, owner)) throw new Error(`Task ${taskId} is not actively leased by ${owner}`);
+      const intent = this.#db.prepare("SELECT lease_owner,status FROM worktree_creations WHERE task_id=?").get(taskId) as { lease_owner: string; status: string } | undefined;
+      if (!intent || intent.lease_owner !== owner || intent.status !== "intent") throw new Error(`Task ${taskId} has no pending creation intent for ${owner}`);
+      const changed = this.#db.prepare("UPDATE worktree_creations SET status='created',observed=?,fingerprint=?,created_at=? WHERE task_id=? AND lease_owner=? AND status='intent'")
+        .run(encode(observed), fingerprint, at, taskId, owner);
+      if (Number(changed.changes) !== 1) throw new Error(`Task ${taskId} worktree creation intent changed before completion`);
+      this.#event(taskId, "worktree.created", { owner, observed, fingerprint }, at);
+    });
+    return this.getWorktreeCreation(taskId)!;
+  }
+
+  /** Fail closed when a write after a creation intent has ambiguous external effects. */
+  requireWorktreeRecovery(taskId: string, owner: string, reason: string, evidence?: unknown): TaskRecord {
+    const at = new Date().toISOString();
+    this.#transaction(() => {
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
+      if (!task || !this.#hasLiveTaskLease(task, owner)) throw new Error(`Task ${taskId} is not actively leased by ${owner}`);
+      const intent = this.#db.prepare("SELECT lease_owner FROM worktree_creations WHERE task_id=?").get(taskId) as { lease_owner: string } | undefined;
+      if (!intent || intent.lease_owner !== owner) throw new Error(`Task ${taskId} has no creation intent for ${owner}`);
+      const recoveryEvidence = { kind: "worktree_creation", owner, reason, plan: this.getWorktreeCreation(taskId)?.plan, detail: evidence };
+      const changed = this.#db.prepare(`UPDATE tasks SET status='recovery_required',updated_at=?,recovery_reason=?,recovery_evidence=?,
+        lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL WHERE id=? AND status='running' AND lease_owner=?`)
+        .run(at, reason, encode(recoveryEvidence), taskId, owner);
+      if (Number(changed.changes) !== 1) throw new Error(`Task ${taskId} could not enter recovery_required`);
+      this.#event(taskId, "task.recovery_required", { reason, evidence: recoveryEvidence }, at);
+    });
+    return this.get(taskId)!;
+  }
+
+  getWorktreeCreation(taskId: string): WorktreeCreationRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM worktree_creations WHERE task_id=?").get(taskId) as {
+      task_id: string; lease_owner: string; status: "intent" | "created"; plan: string; intent_at: string;
+      observed: string | null; fingerprint: string | null; created_at: string | null;
+    } | undefined;
+    if (!row) return undefined;
+    return { taskId: row.task_id, leaseOwner: row.lease_owner, status: row.status, plan: JSON.parse(row.plan), intentAt: row.intent_at,
+      ...(row.observed === null ? {} : { observed: JSON.parse(row.observed) }), ...(row.fingerprint === null ? {} : { fingerprint: row.fingerprint }),
+      ...(row.created_at === null ? {} : { createdAt: row.created_at }) };
   }
 
   transition(id: string, expected: TaskStatus | TaskStatus[], next: TaskStatus, options: {

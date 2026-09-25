@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { HandoffV1, HarnessAdapter, HarnessCapabilities, RouteDecision, RunRequest, RunResult, TaskRecord } from "../domain/types.js";
-import { GitWorktreeManager, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
+import { GitWorktreeManager, type WorktreeCreationEvidence, type WorktreeCreationPlan, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError } from "../core/quota.js";
@@ -121,6 +121,10 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
     });
     const done = await worker.runClaimed(task.id, owner);
     assert.equal(done.status, "done");
+    const creation = store.getWorktreeCreation(task.id);
+    assert.equal(creation?.status, "created");
+    assert.match(creation?.fingerprint ?? "", /^[a-f0-9]{64}$/);
+    assert.equal((creation?.observed as WorktreeCreationEvidence | undefined)?.head, creation?.plan && (creation.plan as WorktreeCreationPlan).baseCommit);
     assert.equal(done.revisionCount, 1);
     assert.equal(reviewCount, 2);
     const attempts = store.attempts(task.id);
@@ -152,6 +156,36 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
     store.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("ambiguous post-add failure retains intent and quarantines without a second claim", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-create-intent-test-"));
+  const repo = join(root, "repo");
+  const store = new TaskStore();
+  try {
+    await initRepo(repo);
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "create worktree", checks: [{ id: "unused", argv: [process.execPath, "-e", "process.exit(0)"] }] }, "ambiguous_create");
+    class AmbiguousCreateManager extends GitWorktreeManager {
+      override async executePlan(plan: WorktreeCreationPlan): Promise<WorktreeCreationEvidence> {
+        await super.executePlan(plan);
+        throw new Error("simulated failure after Git registration");
+      }
+    }
+    const owner = "create-worker";
+    store.claimNext(owner);
+    let routes = 0;
+    const worker = new TaskWorker({ store, worktrees: new AmbiguousCreateManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router: { async route(current) { routes++; return routeFor(current); } },
+      reviewer: { async review() { throw new Error("must not review"); } }, adapters: new Map([ ["fake", new FakeAdapter()] ]), artifactRoot: join(root, "artifacts") });
+    const result = await worker.runClaimed(task.id, owner);
+    assert.equal(result.status, "recovery_required");
+    assert.match(result.recoveryReason ?? "", /simulated failure after Git registration/);
+    assert.equal(store.getWorktreeCreation(task.id)?.status, "intent");
+    assert.equal(await new GitWorktreeManager(join(root, "worktrees")).exists(task.id), true);
+    await assert.doesNotReject(exec("git", ["show-ref", "--verify", `refs/heads/zero/${task.id}`], { cwd: repo }));
+    assert.equal(routes, 0);
+    assert.equal(store.claimNext("second-worker"), undefined);
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 test("worker refuses a late allowed-path edit injected after review checks and before commit", async () => {
@@ -818,7 +852,7 @@ test("a late write after one stage is fingerprinted prevents the next writer fro
       fingerprintCalls = 0;
       override async fingerprint(info: WorktreeInfo): Promise<string> {
         this.fingerprintCalls++;
-        if (this.fingerprintCalls === 3) await writeFile(join(info.path, "late.bin"), Buffer.from([0, 1, 2, 3]));
+        if (this.fingerprintCalls === 4) await writeFile(join(info.path, "late.bin"), Buffer.from([0, 1, 2, 3]));
         return super.fingerprint(info);
       }
     }

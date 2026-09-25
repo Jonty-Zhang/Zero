@@ -19,6 +19,25 @@ export interface WorktreeInfo {
   baseCommit: string;
 }
 
+/** Canonical, serializable inputs recorded before `git worktree add` can mutate Git state. */
+export interface WorktreeCreationPlan {
+  taskId: string;
+  repoPath: string;
+  commonGitDir: string;
+  worktreeRoot: string;
+  path: string;
+  branch: string;
+  baseCommit: string;
+}
+
+/** Observed identity persisted only after Git has created and registered the worktree. */
+export interface WorktreeCreationEvidence {
+  info: WorktreeInfo;
+  commonGitDir: string;
+  head: string;
+  fingerprint: string;
+}
+
 /** Immutable, staged tree and complete patch that a reviewer approved. */
 export interface WorktreeReviewSnapshot {
   fingerprint: string;
@@ -48,24 +67,51 @@ export class GitWorktreeManager {
     }
   }
 
-  async create(taskId: string, repoPath: string, baseRef: string): Promise<WorktreeInfo> {
+  async prepareCreatePlan(taskId: string, repoPath: string, baseRef: string): Promise<WorktreeCreationPlan> {
     this.#assertTaskId(taskId);
     if (!baseRef || baseRef.startsWith("-")) throw new Error("Invalid baseRef");
     const repo = await realpath(repoPath);
     const { stdout: repoTop } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: repo, windowsHide: true });
     const canonicalRepo = await realpath(repoTop.trim());
+    const { stdout: commonOutput } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: canonicalRepo, windowsHide: true });
+    const commonGitDir = await realpath(commonOutput.trim());
     const { stdout: baseOutput } = await execFileAsync("git", ["rev-parse", "--verify", `${baseRef}^{commit}`], { cwd: canonicalRepo, windowsHide: true });
     const baseCommit = baseOutput.trim();
     await mkdir(this.#root, { recursive: true });
     const safeRoot = await realpath(this.#root);
     const path = resolve(safeRoot, taskId);
     this.#assertInside(safeRoot, path);
-    try { await lstat(path); throw new Error(`Worktree path already exists: ${path}`); } catch (e) {
-      if (!(e instanceof Error) || !("code" in e) || e.code !== "ENOENT") throw e;
-    }
     const branch = `zero/${taskId}`;
-    await execFileAsync("git", ["worktree", "add", "-b", branch, path, baseCommit], { cwd: canonicalRepo, windowsHide: true, maxBuffer: 1024 * 1024 });
-    return { taskId, repoPath: canonicalRepo, path, branch, baseCommit };
+    const plan = { taskId, repoPath: canonicalRepo, commonGitDir, worktreeRoot: safeRoot, path, branch, baseCommit };
+    await this.#revalidateCreationPlan(plan);
+    return plan;
+  }
+
+  /** Rechecks every persisted identity before the first Git mutation, then captures observed creation evidence. */
+  async executePlan(plan: WorktreeCreationPlan): Promise<WorktreeCreationEvidence> {
+    await this.#revalidateCreationPlan(plan);
+    await execFileAsync("git", ["worktree", "add", "-b", plan.branch, plan.path, plan.baseCommit], {
+      cwd: plan.repoPath, windowsHide: true, maxBuffer: 1024 * 1024,
+    });
+    const info: WorktreeInfo = {
+      taskId: plan.taskId, repoPath: plan.repoPath, path: plan.path, branch: plan.branch, baseCommit: plan.baseCommit,
+    };
+    await this.#validateInfo(info);
+    await this.#ensureTaskBranch(info);
+    const [headResult, commonResult] = await Promise.all([
+      execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: plan.path, windowsHide: true }),
+      execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: plan.path, windowsHide: true }),
+    ]);
+    const head = headResult.stdout.trim();
+    const commonGitDir = await realpath(commonResult.stdout.trim());
+    if (head !== plan.baseCommit) throw new Error("Created worktree HEAD does not match its planned base commit");
+    if (commonGitDir !== plan.commonGitDir) throw new Error("Created worktree belongs to a different Git common directory");
+    const fingerprint = await this.fingerprint(info);
+    return { info, commonGitDir, head, fingerprint };
+  }
+
+  async create(taskId: string, repoPath: string, baseRef: string): Promise<WorktreeInfo> {
+    return (await this.executePlan(await this.prepareCreatePlan(taskId, repoPath, baseRef))).info;
   }
 
   /** Reopen only a task worktree that is still registered with the expected repository and branch. */
@@ -396,6 +442,35 @@ export class GitWorktreeManager {
     await this.#validateInfo(info);
     await execFileAsync("git", ["worktree", "remove", "--force", info.path], { cwd: info.repoPath, windowsHide: true, maxBuffer: 1024 * 1024 });
     if (options.deleteBranch) await execFileAsync("git", ["branch", "-D", info.branch], { cwd: info.repoPath, windowsHide: true });
+  }
+
+  async #revalidateCreationPlan(plan: WorktreeCreationPlan): Promise<void> {
+    this.#assertTaskId(plan.taskId);
+    const [repo, root] = await Promise.all([realpath(plan.repoPath), realpath(this.#root)]);
+    if (repo !== plan.repoPath) throw new Error("Repository path changed after worktree creation was planned");
+    if (root !== plan.worktreeRoot) throw new Error("Worktree root changed after worktree creation was planned");
+    const expectedPath = resolve(root, plan.taskId);
+    this.#assertInside(root, plan.path);
+    if (plan.path !== expectedPath) throw new Error("Worktree path does not match its planned task id");
+    const { stdout: repoTop } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: repo, windowsHide: true });
+    if (await realpath(repoTop.trim()) !== plan.repoPath) throw new Error("Repository identity changed after worktree creation was planned");
+    const { stdout: commonOutput } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo, windowsHide: true });
+    if (await realpath(commonOutput.trim()) !== plan.commonGitDir) throw new Error("Repository Git common directory changed after worktree creation was planned");
+    if (plan.branch !== `zero/${plan.taskId}`) throw new Error("Worktree branch does not match its planned task id");
+    if (!/^[a-fA-F0-9]{40,64}$/.test(plan.baseCommit)) throw new Error("Invalid planned base commit");
+    const { stdout: baseOutput } = await execFileAsync("git", ["rev-parse", "--verify", `${plan.baseCommit}^{commit}`], { cwd: repo, windowsHide: true });
+    if (baseOutput.trim().toLowerCase() !== plan.baseCommit.toLowerCase()) throw new Error("Planned base commit is no longer available");
+    try {
+      const stat = await lstat(plan.path);
+      if (stat.isSymbolicLink()) throw new Error(`Refusing symlink at task worktree path: ${plan.path}`);
+      throw new Error(`Worktree path already exists: ${plan.path}`);
+    } catch (error) {
+      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+    }
+    const branchRef = `refs/heads/${plan.branch}`;
+    const existingBranch = await execFileAsync("git", ["show-ref", "--verify", "--quiet", branchRef], { cwd: repo, windowsHide: true })
+      .then(() => true, error => (error as { code?: number }).code === 1 ? false : Promise.reject(error));
+    if (existingBranch) throw new Error(`Worktree branch already exists: ${plan.branch}`);
   }
 
   async #validateInfo(info: WorktreeInfo): Promise<void> {

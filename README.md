@@ -15,6 +15,7 @@ Zero is an application made of one Node.js service, a local React web UI, and a 
 - Ordered `executionStages` run serially in one task worktree through the core, HTTP API, and CLI `--stages-file` option. Each stage records a linked attempt, worktree fingerprint, and versioned handoff based on facts Zero observed. Reports include this stage history.
 - A `waiting` state for verified provider usage limits, with a persisted checkpoint and scheduled retry. Quota resume is mock-tested, including across service restart; a real provider quota event has not been observed. For ordinary crashes, Zero periodically moves expired active leases to `recovery_required`, records lease and interrupted attempt/stage evidence, and does not automatically retry because expiry does not prove the old process stopped. Inspect the worker process and task worktree before deciding how to continue.
 - The crash recovery boundary and follow-on design are documented in [the crash recovery design](docs/crash-recovery-design.md).
+- Worktree creation records its planned repository, branch, path, and base commit before `git worktree add`, then saves observed identity and fingerprint. An ambiguous creation failure keeps that evidence for inspection.
 - A native Windows process guardian with passing CI build and process-containment tests. Deployment to the target machine and a boot test remain unverified; see [Windows deployment](docs/windows-deployment.md).
 
 ## What is still a design or validation target

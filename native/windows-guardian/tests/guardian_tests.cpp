@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <objbase.h>
+#include <sddl.h>
 
 #include <cwchar>
 #include <cstdlib>
@@ -63,6 +64,11 @@ bool WaitForExit(HANDLE process, DWORD timeout_ms) {
   return WaitForSingleObject(process, timeout_ms) == WAIT_OBJECT_0;
 }
 
+void SignalFile(const std::wstring& path) {
+  std::ofstream signal(path);
+  signal << "release\n";
+}
+
 int Fail(const char* message) {
   std::cerr << "guardian test failed: " << message << "\n";
   return 1;
@@ -79,6 +85,29 @@ std::wstring TempPath(const wchar_t* suffix) {
   result += L"zero-guardian-";
   result += guid;
   result += suffix;
+  return result;
+}
+
+std::wstring CurrentUserSidString() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return {};
+  DWORD bytes = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+  if (bytes == 0) {
+    CloseHandle(token);
+    return {};
+  }
+  std::vector<unsigned char> buffer(bytes);
+  if (!GetTokenInformation(token, TokenUser, buffer.data(), bytes, &bytes)) {
+    CloseHandle(token);
+    return {};
+  }
+  CloseHandle(token);
+  auto* user = reinterpret_cast<TOKEN_USER*>(buffer.data());
+  LPWSTR sid = nullptr;
+  if (!ConvertSidToStringSidW(user->User.Sid, &sid)) return {};
+  std::wstring result(sid);
+  LocalFree(sid);
   return result;
 }
 
@@ -188,6 +217,109 @@ int RunDuplicateLock(const std::wstring& guardian, const std::wstring& test_exe)
   if (!exited || exit_code == 0) return Fail("duplicate lock was not rejected");
   return 0;
 }
+
+int RunSuccessorWaitsForPreviousTree(const std::wstring& guardian,
+                                     const std::wstring& test_exe) {
+  const std::wstring report_name = TempPath(L".held-tree.txt");
+  const std::wstring release_name = TempPath(L".release");
+  const std::wstring launch_name = TempPath(L".successor-launched");
+  if (report_name.empty() || release_name.empty() || launch_name.empty()) {
+    return Fail("could not allocate successor test paths");
+  }
+  const std::wstring lock_id = L"successor-wait-" + std::to_wstring(GetCurrentProcessId());
+  const std::wstring first_command = Quote(guardian) + L" --lock-id " + lock_id + L" -- " +
+      Quote(test_exe) + L" --helper-held-tree " + Quote(report_name) + L" " +
+      Quote(release_name) + L" " + lock_id;
+  PROCESS_INFORMATION first{};
+  if (!Start(first_command, &first)) return Fail("could not start held-tree guardian");
+
+  const std::filesystem::path report(report_name);
+  if (!WaitForFile(report, 15000)) {
+    SignalFile(release_name);
+    TerminateProcess(first.hProcess, 1);
+    WaitForSingleObject(first.hProcess, INFINITE);
+    CloseHandle(first.hThread);
+    CloseHandle(first.hProcess);
+    return Fail("held-tree helper did not publish process IDs");
+  }
+  DWORD child_pid = 0;
+  DWORD grandchild_pid = 0;
+  {
+    std::ifstream input(report_name);
+    input >> child_pid >> grandchild_pid;
+  }
+  HANDLE child = OpenProcess(SYNCHRONIZE, FALSE, child_pid);
+  HANDLE grandchild = OpenProcess(SYNCHRONIZE, FALSE, grandchild_pid);
+  if (child == nullptr || grandchild == nullptr) {
+    SignalFile(release_name);
+    TerminateProcess(first.hProcess, 1);
+    WaitForSingleObject(first.hProcess, INFINITE);
+    if (child) CloseHandle(child);
+    if (grandchild) CloseHandle(grandchild);
+    CloseHandle(first.hThread);
+    CloseHandle(first.hProcess);
+    return Fail("could not observe held-tree processes");
+  }
+
+  TerminateProcess(first.hProcess, 99);
+  WaitForSingleObject(first.hProcess, INFINITE);
+  CloseHandle(first.hThread);
+  CloseHandle(first.hProcess);
+  if (WaitForSingleObject(child, 0) != WAIT_TIMEOUT ||
+      WaitForSingleObject(grandchild, 0) != WAIT_TIMEOUT) {
+    SignalFile(release_name);
+    WaitForExit(child, 15000);
+    WaitForExit(grandchild, 15000);
+    CloseHandle(child);
+    CloseHandle(grandchild);
+    return Fail("held Job did not preserve processes for successor wait test");
+  }
+
+  const std::wstring successor_command = Quote(guardian) + L" --lock-id " + lock_id + L" -- " +
+      Quote(test_exe) + L" --helper-report-exit " + Quote(launch_name);
+  PROCESS_INFORMATION successor{};
+  if (!Start(successor_command, &successor)) {
+    SignalFile(release_name);
+    WaitForExit(child, 15000);
+    WaitForExit(grandchild, 15000);
+    CloseHandle(child);
+    CloseHandle(grandchild);
+    return Fail("could not start successor guardian");
+  }
+  Sleep(750);
+  const bool launched_early = std::filesystem::exists(launch_name);
+  const bool successor_exited_early = WaitForSingleObject(successor.hProcess, 0) == WAIT_OBJECT_0;
+  if (launched_early || successor_exited_early) {
+    TerminateProcess(successor.hProcess, 1);
+    WaitForSingleObject(successor.hProcess, INFINITE);
+    SignalFile(release_name);
+    WaitForExit(child, 15000);
+    WaitForExit(grandchild, 15000);
+    CloseHandle(successor.hThread);
+    CloseHandle(successor.hProcess);
+    CloseHandle(child);
+    CloseHandle(grandchild);
+    return Fail("successor launched before prior Job descendants terminated");
+  }
+
+  SignalFile(release_name);
+  const bool old_tree_stopped = WaitForExit(child, 15000) && WaitForExit(grandchild, 15000);
+  const bool launched = WaitForFile(launch_name, 15000);
+  const bool successor_exited = WaitForExit(successor.hProcess, 15000);
+  DWORD successor_code = 1;
+  if (successor_exited) GetExitCodeProcess(successor.hProcess, &successor_code);
+  CloseHandle(child);
+  CloseHandle(grandchild);
+  CloseHandle(successor.hThread);
+  CloseHandle(successor.hProcess);
+  DeleteFileW(report_name.c_str());
+  DeleteFileW(release_name.c_str());
+  DeleteFileW(launch_name.c_str());
+  if (!old_tree_stopped || !launched || !successor_exited || successor_code != 0) {
+    return Fail("successor did not launch after the prior tree became empty");
+  }
+  return 0;
+}
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -214,6 +346,34 @@ int wmain(int argc, wchar_t** argv) {
     Sleep(60000);
     return 0;
   }
+  if (argc >= 5 && wcscmp(argv[1], L"--helper-held-tree") == 0) {
+    const std::wstring sid = CurrentUserSidString();
+    if (sid.empty()) return 82;
+    const std::wstring job_name = L"Global\\ZeroGuardianJob_" + sid + L"_" + argv[4];
+    // Hold an extra Job handle across guardian termination so the successor's
+    // wait is observable; the release signal terminates this whole test tree.
+    HANDLE job = OpenJobObjectW(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, FALSE,
+                                job_name.c_str());
+    if (job == nullptr) return 83;
+    const std::wstring self = ModulePath();
+    const std::wstring command = Quote(self) + L" --helper-leaf";
+    PROCESS_INFORMATION leaf{};
+    if (!Start(command, &leaf)) { CloseHandle(job); return 84; }
+    CloseHandle(leaf.hThread);
+    CloseHandle(leaf.hProcess);
+    std::ofstream output{std::filesystem::path(argv[2])};
+    output << GetCurrentProcessId() << " " << leaf.dwProcessId << "\n";
+    output.close();
+    while (!std::filesystem::exists(argv[3])) Sleep(20);
+    TerminateJobObject(job, 0);
+    CloseHandle(job);
+    return 0;
+  }
+  if (argc >= 3 && wcscmp(argv[1], L"--helper-report-exit") == 0) {
+    std::ofstream output{std::filesystem::path(argv[2])};
+    output << GetCurrentProcessId() << "\n";
+    return output ? 0 : 85;
+  }
   if (argc >= 2 && wcscmp(argv[1], L"--helper-leaf") == 0) {
     Sleep(60000);
     return 0;
@@ -226,6 +386,7 @@ int wmain(int argc, wchar_t** argv) {
   if (RunNormalExit(guardian, test_exe) != 0) return 1;
   if (RunDuplicateLock(guardian, test_exe) != 0) return 1;
   if (RunForcedTreeCleanup(guardian, test_exe) != 0) return 1;
+  if (RunSuccessorWaitsForPreviousTree(guardian, test_exe) != 0) return 1;
   std::cout << "Windows guardian tests passed\n";
   return 0;
 }

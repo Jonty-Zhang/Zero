@@ -86,17 +86,27 @@ std::wstring CurrentUserSidString() {
 }
 
 DWORD WaitForJobToBecomeEmpty(HANDLE job) {
-  // Keep the Job handle open on any accounting error. Closing it while members
-  // may remain would weaken the exit guarantee this process is responsible for.
   for (;;) {
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
-    if (QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
-                                  &accounting, sizeof(accounting), nullptr) &&
-        accounting.ActiveProcesses == 0) {
-      return ERROR_SUCCESS;
+    if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                                   &accounting, sizeof(accounting), nullptr)) {
+      return GetLastError();
     }
+    if (accounting.ActiveProcesses == 0) return ERROR_SUCCESS;
     Sleep(kPollMilliseconds);
   }
+}
+
+DWORD WaitForPreviousJobToBecomeEmpty(const std::wstring& job_name) {
+  HANDLE previous_job = OpenJobObjectW(JOB_OBJECT_QUERY, FALSE, job_name.c_str());
+  if (previous_job == nullptr) {
+    const DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : error;
+  }
+
+  const DWORD result = WaitForJobToBecomeEmpty(previous_job);
+  CloseHandle(previous_job);
+  return result;
 }
 }  // namespace
 
@@ -113,18 +123,44 @@ int wmain(int argc, wchar_t** argv) {
   // The default DACL restricts the object to the current user's token. Including
   // the SID in the name makes the lock per-user across interactive sessions.
   const std::wstring mutex_name = L"Global\\ZeroGuardian_" + sid + L"_" + argv[2];
+  const std::wstring job_name = L"Global\\ZeroGuardianJob_" + sid + L"_" + argv[2];
   SECURITY_ATTRIBUTES non_inheritable{};
   non_inheritable.nLength = sizeof(non_inheritable);
   non_inheritable.bInheritHandle = FALSE;
-  HANDLE mutex = CreateMutexW(&non_inheritable, FALSE, mutex_name.c_str());
+  SetLastError(ERROR_SUCCESS);
+  HANDLE mutex = CreateMutexW(&non_inheritable, TRUE, mutex_name.c_str());
   if (mutex == nullptr) return static_cast<int>(kFailure);
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    CloseHandle(mutex);
-    return static_cast<int>(ERROR_ALREADY_EXISTS);
+    const DWORD wait = WaitForSingleObject(mutex, 0);
+    if (wait == WAIT_TIMEOUT) {
+      CloseHandle(mutex);
+      return static_cast<int>(ERROR_ALREADY_EXISTS);
+    }
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+      CloseHandle(mutex);
+      return static_cast<int>(kFailure);
+    }
   }
 
-  HANDLE job = CreateJobObjectW(&non_inheritable, nullptr);
+  // Do not open the previous Job until this process owns the mutex. Keeping an
+  // old Job handle open before the old guardian exits suppresses last-handle
+  // KILL_ON_JOB_CLOSE behavior.
+  if (WaitForPreviousJobToBecomeEmpty(job_name) != ERROR_SUCCESS) {
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    return static_cast<int>(kFailure);
+  }
+
+  SetLastError(ERROR_SUCCESS);
+  HANDLE job = CreateJobObjectW(&non_inheritable, job_name.c_str());
   if (job == nullptr) {
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    return static_cast<int>(kFailure);
+  }
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    CloseHandle(job);
+    ReleaseMutex(mutex);
     CloseHandle(mutex);
     return static_cast<int>(kFailure);
   }
@@ -133,6 +169,7 @@ int wmain(int argc, wchar_t** argv) {
   if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
                                sizeof(limits))) {
     CloseHandle(job);
+    ReleaseMutex(mutex);
     CloseHandle(mutex);
     return static_cast<int>(kFailure);
   }
@@ -140,6 +177,7 @@ int wmain(int argc, wchar_t** argv) {
   std::wstring command_line = BuildCommandLine(argc, argv, 4);
   if (command_line.size() >= 32767) {
     CloseHandle(job);
+    ReleaseMutex(mutex);
     CloseHandle(mutex);
     return static_cast<int>(kInvalidArgs);
   }
@@ -152,6 +190,7 @@ int wmain(int argc, wchar_t** argv) {
   if (!CreateProcessW(argv[4], mutable_command.data(), nullptr, nullptr, FALSE,
                       CREATE_SUSPENDED, nullptr, nullptr, &startup, &process)) {
     CloseHandle(job);
+    ReleaseMutex(mutex);
     CloseHandle(mutex);
     return static_cast<int>(kFailure);
   }
@@ -162,6 +201,7 @@ int wmain(int argc, wchar_t** argv) {
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     CloseHandle(job);
+    ReleaseMutex(mutex);
     CloseHandle(mutex);
     return static_cast<int>(kFailure);
   }
@@ -173,6 +213,7 @@ int wmain(int argc, wchar_t** argv) {
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     CloseHandle(job);
+    ReleaseMutex(mutex);
     CloseHandle(mutex);
     return static_cast<int>(kFailure);
   }
@@ -189,6 +230,7 @@ int wmain(int argc, wchar_t** argv) {
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
   CloseHandle(job);
+  ReleaseMutex(mutex);
   CloseHandle(mutex);
   return static_cast<int>(child_exit_code);
 }

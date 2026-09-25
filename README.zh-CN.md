@@ -15,6 +15,7 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 - 有序 `executionStages` 已通过核心、HTTP API 和 CLI 的 `--stages-file` 选项实现，会在同一个任务 worktree 中串行执行。每个阶段会记录关联尝试、工作树指纹，以及由 Zero 实测事实构成的版本化交接单；报告收录这些阶段记录。
 - 对已验证的模型使用额度限制提供 `waiting` 状态、持久检查点和定时重试。额度恢复已通过 mock 测试，包括服务重启后的恢复；尚未观察到真实提供方额度限制事件。普通崩溃发生时，Zero 会定期将租约过期的活动任务转为 `recovery_required`，保存租约及被中断尝试/阶段的证据。租约过期不能证明旧进程已停止，因此不会自动重试；请先检查 worker 进程和任务 worktree，再决定如何继续。
 - 崩溃恢复的当前边界和后续设计见[崩溃恢复设计](docs/crash-recovery-design.md)。
+- 创建 worktree 前会持久记录目标仓库、分支、路径和基点；`git worktree add` 成功后再记录实测身份与指纹。创建结果不确定时保留这些证据并等待检查。
 - 原生 Windows 进程 guardian 已在 CI 中通过构建和进程包含测试；目标机器部署及启动测试仍未验证。详见 [Windows 部署](docs/windows-deployment.md)。
 
 ## 尚属设计或待验证的目标

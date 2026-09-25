@@ -49,6 +49,36 @@ test("restart before lease expiry preserves active work and later scan quarantin
   }
 });
 
+test("worktree creation intent survives ambiguous failure and successful creation records observed identity", () => {
+  const store = new TaskStore();
+  try {
+    const failed = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "create" }, "intent_failure");
+    store.claimNext("worker-a");
+    const plan = { taskId: failed.id, repoPath: "C:/repo", commonGitDir: "C:/repo/.git", path: "C:/worktrees/intent_failure",
+      branch: `zero/${failed.id}`, baseCommit: "a".repeat(40) };
+    store.recordWorktreeCreationIntent(failed.id, "worker-a", plan);
+    // Models a Git add that throws after possibly registering external Git state.
+    const quarantined = store.requireWorktreeRecovery(failed.id, "worker-a", "git worktree add failed", { phase: "execute_or_observe" });
+    assert.equal(store.getWorktreeCreation(failed.id)?.status, "intent");
+    assert.equal(quarantined.status, "recovery_required");
+    assert.equal(store.claimNext("worker-b"), undefined);
+
+    const succeeded = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "create" }, "intent_success");
+    store.claimNext("worker-c");
+    const successPlan = { ...plan, taskId: succeeded.id, path: `C:/worktrees/${succeeded.id}`, branch: `zero/${succeeded.id}` };
+    store.recordWorktreeCreationIntent(succeeded.id, "worker-c", successPlan);
+    const observed = { info: { taskId: succeeded.id, path: successPlan.path, branch: successPlan.branch, baseCommit: successPlan.baseCommit },
+      commonGitDir: successPlan.commonGitDir, head: successPlan.baseCommit };
+    assert.throws(() => store.completeWorktreeCreation(succeeded.id, "other-worker", observed, "b".repeat(64)), /not actively leased/);
+    assert.equal(store.getWorktreeCreation(succeeded.id)?.status, "intent");
+    const created = store.completeWorktreeCreation(succeeded.id, "worker-c", observed, "b".repeat(64));
+    assert.equal(created.status, "created");
+    assert.deepEqual(created.observed, observed);
+    assert.equal(created.fingerprint, "b".repeat(64));
+    assert.ok(created.createdAt);
+  } finally { store.close(); }
+});
+
 test("additive recovery migration preserves existing SQLite task rows", async () => {
   const root = await mkdtemp(join(process.cwd(), ".zero-recovery-migration-"));
   const path = join(root, "legacy.sqlite");

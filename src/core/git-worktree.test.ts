@@ -41,6 +41,27 @@ test("worktree is isolated, diff includes untracked files, and commit records ou
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("worktree creation plan rejects path or repository identity drift before Git writes", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-git-create-plan-test-"));
+  const repo = join(root, "repo");
+  const worktrees = join(root, "worktrees");
+  await mkdir(repo);
+  try {
+    await exec("git", ["init", "-b", "main"], { cwd: repo });
+    await exec("git", ["config", "user.name", "Test"], { cwd: repo });
+    await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    await writeFile(join(repo, "seed.txt"), "base\n");
+    await exec("git", ["add", "seed.txt"], { cwd: repo });
+    await exec("git", ["commit", "-m", "seed"], { cwd: repo });
+    const manager = new GitWorktreeManager(worktrees);
+    const plan = await manager.prepareCreatePlan("plan_drift", repo, "main");
+    await assert.rejects(manager.executePlan({ ...plan, path: join(worktrees, "elsewhere") }), /path does not match its planned task id/);
+    await assert.rejects(manager.executePlan({ ...plan, commonGitDir: join(root, "other.git") }), /Git common directory changed/);
+    await assert.equal(await manager.exists("plan_drift"), false);
+    await assert.rejects(exec("git", ["show-ref", "--verify", "refs/heads/zero/plan_drift"], { cwd: repo }));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("commit refuses a harness-created empty commit when base-to-HEAD has no changes", async () => {
   const root = await mkdtemp(join(process.cwd(), ".zero-git-empty-test-"));
   const repo = join(root, "repo");

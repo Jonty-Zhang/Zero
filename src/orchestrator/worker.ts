@@ -129,6 +129,7 @@ export class TaskWorker {
     let finalizedExecutionFingerprint: string | undefined;
     let worktree: WorktreeInfo | undefined;
     let baseCommit: string | undefined;
+    let worktreeCreationIntentPending = false;
     let resultCommit: string | undefined;
     let errorMessage: string | undefined;
     let markedDone = false;
@@ -187,8 +188,17 @@ export class TaskWorker {
         if (await this.#options.worktrees.exists(taskId)) {
           throw new Error("An existing task worktree requires recovery inspection; refusing to create or reuse it automatically");
         }
-        worktree = await this.#options.worktrees.create(taskId, task.repoPath, task.baseRef);
+        this.#assertLease(taskId, owner, () => leaseLost);
+        const plan = await this.#options.worktrees.prepareCreatePlan(taskId, task.repoPath, task.baseRef);
+        this.#assertLease(taskId, owner, () => leaseLost);
+        this.#options.store.recordWorktreeCreationIntent(taskId, owner, plan);
+        worktreeCreationIntentPending = true;
+        const created = await this.#options.worktrees.executePlan(plan);
+        worktree = created.info;
         baseCommit = worktree.baseCommit;
+        this.#assertLease(taskId, owner, () => leaseLost);
+        this.#options.store.completeWorktreeCreation(taskId, owner, created, created.fingerprint);
+        worktreeCreationIntentPending = false;
       }
       this.#assertNotCancelled(active);
       this.#assertLease(taskId, owner, () => leaseLost);
@@ -446,6 +456,15 @@ export class TaskWorker {
     } catch (error) {
       const cancelled = active.cancelRequested;
       errorMessage = cancelled ? "Cancelled by user" : errorText(error);
+      if (worktreeCreationIntentPending) {
+        try {
+          this.#assertLease(taskId, owner, () => leaseLost);
+          task = this.#options.store.requireWorktreeRecovery(taskId, owner, errorMessage, { phase: "execute_or_observe" });
+        } catch {
+          // A lost lease leaves the durable intent for recoverExpired to quarantine.
+        }
+        return this.#options.store.get(taskId) ?? task;
+      }
       const quotaFailure = error instanceof QuotaLimitError && !cancelled && !leaseLost;
       let executionStageFinalizationFailed = false;
       if (activeAttempt) {

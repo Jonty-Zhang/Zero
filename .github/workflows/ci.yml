@@ -45,7 +45,7 @@ jobs:
           if errorlevel 1 exit /b 1
           cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE native\windows-guardian\guardian.cpp /Fe:guardian.exe Advapi32.lib
           if errorlevel 1 exit /b 1
-          cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE native\windows-guardian\tests\guardian_tests.cpp /Fe:guardian_tests.exe Ole32.lib
+          cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE native\windows-guardian\tests\guardian_tests.cpp /Fe:guardian_tests.exe Ole32.lib Advapi32.lib
           if errorlevel 1 exit /b 1
       - name: Test guardian process containment
         shell: pwsh
