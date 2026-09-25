@@ -17,7 +17,7 @@ Zero is an application made of one Node.js service, a local React web UI, and a 
 - The crash recovery boundary and follow-on design are documented in [the crash recovery design](docs/crash-recovery-design.md).
 - Worktree creation records its planned repository, branch, path, and base commit before `git worktree add`, then saves observed identity and fingerprint. An ambiguous creation failure keeps that evidence for inspection.
 - A native Windows process guardian with passing CI build and process-containment tests. Deployment to the target machine and a boot test remain unverified; see [Windows deployment](docs/windows-deployment.md).
-- A Windows release staging script bundles the built runtime, UI, CLI, pinned Node executable, and tested guardian with a file-hash manifest. The [single-app packaging plan](docs/windows-app-packaging.md) targets one NSIS installer; an installer and target-machine acceptance remain unfinished.
+- A Windows release staging script bundles the built runtime, UI, CLI, explicitly supplied Node executable, and tested guardian with a file-hash manifest. An independent verifier checks every file and starts the bundled CLI in CI. The [single-app packaging plan](docs/windows-app-packaging.md) targets one NSIS installer; version pinning, an installer, and target-machine acceptance remain unfinished.
 
 ## What is still a design or validation target
 
@@ -25,7 +25,7 @@ Zero is an application made of one Node.js service, a local React web UI, and a 
 - DSH and isolated ZCode CLI bindings are not enabled for routing merely because their adapters exist. Their bindings must be created and verified in Zero's isolated data area; availability and evidence level depend on the local CLI version and successful checks. See [server setup](src/server/README.md).
 - Current review is a new Codex session. It is not a different-model guarantee: when the execution Harness is also Codex, model-level independence depends on the configured reviewer binding.
 
-For the broader target, upstream comparisons, and license review, see [the Zero v1 proposal](docs/zero-v1-proposal.md). The project is original code rather than a fork of the reviewed projects and is licensed under [Apache-2.0](LICENSE).
+For the broader target, upstream comparisons, and license review, see [the Zero v1 proposal](docs/zero-v1-proposal.md) and the later [Herdr assessment](docs/herdr-assessment.md). The project is original code rather than a fork of the reviewed projects and is licensed under [Apache-2.0](LICENSE).
 
 ## Install and run from source
 
@@ -97,6 +97,7 @@ SQLite is authoritative for task state. Zero records attempts and evidence, runs
 ## Project notes
 
 - [Zero v1 proposal, upstream comparison, and licenses](docs/zero-v1-proposal.md)
+- [Herdr ecosystem reuse assessment](docs/herdr-assessment.md)
 - [Workspace and cross-Harness handoff design](docs/workspace-handoff-design.md)
 - [Routing and review contract](docs/route-review-contract.md)
 - [Local server setup and binding verification](src/server/README.md)

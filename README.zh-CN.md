@@ -17,7 +17,7 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 - 崩溃恢复的当前边界和后续设计见[崩溃恢复设计](docs/crash-recovery-design.md)。
 - 创建 worktree 前会持久记录目标仓库、分支、路径和基点；`git worktree add` 成功后再记录实测身份与指纹。创建结果不确定时保留这些证据并等待检查。
 - 原生 Windows 进程 guardian 已在 CI 中通过构建和进程包含测试；目标机器部署及启动测试仍未验证。详见 [Windows 部署](docs/windows-deployment.md)。
-- Windows 发布目录脚本可打包已构建的服务、界面、CLI、固定 Node 运行时与 guardian，并生成文件哈希清单。[单应用交付方案](docs/windows-app-packaging.md)采用 NSIS 安装包；安装包与目标机器验收尚未完成。
+- Windows 发布目录脚本可打包已构建的服务、界面、CLI、显式指定的 Node 运行时与 guardian，并生成文件哈希清单。独立校验器在 CI 中核对所有文件并启动包内 CLI。[单应用交付方案](docs/windows-app-packaging.md)采用 NSIS 安装包；版本钉住、安装包与目标机器验收尚未完成。
 
 ## 尚属设计或待验证的目标
 
@@ -25,7 +25,7 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 - DSH 和隔离式 ZCode CLI 不会仅因适配器存在就加入路由。必须先在 Zero 隔离的数据目录中创建并验证绑定；可用性和证据等级取决于本机 CLI 版本及验证结果。详见[服务端配置](src/server/README.md)。
 - 当前审核使用新的 Codex 会话，但不保证审核模型一定不同于执行模型：当执行 Harness 也是 Codex 时，模型层面的独立性取决于审核绑定配置。
 
-更完整的目标架构、上游项目比较和许可证核查见 [Zero v1 方案](docs/zero-v1-proposal.md)。Zero 是原创代码，并非对所研究项目的 fork；项目采用 [Apache-2.0 许可证](LICENSE)。
+更完整的目标架构、上游项目比较和许可证核查见 [Zero v1 方案](docs/zero-v1-proposal.md)及后续的 [Herdr 生态评估](docs/herdr-assessment.md)。Zero 是原创代码，并非对所研究项目的 fork；项目采用 [Apache-2.0 许可证](LICENSE)。
 
 ## 从源码安装和运行
 
@@ -96,6 +96,7 @@ SQLite 是任务状态的权威来源。Zero 记录尝试和证据、运行配�
 ## 项目文档
 
 - [Zero v1 方案、上游项目比较和许可证](docs/zero-v1-proposal.md)
+- [Herdr 生态复用评估](docs/herdr-assessment.md)
 - [工作区与跨 Harness 接力设计](docs/workspace-handoff-design.md)
 - [路由与审核契约](docs/route-review-contract.md)
 - [本地服务配置与绑定验证](src/server/README.md)

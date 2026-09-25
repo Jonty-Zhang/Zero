@@ -1,13 +1,13 @@
 # Zero 无人值守恢复设计
 
-状态：架构决策，2026-09-25。本文区分已实现的额度等待和仍需实现的进程崩溃恢复；不能把测试中的定时重试当作整机重启后的自动接力。
+状态：架构决策，2026-09-25。本文区分已实现的额度等待、写入前安全重排与仍需实现的执行中崩溃恢复。当前具体进展与验收边界见[普通崩溃后的安全恢复](crash-recovery-design.md)。
 
 ## 当前事实
 
 - `TaskStore.pauseForQuota` 将可信的提供方额度错误写成 `waiting`、重试时间和阶段 checkpoint，释放 lease；调度器每秒尝试领取到期任务。Worker 恢复时核对原 worktree 指纹、路由和检查证据。这条路径已有进程重启单元测试，但尚未观察到真实订阅额度耗尽及五小时重置。
-- 普通 lease 过期由 `recoverExpired` 归回 `pending` 并中断 attempt/stage。Worker 随后看到已有 worktree 或中断 attempt 会拒绝继续，任务会失败。这保护了文件，但尚未满足无人值守的崩溃恢复。
+- 普通 lease 过期由 `recoverExpired` 原子隔离为 `recovery_required`，不中途暴露为可领取的 `pending`。仅当前领取协议版本、尚无 worktree 创建意图或任何执行证据、且目标 worktree 路径不存在的写入前任务，才能经专用事务重新排队。已有 worktree 或不确定证据仍等待安全恢复。
 - `runProcess` 在父进程活着时可用 `taskkill /T /F` 停止 Windows 子进程；若 Zero 自身突然退出，这段清理代码不能执行。stage 的 `processStartId` 是 UUID，不是可供新进程证明旧子进程已结束的 OS 身份。
-- 仓库已有 Windows Task Scheduler 安装脚本，可用标准用户账户及密码注册开机启动；目标电脑尚未完成安装后重启、订阅凭据和代理的实测。服务仍没有跨进程单实例锁或能确认旧子进程退出的监督层。
+- 仓库已有 Windows Task Scheduler 安装脚本和原生 guardian。guardian 为同一用户/数据目录持有命名 mutex，继任实例等待旧命名 Job 的活动进程清零；公开 CI 已测试这一机制。它尚未与 TaskStore 的某次尝试和阶段意图绑定，目标电脑也尚未完成安装后重启、订阅凭据和代理的实测。
 
 ## 决定
 

@@ -10,6 +10,8 @@ Zero v1 做成**一个独立安装的应用**：后台服务负责无人值守�
 
 这个判断针对当前 Windows 节点和 Zero 的交付标准：每项任务必须经过可追溯的路由、独立工作区、机器测试、Codex 独立审核、有限返工和持久归档。Zero 自己维护状态机，避免把某个 Agent 的自然语言“已完成”当成 DONE。按用户最新决定，**Codex 固定担任分配器和 Reviewer**；用户可在 Zero 中手动指定执行 Harness、模型和思考强度，未指定的字段由 Codex 在可用候选中选择。
 
+2026-09-25 补充：用户提及的 **Herdr** 与下表 Hydra 是不同项目。官方 Herdr、herdr-board 和 herdr-orchestrator 的复用判断见[Herdr 生态评估](herdr-assessment.md)。
+
 ## 参考项目核查
 
 | 项目 | 架构与可借鉴处（已核实） | 许可证（已核实） | 对 Zero 的判断 |
