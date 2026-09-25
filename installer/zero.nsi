@@ -80,7 +80,7 @@ Function .onInit
   StrCmp $0 "0" init_done
   Goto init_refuse
   init_refuse:
-    MessageBox MB_ICONSTOP|MB_OK "A Zero installation directory or Zero Task Node already exists. This installer only supports first installation and will not overwrite it. Uninstall the existing version first."
+    MessageBox MB_ICONSTOP|MB_OK "A Zero installation directory or Zero Task Node already exists. This installer only supports first installation and will not overwrite it. Uninstall the existing version first." /SD IDOK
     Abort
   init_done:
 FunctionEnd
@@ -153,7 +153,7 @@ Section "Uninstall"
   Pop $0
   Pop $1
   StrCmp $0 "0" uninstall_task_removed
-  MessageBox MB_ICONSTOP|MB_OK "Could not remove the Zero scheduled task. The program files were kept. Review Task Scheduler and try uninstall again."
+  MessageBox MB_ICONSTOP|MB_OK "Could not remove the Zero scheduled task. The program files were kept. Review Task Scheduler and try uninstall again." /SD IDOK
   Abort
   uninstall_task_removed:
   Delete "$SMPROGRAMS\Zero\Zero Dashboard.url"

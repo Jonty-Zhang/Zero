@@ -37,6 +37,23 @@ $registryKey = 'HKCU:\Software\Zero\Installer'
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zero'
 $startMenu = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)) 'Zero'
 
+function Invoke-BoundedProcess([string]$FilePath, [string[]]$ArgumentList, [string]$Phase, [int]$TimeoutSeconds = 120) {
+    $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait:$false -PassThru -WindowStyle Hidden
+    try {
+        $completed = $process.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $completed) {
+            try {
+                if (-not $process.HasExited) { $process.Kill($true) }
+            }
+            catch { Write-Warning "Could not terminate the $Phase process tree: $($_.Exception.Message)" }
+            $null = $process.WaitForExit(10000)
+            throw "Windows installer smoke test timed out during $Phase after $TimeoutSeconds seconds; terminated only the process tree started for this phase."
+        }
+        if ($process.ExitCode -ne 0) { throw "$Phase exited with code $($process.ExitCode)." }
+    }
+    finally { $process.Dispose() }
+}
+
 try {
     if ((Test-Path -LiteralPath $programDir) -or (Test-Path -LiteralPath $registryKey) -or
         (Test-Path -LiteralPath $uninstallKey) -or (Test-Path -LiteralPath $startMenu) -or
@@ -48,8 +65,7 @@ try {
     Set-Content -LiteralPath $marker -Value 'retain this smoke-test data' -NoNewline
     $markerCreated = $true
 
-    $install = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
-    if ($install.ExitCode -ne 0) { throw "Silent installer exited $($install.ExitCode)." }
+    Invoke-BoundedProcess -FilePath $installer -ArgumentList @('/S') -Phase 'install'
     foreach ($required in @('manifest.json', 'runtime\node.exe', 'guardian\guardian.exe', 'dist\cli.js')) {
         if (-not (Test-Path -LiteralPath (Join-Path $programDir $required) -PathType Leaf)) {
             throw "Installed payload is missing $required."
@@ -68,8 +84,7 @@ try {
     }
 
     $uninstaller = Join-Path $programDir 'uninstall.exe'
-    $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
-    if ($uninstall.ExitCode -ne 0) { throw "Silent uninstaller exited $($uninstall.ExitCode)." }
+    Invoke-BoundedProcess -FilePath $uninstaller -ArgumentList @('/S') -Phase 'uninstall'
     if (Test-Path -LiteralPath $programDir) { throw 'Uninstaller left program files behind.' }
     if ((Test-Path -LiteralPath $registryKey) -or (Test-Path -LiteralPath $uninstallKey)) {
         throw 'Uninstaller left install registry markers behind.'
