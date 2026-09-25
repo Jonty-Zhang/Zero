@@ -149,7 +149,7 @@ Section "Uninstall"
   SetShellVarContext current
   ; The user explicitly chose uninstall. Ask the existing credential-free
   ; helper to stop and unregister the task before deleting its executable.
-  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "$INSTDIR\scripts\uninstall-windows-task.ps1" -Confirm:$$false'
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "$INSTDIR\scripts\uninstall-windows-task.ps1" -Unattended'
   Pop $0
   Pop $1
   StrCmp $0 "0" uninstall_task_removed

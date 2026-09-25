@@ -26,6 +26,7 @@ function Assert-InstallerFailure([hashtable]$Parameters, [string]$ExpectedMessag
 }
 
 $script:InstallerPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'install-windows-task.ps1'
+$script:UninstallerPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'uninstall-windows-task.ps1'
 $resolvedGuardian = (Resolve-Path -LiteralPath $GuardianPath -ErrorAction Stop).Path
 
 if ([System.IO.Path]::GetExtension($resolvedGuardian).ToLowerInvariant() -ne '.exe') {
@@ -64,6 +65,17 @@ try {
     $nsiSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'installer\zero.nsi') -Raw
     Assert-True ($nsiSource -match 'CreateShortcut "\$SMPROGRAMS\\Zero\\Configure Zero Background Service\.lnk"[\s\S]*?-Install -InstallDir') 'NSIS registration shortcut must call install without constructing an account name.'
     Assert-True ($nsiSource -notmatch 'Configure Zero Background Service[\s\S]{0,500}-Account') 'NSIS shortcut must not pass an account parameter.'
+    Assert-True ($nsiSource -match 'uninstall-windows-task\.ps1" -Unattended') 'NSIS uninstaller must call the task helper with its non-interactive switch.'
+    Assert-True ($nsiSource -notmatch 'uninstall-windows-task\.ps1"[^\r\n]*-Confirm:') 'NSIS must not pass an explicit Boolean to PowerShell -File.'
+
+    $uninstallerSource = Get-Content -LiteralPath $script:UninstallerPath -Raw
+    Assert-True ($uninstallerSource -match '\[switch\]\$Unattended') 'Task uninstaller must expose an explicit Unattended switch.'
+    Assert-True ($uninstallerSource -match 'if \(\$Unattended\) \{ \$ConfirmPreference = ''None'' \}') 'Only Unattended mode should suppress ShouldProcess confirmation.'
+    $safeTaskName = 'Zero Unattended Dry Run ' + [Guid]::NewGuid().ToString('N')
+    $unattendedOutput = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned `
+        -File $script:UninstallerPath -Unattended -TaskName $safeTaskName)
+    if ($LASTEXITCODE -ne 0) { throw "Task uninstaller -File switch dry-run exited with code $LASTEXITCODE." }
+    Assert-True ($unattendedOutput -ccontains "Scheduled task '$safeTaskName' is not registered; nothing to remove.") 'Unattended -File dry-run did not safely handle a missing task.'
 
     # Exercise the exact helper functions used by the installer without printing the ID.
     $canonicalPath = Get-CanonicalDataDir $dataDir

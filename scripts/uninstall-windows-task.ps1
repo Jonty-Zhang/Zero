@@ -1,7 +1,12 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
-param([string]$TaskName = 'Zero Task Node')
+param(
+    [string]$TaskName = 'Zero Task Node',
+    [switch]$Unattended
+)
 
 $ErrorActionPreference = 'Stop'
+if ($Unattended) { $ConfirmPreference = 'None' }
+
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if (-not $task) {
     Write-Output ("Scheduled task '{0}' is not registered; nothing to remove." -f $TaskName)
