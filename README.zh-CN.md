@@ -8,12 +8,13 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 
 ## 当前已实现
 
-- 基于 SQLite 的任务队列和本地 HTTP API，任务状态包括 `pending`、`running`、`reviewing`、`revision`、`waiting`、`done` 和 `failed`。
+- 基于 SQLite 的任务队列和本地 HTTP API，任务状态包括 `pending`、`running`、`reviewing`、`revision`、`waiting`、`recovery_required`、`done` 和 `failed`。
 - 使用 Codex 进行任务分配，并启动独立的只读 Codex 会话进行审核。用户可以手动固定执行 Harness、模型和思考强度中的任意字段；Codex 只会从 Zero 已验证的绑定中补全未指定字段。
 - Codex、DeepSeek Harness（DSH）和 ZCode 适配器。存在适配器不代表 Harness/模型组合已可用于路由：Zero 要求先验证绑定。DSH 和隔离式 ZCode CLI 绑定使用 Zero 自有配置档。现有桌面 ZCode `app-server` 适配器及 `verify-binding zcode-desktop` 流程已通过 mock 测试；实时接入尚未成功，因此该路由尚未验证，也不会用于任务路由。验证边界见[服务端配置](src/server/README.md)。
 - 每个任务使用独立 Git worktree，运行配置的验证命令，限制返工次数，并归档包含执行、测试、审核和 Git 证据的报告。成功任务的分支保留在源代码仓库中；Zero 不会自动合并或推送分支。
 - 有序 `executionStages` 已通过核心、HTTP API 和 CLI 的 `--stages-file` 选项实现，会在同一个任务 worktree 中串行执行。每个阶段会记录关联尝试、工作树指纹，以及由 Zero 实测事实构成的版本化交接单；报告收录这些阶段记录。
-- 对已验证的模型使用额度限制提供 `waiting` 状态、持久检查点和定时重试。额度恢复已通过 mock 测试，包括服务重启后的恢复；尚未观察到真实提供方额度限制事件。普通崩溃恢复尚未实现：中断的尝试会暂停供检查，不会自动续跑。
+- 对已验证的模型使用额度限制提供 `waiting` 状态、持久检查点和定时重试。额度恢复已通过 mock 测试，包括服务重启后的恢复；尚未观察到真实提供方额度限制事件。普通崩溃发生时，Zero 会定期将租约过期的活动任务转为 `recovery_required`，保存租约及被中断尝试/阶段的证据。租约过期不能证明旧进程已停止，因此不会自动重试；请先检查 worker 进程和任务 worktree，再决定如何继续。
+- 崩溃恢复的当前边界和后续设计见[崩溃恢复设计](docs/crash-recovery-design.md)。
 - 原生 Windows 进程 guardian 已在 CI 中通过构建和进程包含测试；目标机器部署及启动测试仍未验证。详见 [Windows 部署](docs/windows-deployment.md)。
 
 ## 尚属设计或待验证的目标

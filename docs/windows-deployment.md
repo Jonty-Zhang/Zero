@@ -26,7 +26,7 @@ node .\dist\cli.js help
 
 安装脚本要求 Node.js 24 或更高版本，并要求 `dist\cli.js` 已构建。`-NodePath` 可显式指定 `node.exe` 的绝对路径；建议使用机器范围安装位置，例如 `C:\Program Files\nodejs\node.exe`。计划任务不依赖交互式终端里的当前目录或 PATH 来启动 Node。任务动作使用 Windows PowerShell 的 `RemoteSigned` 策略，不会覆盖机器策略；本地 `run-zero.ps1` 必须可按本机策略执行。如果从带有 Internet Zone 标记的 ZIP 或浏览器下载目录运行，先审阅文件来源，并按组织签名/解锁流程处理；不要把执行策略改成全局 `Unrestricted` 或 `Bypass`。
 
-`native\windows-guardian\guardian.cpp` 需由可信的 Windows C++ 构建环境编译，并将生成的 `guardian.exe` 放在发布目录中。公开 CI 会保留通过进程树测试的 `zero-windows-guardian` 构建产物；安装时用 `-GuardianPath` 指向其绝对路径。脚本仅检查路径、`.exe` 扩展名和 PE 文件头，**不验证代码签名或构建来源**。示例发布位置为 `C:\Program Files\Zero\native\windows-guardian\guardian.exe`。
+`native\windows-guardian\guardian.cpp` 需由可信的 Windows C++ 构建环境编译，并将生成的 `guardian.exe` 放在发布目录中。公开 CI 会保留通过进程树测试的 `zero-windows-guardian` 构建产物，并使用该构建产物运行安装脚本的非安装 dry-run 断言；测试不会注册计划任务。安装时用 `-GuardianPath` 指向其绝对路径。脚本仅检查路径、`.exe` 扩展名和 PE 文件头，**不验证代码签名或构建来源**。示例发布位置为 `C:\Program Files\Zero\native\windows-guardian\guardian.exe`。
 
 先执行 dry run 查看路径，不会注册任务或写系统配置：
 

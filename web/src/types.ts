@@ -1,4 +1,4 @@
-export type Status = 'pending' | 'running' | 'reviewing' | 'revision' | 'waiting' | 'done' | 'failed';
+export type Status = 'pending' | 'running' | 'reviewing' | 'revision' | 'waiting' | 'recovery_required' | 'done' | 'failed';
 export type Choice = { id: string; label: string };
 export type HarnessHealth = { id: string; name: string; available: boolean; reason?: string | null };
 export type Binding = {
@@ -47,6 +47,8 @@ export type Task = {
   createdAt?: string;
   updatedAt?: string;
   retryAt?: string;
+  recoveryReason?: string;
+  recoveryEvidence?: Record<string, unknown>;
   route?: RouteInfo;
   attempts?: Attempt[];
   tests?: TestResult[];

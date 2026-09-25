@@ -6,6 +6,7 @@ export type TaskStatus =
   | "reviewing"
   | "revision"
   | "waiting"
+  | "recovery_required"
   | "done"
   | "failed";
 
@@ -70,6 +71,10 @@ export interface TaskRecord extends TaskSubmission {
   leaseExpiresAt?: string;
   heartbeatAt?: string;
   failureReason?: string;
+  /** Why automatic execution stopped after an expired lease. */
+  recoveryReason?: string;
+  /** Snapshot of the expired lease and interrupted work, retained for inspection. */
+  recoveryEvidence?: Record<string, unknown>;
   route?: RouteDecision;
   activeAttemptId?: string;
   retryAt?: string;

@@ -154,7 +154,8 @@ test("expired task lease interrupts linked attempts and stages in the same recov
 
     expireLease(store, task.id, "expired-worker");
     assert.deepEqual(store.recoverExpired(new Date()), [task.id]);
-    assert.equal(store.get(task.id)?.status, "pending");
+    assert.equal(store.get(task.id)?.status, "recovery_required");
+    assert.equal(store.get(task.id)?.recoveryEvidence?.activeAttemptId, attempt.id);
     assert.equal(store.attempts(task.id)[0]?.status, "interrupted");
     assert.equal(store.stages(task.id)[0]?.status, "interrupted");
     assert.match(store.stages(task.id)[0]?.error ?? "", /inspect process and worktree/);

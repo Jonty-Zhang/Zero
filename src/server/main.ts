@@ -91,7 +91,7 @@ export async function startZeroServer(options: { host?: string; port?: number } 
     activePromise = worker.runNext().catch(error => console.error('[zero] worker error:', error instanceof Error ? error.message : error)).then(() => undefined).finally(() => { busy = false; activePromise = undefined; });
   };
   const recovery = store.recoverExpired();
-  if (recovery.length) console.warn(`[zero] Recovered ${recovery.length} expired task lease(s); interrupted work will fail closed pending inspection.`);
+  if (recovery.length) console.warn(`[zero] Moved ${recovery.length} expired task lease(s) to recovery_required for inspection.`);
   const timer = setInterval(kick, 1000); timer.unref();
   server.on('error', error => console.error('[zero] HTTP server error:', error));
   await new Promise<void>((resolveStart, reject) => {

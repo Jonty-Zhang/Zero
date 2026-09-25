@@ -348,7 +348,8 @@ function mapTaskList(task: TaskRecord) {
   return { id: task.id, title: task.prompt.split(/\r?\n/, 1)[0]?.slice(0, 100), status: task.status,
     repoPath: task.repoPath, baseRef: task.baseRef, createdAt: task.createdAt, updatedAt: task.updatedAt,
     maxRevisions: task.maxRevisions, route: route ? mapRoute(route as unknown as Record<string, unknown>) : undefined,
-    retryAt: task.status === 'waiting' ? task.retryAt : undefined, error: task.failureReason };
+    retryAt: task.status === 'waiting' ? task.retryAt : undefined, error: task.failureReason,
+    recoveryReason: task.recoveryReason, recoveryEvidence: task.recoveryEvidence };
 }
 function mapRoute(route: Record<string, unknown> | RouteDecision) { const value = route as Record<string, unknown>; return { harnessId: value.harness, modelId: value.model, reasoningEffort: value.effectiveReasoningEffort ?? value.reasoningEffort, selectionSource: value.selectionSource, reason: value.reason }; }
 function mapAttempt(value: Attempt) {

@@ -8,12 +8,13 @@ Zero is an application made of one Node.js service, a local React web UI, and a 
 
 ## What works today
 
-- A SQLite-backed task queue and local HTTP API, with `pending`, `running`, `reviewing`, `revision`, `waiting`, `done`, and `failed` task states.
+- A SQLite-backed task queue and local HTTP API, with `pending`, `running`, `reviewing`, `revision`, `waiting`, `recovery_required`, `done`, and `failed` task states.
 - Codex-based task allocation and a separate read-only Codex review. You can pin any subset of the execution Harness, model, and reasoning effort; Codex fills only fields you leave unset, from bindings Zero has verified.
 - Codex, DeepSeek Harness (DSH), and ZCode adapters. An adapter being present does not make a Harness/model pair eligible: Zero requires a locally verified binding. DSH and isolated ZCode CLI bindings use Zero-owned profiles. The existing-desktop ZCode `app-server` adapter and `verify-binding zcode-desktop` path are mock-tested; live enrollment has not succeeded, so this route is not verified or available for routing. See [server setup](src/server/README.md) for the verification boundary.
 - A task-specific Git worktree, configured validation commands, bounded revision attempts, and an archived report with execution, test, review, and Git evidence. Successful task branches remain in the source repository; Zero does not automatically merge or push them.
 - Ordered `executionStages` run serially in one task worktree through the core, HTTP API, and CLI `--stages-file` option. Each stage records a linked attempt, worktree fingerprint, and versioned handoff based on facts Zero observed. Reports include this stage history.
-- A `waiting` state for verified provider usage limits, with a persisted checkpoint and scheduled retry. Quota resume is mock-tested, including across service restart; a real provider quota event has not been observed. Ordinary crash recovery is not implemented: interrupted attempts fail closed for inspection rather than resuming automatically.
+- A `waiting` state for verified provider usage limits, with a persisted checkpoint and scheduled retry. Quota resume is mock-tested, including across service restart; a real provider quota event has not been observed. For ordinary crashes, Zero periodically moves expired active leases to `recovery_required`, records lease and interrupted attempt/stage evidence, and does not automatically retry because expiry does not prove the old process stopped. Inspect the worker process and task worktree before deciding how to continue.
+- The crash recovery boundary and follow-on design are documented in [the crash recovery design](docs/crash-recovery-design.md).
 - A native Windows process guardian with passing CI build and process-containment tests. Deployment to the target machine and a boot test remain unverified; see [Windows deployment](docs/windows-deployment.md).
 
 ## What is still a design or validation target

@@ -24,6 +24,7 @@ type TaskRow = {
   lease_expires_at: string | null; heartbeat_at: string | null;
   failure_reason: string | null; active_attempt_id: string | null;
   retry_at?: string | null;
+  recovery_reason?: string | null; recovery_evidence?: string | null;
 };
 type StageRow = Record<string, unknown>;
 type HandoffRow = { id: string; task_id: string; stage_id: string; attempt_id: string; schema_version: number; created_at: string; payload: string; payload_bytes: number };
@@ -44,7 +45,8 @@ export class TaskStore {
         id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         payload TEXT NOT NULL, revision_count INTEGER NOT NULL DEFAULT 0,
         lease_owner TEXT, lease_expires_at TEXT, heartbeat_at TEXT,
-        failure_reason TEXT, active_attempt_id TEXT
+        failure_reason TEXT, active_attempt_id TEXT,
+        recovery_reason TEXT, recovery_evidence TEXT
       );
       CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status, created_at);
       CREATE TABLE IF NOT EXISTS events (
@@ -104,6 +106,9 @@ export class TaskStore {
     if (!stageColumns.some(column => column.name === "error")) {
       this.#db.exec("ALTER TABLE stages ADD COLUMN error TEXT");
     }
+    const taskColumns = this.#db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    if (!taskColumns.some(column => column.name === "recovery_reason")) this.#db.exec("ALTER TABLE tasks ADD COLUMN recovery_reason TEXT");
+    if (!taskColumns.some(column => column.name === "recovery_evidence")) this.#db.exec("ALTER TABLE tasks ADD COLUMN recovery_evidence TEXT");
     this.#db.exec("CREATE INDEX IF NOT EXISTS attempts_stage_sequence ON attempts(stage_id, sequence)");
   }
 
@@ -189,6 +194,7 @@ export class TaskStore {
       running: ["reviewing", "revision", "failed"],
       reviewing: ["done", "revision", "failed"],
       revision: ["running", "failed"],
+      recovery_required: [],
       done: [], failed: [],
     };
     if (expectedList.some(source => !allowed[source].includes(next))) {
@@ -257,26 +263,35 @@ export class TaskStore {
     });
   }
 
-  /** Expired leases are returned to pending; the orchestrator must inspect old processes and worktrees before retrying. */
+  /** Expired leases fail closed for manual inspection; lease expiry does not prove the old process stopped. */
   recoverExpired(now = new Date()): string[] {
     const at = now.toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const rows = this.#db.prepare(`SELECT id, active_attempt_id FROM tasks
-        WHERE status IN ('running','reviewing','revision') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`).all(at) as { id: string; active_attempt_id: string | null }[];
+      const rows = this.#db.prepare(`SELECT id,status,lease_owner,lease_expires_at,heartbeat_at,active_attempt_id FROM tasks
+        WHERE status IN ('running','reviewing','revision') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`).all(at) as Array<{
+          id: string; status: TaskStatus; lease_owner: string | null; lease_expires_at: string; heartbeat_at: string | null; active_attempt_id: string | null;
+        }>;
       for (const row of rows) {
-        this.#db.prepare(`UPDATE tasks SET status='pending', updated_at=?, lease_owner=NULL, lease_expires_at=NULL,
-          heartbeat_at=NULL, active_attempt_id=NULL WHERE id=?`).run(at, row.id);
-        if (row.active_attempt_id) this.#db.prepare("UPDATE attempts SET status='interrupted', finished_at=?, error=COALESCE(error,'lease expired') WHERE id=? AND status='running'").run(at, row.active_attempt_id);
+        const runningAttempts = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? AND status='running'").all(row.id) as Array<{ id: string }>;
         const runningStages = this.#db.prepare("SELECT id,process_start_id FROM stages WHERE task_id=? AND status='running'").all(row.id) as Array<{ id: string; process_start_id: string }>;
-        this.#db.prepare("UPDATE attempts SET status='interrupted',finished_at=?,error=COALESCE(error,'task lease expired') WHERE task_id=? AND stage_id IN (SELECT id FROM stages WHERE task_id=? AND status='running') AND status='running'")
-          .run(at, row.id, row.id);
+        const reason = "Task lease expired while execution was active; inspect the worker process and task worktree before any retry.";
+        const evidence = { previousStatus: row.status, leaseOwner: row.lease_owner, leaseExpiresAt: row.lease_expires_at,
+          heartbeatAt: row.heartbeat_at, activeAttemptId: row.active_attempt_id,
+          runningAttemptIds: runningAttempts.map(attempt => attempt.id),
+          runningStages: runningStages.map(stage => ({ id: stage.id, processStartId: stage.process_start_id })) };
+        this.#db.prepare(`UPDATE tasks SET status='recovery_required', updated_at=?, lease_owner=NULL, lease_expires_at=NULL,
+          heartbeat_at=NULL, active_attempt_id=NULL, recovery_reason=?, recovery_evidence=? WHERE id=?`)
+          .run(at, reason, JSON.stringify(evidence), row.id);
+        this.#db.prepare("UPDATE attempts SET status='interrupted',finished_at=?,error=COALESCE(error,'task lease expired') WHERE task_id=? AND status='running'")
+          .run(at, row.id);
         for (const stage of runningStages) {
           const reason = "task lease expired; inspect process and worktree before resuming";
           this.#db.prepare("UPDATE stages SET status='interrupted',finished_at=?,error=? WHERE id=? AND status='running'").run(at, reason, stage.id);
           this.#event(row.id, "stage.finished", { stageId: stage.id, status: "interrupted", processStartId: stage.process_start_id, error: reason }, at);
         }
-        this.#event(row.id, "task.lease_expired", { previousAttemptId: row.active_attempt_id }, at);
+        this.#event(row.id, "task.lease_expired", { previousStatus: row.status, previousAttemptId: row.active_attempt_id, reason, evidence }, at);
+        this.#event(row.id, "task.recovery_required", { reason, evidence }, at);
       }
       this.#db.exec("COMMIT");
       return rows.map(row => row.id);
@@ -581,6 +596,8 @@ export class TaskStore {
       updatedAt: row.updated_at, revisionCount: row.revision_count, leaseOwner: row.lease_owner ?? undefined,
       leaseExpiresAt: row.lease_expires_at ?? undefined, heartbeatAt: row.heartbeat_at ?? undefined,
       failureReason: row.failure_reason ?? undefined, activeAttemptId: row.active_attempt_id ?? undefined,
+      recoveryReason: row.recovery_reason ?? undefined,
+      recoveryEvidence: row.recovery_evidence ? JSON.parse(row.recovery_evidence) as Record<string, unknown> : undefined,
       ...(quota ? { retryAt: quota.retry_at, resumeCheckpoint: JSON.parse(quota.checkpoint) as Record<string, unknown>, quotaRetryCount: quota.retry_count,
         ...(typeof (JSON.parse(quota.checkpoint) as Record<string, unknown>).stage === "string" ? { resumeStage: (JSON.parse(quota.checkpoint) as Record<string, unknown>).stage as TaskRecord["resumeStage"] } : {}) } : {}),
       route: this.getRoute(row.id) };

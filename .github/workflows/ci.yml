@@ -50,6 +50,9 @@ jobs:
       - name: Test guardian process containment
         shell: pwsh
         run: .\guardian_tests.exe (Resolve-Path .\guardian.exe).Path
+      - name: Test Windows task installer dry run
+        shell: pwsh
+        run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\tests\install-windows-task-tests.ps1 -GuardianPath (Resolve-Path .\guardian.exe).Path
       - name: Retain tested guardian executable
         uses: actions/upload-artifact@v4
         with:

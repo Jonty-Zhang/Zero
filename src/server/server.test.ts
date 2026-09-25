@@ -161,6 +161,22 @@ test('POST /api/tasks maps repository, checks, and manually locked route fields'
   } finally { await f.close(); }
 });
 
+test('GET /api/tasks exposes recovery_required status and saved evidence', async () => {
+  const f = await createFixture();
+  try {
+    const task = f.store.submit({ repoPath: f.repoPath, baseRef: 'main', prompt: 'Inspect this interrupted task.' }, 'api_recovery_required');
+    f.store.claimNext('expired-api-worker', 1, new Date(Date.now() - 10_000));
+    f.store.recoverExpired();
+    const response = await fetch(`${f.url}/api/tasks`);
+    assert.equal(response.status, 200);
+    const tasks = await response.json() as Array<{ id: string; status: string; recoveryReason?: string; recoveryEvidence?: Record<string, unknown> }>;
+    const recovered = tasks.find(item => item.id === task.id);
+    assert.equal(recovered?.status, 'recovery_required');
+    assert.match(recovered?.recoveryReason ?? '', /lease expired/);
+    assert.equal(recovered?.recoveryEvidence?.leaseOwner, 'expired-api-worker');
+  } finally { await f.close(); }
+});
+
 test('POST /api/tasks rejects an incompatible Harness and model pair with 400', async () => {
   const f = await createFixture();
   try {

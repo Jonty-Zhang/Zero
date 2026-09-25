@@ -366,7 +366,7 @@ test("worker rechecks changed paths after test commands and rejects test-created
   }
 });
 
-test("worker refuses to reuse an existing worktree after lease recovery", async () => {
+test("periodic worker scan quarantines expired task with existing worktree before any claim", async () => {
   const root = await mkdtemp(join(process.cwd(), ".zero-worker-test-"));
   const repo = join(root, "repo");
   const store = new TaskStore();
@@ -383,8 +383,6 @@ test("worker refuses to reuse an existing worktree after lease recovery", async 
     store.claimNext(owner, 1000, new Date("2026-01-01T00:00:00Z"));
     const worktrees = new GitWorktreeManager(join(root, "worktrees"));
     await worktrees.create(task.id, repo, "main");
-    store.recoverExpired(new Date("2026-01-01T00:00:02Z"));
-    store.claimNext("new-worker");
     let routed = false;
     const worker = new TaskWorker({
       store, worktrees, testRunner: new TestRunner(),
@@ -392,9 +390,11 @@ test("worker refuses to reuse an existing worktree after lease recovery", async 
       reviewer: { async review() { throw new Error("must not review"); } },
       adapters: new Map([["fake", new FakeAdapter()]]), artifactRoot: join(root, "artifacts"),
     });
-    const recovered = await worker.runClaimed(task.id, "new-worker");
-    assert.equal(recovered.status, "failed");
-    assert.match(recovered.failureReason ?? "", /existing task worktree requires recovery inspection/);
+    const recovered = await worker.runNext("new-worker");
+    assert.equal(recovered, undefined);
+    assert.equal(store.get(task.id)?.status, "recovery_required");
+    assert.ok(store.get(task.id)?.recoveryEvidence);
+    assert.equal(store.claimNext("another-worker"), undefined);
     assert.equal(routed, false);
   } finally {
     store.close();

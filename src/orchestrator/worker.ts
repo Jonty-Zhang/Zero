@@ -107,6 +107,9 @@ export class TaskWorker {
   }
 
   async runNext(owner = `worker-${randomUUID()}`): Promise<TaskRecord | undefined> {
+    // Lease expiry is not proof that a prior child process stopped. Quarantine
+    // expired active work before considering any new claim.
+    this.#options.store.recoverExpired();
     const task = this.#options.store.claimNext(owner, this.#options.leaseMs);
     if (!task) return undefined;
     return this.runClaimed(task.id, owner);

@@ -4,8 +4,9 @@ import { TaskStore } from "./task-store.js";
 import type { TaskSubmission } from "../domain/types.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
-test("task queue claims once and recovers an expired lease with an interrupted attempt", () => {
+test("expired active lease requires inspection and retains interrupted attempt evidence", () => {
   const store = new TaskStore();
   try {
     const task = store.submit({ repoPath: "C:/repo", baseRef: "main", prompt: "make a change" }, "queue_test");
@@ -16,12 +17,60 @@ test("task queue claims once and recovers an expired lease with an interrupted a
     assert.equal(store.claimNext("worker-b", 1000, now), undefined);
     const attempt = store.createAttempt(task.id, "implement", { owner: "worker-a" });
     assert.deepEqual(store.recoverExpired(new Date("2026-01-01T00:00:02.000Z")), [task.id]);
-    assert.equal(store.get(task.id)?.status, "pending");
+    assert.equal(store.get(task.id)?.status, "recovery_required");
     assert.equal(store.attempts(task.id)[0]?.status, "interrupted");
     assert.equal(store.get(task.id)?.activeAttemptId, undefined);
     assert.ok(store.events(task.id).some(e => e.type === "task.lease_expired"));
+    assert.equal(store.get(task.id)?.recoveryEvidence?.activeAttemptId, attempt.id);
+    assert.match(store.get(task.id)?.recoveryReason ?? "", /lease expired/);
+    assert.equal(store.claimNext("worker-c"), undefined);
     assert.equal(attempt.id, store.attempts(task.id)[0]?.id);
   } finally { store.close(); }
+});
+
+test("restart before lease expiry preserves active work and later scan quarantines it", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-recovery-store-"));
+  const path = join(root, "tasks.sqlite");
+  let store = new TaskStore(path);
+  const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "active task" }, "restart_before_expiry");
+  const claimedAt = new Date("2026-01-01T00:00:00.000Z");
+  store.claimNext("old-worker", 60_000, claimedAt);
+  store.close();
+  try {
+    store = new TaskStore(path);
+    assert.deepEqual(store.recoverExpired(new Date("2026-01-01T00:00:30.000Z")), []);
+    assert.equal(store.get(task.id)?.status, "running");
+    assert.deepEqual(store.recoverExpired(new Date("2026-01-01T00:01:01.000Z")), [task.id]);
+    assert.equal(store.get(task.id)?.status, "recovery_required");
+    assert.equal(store.claimNext("new-worker"), undefined);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("additive recovery migration preserves existing SQLite task rows", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-recovery-migration-"));
+  const path = join(root, "legacy.sqlite");
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE tasks (
+    id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    payload TEXT NOT NULL, revision_count INTEGER NOT NULL DEFAULT 0, lease_owner TEXT,
+    lease_expires_at TEXT, heartbeat_at TEXT, failure_reason TEXT, active_attempt_id TEXT
+  )`);
+  legacy.prepare("INSERT INTO tasks(id,status,created_at,updated_at,payload) VALUES(?,?,?,?,?)")
+    .run("legacy_task", "pending", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", JSON.stringify({ repoPath: ".", baseRef: "main", prompt: "preserve me" }));
+  legacy.close();
+  const store = new TaskStore(path);
+  try {
+    const existing = store.get("legacy_task");
+    assert.equal(existing?.status, "pending");
+    assert.equal(existing?.prompt, "preserve me");
+    assert.equal(existing?.recoveryReason, undefined);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("task transitions reject illegal shortcuts and record only committed state changes", () => {
