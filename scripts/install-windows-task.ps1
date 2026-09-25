@@ -59,6 +59,11 @@ function Resolve-GuardianPath([string]$Path) {
     return $fullPath
 }
 
+function Resolve-TaskAccount([string]$RequestedAccount) {
+    if ($RequestedAccount) { return $RequestedAccount }
+    return [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+}
+
 function Stop-TaskIfRunning($Task) {
     if ($Task.State -ne 'Running') { return }
     Stop-ScheduledTask -InputObject $Task
@@ -125,6 +130,8 @@ if (-not $Install -and -not $Uninstall) {
     return
 }
 
+if ($Install) { $Account = Resolve-TaskAccount $Account }
+
 if (-not $TaskName.Trim() -or $TaskName.Length -gt 128) { throw 'TaskName must contain 1 to 128 characters.' }
 
 if ($Uninstall) {
@@ -141,7 +148,6 @@ if ($Uninstall) {
     return
 }
 
-if (-not $Account) { throw '-Account is required for installation. Use the standard Windows account that owns the Codex login.' }
 $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existingTask) { throw "Scheduled task '$TaskName' already exists. Review and remove it with -Uninstall before installing again." }
 

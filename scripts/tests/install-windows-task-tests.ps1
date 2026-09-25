@@ -55,6 +55,15 @@ try {
     Assert-True ($dryRunOutput -ccontains $expectedDataLine) 'Dry-run did not preserve DataDir casing in its display.'
     Assert-True (($dryRunOutput -join "`n") -match 'Guardian lock ID: SHA-256 \(64 hex characters; data path is not passed to guardian\)') 'Dry-run did not report the fixed SHA-256 lock ID length.'
     Assert-Equal ([string]$script:registerScheduledTaskCalls) '0' 'Dry-run registered a scheduled task.'
+    $currentAccount = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    Assert-Equal (Resolve-TaskAccount $null) $currentAccount 'Task account default must use the current Windows identity.'
+    $explicitAccount = 'EXAMPLE\provided-user'
+    Assert-Equal (Resolve-TaskAccount $explicitAccount) $explicitAccount 'An explicitly configured task account must be preserved.'
+    $installerSource = Get-Content -LiteralPath $script:InstallerPath -Raw
+    Assert-True ($installerSource -match 'if \(\$Install\) \{ \$Account = Resolve-TaskAccount \$Account \}') 'Install flow must resolve the account before registration.'
+    $nsiSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'installer\zero.nsi') -Raw
+    Assert-True ($nsiSource -match 'CreateShortcut "\$SMPROGRAMS\\Zero\\Configure Zero Background Service\.lnk"[\s\S]*?-Install -InstallDir') 'NSIS registration shortcut must call install without constructing an account name.'
+    Assert-True ($nsiSource -notmatch 'Configure Zero Background Service[\s\S]{0,500}-Account') 'NSIS shortcut must not pass an account parameter.'
 
     # Exercise the exact helper functions used by the installer without printing the ID.
     $canonicalPath = Get-CanonicalDataDir $dataDir

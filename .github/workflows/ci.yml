@@ -88,3 +88,35 @@ jobs:
           name: zero-windows-release-stage-unsigned
           path: release-stage/
           if-no-files-found: error
+      - name: Install pinned NSIS compiler
+        shell: pwsh
+        run: |
+          $nsisVersion = '3.10'
+          $nsisSha256 = '4313d352e0dafd1f22b6517126a655cae3b444fa758d2845eddfbe72f24f7bdd'
+          $nsisSetup = Join-Path $env:RUNNER_TEMP "nsis-$nsisVersion-setup.exe"
+          $nsisRoot = Join-Path $env:RUNNER_TEMP "nsis-$nsisVersion"
+          Invoke-WebRequest -Uri "https://downloads.sourceforge.net/project/nsis/NSIS%203/$nsisVersion/nsis-$nsisVersion-setup.exe" -OutFile $nsisSetup
+          $actualHash = (Get-FileHash -LiteralPath $nsisSetup -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $nsisSha256) { throw "NSIS SHA-256 mismatch: $actualHash" }
+          & $nsisSetup /S "/D=$nsisRoot"
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS setup extraction failed.' }
+          $makensis = Join-Path $nsisRoot 'makensis.exe'
+          if (-not (Test-Path -LiteralPath $makensis -PathType Leaf)) { throw 'Pinned NSIS compiler was not extracted.' }
+          "MAKENSIS=$makensis" >> $env:GITHUB_ENV
+      - name: Build verified unsigned Windows installer
+        shell: pwsh
+        run: |
+          $nodeExe = (Get-Command node -ErrorAction Stop).Source
+          $installer = Join-Path (Get-Location) 'installer-output\Zero-Setup-unsigned.exe'
+          .\scripts\package-windows-installer.ps1 -StageDir (Join-Path (Get-Location) 'release-stage') -MakensisPath $env:MAKENSIS -OutputFile $installer -NodePath $nodeExe -ProductVersion '0.1.0'
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer packaging failed.' }
+          "ZERO_INSTALLER=$installer" >> $env:GITHUB_ENV
+      - name: Smoke test Windows installer and uninstaller
+        shell: pwsh
+        run: .\scripts\tests\windows-installer-smoke.ps1 -InstallerPath $env:ZERO_INSTALLER
+      - name: Retain unsigned Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: zero-windows-installer-unsigned
+          path: installer-output/Zero-Setup-unsigned.exe
+          if-no-files-found: error
