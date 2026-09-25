@@ -1,6 +1,6 @@
 # Zero Windows 单应用安装包
 
-状态：第一版按用户 NSIS 安装器已加入 CI 构建与 smoke 测试，尚待首轮 Windows CI 实际执行验证。发布产物未签名；真实目标电脑验收、自动更新事务和签名发布仍未完成。
+状态：第一版按用户 NSIS 安装器已在 [Windows CI](https://github.com/Jonty-Zhang/Zero/actions/runs/36148528629) 构建，并通过安装/卸载 smoke 测试。发布产物未签名；真实目标电脑验收、自动更新事务和签名发布仍未完成。
 
 ## 安装器行为
 
@@ -31,4 +31,4 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\package-
   -ProductVersion '0.1.0'
 ```
 
-只有 CI 中的实际 NSIS 编译和 smoke 测试通过后，安装器产物才算通过本轮构建验证。它们不证明目标电脑的计划任务密码、代理、Harness 登录或真实任务执行已经配置。
+[本轮 CI](https://github.com/Jonty-Zhang/Zero/actions/runs/36148528629) 的 NSIS 编译、安装与卸载 smoke 测试已通过。它们不证明目标电脑的计划任务密码、代理、Harness 登录或真实任务执行已经配置。

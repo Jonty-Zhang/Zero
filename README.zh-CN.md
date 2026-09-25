@@ -17,7 +17,7 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 - 崩溃恢复的当前边界和后续设计见[崩溃恢复设计](docs/crash-recovery-design.md)。
 - 创建 worktree 前会持久记录目标仓库、分支、路径和基点；`git worktree add` 成功后再记录实测身份与指纹。创建结果不确定时保留这些证据并等待检查。
 - 原生 Windows 进程 guardian 已在 CI 中通过构建和进程包含测试；目标机器部署及启动测试仍未验证。详见 [Windows 部署](docs/windows-deployment.md)。
-- Windows 发布目录脚本可打包已构建的服务、界面、CLI、显式指定的 Node 运行时与 guardian，并生成文件哈希清单。独立校验器在 CI 中核对所有文件并启动包内 CLI。[单应用交付方案](docs/windows-app-packaging.md)采用 NSIS 安装包；版本钉住、安装包与目标机器验收尚未完成。
+- Windows 发布目录脚本可打包已构建的服务、界面、CLI、显式指定的 Node 运行时与 guardian，并生成文件哈希清单。独立校验器在 CI 中核对所有文件并启动包内 CLI。未签名 NSIS 安装包已在 GitHub Windows runner 上通过安装/卸载冒烟测试，详见 [Windows 单应用安装包](docs/windows-app-packaging.md)；目标电脑上的安装和无人值守运行仍未验收。
 
 ## 尚属设计或待验证的目标
 

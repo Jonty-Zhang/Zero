@@ -17,7 +17,7 @@ Zero is an application made of one Node.js service, a local React web UI, and a 
 - The crash recovery boundary and follow-on design are documented in [the crash recovery design](docs/crash-recovery-design.md).
 - Worktree creation records its planned repository, branch, path, and base commit before `git worktree add`, then saves observed identity and fingerprint. An ambiguous creation failure keeps that evidence for inspection.
 - A native Windows process guardian with passing CI build and process-containment tests. Deployment to the target machine and a boot test remain unverified; see [Windows deployment](docs/windows-deployment.md).
-- A Windows release staging script bundles the built runtime, UI, CLI, explicitly supplied Node executable, and tested guardian with a file-hash manifest. An independent verifier checks every file and starts the bundled CLI in CI. The [single-app packaging plan](docs/windows-app-packaging.md) targets one NSIS installer; version pinning, an installer, and target-machine acceptance remain unfinished.
+- A Windows release staging script bundles the built runtime, UI, CLI, explicitly supplied Node executable, and tested guardian with a file-hash manifest. An independent verifier checks every file and starts the bundled CLI in CI. An unsigned NSIS installer is built and passes install/uninstall smoke tests on GitHub's Windows runner; see [Windows app packaging](docs/windows-app-packaging.md). Installation and unattended operation on the target machine remain unverified.
 
 ## What is still a design or validation target
 
