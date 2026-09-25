@@ -54,6 +54,28 @@ function Invoke-BoundedProcess([string]$FilePath, [string[]]$ArgumentList, [stri
     finally { $process.Dispose() }
 }
 
+function Wait-ForUninstallState([int]$TimeoutSeconds = 60) {
+    $shortcuts = @(
+        (Join-Path $startMenu 'Zero Dashboard.url'),
+        (Join-Path $startMenu 'Configure Zero Background Service.lnk'),
+        (Join-Path $startMenu 'Uninstall Zero.lnk')
+    )
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        $state = [pscustomobject]@{
+            ProgramDirPresent = Test-Path -LiteralPath $programDir
+            InstallerMarkerPresent = Test-Path -LiteralPath $registryKey
+            UninstallMarkerPresent = Test-Path -LiteralPath $uninstallKey
+            ShortcutsPresent = @($shortcuts | Where-Object { Test-Path -LiteralPath $_ }).Count
+        }
+        if (-not $state.ProgramDirPresent -and -not $state.InstallerMarkerPresent -and
+            -not $state.UninstallMarkerPresent -and $state.ShortcutsPresent -eq 0) { return }
+        if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { break }
+        Start-Sleep -Seconds 1
+    } while ($true)
+    throw "Uninstall state timed out after $TimeoutSeconds seconds; programDirPresent=$($state.ProgramDirPresent), installerMarkerPresent=$($state.InstallerMarkerPresent), uninstallMarkerPresent=$($state.UninstallMarkerPresent), shortcutsRemaining=$($state.ShortcutsPresent)."
+}
+
 try {
     if ((Test-Path -LiteralPath $programDir) -or (Test-Path -LiteralPath $registryKey) -or
         (Test-Path -LiteralPath $uninstallKey) -or (Test-Path -LiteralPath $startMenu) -or
@@ -85,15 +107,11 @@ try {
 
     $uninstaller = Join-Path $programDir 'uninstall.exe'
     Invoke-BoundedProcess -FilePath $uninstaller -ArgumentList @('/S') -Phase 'uninstall'
-    if (Test-Path -LiteralPath $programDir) { throw 'Uninstaller left program files behind.' }
-    if ((Test-Path -LiteralPath $registryKey) -or (Test-Path -LiteralPath $uninstallKey)) {
-        throw 'Uninstaller left install registry markers behind.'
-    }
+    # NSIS normally starts a temporary copy of the uninstaller and returns from
+    # the original process first. Judge completion from installed state instead.
+    Wait-ForUninstallState -TimeoutSeconds 60
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
         throw 'Uninstaller deleted runtime data; expected it to be retained.'
-    }
-    if (Test-Path -LiteralPath (Join-Path $startMenu 'Configure Zero Background Service.lnk')) {
-        throw 'Uninstaller left a Start Menu shortcut behind.'
     }
     Write-Output 'Windows installer smoke test passed: install, shortcuts, no implicit task, uninstall, and data retention.'
 }
