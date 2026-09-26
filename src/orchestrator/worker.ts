@@ -17,7 +17,14 @@ import type {
 } from "../domain/types.js";
 import { GitWorktreeManager, type WorktreeCreationEvidence, type WorktreeCreationPlan, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
-import type { CheckRunSnapshot, ReviewPackageRecord } from "../core/task-store.js";
+import type {
+  CheckRunSnapshot,
+  ReviewPackageRecord,
+  ReviewReworkClaimRecord,
+  ReviewReworkContinuationRecord,
+  ReviewReworkGitInspection,
+  ReviewReworkQuotaResumeClaimRecord,
+} from "../core/task-store.js";
 import { materializeReportProjection } from "../core/report-projection.js";
 import { inspectReviewRecovery } from "./review-recovery-inspector.js";
 import { TestRunner } from "../core/test-runner.js";
@@ -25,6 +32,21 @@ import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
 import { HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
 
 type ResumeStage = "route" | "execute" | "review";
+interface ReviewReworkRunContext {
+  continuation: ReviewReworkContinuationRecord;
+  worktree: WorktreeInfo;
+  fingerprint: string;
+  claim?: ReviewReworkClaimRecord;
+  quotaResume?: ReviewReworkQuotaResumeClaimRecord;
+  reviewRecoveryProof?: {
+    kind: "review" | "quota";
+    packageId: string;
+    owner: string;
+    generationId: string;
+    claimId?: string;
+  };
+}
+
 interface WorkerCheckpoint {
   version: 1;
   stage: ResumeStage;
@@ -183,6 +205,39 @@ export class TaskWorker {
         // Transient filesystem or Git I/O leaves the recovery candidate intact.
       }
     }
+    // A persisted changes-requested verdict has a separate rework continuation.
+    // Reopen and inspect the registered checkout before the Store atomically
+    // reclaims it; the ordinary review recovery path must not consume it.
+    for (const candidate of this.#options.store.list("recovery_required")) {
+      const evidence = candidate.recoveryEvidence;
+      if (evidence?.kind !== "lease_expiry" || evidence.claimProtocolVersion !== 2
+        || !["reviewing", "running", "revision"].includes(String(evidence.previousStatus))
+        || !candidate.claimGenerationId || !this.#options.store.currentStartupProvesGenerationDrained(candidate.claimGenerationId)) continue;
+      const latestVerdict = this.#options.store.packageReviewVerdicts(candidate.id).at(-1);
+      if (latestVerdict?.result.verdict !== "changes_requested") continue;
+      try {
+        const creation = this.#options.store.getWorktreeCreation(candidate.id);
+        if (!creation || creation.status !== "created" || !creation.plan || !creation.observed
+          || !await this.#options.worktrees.exists(candidate.id)) continue;
+        const reopened = await this.#options.worktrees.reopenFromEvidence(
+          creation.plan as WorktreeCreationPlan, creation.observed as WorktreeCreationEvidence);
+        const inspection = await this.#inspectReviewReworkGit(candidate, reopened);
+        const claimed = this.#options.store.claimReviewReworkContinuation(candidate.id, owner, {
+          leaseMs: this.#options.leaseMs,
+          identity: inspection.identity,
+          gitState: inspection.gitState,
+        });
+        if (!claimed) continue;
+        const continuation = this.#options.store.getReviewReworkContinuation(candidate.id, claimed.continuationId);
+        if (!continuation || continuation.packageId !== latestVerdict.packageId || continuation.verdictId !== latestVerdict.id) {
+          throw new Error("Review rework claim does not match the exact persisted package verdict");
+        }
+        return this.#runClaimed(candidate.id, owner, { continuation, worktree: reopened.info,
+          fingerprint: inspection.identity.fingerprint, claim: claimed });
+      } catch {
+        // Missing, stale, or ambiguous evidence remains quarantined.
+      }
+    }
     // Review recovery is a separate commit/report state machine. It must never
     // re-enter route, implementation, or validation after a review package was sealed.
     for (const candidate of this.#options.store.list("recovery_required")) {
@@ -203,7 +258,9 @@ export class TaskWorker {
           gitState: inspection.gitState,
         });
         if (!claimed) continue;
-        return this.#resumeReviewRecovery(candidate.id, owner, claimed.id, inspection.info, reviewPackage);
+        return this.#resumeReviewAndContinue(candidate.id, owner, claimed.id, inspection.info, reviewPackage, {
+          kind: "review", packageId: reviewPackage.id, owner, generationId: claimed.claimGenerationId, claimId: claimed.id,
+        });
       } catch {
         // Failed or ambiguous inspection stays quarantined for an operator or later retry.
       }
@@ -232,9 +289,54 @@ export class TaskWorker {
         });
         if (!claimed) continue;
         if (claimed.packageId !== reviewPackage.id) throw new Error("Review quota claim changed its immutable package binding");
-        return this.#resumeReviewRecovery(candidate.id, owner, claimed.reviewRecoveryClaimId, inspection.info, reviewPackage);
+        const claimGenerationId = this.#options.store.get(candidate.id)?.claimGenerationId;
+        if (!claimGenerationId) throw new Error("Review quota claim has no current generation");
+        return this.#resumeReviewAndContinue(candidate.id, owner, claimed.reviewRecoveryClaimId, inspection.info, reviewPackage, {
+          kind: "quota", packageId: reviewPackage.id, owner, generationId: claimGenerationId,
+          ...(claimed.reviewRecoveryClaimId ? { claimId: claimed.reviewRecoveryClaimId } : {}),
+        });
       } catch {
         // Stale, not-yet-due, or ambiguous quota evidence remains waiting for a safe retry.
+      }
+    }
+    // Reviewer-requested revisions have their own quota checkpoint. It remains
+    // excluded from claimNext and is reclaimed only after fresh bound Git proof.
+    const reworkQuotaNow = new Date();
+    for (const candidate of this.#options.store.list("waiting")) {
+      const checkpoint = this.#options.store.quotaCheckpoint(candidate.id);
+      if (checkpoint?.kind !== "rework_quota" || !candidate.retryAt
+        || !Number.isFinite(Date.parse(candidate.retryAt)) || Date.parse(candidate.retryAt) > reworkQuotaNow.getTime()) continue;
+      try {
+        const continuationId = typeof checkpoint.continuationId === "string" ? checkpoint.continuationId : "";
+        const continuation = continuationId
+          ? this.#options.store.getReviewReworkContinuation(candidate.id, continuationId) : undefined;
+        const creation = this.#options.store.getWorktreeCreation(candidate.id);
+        const revisionHighWater = continuation
+          ? this.#options.store.reviewReworkRevisionSteps(candidate.id, continuation.id).at(-1)?.revisionAfter ?? continuation.revisionAfter
+          : undefined;
+        if (!continuation || !creation || creation.status !== "created" || !creation.plan || !creation.observed
+          || !await this.#options.worktrees.exists(candidate.id)) continue;
+        const verdict = this.#options.store.getPackageReviewVerdict(continuation.verdictId);
+        if (!verdict || verdict.packageId !== continuation.packageId || verdict.result.verdict !== "changes_requested"
+          || checkpoint.packageId !== continuation.packageId || checkpoint.verdictId !== continuation.verdictId
+          || checkpoint.revision !== revisionHighWater) continue;
+        const reopened = await this.#options.worktrees.reopenFromEvidence(
+          creation.plan as WorktreeCreationPlan, creation.observed as WorktreeCreationEvidence);
+        const inspection = await this.#inspectReviewReworkGit(candidate, reopened);
+        const claimed = this.#options.store.claimReviewReworkQuotaResume(candidate.id, owner, {
+          leaseMs: this.#options.leaseMs,
+          identity: inspection.identity,
+          gitState: inspection.gitState,
+        });
+        if (!claimed) continue;
+        if (claimed.continuationId !== continuation.id || claimed.packageId !== continuation.packageId
+          || claimed.verdictId !== continuation.verdictId || claimed.revision !== revisionHighWater) {
+          throw new Error("Rework quota claim changed its continuation, package, verdict, or revision binding");
+        }
+        return this.#runClaimed(candidate.id, owner, { continuation, worktree: reopened.info,
+          fingerprint: inspection.identity.fingerprint, quotaResume: claimed });
+      } catch {
+        // Missing, stale, not-yet-due, or ambiguous evidence stays waiting.
       }
     }
     const task = this.#options.store.claimNext(owner, this.#options.leaseMs);
@@ -242,10 +344,141 @@ export class TaskWorker {
     return this.runClaimed(task.id, owner);
   }
 
+  async #inspectReviewReworkGit(task: TaskRecord, reopened: WorktreeCreationEvidence): Promise<{
+    identity: { checkedAt: string; observed: WorktreeCreationEvidence; fingerprint: string };
+    gitState: ReviewReworkGitInspection;
+  }> {
+    const branchBefore = await this.#options.worktrees.readTaskBranchHead(reopened.info);
+    this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(reopened.info));
+    await this.#options.worktrees.prepareReview(reopened.info);
+    const changedPaths = await this.#options.worktrees.changedPaths(reopened.info);
+    this.#assertAllowedPaths(task, changedPaths);
+    const snapshot = await this.#options.worktrees.captureReviewSnapshot(reopened.info);
+    const branchAfter = await this.#options.worktrees.readTaskBranchHead(reopened.info);
+    if (branchBefore.ref !== branchAfter.ref || branchBefore.head !== branchAfter.head) {
+      throw new Error("Task branch moved during fresh review rework Git inspection");
+    }
+    const fingerprint = await this.#options.worktrees.fingerprint(reopened.info);
+    if (fingerprint !== snapshot.fingerprint) throw new Error("Worktree changed during fresh review rework Git inspection");
+    const checkedAt = new Date().toISOString();
+    return {
+      identity: { checkedAt, observed: { ...reopened, fingerprint }, fingerprint },
+      gitState: {
+        checkedAt,
+        branchRef: branchAfter.ref,
+        head: branchAfter.head,
+        snapshot: { baseCommit: reopened.info.baseCommit, preHead: branchAfter.head, ...snapshot },
+        changedPaths,
+        allowedPathsVerified: true,
+      },
+    };
+  }
+
+  async #resumeReviewAndContinue(taskId: string, owner: string, recoveryClaimId: string | undefined,
+    worktree: WorktreeInfo, reviewPackage: ReviewPackageRecord, reviewRecoveryProof: NonNullable<ReviewReworkRunContext["reviewRecoveryProof"]>): Promise<TaskRecord> {
+    const result = await this.#resumeReviewRecovery(taskId, owner, recoveryClaimId, worktree, reviewPackage);
+    if (result.status !== "running" || result.leaseOwner !== owner) return result;
+    const verdict = this.#options.store.packageReviewVerdicts(taskId).at(-1);
+    if (!verdict || verdict.packageId !== reviewPackage.id || verdict.result.verdict !== "changes_requested") return result;
+    const continuation = this.#options.store.getReviewReworkContinuation(taskId);
+    if (!continuation || continuation.verdictId !== verdict.id || continuation.packageId !== reviewPackage.id) {
+      throw new Error("Recovered changes-requested verdict has no exact durable rework continuation");
+    }
+    return this.#runClaimed(taskId, owner, { continuation, worktree,
+      fingerprint: await this.#options.worktrees.fingerprint(worktree), reviewRecoveryProof });
+  }
+
   async runClaimed(taskId: string, owner: string): Promise<TaskRecord> {
+    return this.#runClaimed(taskId, owner);
+  }
+
+  #assertReviewReworkResume(task: TaskRecord, owner: string, resume: ReviewReworkRunContext): void {
+    const continuation = this.#options.store.getReviewReworkContinuation(task.id, resume.continuation.id);
+    const revisionHighWater = continuation
+      ? this.#options.store.reviewReworkRevisionSteps(task.id, continuation.id).at(-1)?.revisionAfter ?? continuation.revisionAfter
+      : undefined;
+    const verdict = this.#options.store.getPackageReviewVerdict(resume.continuation.verdictId);
+    const latestPackage = this.#options.store.reviewPackages(task.id).at(-1);
+    if (task.status !== "running" || task.leaseOwner !== owner || !task.claimGenerationId
+      || !continuation || continuation.packageId !== resume.continuation.packageId
+      || continuation.verdictId !== resume.continuation.verdictId
+      || revisionHighWater !== task.revisionCount
+      || !verdict || verdict.packageId !== continuation.packageId || verdict.result.verdict !== "changes_requested"
+      || latestPackage?.id !== continuation.packageId
+      || this.#options.store.commitOperations(task.id).length > 0 || this.#options.store.reportOperations(task.id).length > 0) {
+      throw new Error("Review rework resume is not bound to the live task, exact changes-requested verdict, and current revision");
+    }
+    if (resume.quotaResume) {
+      const quotaClaim = resume.quotaResume;
+      const resumedEvent = this.#options.store.events(task.id).some(event => {
+        if (event.type !== "task.review_rework_quota_resumed") return false;
+        const payload = event.payload as Record<string, unknown> | undefined;
+        return payload?.continuationId === continuation.id && payload.packageId === continuation.packageId
+          && payload.verdictId === continuation.verdictId && payload.revision === revisionHighWater
+          && payload.owner === owner && payload.generationId === task.claimGenerationId
+          && payload.claimId === quotaClaim.id;
+      });
+      if (quotaClaim.taskId !== task.id || quotaClaim.continuationId !== continuation.id
+        || quotaClaim.packageId !== continuation.packageId || quotaClaim.verdictId !== continuation.verdictId
+        || quotaClaim.revision !== revisionHighWater || quotaClaim.owner !== owner
+        || quotaClaim.claimGenerationId !== task.claimGenerationId || !resumedEvent) {
+        throw new Error("Review rework quota resume has no matching durable Store proof");
+      }
+      if (quotaClaim.id) {
+        const claimEvent = this.#options.store.events(task.id).some(event => {
+          if (event.type !== "task.review_rework_claimed") return false;
+          const payload = event.payload as Partial<ReviewReworkClaimRecord> | undefined;
+          return payload !== undefined && payload.id === quotaClaim.id && payload.continuationId === continuation.id
+            && payload.claimGenerationId === task.claimGenerationId && payload.owner === owner;
+        });
+        if (!claimEvent) throw new Error("Cross-generation rework quota resume has no appended continuation claim");
+      }
+      return;
+    }
+    if (resume.claim) {
+      const claim = resume.claim;
+      const eventMatches = this.#options.store.events(task.id).some(event => {
+        if (event.type !== "task.review_rework_claimed") return false;
+        const payload = event.payload as Partial<ReviewReworkClaimRecord> | undefined;
+        return payload?.id === claim.id && payload.continuationId === continuation.id
+          && payload.claimGenerationId === task.claimGenerationId && payload.owner === owner;
+      });
+      if (claim.taskId !== task.id || claim.continuationId !== continuation.id || claim.owner !== owner
+        || claim.claimGenerationId !== task.claimGenerationId || !eventMatches) {
+        throw new Error("Review rework resume has no matching durable Store claim proof");
+      }
+      return;
+    }
+    const proof = resume.reviewRecoveryProof;
+    if (!proof || proof.packageId !== continuation.packageId || proof.owner !== owner
+      || proof.generationId !== task.claimGenerationId) {
+      throw new Error("Review rework resume has no matching durable review-recovery proof");
+    }
+    if (proof.kind === "review") {
+      const claim = proof.claimId
+        ? this.#options.store.reviewRecoveryClaims(task.id).find(item => item.id === proof.claimId)
+        : undefined;
+      if (!claim || claim.packageId !== continuation.packageId || claim.owner !== owner
+        || claim.claimGenerationId !== task.claimGenerationId) {
+        throw new Error("Review rework resume is not authorized by its persisted review-recovery claim");
+      }
+      return;
+    }
+    const resumedEvent = this.#options.store.events(task.id).some(event => {
+      if (event.type !== "task.review_quota_resumed") return false;
+      const payload = event.payload as Record<string, unknown> | undefined;
+      return payload?.packageId === continuation.packageId && payload.owner === owner
+        && payload.generationId === task.claimGenerationId
+        && (proof.claimId === undefined || payload.reviewRecoveryClaimId === proof.claimId);
+    });
+    if (!resumedEvent) throw new Error("Review rework resume is not authorized by its persisted review-quota claim");
+  }
+
+  async #runClaimed(taskId: string, owner: string, reworkResume?: ReviewReworkRunContext): Promise<TaskRecord> {
     let task = this.#requireTask(taskId);
     if (task.status !== "running" || task.leaseOwner !== owner) throw new Error(`Task ${taskId} is not leased by ${owner}`);
     if (this.#active.has(taskId)) throw new Error(`Task ${taskId} is already active in this worker`);
+    if (reworkResume) this.#assertReviewReworkResume(task, owner, reworkResume);
     const active = { controller: new AbortController(), cancelRequested: false } as { controller: AbortController; adapter?: HarnessAdapter; attempt?: Attempt; cancelRequested: boolean };
     this.#active.set(taskId, active);
     let leaseLost = false;
@@ -275,6 +508,9 @@ export class TaskWorker {
     let executionRecovery = false;
     let firstRecoveredExecution = false;
     let recoveryCheckpoint: Record<string, unknown> | undefined;
+    let reviewReworkContinuationId: string | undefined;
+    let reworkStageId: string | undefined;
+    let reworkFirstWriterRecovery = false;
     const interval = setInterval(() => {
       try {
         if (!this.#options.store.heartbeat(taskId, owner, this.#options.leaseMs)) {
@@ -294,16 +530,72 @@ export class TaskWorker {
       const priorAttempts = this.#options.store.attempts(taskId);
       recoveryCheckpoint = this.#options.store.executionRecoveryCheckpoint(taskId);
       const claimedExecutionRecovery = recoveryCheckpoint !== undefined;
-      const checkpoint = claimedExecutionRecovery ? undefined : parseCheckpoint(task.resumeCheckpoint);
+      const checkpoint = claimedExecutionRecovery || reworkResume ? undefined : parseCheckpoint(task.resumeCheckpoint);
       executionRecovery = claimedExecutionRecovery || checkpoint?.executionRecovery === true;
       firstRecoveredExecution = claimedExecutionRecovery || checkpoint?.firstRecoveredExecution === true;
       this.#assertNotCancelled(active);
       const recoveryQuotaContinuation = checkpoint?.executionRecovery === true
         && this.#options.store.events(taskId).some(event => event.type === "task.execution_recovery_claimed");
-      if (!claimedExecutionRecovery && !recoveryQuotaContinuation && priorAttempts.some(attempt => attempt.status === "interrupted")) {
+      if (!reworkResume && !claimedExecutionRecovery && !recoveryQuotaContinuation && priorAttempts.some(attempt => attempt.status === "interrupted")) {
         throw new Error("An earlier attempt was interrupted; inspect its process, artifacts, and worktree before retrying");
       }
-      if (claimedExecutionRecovery) {
+      if (reworkResume) {
+        const creation = this.#options.store.getWorktreeCreation(taskId);
+        if (!creation || creation.status !== "created" || !creation.plan || !creation.observed
+          || !await this.#options.worktrees.exists(taskId)) {
+          throw new Error("Review rework continuation has no registered task worktree");
+        }
+        const reopened = await this.#options.worktrees.reopenFromEvidence(
+          creation.plan as WorktreeCreationPlan, creation.observed as WorktreeCreationEvidence);
+        if (reopened.fingerprint !== reworkResume.fingerprint) {
+          throw new Error("Review rework worktree changed after its fresh recovery claim");
+        }
+        this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(reopened.info));
+        worktree = reopened.info;
+        baseCommit = reopened.info.baseCommit;
+        reviewReworkContinuationId = reworkResume.continuation.id;
+        const revisionSteps = this.#options.store.reviewReworkRevisionSteps(taskId, reworkResume.continuation.id);
+        const latestCheckRun = this.#options.store.checkRuns(taskId).at(-1);
+        let latestFailedStep = revisionSteps.at(-1);
+        if (latestCheckRun?.status === "failed"
+          && !revisionSteps.some(step => step.failedCheckRunId === latestCheckRun.id)) {
+          const retry = this.#options.store.beginReviewReworkCheckRetry(taskId, reworkResume.continuation.id, {
+            checkRunId: latestCheckRun.id, owner, generationId: task.claimGenerationId!,
+          });
+          if (retry.kind === "revision_limit") return retry.task;
+          task = retry.task;
+          latestFailedStep = retry.step;
+          revisionSteps.push(retry.step);
+        }
+        revision = revisionSteps.at(-1)?.revisionAfter ?? reworkResume.continuation.revisionAfter;
+        if (task.revisionCount !== revision) throw new Error("Review rework revision count differs from its append-only revision high-water");
+        const reviewVerdict = this.#options.store.getPackageReviewVerdict(reworkResume.continuation.verdictId);
+        if (!reviewVerdict || reviewVerdict.packageId !== reworkResume.continuation.packageId
+          || reviewVerdict.result.verdict !== "changes_requested") {
+          throw new Error("Review rework continuation verdict binding is missing or no longer requests changes");
+        }
+        if (latestFailedStep) {
+          const failedChecks = this.#options.store.checkRunResults(latestFailedStep.failedCheckRunId);
+          if (!failedChecks.length || failedChecks.every(check => check.status === "passed")) {
+            throw new Error("Review rework revision step has no persisted failed check results");
+          }
+          revisionBrief = this.#revisionBrief(task, failedChecks, undefined, revision);
+        } else {
+          revisionBrief = this.#revisionBrief(task, [], reviewVerdict.result, revision);
+        }
+        finalRoute = undefined;
+        finalChecks = [];
+        checksSnapshot = undefined;
+        reviewPackageId = undefined;
+        stage = "route";
+        executionStageIndex = 0;
+        const priorReworkGeneration = reworkResume.claim?.priorClaimGenerationId ?? reworkResume.quotaResume?.priorClaimGenerationId;
+        reworkFirstWriterRecovery = priorReworkGeneration !== undefined && this.#options.store.stages(taskId)
+          .some(candidate => candidate.sequence > reworkResume.continuation.stageHighWater
+            && ["implement", "revise"].includes(candidate.role)
+            && candidate.generationId === priorReworkGeneration
+            && candidate.startedAt !== undefined);
+      } else if (claimedExecutionRecovery) {
         try {
           const creation = this.#options.store.getWorktreeCreation(taskId);
           const expectedIdentity = recoveryCheckpoint?.freshIdentity as { fingerprint?: unknown } | undefined;
@@ -391,6 +683,11 @@ export class TaskWorker {
         if (stage === "route") {
           const routeTask = this.#taskForExecutionStage(task, executionStageIndex);
           const routeAttempt = this.#options.store.createAttempt(taskId, "route", { owner, harness: "codex" });
+          if (reviewReworkContinuationId) {
+            this.#options.store.checkpointReviewRework(taskId, reviewReworkContinuationId, { owner, generationId: task.claimGenerationId! }, {
+              phase: "route_started", checkpoint: { attemptId: routeAttempt.id, revision },
+            });
+          }
           activeAttempt = routeAttempt;
           active.adapter = this.#options.adapters.get("codex");
           active.attempt = routeAttempt;
@@ -437,7 +734,8 @@ export class TaskWorker {
         const role = revision === 0 ? "implement" : "revise";
         const inputFingerprint = await this.#options.worktrees.fingerprint(worktree);
         const isFirstRecoveredStage = firstRecoveredExecution;
-        const previousExecutionStage = isFirstRecoveredStage
+        const isFirstReworkRecoveryWriter = reworkFirstWriterRecovery && executionStageIndex === 0;
+        const previousExecutionStage = isFirstRecoveredStage || isFirstReworkRecoveryWriter
           ? undefined
           : this.#options.store.stages(taskId).filter(item => item.role === "implement" || item.role === "revise").at(-1);
         if (executionStageIndex > 0 && (!previousExecutionStage
@@ -460,6 +758,14 @@ export class TaskWorker {
           inputFingerprint,
         });
         executionStage = this.#options.store.startStage(pendingStage.id, owner, processStartId);
+        reworkStageId = executionStage.id;
+        if (reviewReworkContinuationId) {
+          this.#options.store.checkpointReviewRework(taskId, reviewReworkContinuationId,
+            { owner, generationId: task.claimGenerationId! }, {
+              phase: "writer_started", stageId: executionStage.id,
+              checkpoint: { revision, executionStageIndex, worktreeFingerprint: inputFingerprint },
+            });
+        }
         if (executionRecovery) firstRecoveredExecution = false;
         executionChecks = [];
         const attempt = this.#options.store.createAttempt(taskId, role, {
@@ -483,6 +789,8 @@ export class TaskWorker {
             executionBrief,
             ...(isFirstRecoveredStage && revision === 0 && executionStageIndex === 0
               ? ["The checkout may contain incomplete edits from an interrupted earlier writer. Inspect the current changes, preserve correct work, and finish the task from this state. The earlier attempt did not complete or pass review."] : []),
+            ...(isFirstReworkRecoveryWriter
+              ? ["The checkout may contain partial edits from the interrupted reviewer-requested revision. Inspect the current changes, preserve correct work, and complete this revision. That earlier writer did not complete validation or review."] : []),
             ...(continuingExecution ? ["Zero paused this attempt after a verified provider usage limit. Continue in this same worktree. Inspect the existing changes first, preserve correct work, and complete the task."] : []),
             ...(priorHandoffContext ? [priorHandoffContext] : []),
           ].join("\n\n"),
@@ -494,6 +802,7 @@ export class TaskWorker {
           artifactDir: this.#artifactDirectory(taskId),
           deadline: new Date(Date.now() + 30 * 60_000).toISOString(),
         });
+        if (isFirstReworkRecoveryWriter) reworkFirstWriterRecovery = false;
         this.#options.store.finishAttempt(attempt.id, {
           status: runResult.status === "completed" && runResult.exitCode === 0 ? "succeeded" : runResult.status === "cancelled" ? "interrupted" : "failed",
           exitCode: runResult.exitCode ?? undefined,
@@ -516,6 +825,13 @@ export class TaskWorker {
 
         const changedPaths = await this.#options.worktrees.changedPaths(worktree);
         this.#assertAllowedPaths(task, changedPaths);
+        if (reviewReworkContinuationId && reworkStageId) {
+          this.#options.store.checkpointReviewRework(taskId, reviewReworkContinuationId,
+            { owner, generationId: task.claimGenerationId! }, {
+              phase: "writer_finished", stageId: reworkStageId,
+              checkpoint: { revision, executionStageIndex, worktreeFingerprint: await this.#worktreeFingerprint(worktree) },
+            });
+        }
         if (executionStageIndex + 1 < executionStageCount) {
           await this.#finishExecutionStage({
             task, worktree, stage: executionStage, attempt: executionAttempt, route, owner,
@@ -553,6 +869,13 @@ export class TaskWorker {
           checkDefinitionHash,
           expectedCheckIds: requiredChecks.map(check => check.id),
         });
+        if (reviewReworkContinuationId) {
+          this.#options.store.checkpointReviewRework(taskId, reviewReworkContinuationId,
+            { owner, generationId }, {
+              phase: "checks_started", stageId: executionStage.id,
+              checkpoint: { checkRunId: checkRun.id, revision },
+            });
+        }
         activeCheckRunId = checkRun.id;
         const checks = await this.#options.testRunner.run(requiredChecks, worktree.path, { signal: active.controller.signal });
         for (const check of checks) {
@@ -595,6 +918,21 @@ export class TaskWorker {
             task, worktree, stage: executionStage, attempt: executionAttempt, route, owner,
             status: "failed", checks, summary: "Zero observed one or more failed validation checks.",
           });
+          if (reviewReworkContinuationId) {
+            const retry = this.#options.store.beginReviewReworkCheckRetry(taskId, reviewReworkContinuationId, {
+              checkRunId: checkRun.id, owner, generationId,
+            });
+            if (retry.kind === "revision_limit") return retry.task;
+            task = retry.task;
+            revision = retry.step.revisionAfter;
+            revisionBrief = this.#revisionBrief(task, failedChecks, undefined, revision);
+            executionStage = undefined;
+            executionAttempt = undefined;
+            finalRoute = undefined;
+            stage = "route";
+            executionStageIndex = 0;
+            continue;
+          }
           executionStage = undefined;
           executionAttempt = undefined;
           if (revision >= maximumRevisions) throw new Error(`Validation failed after ${revision} content revisions: ${failedChecks.map(check => check.id).join(", ")}`);
@@ -619,6 +957,13 @@ export class TaskWorker {
           const headBeforePackage = await this.#options.worktrees.readTaskBranchHead(worktree);
           if (headBeforePackage.ref !== branchHead.ref || headBeforePackage.head !== branchHead.head) {
             throw new Error("Task branch moved after validation; its results cannot be sealed into a review package");
+          }
+          if (reviewReworkContinuationId && reworkStageId) {
+            this.#options.store.checkpointReviewRework(taskId, reviewReworkContinuationId,
+              { owner, generationId }, {
+                phase: "checks_finished", stageId: reworkStageId,
+                checkpoint: { revision, executionStageIndex, checkRunId: checkRun.id },
+              });
           }
           const sealed = this.#options.store.completeCheckRun(checkRun.id, { owner, generationId }, {
             baseCommit: worktree.baseCommit,
@@ -751,12 +1096,25 @@ export class TaskWorker {
         finalReview = review.result;
         if (review.result.verdict === "blocked") throw new Error(`Review blocked: ${review.result.summary}`);
         if (review.result.verdict === "changes_requested") {
-          if (revision >= maximumRevisions) throw new Error(`Review requested changes after ${revision} content revisions: ${review.result.summary}`);
-          const brief = this.#revisionBrief(task, [], review.result, revision + 1);
-          task = this.#options.store.transition(taskId, "reviewing", "revision", { owner, incrementRevision: true, reason: "review requested changes" });
-          revision++;
-          revisionBrief = brief;
-          task = this.#options.store.transition(taskId, "revision", "running", { owner, reason: "starting review revision" });
+          if (reviewPackage && packageVerdictId) {
+            const generationId = task.claimGenerationId;
+            if (!generationId) throw new Error("Task claim has no startup generation; review rework cannot be bound");
+            const begun = this.#options.store.beginReviewRework(taskId, {
+              packageId: reviewPackage.id, verdictId: packageVerdictId, owner, generationId,
+            });
+            if (begun.kind === "revision_limit") return begun.task;
+            reviewReworkContinuationId = begun.continuation.id;
+            task = begun.task;
+            revision = begun.continuation.revisionAfter;
+            revisionBrief = this.#revisionBrief(task, [], review.result, revision);
+          } else {
+            if (revision >= maximumRevisions) throw new Error(`Review requested changes after ${revision} content revisions: ${review.result.summary}`);
+            const brief = this.#revisionBrief(task, [], review.result, revision + 1);
+            task = this.#options.store.transition(taskId, "reviewing", "revision", { owner, incrementRevision: true, reason: "review requested changes" });
+            revision++;
+            revisionBrief = brief;
+            task = this.#options.store.transition(taskId, "revision", "running", { owner, reason: "starting review revision" });
+          }
           stage = "route";
           executionStageIndex = 0;
           continue;
@@ -944,6 +1302,47 @@ export class TaskWorker {
           catch { leaseLost = true; }
         }
       }
+      if (quotaFailure && reviewReworkContinuationId && stage !== "review" && !leaseLost && worktree) {
+        try {
+          this.#assertNotCancelled(active);
+          this.#assertLease(taskId, owner, () => leaseLost);
+          const latestAttempt = this.#options.store.attempts(taskId).at(-1);
+          if (!latestAttempt || !["route", "implement", "revise"].includes(latestAttempt.role)
+            || !["failed", "interrupted"].includes(latestAttempt.status)) {
+            throw new Error("Rework quota stop has no latest terminal route or writer attempt");
+          }
+          const continuation = this.#options.store.getReviewReworkContinuation(taskId, reviewReworkContinuationId);
+          const creation = this.#options.store.getWorktreeCreation(taskId);
+          if (!continuation || !creation || creation.status !== "created" || !creation.plan || !creation.observed) {
+            throw new Error("Rework quota stop lost its registered continuation or worktree evidence");
+          }
+          const reopened = await this.#options.worktrees.reopenFromEvidence(
+            creation.plan as WorktreeCreationPlan, creation.observed as WorktreeCreationEvidence);
+          const inspection = await this.#inspectReviewReworkGit(task, reopened);
+          this.#assertNotCancelled(active);
+          this.#assertLease(taskId, owner, () => leaseLost);
+          const retryAt = quotaRetryAt(task.quotaRetryCount ?? 0, {
+            source: error.retryAt ? "provider_message" : "fallback", retryAt: error.retryAt,
+          });
+          task = this.#options.store.pauseReviewReworkForQuota(taskId, owner, {
+            continuationId: continuation.id,
+            attemptId: latestAttempt.id,
+            retryAt,
+            reason: errorMessage,
+            identity: inspection.identity,
+            gitState: inspection.gitState,
+          });
+          try {
+            await this.#writeReport(taskId, "waiting", { task, baseCommit, error: errorMessage,
+              diff: inspection.gitState.snapshot.diff, checks: finalChecks, authoritativeCheckAttemptId: finalCheckAttemptId });
+          } catch { /* The Store checkpoint is authoritative. */ }
+          return task;
+        } catch {
+          // Never fall back to generic route/execute quota resume for a bound revision.
+          // Keeping the live lease untouched lets normal lease recovery quarantine it.
+          return this.#options.store.get(taskId) ?? task;
+        }
+      }
       if (quotaFailure && !executionStageFinalizationFailed && !leaseLost && worktree && baseCommit) {
         try {
           this.#assertLease(taskId, owner, () => leaseLost);
@@ -1046,6 +1445,11 @@ export class TaskWorker {
       if (!latestPackage || latestPackage.id !== reviewPackage.id) throw new Error("Review recovery package is no longer the latest sealed package");
       const checks = this.#options.store.checkRunResults(reviewPackage.checkRunId);
       const savedVerdict = this.#options.store.packageReviewVerdicts(taskId).at(-1);
+      if (savedVerdict?.packageId === reviewPackage.id && savedVerdict.result.verdict === "blocked") {
+        this.#assertNotCancelled(active);
+        this.#assertLease(taskId, owner, () => leaseLost);
+        return this.#options.store.fail(taskId, "reviewing", `Review blocked: ${savedVerdict.result.summary}`, owner);
+      }
       let verdictId = savedVerdict?.packageId === reviewPackage.id && savedVerdict.result.verdict === "pass"
         ? savedVerdict.id : undefined;
       if (!verdictId) {
@@ -1088,12 +1492,19 @@ export class TaskWorker {
         reviewAttempt = undefined;
         (activeWithAttempt as { adapter?: HarnessAdapter; attempt?: Attempt }).adapter = undefined;
         (activeWithAttempt as { adapter?: HarnessAdapter; attempt?: Attempt }).attempt = undefined;
-        if (review.result.verdict !== "pass") {
-          // The Store currently records this exact verdict, but only allows a later
-          // recovery claim to continue from a persisted pass verdict.
-          return this.#options.store.get(taskId) ?? task;
-        }
         verdictId = persistedVerdict.id;
+        if (review.result.verdict === "changes_requested") {
+          const begun = this.#options.store.beginReviewRework(taskId, {
+            packageId: reviewPackage.id, verdictId, owner, generationId,
+          });
+          return begun.task;
+        }
+        if (review.result.verdict === "blocked") {
+          return this.#options.store.fail(taskId, "reviewing", `Review blocked: ${review.result.summary}`, owner);
+        }
+        if (review.result.verdict !== "pass") {
+          return this.#options.store.fail(taskId, "reviewing", "Recovered review returned an unsupported verdict", owner);
+        }
       }
 
       let operation = this.#options.store.commitOperations(taskId).at(-1);

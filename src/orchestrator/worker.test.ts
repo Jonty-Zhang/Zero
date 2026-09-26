@@ -381,6 +381,12 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
     assert.equal(attempts.find(attempt => attempt.role === "review")?.model, "review-model");
     assert.equal(store.checks(task.id).length, 2);
     assert.equal(store.reviewPackages(task.id).length, 2);
+    const rework = store.getReviewReworkContinuation(task.id);
+    assert.ok(rework);
+    assert.equal(rework.revisionAfter, 1);
+    assert.equal(rework.verdictId, store.packageReviewVerdicts(task.id)[0]?.id);
+    assert.deepEqual(store.reviewReworkProgress(task.id, rework.id).map(item => item.phase),
+      ["route_started", "writer_started", "writer_finished", "checks_started", "checks_finished"]);
     assert.deepEqual(store.reviewPackages(task.id).map(item => item.expectedCheckIds), [["result-check"], ["result-check"]]);
     const packageVerdicts = store.packageReviewVerdicts(task.id);
     assert.equal(packageVerdicts.length, 2);
@@ -486,6 +492,322 @@ test("worker leaves a raced reviewed branch failed with its candidate intent and
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("guardian review rework recovery restarts route and validation from the registered partial worktree", async () => {
+  for (const boundary of ["before-begin", "fresh-review", "fresh-blocked", "after-begin", "mid-writer", "post-writer",
+    "failed-check-before-retry", "failed-check-after-retry"] as const) {
+    const root = await mkdtemp(join(process.cwd(), `.zero-worker-rework-recovery-${boundary}-`));
+    const repo = join(root, "repo");
+    const db = join(root, "tasks.sqlite");
+    const worktreeRoot = join(root, "worktrees");
+    await initRepo(repo);
+    let store = new TaskStore(db, guardianGeneration("1".repeat(32)));
+    try {
+      const failedCheckBoundary = boundary.startsWith("failed-check-");
+      const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create approved result.txt", maxRevisions: failedCheckBoundary ? 2 : 1,
+        allowedPaths: ["result.txt"], checks: [{ id: "always-pass", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+      const oldOwner = `rework-old-${boundary}`;
+      assert.equal(store.claimNext(oldOwner, 120_000)?.id, task.id);
+      const worktrees = new GitWorktreeManager(worktreeRoot);
+      const plan = await worktrees.prepareCreatePlan(task.id, repo, "main");
+      store.recordWorktreeCreationIntent(task.id, oldOwner, plan);
+      const created = await worktrees.executePlan(plan);
+      store.completeWorktreeCreation(task.id, oldOwner, created, created.fingerprint);
+
+      const originalRoute = routeFor(task);
+      const originalRouteAttempt = store.createAttempt(task.id, "route", { owner: oldOwner, harness: "codex" });
+      store.saveRoute(originalRoute);
+      store.finishAttempt(originalRouteAttempt.id, { status: "succeeded", metadata: { decision: originalRoute } });
+      const originalStage = store.createStage(task.id, { role: "implement", harness: "fake", model: "model",
+        processStartId: `original-${boundary}` });
+      store.startStage(originalStage.id, oldOwner, `original-${boundary}`);
+      const originalAttempt = store.createAttempt(task.id, "implement", { owner: oldOwner, stageId: originalStage.id,
+        harness: "fake", model: "model" });
+      await writeFile(join(plan.path, "result.txt"), "approved\n");
+      store.finishAttempt(originalAttempt.id, { status: "succeeded" }, { owner: oldOwner, processStartId: `original-${boundary}` });
+      const originalBranch = await worktrees.readTaskBranchHead(created.info);
+      const originalSnapshot = await worktrees.prepareReview(created.info);
+      const originalChecks = store.startCheckRun({ taskId: task.id, owner: oldOwner,
+        generationId: store.get(task.id)!.claimGenerationId!, executionAttemptId: originalAttempt.id,
+        executionStageId: originalStage.id, routeAttemptId: originalRouteAttempt.id, route: originalRoute,
+        branchRef: originalBranch.ref, snapshot: { baseCommit: created.info.baseCommit, preHead: originalBranch.head, ...originalSnapshot },
+        checkDefinitionHash: (await import("node:crypto")).createHash("sha256").update(JSON.stringify(task.checks)).digest("hex"),
+        expectedCheckIds: ["always-pass"] });
+      store.recordCheckResult(originalChecks.id, { owner: oldOwner, generationId: store.get(task.id)!.claimGenerationId! },
+        { id: "always-pass", argv: [], status: "passed", exitCode: 0, durationMs: 1 });
+      store.finishStage(originalStage.id, oldOwner, `original-${boundary}`, "succeeded", await worktrees.fingerprint(created.info));
+      const originalPackage = store.completeCheckRun(originalChecks.id,
+        { owner: oldOwner, generationId: store.get(task.id)!.claimGenerationId! },
+        { baseCommit: created.info.baseCommit, preHead: originalBranch.head, ...originalSnapshot }).reviewPackage;
+      const originalGeneration = store.get(task.id)!.claimGenerationId!;
+      let verdictId: string | undefined;
+      if (boundary === "fresh-review" || boundary === "fresh-blocked") {
+        const crashedReview = store.createAttempt(task.id, "review", { owner: oldOwner, harness: "codex",
+          metadata: { packageId: originalPackage.id, generationId: originalGeneration } });
+        store.finishAttempt(crashedReview.id, { status: "interrupted", error: "worker stopped before verdict" });
+      } else {
+        const verdictAttempt = store.createAttempt(task.id, "review", { owner: oldOwner, harness: "codex",
+          metadata: { packageId: originalPackage.id, generationId: originalGeneration } });
+        verdictId = store.finishPackageReview({ packageId: originalPackage.id, attemptId: verdictAttempt.id,
+          owner: oldOwner, generationId: originalGeneration, recheckedSnapshot: originalPackage.snapshot,
+          result: { verdict: "changes_requested", summary: "Add a stronger result marker.", findings: [
+            { severity: "low", evidence: "The result is incomplete.", requestedChange: "Rewrite result.txt with the approved marker." },
+          ] }, attemptResult: { exitCode: 0, model: "review" } }).id;
+      }
+
+      let continuationId: string | undefined;
+      if (!["before-begin", "fresh-review", "fresh-blocked"].includes(boundary)) {
+        const begun = store.beginReviewRework(task.id, { packageId: originalPackage.id, verdictId: verdictId!,
+          owner: oldOwner, generationId: originalGeneration });
+        assert.equal(begun.kind, "started");
+        continuationId = begun.continuation.id;
+      }
+      if (!["before-begin", "fresh-review", "fresh-blocked", "after-begin"].includes(boundary)) {
+        const continuation = store.getReviewReworkContinuation(task.id, continuationId)!;
+        const routeAttempt = store.createAttempt(task.id, "route", { owner: oldOwner, harness: "codex" });
+        store.checkpointReviewRework(task.id, continuation.id, { owner: oldOwner, generationId: originalGeneration }, {
+          phase: "route_started", checkpoint: { attemptId: routeAttempt.id, revision: 1 },
+        });
+        const reworkRoute = routeFor({ ...task, revisionCount: 1 });
+        store.saveRoute(reworkRoute);
+        store.finishAttempt(routeAttempt.id, { status: "succeeded", metadata: { decision: reworkRoute } });
+        const processStartId = `rework-${boundary}`;
+        const stage = store.createStage(task.id, { role: "revise", harness: "fake", model: "model", processStartId });
+        store.startStage(stage.id, oldOwner, processStartId);
+        store.checkpointReviewRework(task.id, continuation.id, { owner: oldOwner, generationId: originalGeneration }, {
+          phase: "writer_started", stageId: stage.id, checkpoint: { revision: 1, executionStageIndex: 0 },
+        });
+        const attempt = store.createAttempt(task.id, "revise", { owner: oldOwner, stageId: stage.id,
+          harness: "fake", model: "model", metadata: { revision: 1 } });
+        await writeFile(join(plan.path, "result.txt"), boundary === "mid-writer" ? "partial\n" : "revised\n");
+        if (failedCheckBoundary) {
+          await worktrees.prepareReview(created.info);
+          store.finishAttempt(attempt.id, { status: "succeeded" }, { owner: oldOwner, processStartId });
+          const branch = await worktrees.readTaskBranchHead(created.info);
+          const failedRun = store.startCheckRun({ taskId: task.id, owner: oldOwner, generationId: originalGeneration,
+            executionAttemptId: attempt.id, executionStageId: stage.id, routeAttemptId: routeAttempt.id,
+            route: reworkRoute, branchRef: branch.ref,
+            snapshot: { baseCommit: created.info.baseCommit, preHead: branch.head, ...await worktrees.captureReviewSnapshot(created.info) },
+            checkDefinitionHash: (await import("node:crypto")).createHash("sha256").update(JSON.stringify(task.checks)).digest("hex"),
+            expectedCheckIds: ["always-pass"] });
+          store.recordCheckResult(failedRun.id, { owner: oldOwner, generationId: originalGeneration },
+            { id: "always-pass", argv: [], status: "failed", exitCode: 1, durationMs: 1, error: "simulated failed rework validation" });
+          store.finishCheckRun(failedRun.id, { owner: oldOwner, generationId: originalGeneration }, "failed", "simulated failed rework validation");
+          store.finishStage(stage.id, oldOwner, processStartId, "failed", await worktrees.fingerprint(created.info));
+          if (boundary === "failed-check-after-retry") {
+            const retry = store.beginReviewReworkCheckRetry(task.id, continuationId!, {
+              checkRunId: failedRun.id, owner: oldOwner, generationId: originalGeneration,
+            });
+            assert.equal(retry.kind, "started");
+            assert.equal(retry.step.revisionAfter, 2);
+          }
+        } else if (boundary === "post-writer") {
+          await worktrees.prepareReview(created.info);
+          store.finishAttempt(attempt.id, { status: "succeeded" }, { owner: oldOwner, processStartId });
+          store.finishStage(stage.id, oldOwner, processStartId, "succeeded", await worktrees.fingerprint(created.info));
+          store.checkpointReviewRework(task.id, continuation.id, { owner: oldOwner, generationId: originalGeneration }, {
+            phase: "writer_finished", stageId: stage.id, checkpoint: { revision: 1 },
+          });
+        }
+      }
+
+      assert.deepEqual(store.recoverExpired(new Date(Date.now() + 240_000)), [task.id]);
+      store.close();
+      store = new TaskStore(db, guardianGeneration("2".repeat(32)));
+      let routeCalls = 0;
+      let writerCalls = 0;
+      let reviewCalls = 0;
+      const adapter: HarnessAdapter = { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+        async run(request) {
+          writerCalls++;
+          assert.equal(request.cwd, plan.path);
+          if (failedCheckBoundary) assert.match(request.prompt, /Failed checks:/);
+          else assert.match(request.prompt, /Reviewer verdict: changes_requested/);
+          if (["mid-writer", "post-writer", "failed-check-before-retry", "failed-check-after-retry"].includes(boundary)) {
+            assert.match(request.prompt, /partial edits from the interrupted reviewer-requested revision/);
+          }
+          await writeFile(join(request.cwd, "result.txt"), "approved\n");
+          return { status: "completed", exitCode: 0, durationMs: 1 };
+        } };
+      const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(worktreeRoot), testRunner: new TestRunner(),
+        router: { async route(current) { routeCalls++; assert.equal(current.revisionCount, failedCheckBoundary ? 2 : 1); return routeFor(current); } },
+        reviewer: { async review(_current, _worktree, _route, checks) {
+          reviewCalls++;
+          assert.ok(checks.length === 1 && checks[0]?.status === "passed");
+          return { harness: "codex", model: "review", exitCode: 0,
+            result: boundary === "fresh-blocked"
+              ? { verdict: "blocked", summary: "Review requires operator input.", findings: [] }
+              : boundary === "fresh-review" && reviewCalls === 1
+                ? { verdict: "changes_requested", summary: "Add a stronger result marker.", findings: [
+                { severity: "low", evidence: "The result is incomplete.", requestedChange: "Rewrite result.txt with the approved marker." },
+              ] }
+              : { verdict: "pass", summary: "approved", findings: [] } };
+        } }, adapters: new Map([["fake", adapter]]), artifactRoot: join(root, "artifacts") });
+      const done = await worker.runNext(`rework-new-${boundary}`);
+      assert.equal(done?.id, task.id);
+      if (boundary === "fresh-blocked") {
+        assert.equal(done?.status, "failed");
+        assert.match(done?.failureReason ?? "", /^Review blocked:/);
+        assert.equal(routeCalls, 0);
+        assert.equal(writerCalls, 0);
+        assert.equal(reviewCalls, 1);
+        assert.deepEqual(store.packageReviewVerdicts(task.id).map(item => item.result.verdict), ["blocked"]);
+        assert.equal(store.commitOperations(task.id).length, 0);
+        continue;
+      }
+      assert.equal(done?.status, "done", done?.failureReason);
+      assert.equal(done?.revisionCount, failedCheckBoundary ? 2 : 1);
+      assert.equal(routeCalls, 1);
+      assert.equal(writerCalls, 1);
+      assert.equal(reviewCalls, boundary === "fresh-review" ? 2 : 1);
+      assert.equal(store.reviewPackages(task.id).length, 2);
+      assert.equal(store.checkRuns(task.id).length, failedCheckBoundary ? 3 : 2, "the original passing check run is not reused for revised content");
+      assert.deepEqual(store.packageReviewVerdicts(task.id).map(item => item.result.verdict), ["changes_requested", "pass"]);
+      assert.equal(store.commitOperations(task.id).length, 1);
+      assert.equal(store.commitOperations(task.id)[0]?.packageId, store.reviewPackages(task.id)[1]?.id);
+      assert.equal(store.getReviewReworkContinuation(task.id)?.verdictId,
+        verdictId ?? store.packageReviewVerdicts(task.id)[0]?.id);
+      assert.ok(store.reviewReworkProgress(task.id, store.getReviewReworkContinuation(task.id)!.id)
+        .some(item => item.phase === "checks_finished"));
+      if (failedCheckBoundary) {
+        const steps = store.reviewReworkRevisionSteps(task.id, store.getReviewReworkContinuation(task.id)!.id);
+        assert.equal(steps.length, 1);
+        assert.equal(steps[0]?.revisionAfter, 2);
+      }
+    } finally {
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("reviewer-requested revision consumes failed checks once and retries within the same task claim", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-rework-check-retry-"));
+  const repo = join(root, "repo");
+  await initRepo(repo);
+  const store = new TaskStore(join(root, "tasks.sqlite"), guardianGeneration("5".repeat(32)));
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create approved result.txt", maxRevisions: 2,
+      allowedPaths: ["result.txt"], checks: [{ id: "approved", argv: [process.execPath,
+        "-e", "process.exit(require('node:fs').readFileSync('result.txt','utf8').includes('valid') ? 0 : 1)"] }] });
+    const owner = "rework-check-retry-owner";
+    assert.equal(store.claimNext(owner)?.id, task.id);
+    let routeCalls = 0;
+    let writerCalls = 0;
+    let reviewCalls = 0;
+    const adapter: HarnessAdapter = { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+      async run(request) {
+        writerCalls++;
+        if (writerCalls === 3) assert.match(request.prompt, /Failed checks:/);
+        await writeFile(join(request.cwd, "result.txt"), writerCalls === 1 ? "valid initial\n"
+          : writerCalls === 2 ? "bad revision\n" : "valid approved\n");
+        return { status: "completed", exitCode: 0, durationMs: 1 };
+      } };
+    const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router: { async route(current) { routeCalls++; return routeFor(current); } },
+      reviewer: { async review() {
+        reviewCalls++;
+        return { harness: "codex", model: "review", exitCode: 0,
+          result: reviewCalls === 1
+            ? { verdict: "changes_requested", summary: "Improve the result.", findings: [
+              { severity: "low", evidence: "The result needs stronger content.", requestedChange: "Improve result.txt." },
+            ] }
+            : { verdict: "pass", summary: "Approved.", findings: [] } };
+      } }, adapters: new Map([["fake", adapter]]), artifactRoot: join(root, "artifacts") });
+    const result = await worker.runClaimed(task.id, owner);
+    assert.equal(result.status, "done", result.failureReason);
+    assert.equal(result.revisionCount, 2);
+    assert.equal(routeCalls, 3);
+    assert.equal(writerCalls, 3);
+    assert.equal(reviewCalls, 2);
+    const continuation = store.getReviewReworkContinuation(task.id)!;
+    const steps = store.reviewReworkRevisionSteps(task.id, continuation.id);
+    assert.equal(steps.length, 1);
+    assert.equal(steps[0]?.revisionBefore, 1);
+    assert.equal(steps[0]?.revisionAfter, 2);
+    assert.equal(store.checkRuns(task.id).length, 3);
+    assert.equal(store.checkRuns(task.id)[1]?.status, "failed");
+    assert.equal(store.checkRuns(task.id)[2]?.status, "completed");
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("review rework quota resumes its saved revision after guardian reboot without consuming another revision", async () => {
+  for (const quotaAfterFailedCheck of [false, true]) {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-rework-quota-reboot-"));
+  const repo = join(root, "repo");
+  const db = join(root, "tasks.sqlite");
+  const worktreeRoot = join(root, "worktrees");
+  const artifacts = join(root, "artifacts");
+  await initRepo(repo);
+  let store = new TaskStore(db, guardianGeneration("3".repeat(32)));
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create approved result.txt", maxRevisions: quotaAfterFailedCheck ? 2 : 1,
+      allowedPaths: ["result.txt"], checks: [{ id: "approved", argv: [process.execPath,
+        "-e", "process.exit(require('node:fs').readFileSync('result.txt','utf8') === 'approved\\n' ? 0 : 1)"] }] });
+    const owner = "rework-quota-first-owner";
+    assert.equal(store.claimNext(owner)?.id, task.id);
+    let routeCalls = 0;
+    let writerCalls = 0;
+    let reviewCalls = 0;
+    const retryAt = new Date(Date.now() + 60_000).toISOString();
+    const router: TaskRouter = { async route(current) { routeCalls++; return routeFor(current); } };
+    const adapter: HarnessAdapter = { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+      async run(request) {
+        writerCalls++;
+        const quotaWriter = quotaAfterFailedCheck ? 3 : 2;
+        if (writerCalls === quotaWriter) {
+          await writeFile(join(request.cwd, "result.txt"), "partial revision\n");
+          return { status: "failed", exitCode: 1, durationMs: 1,
+            quota: { retryAt, source: "provider_message" }, error: "revision quota" };
+        }
+        if (quotaAfterFailedCheck && writerCalls === 2) {
+          await writeFile(join(request.cwd, "result.txt"), "bad revision\n");
+          return { status: "completed", exitCode: 0, durationMs: 1 };
+        }
+        await writeFile(join(request.cwd, "result.txt"), "approved\n");
+        return { status: "completed", exitCode: 0, durationMs: 1 };
+      } };
+    const reviewer: TaskReviewer = { async review() {
+      reviewCalls++;
+      return { harness: "codex", model: "review", exitCode: 0,
+        result: reviewCalls === 1
+          ? { verdict: "changes_requested", summary: "Strengthen the result.", findings: [
+            { severity: "low", evidence: "The marker is missing.", requestedChange: "Write the approved marker." },
+          ] }
+          : { verdict: "pass", summary: "Approved.", findings: [] } };
+    } };
+    const makeWorker = () => new TaskWorker({ store, worktrees: new GitWorktreeManager(worktreeRoot),
+      testRunner: new TestRunner(), router, reviewer, adapters: new Map([["fake", adapter]]), artifactRoot: artifacts });
+    const waiting = await makeWorker().runClaimed(task.id, owner);
+    assert.equal(waiting.status, "waiting");
+    assert.equal(waiting.revisionCount, quotaAfterFailedCheck ? 2 : 1);
+    assert.equal(store.quotaCheckpoint(task.id)?.kind, "rework_quota");
+    const continuation = store.getReviewReworkContinuation(task.id)!;
+    assert.equal(store.reviewReworkProgress(task.id, continuation.id).filter(event => event.phase === "writer_started").length,
+      quotaAfterFailedCheck ? 2 : 1);
+    assert.deepEqual(store.attempts(task.id).filter(attempt => ["implement", "revise"].includes(attempt.role))
+      .map(attempt => attempt.status), quotaAfterFailedCheck ? ["succeeded", "succeeded", "failed"] : ["succeeded", "failed"]);
+    assert.equal(store.reviewPackages(task.id).length, 1);
+    store.close();
+
+    store = new TaskStore(db, guardianGeneration("4".repeat(32)));
+    const quotaDb = new DatabaseSync(db);
+    quotaDb.prepare("UPDATE quota_pauses SET retry_at=? WHERE task_id=?").run(new Date(Date.now() - 1_000).toISOString(), task.id);
+    quotaDb.close();
+    const resumed = await makeWorker().runNext("rework-quota-guardian-resume");
+    assert.equal(resumed?.id, task.id);
+    assert.equal(resumed?.status, "done", resumed?.failureReason);
+    assert.equal(resumed?.revisionCount, quotaAfterFailedCheck ? 2 : 1);
+    assert.equal(routeCalls, quotaAfterFailedCheck ? 4 : 3);
+    assert.equal(writerCalls, quotaAfterFailedCheck ? 4 : 3);
+    assert.equal(reviewCalls, 2);
+    assert.equal(store.reviewPackages(task.id).length, 2);
+    assert.equal(store.checkRuns(task.id).length, quotaAfterFailedCheck ? 3 : 2);
+    assert.equal(store.events(task.id).some(event => event.type === "task.review_rework_quota_resumed"), true);
+    assert.ok(store.getReviewReworkContinuation(task.id));
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
   }
 });
 

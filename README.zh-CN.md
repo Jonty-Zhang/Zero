@@ -13,7 +13,7 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 - Codex、DeepSeek Harness（DSH）和 ZCode 适配器。存在适配器不代表 Harness/模型组合已可用于路由：Zero 要求先验证绑定。DSH 和隔离式 ZCode CLI 绑定使用 Zero 自有配置档。现有桌面 ZCode `app-server` 适配器及 `verify-binding zcode-desktop` 流程已通过 mock 测试；实时接入尚未成功，因此该路由尚未验证，也不会用于任务路由。验证边界见[服务端配置](src/server/README.md)。
 - 每个任务使用独立 Git worktree，运行配置的验证命令，限制返工次数，并归档包含执行、测试、审核和 Git 证据的报告。成功任务的分支保留在源代码仓库中；Zero 不会自动合并或推送分支。
 - 有序 `executionStages` 已通过核心、HTTP API 和 CLI 的 `--stages-file` 选项实现，会在同一个任务 worktree 中串行执行。每个阶段会记录关联尝试、工作树指纹，以及由 Zero 实测事实构成的版本化交接单；报告收录这些阶段记录。
-- 对已验证的模型使用额度限制提供 `waiting` 状态、持久检查点和定时重试。额度续跑走独立的检查点路径，已通过 mock 测试（包括服务重启后恢复）；尚未观察到真实提供方额度限制事件。普通崩溃时，Zero 会先将过期租约隔离。原生 guardian 确认紧邻上一代进程 Job 已清空后，受限的自动恢复路径可在同一 worktree 接续合格任务：重新取得基线、重新路由、创建新的执行尝试，然后重跑全部配置检查和 Codex 审核。仅限状态为 `running`、revision 为 0、执行阶段不超过一个且尚未进入审核、提交或报告阶段的任务。重复崩溃必须保留已验证的代际 lineage。审核中断、未经审核的本地提交、lineage 缺失以及任何 worktree 身份/路径不匹配的任务会继续留在 `recovery_required`，等待检查。
+- 对已验证的模型使用额度限制提供 `waiting` 状态、持久检查点和跨服务重启的定时重试。自动化测试覆盖分配、执行、审核和审核要求返工期间的额度续跑；尚未观察到真实提供方的额度限制事件。普通崩溃时，Zero 先隔离过期租约。原生 guardian 证明上一代进程 Job 已清空后，合格任务可在已登记的同一 worktree 中恢复：首次执行、已封存审核包的审核与提交/报告，以及审核要求的返工。恢复的执行和返工会重新路由、建立新的尝试、重跑检查和审核。恢复必须匹配任务代际、Git 身份、允许修改路径、审核包及结论、返工次数等证据；证据缺失或不符时任务保留在 `recovery_required` 等待检查。
 - 恢复实现已包含自动化测试；但无人值守安装、重启恢复、真实 Harness 执行、真实提供方额度恢复，以及目标电脑上的崩溃故障注入尚未验收。忽略的构建/缓存文件不包含在 Zero 基于 Git 的 worktree 指纹中；它们可能留在 worktree 并影响恢复后的命令，因此应使用可重复的检查，不要依赖隐藏的本地缓存状态。详见[崩溃恢复设计](docs/crash-recovery-design.md)和[恢复实现边界](docs/crash-recovery-next-slice.md)。
 - 创建 worktree 前会持久记录目标仓库、分支、路径和基点；`git worktree add` 成功后再记录实测身份与指纹。创建结果不确定时保留这些证据并等待检查。
 - 原生 Windows 进程 guardian 已在 CI 中通过构建和进程包含测试；目标机器部署及启动测试仍未验证。详见 [Windows 部署](docs/windows-deployment.md)。
