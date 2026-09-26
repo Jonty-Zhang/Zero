@@ -27,7 +27,7 @@ import { QuotaLimitError } from '../core/quota.js';
 import { TaskWorker } from '../orchestrator/worker.js';
 import { ConfigStore } from './config-store.js';
 import { createCodexAdapter, createDefaultAdapters, createZeroServer } from './server.js';
-import type { TaskSequenceRecord, TaskStatus } from '../domain/types.js';
+import type { HarnessAdapter, TaskSequenceRecord, TaskStatus } from '../domain/types.js';
 import { DshAdapter } from '../adapters/dsh.js';
 import { ZCodeAdapter } from '../adapters/zcode.js';
 
@@ -151,77 +151,8 @@ export async function startZeroServer(options: { host?: string; port?: number } 
     },
   };
   const worker = new TaskWorker({ store, worktrees, testRunner, router, reviewer, adapters: new Map(Object.entries(adapters)), artifactRoot: resolve(dataRoot, 'artifacts') });
-  const warnedGoalRevisionAttempts = new Set<string>();
-  const goalRevisionRetryAfter = new Map<string, number>();
-  const reviewReadySequences = async () => {
-    for (const sequence of store.listSequences()) {
-      if ((!sequence.objective && !sequence.acceptanceCriteria?.length) || !sequence.steps.length || sequence.steps.some(step => step.task.status !== 'done')) continue;
-      const reviewRoot = resolve(dataRoot, 'artifacts', 'goal-review');
-      const previous = store.sequenceGoalReview(sequence.id);
-      if (previous?.state === 'verdict' && previous.result?.verdict === 'changes_requested' &&
-        (goalRevisionRetryAfter.get(previous.attemptId) ?? 0) > Date.now()) continue;
-      if (previous?.state === 'running' && previous.generationId === store.startupGeneration().id &&
-        Date.parse(previous.createdAt) + 15 * 60_000 > Date.now()) continue;
-      if (previous?.state === 'quota' && previous.retryAt && Date.parse(previous.retryAt) > Date.now()) continue;
-      let before: Awaited<ReturnType<typeof captureSequenceGoalEvidence>>;
-      try { before = await captureSequenceGoalEvidence(store, worktrees, sequence, reviewRoot); }
-      catch (error) {
-        const fingerprint = createHash('sha256').update(JSON.stringify({ sequenceId: sequence.id, objective: sequence.objective,
-          acceptanceCriteria: sequence.acceptanceCriteria, stepIds: sequence.steps.map(step => step.task.id), reason: safeGoalBlockReason(error) })).digest('hex');
-        if (previous?.evidenceFingerprint === fingerprint && previous.state === 'verdict') continue;
-        const attempt = store.startSequenceGoalReview(sequence.id, fingerprint);
-        store.finishSequenceGoalReview({ attemptId: attempt.attemptId, verifiedEvidenceFingerprint: fingerprint,
-          result: goalBlockedResult(safeGoalBlockReason(error)) });
-        return;
-      }
-      if (previous?.evidenceFingerprint === before.fingerprint && previous.state === 'verdict') {
-        if (previous.result?.verdict !== 'changes_requested') continue;
-        if (sequence.goalRevisionCount >= sequence.maxGoalRevisions) continue;
-        try {
-          const submission = buildGoalRevisionSubmission(sequence, previous);
-          store.appendSequenceGoalRevision(sequence.id, previous.attemptId, submission);
-          goalRevisionRetryAfter.delete(previous.attemptId);
-          return;
-        } catch {
-          goalRevisionRetryAfter.set(previous.attemptId, Date.now() + 5_000);
-          if (!warnedGoalRevisionAttempts.has(previous.attemptId)) {
-            warnedGoalRevisionAttempts.add(previous.attemptId);
-            console.warn('[zero] Aggregate goal remediation could not be appended safely.');
-          }
-          continue;
-        }
-      }
-      if (previous?.evidenceFingerprint === before.fingerprint && previous.state === 'quota' && previous.retryAt && Date.parse(previous.retryAt) > Date.now()) continue;
-      const attempt = store.startSequenceGoalReview(sequence.id, before.fingerprint);
-      const cfg = await config.read();
-      const goalReviewer = new GoalReviewer({ codex, model: cfg.reviewer.modelId ?? undefined,
-        reasoningEffort: cfg.reviewer.reasoningEffort ?? undefined });
-      try {
-        const execution = await goalReviewer.review({ sequenceId: sequence.id, objective: sequence.objective,
-          acceptanceCriteria: sequence.acceptanceCriteria, stepEvidence: before.stepEvidence, workspacePath: before.workspacePath,
-          artifactRoot: reviewRoot, attemptId: attempt.attemptId, model: cfg.reviewer.modelId ?? undefined,
-          reasoningEffort: cfg.reviewer.reasoningEffort ?? undefined });
-        const after = await captureSequenceGoalEvidence(store, worktrees, sequence, reviewRoot);
-        const verifiedFingerprint = execution.evidenceFingerprint === before.snapshotFingerprint &&
-          execution.verifiedSnapshotFingerprint === after.snapshotFingerprint
-          ? after.fingerprint : '';
-        store.finishSequenceGoalReview({ attemptId: attempt.attemptId, result: execution.result, verifiedEvidenceFingerprint: verifiedFingerprint });
-        return;
-      } catch (error) {
-        if (error instanceof QuotaLimitError) {
-          const retryAt = error.retryAt && Date.parse(error.retryAt) > Date.now()
-            ? error.retryAt : new Date(Date.now() + 5 * 60 * 60_000).toISOString();
-          store.finishSequenceGoalReview({ attemptId: attempt.attemptId, retryAt });
-          return;
-        } else {
-          store.finishSequenceGoalReview({ attemptId: attempt.attemptId, verifiedEvidenceFingerprint: before.fingerprint,
-            result: goalBlockedResult('Aggregate reviewer or evidence verification could not complete safely.') });
-          console.warn('[zero] Aggregate goal review was blocked safely.');
-          return;
-        }
-      }
-    }
-  };
+  const reviewReadySequences = createSequenceGoalReviewScheduler({ store, worktrees, codex,
+    artifactRoot: resolve(dataRoot, 'artifacts'), readReviewerConfig: async () => (await config.read()).reviewer });
   const server = createZeroServer({ store, config, adapters, artifactRoot: resolve(dataRoot, 'artifacts'), staticDir: resolve(repoRoot, 'web/dist'),
     trustedProxyHosts: (process.env.ZERO_TRUSTED_PROXY_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean),
     enqueue: () => kick(), cancel: taskId => worker.cancel(taskId) });
@@ -677,6 +608,85 @@ function isPathWithin(parent: string, child: string): boolean {
 
 function isSafeDshProfile(profile: string): boolean {
   return profile.toLowerCase() !== 'desktop' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(profile);
+}
+
+/** Builds the service's aggregate goal scheduler with injectable local dependencies for end-to-end tests. */
+export function createSequenceGoalReviewScheduler(options: {
+  store: TaskStore;
+  worktrees: GitWorktreeManager;
+  codex: HarnessAdapter;
+  artifactRoot: string;
+  readReviewerConfig: () => Promise<{ modelId?: string | null; reasoningEffort?: ReasoningEffort | null }>;
+}): () => Promise<void> {
+  const { store, worktrees, codex, artifactRoot } = options;
+  const warnedGoalRevisionAttempts = new Set<string>();
+  const goalRevisionRetryAfter = new Map<string, number>();
+  return async () => {
+    for (const sequence of store.listSequences()) {
+      if ((!sequence.objective && !sequence.acceptanceCriteria?.length) || !sequence.steps.length || sequence.steps.some(step => step.task.status !== 'done')) continue;
+      const reviewRoot = resolve(artifactRoot, 'goal-review');
+      const previous = store.sequenceGoalReview(sequence.id);
+      if (previous?.state === 'verdict' && previous.result?.verdict === 'changes_requested' &&
+        (goalRevisionRetryAfter.get(previous.attemptId) ?? 0) > Date.now()) continue;
+      if (previous?.state === 'running' && previous.generationId === store.startupGeneration().id &&
+        Date.parse(previous.createdAt) + 15 * 60_000 > Date.now()) continue;
+      if (previous?.state === 'quota' && previous.retryAt && Date.parse(previous.retryAt) > Date.now()) continue;
+      let before: Awaited<ReturnType<typeof captureSequenceGoalEvidence>>;
+      try { before = await captureSequenceGoalEvidence(store, worktrees, sequence, reviewRoot); }
+      catch (error) {
+        const fingerprint = createHash('sha256').update(JSON.stringify({ sequenceId: sequence.id, objective: sequence.objective,
+          acceptanceCriteria: sequence.acceptanceCriteria, stepIds: sequence.steps.map(step => step.task.id), reason: safeGoalBlockReason(error) })).digest('hex');
+        if (previous?.evidenceFingerprint === fingerprint && previous.state === 'verdict') continue;
+        const attempt = store.startSequenceGoalReview(sequence.id, fingerprint);
+        store.finishSequenceGoalReview({ attemptId: attempt.attemptId, verifiedEvidenceFingerprint: fingerprint,
+          result: goalBlockedResult(safeGoalBlockReason(error)) });
+        return;
+      }
+      if (previous?.evidenceFingerprint === before.fingerprint && previous.state === 'verdict') {
+        if (previous.result?.verdict !== 'changes_requested') continue;
+        if (sequence.goalRevisionCount >= sequence.maxGoalRevisions) continue;
+        try {
+          const submission = buildGoalRevisionSubmission(sequence, previous);
+          store.appendSequenceGoalRevision(sequence.id, previous.attemptId, submission);
+          goalRevisionRetryAfter.delete(previous.attemptId);
+          return;
+        } catch {
+          goalRevisionRetryAfter.set(previous.attemptId, Date.now() + 5_000);
+          if (!warnedGoalRevisionAttempts.has(previous.attemptId)) {
+            warnedGoalRevisionAttempts.add(previous.attemptId);
+            console.warn('[zero] Aggregate goal remediation could not be appended safely.');
+          }
+          continue;
+        }
+      }
+      if (previous?.evidenceFingerprint === before.fingerprint && previous.state === 'quota' && previous.retryAt && Date.parse(previous.retryAt) > Date.now()) continue;
+      const attempt = store.startSequenceGoalReview(sequence.id, before.fingerprint);
+      const cfg = await options.readReviewerConfig();
+      const goalReviewer = new GoalReviewer({ codex, model: cfg.modelId ?? undefined, reasoningEffort: cfg.reasoningEffort ?? undefined });
+      try {
+        const execution = await goalReviewer.review({ sequenceId: sequence.id, objective: sequence.objective,
+          acceptanceCriteria: sequence.acceptanceCriteria, stepEvidence: before.stepEvidence, workspacePath: before.workspacePath,
+          artifactRoot: reviewRoot, attemptId: attempt.attemptId, model: cfg.modelId ?? undefined,
+          reasoningEffort: cfg.reasoningEffort ?? undefined });
+        const after = await captureSequenceGoalEvidence(store, worktrees, sequence, reviewRoot);
+        const verifiedFingerprint = execution.evidenceFingerprint === before.snapshotFingerprint &&
+          execution.verifiedSnapshotFingerprint === after.snapshotFingerprint ? after.fingerprint : '';
+        store.finishSequenceGoalReview({ attemptId: attempt.attemptId, result: execution.result, verifiedEvidenceFingerprint: verifiedFingerprint });
+        return;
+      } catch (error) {
+        if (error instanceof QuotaLimitError) {
+          const retryAt = error.retryAt && Date.parse(error.retryAt) > Date.now()
+            ? error.retryAt : new Date(Date.now() + 5 * 60 * 60_000).toISOString();
+          store.finishSequenceGoalReview({ attemptId: attempt.attemptId, retryAt });
+          return;
+        }
+        store.finishSequenceGoalReview({ attemptId: attempt.attemptId, verifiedEvidenceFingerprint: before.fingerprint,
+          result: goalBlockedResult('Aggregate reviewer or evidence verification could not complete safely.') });
+        console.warn('[zero] Aggregate goal review was blocked safely.');
+        return;
+      }
+    }
+  };
 }
 
 export async function getConfiguredDataRoot() { await mkdir(dataRoot, { recursive: true }); return dataRoot; }

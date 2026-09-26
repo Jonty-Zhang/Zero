@@ -1263,7 +1263,8 @@ export class TaskStore {
     if (!sequence) return undefined;
     const rows = this.#db.prepare(`SELECT s.position,s.effective_base_commit,t.* FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id
       WHERE s.sequence_id=? ORDER BY s.position`).all(id) as Array<TaskRow & { position: number; effective_base_commit: string | null }>;
-    const steps = rows.map(row => ({ position: Number(row.position), task: this.#task(row),
+    const steps = rows.map(row => ({ position: Number(row.position), task: { ...this.#task(row),
+      sequenceBaseCommit: row.effective_base_commit ?? undefined },
       ...(row.effective_base_commit ? { effectiveBaseCommit: row.effective_base_commit } : {}) }));
     const firstUnfinished = steps.find(step => step.task.status !== "done");
     const blockedTask = firstUnfinished && ["recovery_required", "failed"].includes(firstUnfinished.task.status)
