@@ -2,8 +2,8 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { createReadStream } from "node:fs";
-import { mkdir, lstat, readFile, readlink, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { copyFile, mkdir, lstat, readFile, readlink, realpath, rm, mkdtemp } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const execFileAsync = promisify(execFile);
 export const WORKTREE_FINGERPRINT_MAX_FILE_BYTES = 64 * 1024 * 1024;
@@ -291,6 +291,41 @@ export class GitWorktreeManager {
       throw new Error("Worktree changed while capturing the staged review snapshot");
     }
     return { fingerprint: fingerprintAfter, diff, diffHash, treeId: treeAfter };
+  }
+
+  /** Capture the same review tree as prepareReview without changing the real index. */
+  async captureReviewSnapshotWithUnstaged(info: WorktreeInfo): Promise<WorktreeReviewSnapshot> {
+    await this.#validateInfo(info);
+    await this.#ensureTaskBranch(info);
+    const { stdout: indexOutput } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-path", "index"], {
+      cwd: info.path, windowsHide: true,
+    });
+    const indexPath = resolve(info.path, indexOutput.trim());
+    const temporaryDirectory = await mkdtemp(join(dirname(indexPath), "zero-review-index-"));
+    const temporaryIndex = join(temporaryDirectory, "index");
+    try {
+      await copyFile(indexPath, temporaryIndex);
+      const env = { ...process.env, GIT_INDEX_FILE: temporaryIndex };
+      const fingerprintBefore = await this.fingerprint(info);
+      await execFileAsync("git", ["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "add", "-A"], {
+        cwd: info.path, windowsHide: true, env,
+      });
+      const treeBefore = await this.#writeTree(info, env);
+      const diff = await this.#diffTree(info, treeBefore);
+      const diffHash = hash(diff);
+      const fingerprintAfterFirstStage = await this.fingerprint(info);
+      await execFileAsync("git", ["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "add", "-A"], {
+        cwd: info.path, windowsHide: true, env,
+      });
+      const treeAfter = await this.#writeTree(info, env);
+      const fingerprintAfter = await this.fingerprint(info);
+      if (fingerprintBefore !== fingerprintAfterFirstStage || fingerprintBefore !== fingerprintAfter || treeBefore !== treeAfter) {
+        throw new Error("Worktree changed while capturing a read-only review snapshot");
+      }
+      return { fingerprint: fingerprintAfter, diff, diffHash, treeId: treeAfter };
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
   }
 
   /**
@@ -639,8 +674,8 @@ export class GitWorktreeManager {
     if (untracked) throw new Error("Worktree has unstaged untracked files");
   }
 
-  async #writeTree(info: WorktreeInfo): Promise<string> {
-    const { stdout } = await execFileAsync("git", ["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "write-tree"], { cwd: info.path, windowsHide: true });
+  async #writeTree(info: WorktreeInfo, env?: NodeJS.ProcessEnv): Promise<string> {
+    const { stdout } = await execFileAsync("git", ["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "write-tree"], { cwd: info.path, windowsHide: true, env });
     const treeId = stdout.trim();
     if (!/^[a-fA-F0-9]{40,64}$/.test(treeId)) throw new Error("Git returned an invalid staged tree id");
     return treeId;

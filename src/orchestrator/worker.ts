@@ -350,10 +350,9 @@ export class TaskWorker {
   }> {
     const branchBefore = await this.#options.worktrees.readTaskBranchHead(reopened.info);
     this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(reopened.info));
-    await this.#options.worktrees.prepareReview(reopened.info);
+    const snapshot = await this.#options.worktrees.captureReviewSnapshotWithUnstaged(reopened.info);
     const changedPaths = await this.#options.worktrees.changedPaths(reopened.info);
     this.#assertAllowedPaths(task, changedPaths);
-    const snapshot = await this.#options.worktrees.captureReviewSnapshot(reopened.info);
     const branchAfter = await this.#options.worktrees.readTaskBranchHead(reopened.info);
     if (branchBefore.ref !== branchAfter.ref || branchBefore.head !== branchAfter.head) {
       throw new Error("Task branch moved during fresh review rework Git inspection");

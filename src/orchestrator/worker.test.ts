@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { HandoffV1, HarnessAdapter, HarnessCapabilities, RouteDecision, RunRequest, RunResult, TaskRecord } from "../domain/types.js";
@@ -497,7 +497,7 @@ test("worker leaves a raced reviewed branch failed with its candidate intent and
 
 test("guardian review rework recovery restarts route and validation from the registered partial worktree", async () => {
   for (const boundary of ["before-begin", "fresh-review", "fresh-blocked", "after-begin", "mid-writer", "post-writer",
-    "failed-check-before-retry", "failed-check-after-retry"] as const) {
+    "failed-check-before-retry", "failed-check-after-retry", "external-unstaged"] as const) {
     const root = await mkdtemp(join(process.cwd(), `.zero-worker-rework-recovery-${boundary}-`));
     const repo = join(root, "repo");
     const db = join(root, "tasks.sqlite");
@@ -564,7 +564,7 @@ test("guardian review rework recovery restarts route and validation from the reg
         assert.equal(begun.kind, "started");
         continuationId = begun.continuation.id;
       }
-      if (!["before-begin", "fresh-review", "fresh-blocked", "after-begin"].includes(boundary)) {
+      if (!["before-begin", "fresh-review", "fresh-blocked", "after-begin", "external-unstaged"].includes(boundary)) {
         const continuation = store.getReviewReworkContinuation(task.id, continuationId)!;
         const routeAttempt = store.createAttempt(task.id, "route", { owner: oldOwner, harness: "codex" });
         store.checkpointReviewRework(task.id, continuation.id, { owner: oldOwner, generationId: originalGeneration }, {
@@ -613,6 +613,10 @@ test("guardian review rework recovery restarts route and validation from the reg
         }
       }
 
+      if (boundary === "external-unstaged") {
+        await writeFile(join(plan.path, "result.txt"), "external edit\n");
+      }
+
       assert.deepEqual(store.recoverExpired(new Date(Date.now() + 240_000)), [task.id]);
       store.close();
       store = new TaskStore(db, guardianGeneration("2".repeat(32)));
@@ -645,6 +649,21 @@ test("guardian review rework recovery restarts route and validation from the reg
               ] }
               : { verdict: "pass", summary: "approved", findings: [] } };
         } }, adapters: new Map([["fake", adapter]]), artifactRoot: join(root, "artifacts") });
+      if (boundary === "external-unstaged") {
+        const indexPath = (await exec("git", ["rev-parse", "--path-format=absolute", "--git-path", "index"], { cwd: plan.path })).stdout.trim();
+        const indexBefore = await readFile(indexPath);
+        const contentsBefore = await readFile(join(plan.path, "result.txt"));
+        const statusBefore = await worktrees.status(created.info);
+        assert.equal(await worker.runNext(`rework-new-${boundary}`), undefined);
+        assert.equal(store.get(task.id)?.status, "recovery_required");
+        assert.deepEqual(await readFile(indexPath), indexBefore, "rejected recovery must preserve the real Git index bytes");
+        assert.deepEqual(await readFile(join(plan.path, "result.txt")), contentsBefore, "inspection must preserve working tree bytes");
+        assert.equal(await worktrees.status(created.info), statusBefore, "inspection must preserve Git status");
+        assert.equal(routeCalls, 0);
+        assert.equal(writerCalls, 0);
+        assert.equal(reviewCalls, 0);
+        continue;
+      }
       const done = await worker.runNext(`rework-new-${boundary}`);
       assert.equal(done?.id, task.id);
       if (boundary === "fresh-blocked") {
