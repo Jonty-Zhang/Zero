@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import type { HarnessAdapter, HarnessCapabilities, RunRequest, RunResult, TaskSubmission } from '../domain/types.js';
 import type { ModelBinding } from '../adapters/types.js';
 import { TaskStore } from '../core/task-store.js';
@@ -33,8 +34,9 @@ function getWithHost(url: string, host: string): Promise<{ status: number; body:
 }
 
 class ProbeOnlyAdapter implements HarnessAdapter {
+  probeCalls = 0;
   constructor(readonly id: string, private readonly cap: HarnessCapabilities) {}
-  probe(): Promise<HarnessCapabilities> { return Promise.resolve(this.cap); }
+  probe(): Promise<HarnessCapabilities> { this.probeCalls++; return Promise.resolve(this.cap); }
   async run(_request: RunRequest): Promise<RunResult> {
     throw new Error('API integration tests must not execute a Harness');
   }
@@ -45,6 +47,7 @@ interface Fixture {
   repoPath: string;
   artifactRoot: string;
   store: TaskStore;
+  adapter: ProbeOnlyAdapter;
   config: ConfigStore;
   url: string;
   close(): Promise<void>;
@@ -85,7 +88,7 @@ function testConfig(hasLiveVerification: boolean): LocalZeroConfig {
   };
 }
 
-async function createFixture(hasLiveVerification = true): Promise<Fixture> {
+async function createFixture(hasLiveVerification = true, enqueue?: (taskId: string, store: TaskStore) => void | Promise<void>): Promise<Fixture> {
   const root = await mkdtemp(join(process.cwd(), '.zero-server-test-'));
   const repoPath = join(root, 'repo');
   const artifactRoot = join(root, 'artifacts');
@@ -108,7 +111,7 @@ async function createFixture(hasLiveVerification = true): Promise<Fixture> {
     probeEvidence: { versionAndHelp: 'passed', authentication: 'not_checked', modelSmokeTest: 'not_checked', configuredBindings: 'declared_verified' },
   };
   const adapters = { zcode: new ProbeOnlyAdapter('zcode', capability) };
-  const server = createZeroServer({ store, config, adapters, artifactRoot, staticDir: join(root, 'web') });
+  const server = createZeroServer({ store, config, adapters, artifactRoot, staticDir: join(root, 'web'), ...(enqueue ? { enqueue: taskId => enqueue(taskId, store) } : {}) });
   await new Promise<void>((resolveListen, reject) => {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolveListen(); });
@@ -116,7 +119,7 @@ async function createFixture(hasLiveVerification = true): Promise<Fixture> {
   const address = server.address();
   assert.ok(address && typeof address === 'object');
   return {
-    root, repoPath, artifactRoot, store, config,
+    root, repoPath, artifactRoot, store, config, adapter: adapters.zcode,
     url: `http://127.0.0.1:${address.port}`,
     close: async () => {
       await new Promise<void>(resolveClose => server.close(() => resolveClose()));
@@ -210,6 +213,132 @@ test('POST /api/tasks persists ordered partial execution stages with global defa
       { model: 'glm-main' },
       { model: 'glm-main', reasoningEffort: 'low' },
     ]);
+  } finally { await f.close(); }
+});
+
+test('POST /api/sequences validates the full batch before atomically persisting ordered steps and metadata', async () => {
+  const enqueued: Array<{ id: string; committed: boolean }> = [];
+  const f = await createFixture(true, (id, store) => {
+    enqueued.push({ id, committed: store.listSequences().some(sequence => sequence.steps.some(step => step.task.id === id)) });
+  });
+  const task = (prompt: string) => ({ repoPath: f.repoPath, baseRef: 'main', prompt });
+  try {
+    const rejected = await fetch(`${f.url}/api/sequences`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tasks: [task('A valid first sequence step.'), { ...task('Invalid middle sequence step.'), execution: { harnessId: 'codex', modelId: 'glm-main' } }, task('A valid final sequence step.')] }),
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal(f.store.list().length, 0, 'invalid middle step must not leave earlier steps behind');
+    assert.equal(f.store.listSequences().length, 0);
+    assert.equal(f.adapter.probeCalls, 1, 'one adapter probe set is shared across validation of the batch');
+
+    const createdResponse = await fetch(`${f.url}/api/sequences`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        objective: 'Deliver the parser improvement',
+        acceptanceCriteria: ['All ordered steps finish', 'Aggregate behavior is checked'],
+        tasks: [task('First, inspect the current parser.'), task('Then, implement UTF-8 validation.'), task('Finally, document the behavior.')],
+      }),
+    });
+    assert.equal(createdResponse.status, 201);
+    assert.equal(f.adapter.probeCalls, 2, 'the second POST adds only one more adapter probe set regardless of step count');
+    const created = await createdResponse.json() as {
+      id: string; status: string; objective: string; acceptanceCriteria: string[];
+      steps: Array<{ position: number; task: { id: string; status: string; title: string; repoPath: string } }>;
+    };
+    assert.equal(created.status, 'queued');
+    assert.equal(created.objective, 'Deliver the parser improvement');
+    assert.deepEqual(created.acceptanceCriteria, ['All ordered steps finish', 'Aggregate behavior is checked']);
+    assert.deepEqual(created.steps.map(step => step.position), [0, 1, 2]);
+    assert.deepEqual(created.steps.map(step => step.task.title), [
+      'First, inspect the current parser.', 'Then, implement UTF-8 validation.', 'Finally, document the behavior.',
+    ]);
+    assert.ok(created.steps.every(step => step.task.status === 'pending' && step.task.repoPath === resolve(f.repoPath)));
+    assert.deepEqual(f.store.getSequence(created.id)?.steps.map(step => step.task.prompt), [
+      'First, inspect the current parser.', 'Then, implement UTF-8 validation.', 'Finally, document the behavior.',
+    ]);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(enqueued, created.steps.map(step => ({ id: step.task.id, committed: true })));
+
+    const detailResponse = await fetch(`${f.url}/api/sequences/${created.id}`);
+    assert.equal(detailResponse.status, 200);
+    assert.deepEqual(await detailResponse.json(), created);
+    const listResponse = await fetch(`${f.url}/api/sequences`);
+    assert.equal(listResponse.status, 200);
+    const listed = await listResponse.json() as Array<{ id: string; objective: string; steps: unknown[] }>;
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0]?.id, created.id);
+    assert.equal(listed[0]?.objective, 'Deliver the parser improvement');
+    assert.equal(listed[0]?.steps.length, 3);
+  } finally { await f.close(); }
+});
+
+test('POST /api/sequences rejects out-of-range size and GET returns 404 for missing ids', async () => {
+  const f = await createFixture();
+  try {
+    const short = await fetch(`${f.url}/api/sequences`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tasks: [{}, {}, {}].slice(0, 1) }),
+    });
+    assert.equal(short.status, 400);
+    const tooLong = await fetch(`${f.url}/api/sequences`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tasks: Array.from({ length: 21 }, () => ({})) }),
+    });
+    assert.equal(tooLong.status, 400);
+    const missing = await fetch(`${f.url}/api/sequences/not-a-sequence`);
+    assert.equal(missing.status, 404);
+    assert.equal(f.store.list().length, 0);
+  } finally { await f.close(); }
+});
+
+test('sequence GET detail and list expose the aggregate PASS result without internal review evidence', async () => {
+  const f = await createFixture();
+  try {
+    const sequence = f.store.createSequence([
+      { repoPath: f.repoPath, baseRef: 'main', prompt: 'Complete the first goal step.' },
+      { repoPath: f.repoPath, baseRef: 'main', prompt: 'Complete the second goal step.' },
+    ], 'api-goal-review-pass', {
+      objective: 'Deliver the complete goal.',
+      acceptanceCriteria: ['The combined result meets the goal.'],
+    });
+    const db = new DatabaseSync(join(f.root, 'tasks.sqlite'));
+    try {
+      for (const step of sequence.steps) db.prepare("UPDATE tasks SET status='done' WHERE id=?").run(step.task.id);
+    } finally { db.close(); }
+
+    const startedAt = new Date('2026-09-26T00:00:00.000Z');
+    const fingerprint = 'e'.repeat(64);
+    const attempt = f.store.startSequenceGoalReview(sequence.id, fingerprint, 'api-goal-review-attempt', startedAt);
+    const completedAt = new Date(startedAt.getTime() + 1_000);
+    f.store.finishSequenceGoalReview({
+      attemptId: attempt.attemptId,
+      verifiedEvidenceFingerprint: fingerprint,
+      now: completedAt,
+      result: { verdict: 'pass', summary: 'The combined result meets the goal.', findings: [] },
+    });
+
+    const detailResponse = await fetch(`${f.url}/api/sequences/${sequence.id}`);
+    assert.equal(detailResponse.status, 200);
+    const detail = await detailResponse.json() as { goalReview: Record<string, unknown> };
+    const expectedReview = {
+      state: 'verdict',
+      result: { verdict: 'pass', summary: 'The combined result meets the goal.', findings: [] },
+      createdAt: startedAt.toISOString(),
+      completedAt: completedAt.toISOString(),
+    };
+    assert.deepEqual(detail.goalReview, expectedReview);
+    assert.equal(Object.hasOwn(detail.goalReview, 'evidenceFingerprint'), false);
+    assert.equal(Object.hasOwn(detail.goalReview, 'generationId'), false);
+
+    const listResponse = await fetch(`${f.url}/api/sequences`);
+    assert.equal(listResponse.status, 200);
+    const listed = await listResponse.json() as Array<{ id: string; goalReview: Record<string, unknown> }>;
+    const listItem = listed.find(item => item.id === sequence.id);
+    assert.ok(listItem);
+    assert.deepEqual(listItem.goalReview, expectedReview);
+    assert.equal(Object.hasOwn(listItem.goalReview, 'evidenceFingerprint'), false);
+    assert.equal(Object.hasOwn(listItem.goalReview, 'generationId'), false);
   } finally { await f.close(); }
 });
 
@@ -329,5 +458,32 @@ test('capabilities do not call a help-only model binding live verified', async (
     assert.equal(modelBinding?.available, false);
     assert.equal(modelBinding?.verificationLevel, undefined);
     assert.match(modelBinding?.reason ?? '', /尚未通过.*验证/);
+  } finally { await f.close(); }
+});
+
+test('PUT and GET /api/config persist an API coordinator reference without any key value', async () => {
+  const f = await createFixture();
+  try {
+    const configured = await fetch(`${f.url}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      allocator: { kind: 'api', modelId: null, reasoningEffort: null, api: { baseUrl: 'https://provider.example/v1', model: 'router-model', keyEnv: 'ZERO_ROUTE_KEY' } },
+      reviewer: { modelId: null, reasoningEffort: null },
+    }) });
+    assert.equal(configured.status, 200);
+    const payload = await configured.json() as { allocator: { kind: string; modelId: string | null; api: { baseUrl: string; model: string; keyEnv: string } } };
+    assert.equal(payload.allocator.kind, 'api');
+    assert.deepEqual(payload.allocator.api, { baseUrl: 'https://provider.example/v1', model: 'router-model', keyEnv: 'ZERO_ROUTE_KEY' });
+    const persisted = await f.config.read();
+    assert.deepEqual(persisted.allocator.api, payload.allocator.api);
+    assert.equal(JSON.stringify(payload).includes('sk-'), false);
+
+    const read = await fetch(`${f.url}/api/config`);
+    assert.equal(read.status, 200);
+    assert.deepEqual((await read.json() as typeof payload).allocator, payload.allocator);
+    const invalid = await fetch(`${f.url}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      allocator: { kind: 'api', modelId: null, reasoningEffort: null, api: { baseUrl: 'http://provider.example', model: 'm', keyEnv: 'BAD-NAME' } },
+      reviewer: { modelId: null, reasoningEffort: null },
+    }) });
+    assert.equal(invalid.status, 400);
+    assert.match((await invalid.json() as { error: string }).error, /HTTPS/);
   } finally { await f.close(); }
 });

@@ -657,7 +657,7 @@ export class TaskWorker {
           throw new Error("An existing task worktree requires recovery inspection; refusing to create or reuse it automatically");
         }
         this.#assertLease(taskId, owner, () => leaseLost);
-        const plan = await this.#options.worktrees.prepareCreatePlan(taskId, task.repoPath, task.baseRef);
+        const plan = await this.#options.worktrees.prepareCreatePlan(taskId, task.repoPath, task.sequenceBaseCommit ?? task.baseRef);
         this.#assertLease(taskId, owner, () => leaseLost);
         this.#options.store.recordWorktreeCreationIntent(taskId, owner, plan);
         worktreeCreationIntentPending = true;

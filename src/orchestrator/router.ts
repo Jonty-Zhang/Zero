@@ -19,7 +19,11 @@ export interface RouteCandidate {
 }
 
 export interface RouterConfig {
+  /** Existing Codex subscription coordinator. Kept as the default for backward compatibility. */
   codex: HarnessAdapter;
+  /** Optional routing-only external coordinator. It is never an execution candidate. */
+  api?: HarnessAdapter;
+  coordinatorKind?: 'codex' | 'api';
   coordinatorModel: string;
   coordinatorReasoningEffort?: string;
   cwd: string;
@@ -72,10 +76,18 @@ export class RouteError extends Error {
   constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'RouteError'; }
 }
 
-/** Codex coordinator: route only to verified, available candidates and lock every user-selected field. */
+/** A routing-only coordinator chooses among verified candidates and cannot execute a task. */
 export class TaskRouter {
+  private readonly coordinator: HarnessAdapter;
+  private readonly coordinatorSource: SelectionSource;
+  private readonly coordinatorKind: 'codex' | 'api';
+
   constructor(private readonly config: RouterConfig) {
-    if (config.codex.id !== 'codex') throw new Error('The route coordinator must use the Codex adapter');
+    this.coordinatorKind = config.coordinatorKind ?? 'codex';
+    this.coordinator = this.coordinatorKind === 'api' ? config.api! : config.codex;
+    this.coordinatorSource = this.coordinatorKind;
+    if (!this.coordinator) throw new Error('The configured route coordinator is unavailable');
+    if (this.coordinatorKind === 'codex' && this.coordinator.id !== 'codex') throw new Error('The default route coordinator must use the Codex adapter');
     if (!config.coordinatorModel.trim()) throw new Error('A verified coordinator model must be configured');
   }
 
@@ -101,7 +113,7 @@ export class TaskRouter {
   }
 
   async decide(input: RouteInput): Promise<RouteAnalysis> {
-    const caps = await this.config.codex.probe();
+    const caps = await this.coordinator.probe();
     this.validateCoordinator(caps);
     const candidates = this.filterCandidates(input.candidates);
     const selection = resolveSelection(input.submission.selection, input.projectSelection, input.globalSelection);
@@ -112,16 +124,19 @@ export class TaskRouter {
     const outputSchemaPath = await this.writeSchema(input.taskId, 'route', ROUTE_SCHEMA);
     const attemptId = input.attemptId ?? (this.config.createAttemptId ?? randomUUID)();
     const prompt = makeRoutePrompt(input, eligible, selection.values);
-    const trustedCwd = await createTrustedCodexCwd({ artifactRoot: this.config.artifactDir, purpose: 'route', taskWorkspace: this.config.cwd });
+    // The API coordinator receives only the constructed routing prompt; it has no local process or cwd.
+    const trustedCwd = this.coordinatorKind === 'codex'
+      ? await createTrustedCodexCwd({ artifactRoot: this.config.artifactDir, purpose: 'route', taskWorkspace: this.config.cwd })
+      : undefined;
     let run: RunResult;
     try {
-      run = await this.config.codex.run({
+      run = await this.coordinator.run({
         taskId: input.taskId,
         attemptId,
         role: 'route',
-        cwd: trustedCwd.cwd,
+        cwd: trustedCwd?.cwd ?? this.config.cwd,
         prompt,
-        harness: 'codex',
+        harness: this.coordinator.id,
         model: this.config.coordinatorModel,
         ...(this.config.coordinatorReasoningEffort ? { reasoningEffort: this.config.coordinatorReasoningEffort } : {}),
         outputSchemaPath,
@@ -129,22 +144,22 @@ export class TaskRouter {
         readOnly: true,
         ...(this.config.timeoutMs ? { deadline: new Date(Date.now() + this.config.timeoutMs).toISOString() } : {}),
       });
-    } finally { await trustedCwd.dispose(); }
+    } finally { await trustedCwd?.dispose(); }
     if (run.status !== 'completed' || run.exitCode !== 0) {
-      if (run.quota) throw new QuotaLimitError("Codex route paused because the model usage limit was reached", run.quota.retryAt);
-      throw new RouteError(`Codex route call did not complete successfully (${run.status}, exit=${String(run.exitCode)}): ${run.error ?? 'no error detail'}`);
+      if (run.quota) throw new QuotaLimitError(`${this.coordinatorLabel()} route paused because the model usage limit was reached`, run.quota.retryAt);
+      throw new RouteError(`${this.coordinatorLabel()} route call did not complete successfully (${run.status}, exit=${String(run.exitCode)}): ${run.error ?? 'no error detail'}`);
     }
-    const parsed = parseRouteOutput(run.final);
+    const parsed = parseRouteOutput(run.final, this.coordinatorSource);
     const chosen = eligible.find((candidate) => candidate.bindingId === parsed.bindingId);
-    if (!chosen) throw new RouteError(`Codex selected binding outside the candidate set: ${parsed.bindingId}`);
-    validateChoice(parsed, chosen, selection.values);
+    if (!chosen) throw new RouteError(`${this.coordinatorLabel()} selected binding outside the candidate set: ${parsed.bindingId}`);
+    validateChoice(parsed, chosen, selection.values, this.coordinatorLabel());
 
     const fieldSources = {
-      harness: selection.sources.harness ?? 'codex',
-      model: selection.sources.model ?? 'codex',
-      reasoningEffort: selection.sources.reasoningEffort ?? 'codex',
+      harness: selection.sources.harness ?? this.coordinatorSource,
+      model: selection.sources.model ?? this.coordinatorSource,
+      reasoningEffort: selection.sources.reasoningEffort ?? this.coordinatorSource,
     } satisfies RouteDecision['fieldSources'];
-    const selectedSource = overallSource(fieldSources);
+    const selectedSource = overallSource(fieldSources, this.coordinatorSource);
     const decidedAt = (this.config.now ?? (() => new Date()))().toISOString();
     const decision: RouteDecision = {
       taskId: input.taskId,
@@ -167,11 +182,13 @@ export class TaskRouter {
     return { taskType: parsed.taskType, complexity: parsed.complexity, decision };
   }
 
+  private coordinatorLabel(): string { return this.coordinatorKind === 'api' ? 'API' : 'Codex'; }
+
   private validateCoordinator(caps: HarnessCapabilities): void {
-    if (!caps.available || caps.harness !== 'codex') throw new RouteError(`Codex coordinator is unavailable: ${caps.unavailableReason ?? 'probe failed'}`);
-    if (!caps.models.includes(this.config.coordinatorModel)) throw new RouteError(`Coordinator model is not in verified Codex bindings: ${this.config.coordinatorModel}`);
+    if (!caps.available || caps.harness !== this.coordinator.id) throw new RouteError(`${this.coordinatorLabel()} coordinator is unavailable: ${caps.unavailableReason ?? 'probe failed'}`);
+    if (!caps.models.includes(this.config.coordinatorModel)) throw new RouteError(`Coordinator model is not configured for ${this.coordinatorLabel()}: ${this.config.coordinatorModel}`);
     if (this.config.coordinatorReasoningEffort && !caps.reasoningEfforts?.includes(this.config.coordinatorReasoningEffort)) {
-      throw new RouteError(`Coordinator reasoning effort is not supported by the Codex probe: ${this.config.coordinatorReasoningEffort}`);
+      throw new RouteError(`Coordinator reasoning effort is not supported by the ${this.coordinatorLabel()} coordinator: ${this.config.coordinatorReasoningEffort}`);
     }
   }
 
@@ -238,16 +255,17 @@ function makeRoutePrompt(input: RouteInput, candidates: RouteCandidate[], locked
   ].join('\n\n');
 }
 
-function parseRouteOutput(final?: string): RouteOutput {
-  if (!final?.trim()) throw new RouteError('Codex route output is empty');
+function parseRouteOutput(final?: string, source: SelectionSource = 'codex'): RouteOutput {
+  const label = source === 'api' ? 'API' : 'Codex';
+  if (!final?.trim()) throw new RouteError(`${label} route output is empty`);
   let value: unknown;
-  try { value = JSON.parse(final); } catch (error) { throw new RouteError('Codex route output is not strict JSON', { cause: error }); }
-  if (!isRecord(value) || hasExtraKeys(value, ['taskType', 'complexity', 'bindingId', 'reasoningEffort', 'reason'])) throw new RouteError('Codex route output has an invalid object shape');
-  if (typeof value.taskType !== 'string' || !value.taskType.trim() || value.taskType.length > 80) throw new RouteError('Codex route taskType must be a non-empty string');
-  if (value.complexity !== 'low' && value.complexity !== 'medium' && value.complexity !== 'high') throw new RouteError('Codex route complexity is invalid');
-  if (typeof value.bindingId !== 'string' || !value.bindingId.trim()) throw new RouteError('Codex route bindingId must be a non-empty string');
-  if (value.reasoningEffort !== null && (typeof value.reasoningEffort !== 'string' || !value.reasoningEffort.trim())) throw new RouteError('Codex route reasoningEffort must be a string or null');
-  if (typeof value.reason !== 'string' || !value.reason.trim() || value.reason.length > 2000) throw new RouteError('Codex route reason must be a non-empty string');
+  try { value = JSON.parse(final); } catch (error) { throw new RouteError(`${label} route output is not strict JSON`, { cause: error }); }
+  if (!isRecord(value) || hasExtraKeys(value, ['taskType', 'complexity', 'bindingId', 'reasoningEffort', 'reason'])) throw new RouteError(`${label} route output has an invalid object shape`);
+  if (typeof value.taskType !== 'string' || !value.taskType.trim() || value.taskType.length > 80) throw new RouteError(`${label} route taskType must be a non-empty string`);
+  if (value.complexity !== 'low' && value.complexity !== 'medium' && value.complexity !== 'high') throw new RouteError(`${label} route complexity is invalid`);
+  if (typeof value.bindingId !== 'string' || !value.bindingId.trim()) throw new RouteError(`${label} route bindingId must be a non-empty string`);
+  if (value.reasoningEffort !== null && (typeof value.reasoningEffort !== 'string' || !value.reasoningEffort.trim())) throw new RouteError(`${label} route reasoningEffort must be a string or null`);
+  if (typeof value.reason !== 'string' || !value.reason.trim() || value.reason.length > 2000) throw new RouteError(`${label} route reason must be a non-empty string`);
   return {
     taskType: value.taskType,
     complexity: value.complexity as RouteOutput['complexity'],
@@ -289,20 +307,20 @@ function validateLockedEffort(effort: string | undefined, candidates: RouteCandi
   }
 }
 
-function validateChoice(output: RouteOutput, chosen: RouteCandidate, locked: Partial<ExecutionSelection>): void {
-  if (locked.harness !== undefined && chosen.harness !== locked.harness) throw new RouteError('Codex route violates the locked Harness');
-  if (locked.model !== undefined && chosen.model !== locked.model) throw new RouteError('Codex route violates the locked Model');
-  if (locked.reasoningEffort !== undefined && output.reasoningEffort !== locked.reasoningEffort) throw new RouteError('Codex route violates the locked reasoning effort');
+function validateChoice(output: RouteOutput, chosen: RouteCandidate, locked: Partial<ExecutionSelection>, coordinatorLabel: string): void {
+  if (locked.harness !== undefined && chosen.harness !== locked.harness) throw new RouteError(`${coordinatorLabel} route violates the locked Harness`);
+  if (locked.model !== undefined && chosen.model !== locked.model) throw new RouteError(`${coordinatorLabel} route violates the locked Model`);
+  if (locked.reasoningEffort !== undefined && output.reasoningEffort !== locked.reasoningEffort) throw new RouteError(`${coordinatorLabel} route violates the locked reasoning effort`);
   if (chosen.reasoningEfforts.length === 0) {
-    if (output.reasoningEffort !== null) throw new RouteError('Codex selected an unverified reasoning effort for this binding');
+    if (output.reasoningEffort !== null) throw new RouteError(`${coordinatorLabel} selected an unverified reasoning effort for this binding`);
   } else if (typeof output.reasoningEffort !== 'string' || !chosen.reasoningEfforts.includes(output.reasoningEffort)) {
-    throw new RouteError('Codex selected a reasoning effort unsupported by the chosen binding');
+    throw new RouteError(`${coordinatorLabel} selected a reasoning effort unsupported by the chosen binding`);
   }
 }
 
-function overallSource(fields: NonNullable<RouteDecision['fieldSources']>): SelectionSource {
+function overallSource(fields: NonNullable<RouteDecision['fieldSources']>, coordinator: SelectionSource = 'codex'): SelectionSource {
   const values = Object.values(fields);
-  return values.every((value) => value === values[0]) ? values[0]! : 'codex';
+  return values.every((value) => value === values[0]) ? values[0]! : coordinator;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }

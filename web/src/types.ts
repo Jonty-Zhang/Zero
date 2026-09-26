@@ -58,7 +58,31 @@ export type Task = {
   error?: string;
   maxRevisions?: number;
 };
+export type TaskSequenceStatus = 'queued' | 'running' | 'waiting' | 'blocked' | 'steps_completed' | 'completed';
+export type SequenceGoalReview = {
+  state: 'running' | 'quota' | 'verdict';
+  result?: ReviewResult;
+  retryAt?: string;
+  createdAt: string;
+  completedAt?: string;
+};
+export type TaskSequence = {
+  id: string;
+  status: TaskSequenceStatus;
+  objective?: string;
+  acceptanceCriteria?: string[];
+  goalReview?: SequenceGoalReview;
+  createdAt: string;
+  updatedAt: string;
+  steps: Array<{ position: number; task: Task; effectiveBaseCommit?: string }>;
+  blockedReason?: { taskId: string; status: Status; reason?: string };
+};
 export type Config = {
-  allocator: { modelId: string | null; reasoningEffort: string | null };
+  allocator: {
+    kind: 'codex' | 'api';
+    modelId: string | null;
+    reasoningEffort: string | null;
+    api?: { baseUrl: string | null; model: string | null; keyEnv: string | null };
+  };
   reviewer: { modelId: string | null; reasoningEffort: string | null };
 };

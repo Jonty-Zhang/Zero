@@ -2,13 +2,15 @@
 
 核查日期：2026-09-24。本文区分已由项目官方仓库核实的能力与 Zero 的设计判断。上游功能、CLI 参数及许可证应在实施时锁定具体版本再复核。
 
+**当前决策（2026-09-26）：**主分配器可切换为 Codex 订阅或兼容 OpenAI API 的 HTTPS 协调器。两者只负责从 Zero 已验证的执行绑定中选择路由，不实现任务；Zero 的执行器和状态机负责实际工作，独立 Reviewer 仍固定使用 Codex。API 密钥只通过 Zero 服务进程环境提供，配置中的 `keyEnv` 是环境变量名称。下文中明确标注为 Codex 分配器的部分保留早期 Codex 优先方案的分析；当前路由契约见[主分配与审核契约](route-review-contract.md)。
+
 **接入路径更新：**用户现有 ZCode 桌面配置位于 ZCode 自己的 v2 数据根，并已配置 GLM 和 DeepSeek。早期设计的 Zero 独立 `.zcode/cli/config.json` 绑定仅是可选隔离 CLI 路径，不能代表这台电脑正在使用的桌面模型配置。当前优先研究 ZCode `app-server` 的会话级模型选择；[共享工作区与跨 Harness 接力设计](workspace-handoff-design.md)记录新的实施边界。Zero 不移动或改写现有 ZCode 配置/凭据。
 
 ## 结论
 
-Zero v1 做成**一个独立安装的应用**：后台服务负责无人值守执行，同一服务提供本地 Web 界面，CLI 提供脚本入口。核心使用 Node.js 24 + TypeScript、SQLite、Git worktree 和 Codex、DSH、ZCode Harness Adapter；界面采用 React 并作为静态资源随服务打包。**不直接 fork 参考仓库。** 其中 Hydra 是最接近需求的流程参考，CAO 提供清晰的多 CLI Provider/会话抽象，Agent Orchestrator 提供已落地的同任务切换实例；这些项目可继续作为运行时与交接设计参考，但不担任 Zero 的任务状态源。
+Zero v1 做成**一个独立安装的应用**：后台服务负责无人值守执行，同一服务提供本地 Web 界面，CLI 提供脚本入口。核心使用 Node.js 24 + TypeScript、SQLite、Git worktree、Codex/DSH/ZCode Harness Adapter，以及可选 Codex 或 API 主分配器；界面采用 React 并作为静态资源随服务打包。**不直接 fork 参考仓库。** 其中 Hydra 是最接近需求的流程参考，CAO 提供清晰的多 CLI Provider/会话抽象，Agent Orchestrator 提供已落地的同任务切换实例；这些项目可继续作为运行时与交接设计参考，但不担任 Zero 的任务状态源。
 
-这个判断针对当前 Windows 节点和 Zero 的交付标准：每项任务必须经过可追溯的路由、独立工作区、机器测试、Codex 独立审核、有限返工和持久归档。Zero 自己维护状态机，避免把某个 Agent 的自然语言“已完成”当成 DONE。按用户最新决定，**Codex 固定担任分配器和 Reviewer**；用户可在 Zero 中手动指定执行 Harness、模型和思考强度，未指定的字段由 Codex 在可用候选中选择。
+这个判断针对当前 Windows 节点和 Zero 的交付标准：每项任务必须经过可追溯的路由、独立工作区、机器测试、Codex 独立审核、有限返工和持久归档。Zero 自己维护状态机，避免把某个 Agent 的自然语言“已完成”当成 DONE。按当前决定，**主分配器可选 Codex 订阅或 API；Reviewer 固定使用 Codex**。用户可在 Zero 中手动指定执行 Harness、模型和思考强度，未指定的字段由当前主分配器在可用候选中选择。
 
 2026-09-25 补充：用户提及的 **Herdr** 与下表 Hydra 是不同项目。官方 Herdr、herdr-board 和 herdr-orchestrator 的复用判断见[Herdr 生态评估](herdr-assessment.md)。
 
@@ -41,7 +43,7 @@ Zero v1 做成**一个独立安装的应用**：后台服务负责无人值守�
 flowchart LR
   Submit[Web 界面 / CLI 提交] --> DB[(SQLite 任务与事件)]
   DB --> Scheduler[Scheduler / Lease]
-  Scheduler --> Router[Codex 分配器 + Zero 验证器]
+  Scheduler --> Router[主分配器（Codex / API）+ Zero 验证器]
   Router --> Workspace[Git worktree 管理]
   Workspace --> Adapter[Harness Adapter]
   Adapter --> Codex[Codex]
@@ -113,17 +115,17 @@ bindings:
 
 `models` 记录模型能力、上下文上限、成本/配额元数据（若已核实）；`bindings` 才代表 Harness **实际可调用** 某模型。每个 binding 需要 `probe` 证明 CLI 版本、认证、模型选择和最小调用通过。无法确认 profile 选择的模型时将其置为 `unavailable`；若 CLI 在成功调用中不报告实际模型，报告以 `selector_only` 标明证据范围。若 DSH/ZCode 的配置只能修改全局状态，则先做运行级隔离或串行化，不允许并发任务互相改写默认模型。DSH 和 ZCode 当前的 per-run reasoning effort 不可验证，因此不展示为可选能力。配置快照及有效模型写入报告。
 
-## Codex 分配器与双层路由
+## 主分配器与双层路由
 
 1. Zero 先枚举通过 probe 的 `(Harness, Model)` binding，并按操作系统、权限、headless、配额、上下文和阶段能力过滤，得到**实际可运行的候选表**。
-2. 独立的 Codex 分配会话读取任务 brief、仓库摘要、测试要求和候选表，输出结构化的任务类型、复杂度、推荐 Harness、推荐 Model、理由及备用路线。它只能从候选表中选择，不能发明模型 ID 或调用不存在的 CLI。
-3. 用户可在 Zero 界面为执行阶段独立选择 `Harness`、`Model`、`Reasoning Effort`，任一项都允许留空。选择优先级为任务指定 > 项目预设 > 全局预设 > Codex 分配。Codex 只能补全未指定字段；指定 Harness 时仅列出其已验证模型，指定模型时仅列出兼容 Harness。思考强度映射到 Harness 的实际参数或配置，未验证支持的档位不能显示为可选。
-4. Zero 验证 Codex 的输出与用户配置，固定 route decision：`(harness_id, model_id, reasoning_effort, binding_id, config_hash, reason, selection_source)`。执行期间不静默切换模型或思考强度；替换路线产生明确事件和新的 attempt/基础设施重试。
+2. 配置的主分配器（Codex 订阅或兼容 OpenAI API 的 HTTPS 协调器）读取路由 brief 与候选表，输出结构化路由选择。它只能从候选表中选择，不能发明模型 ID 或调用执行器。
+3. 用户可在 Zero 界面为执行阶段独立选择 `Harness`、`Model`、`Reasoning Effort`，任一项都允许留空。选择优先级为任务指定 > 项目预设 > 全局预设 > 当前主分配器。分配器只能补全未指定字段；指定 Harness 时仅列出其已验证模型，指定模型时仅列出兼容 Harness。思考强度映射到 Harness 的实际参数或配置，未验证支持的档位不能显示为可选。
+4. Zero 验证配置的分配器输出与用户配置，固定 route decision：`(harness_id, model_id, reasoning_effort, binding_id, config_hash, reason, selection_source)`。执行期间不静默切换模型或思考强度；替换路线产生明确事件和新的 attempt/基础设施重试。
 5. Review 固定用**新的 Codex 会话**，只读访问 base→head diff、测试证据与验收条件，输出可解析 verdict 和逐项 finding。Reviewer 的模型与思考强度也可在 Zero 中配置；默认尽量与执行模型不同。如果执行阶段也是 Codex 且模型相同，至少强制独立会话、只读权限与机器测试门禁，并在报告中标明审核独立性降低。
 
-Codex 做语义判断，Zero 做约束验证和状态推进。质量、速度与费用的优劣需用 Zero 自己的任务集测量，不能仅根据模型品牌硬编码。分配器失败、输出无效或候选为空时不猜测路线，任务留有诊断记录。
+主分配器做语义路由判断，Zero 做约束验证和状态推进。API 协调器只处理路由，不实现任务；实际执行始终由选定的 Harness 完成。质量、速度与费用的优劣需用 Zero 自己的任务集测量，不能仅根据模型品牌硬编码。分配器失败、输出无效或候选为空时不猜测路线，任务留有诊断记录。
 
-首批 Codex 分配提示可采用用户给出的偏好：复杂开发倾向 ZCode+GLM，长上下文任务倾向 ZCode+DeepSeek，调试/测试倾向 Codex+GPT，独立第二方案倾向 DSH+DeepSeek。**这些是待实测的建议**，只对通过模型绑定冒烟测试的组合生效。每次选择保留候选及排除原因，以便以后用任务完成率、返工率和耗时调整。
+首批路由提示可采用用户给出的偏好：复杂开发倾向 ZCode+GLM，长上下文任务倾向 ZCode+DeepSeek，调试/测试倾向 Codex+GPT，独立第二方案倾向 DSH+DeepSeek。**这些是待实测的建议**，只对通过模型绑定冒烟测试的组合生效。每次选择保留候选及排除原因，以便以后用任务完成率、返工率和耗时调整。
 
 ## 测试、Review 和报告
 
@@ -137,7 +139,7 @@ Codex 做语义判断，Zero 做约束验证和状态推进。质量、速度与
 2. **状态核心**：SQLite schema、task/event/attempt、原子领取、lease/恢复、HTTP API 与 CLI submit/status/cancel；用假 Adapter 证明掉电重启后不丢任务、不重复 DONE。
 3. **工作区与测试**：worktree 创建/保留/清理、范围检查、测试执行器、进程超时与日志归档；证明并行任务互不影响。
 4. **三个 Harness Adapter**：先实现 Codex，再接 DSH 和 ZCode；每个 binding 通过真实冒烟测试才进入 Router 候选。原始事件与标准结果均存档。
-5. **Codex 分配器与 Reviewer**：实现候选过滤、Codex 结构化分配、用户模型覆盖、route 快照、Codex 独立只读 review、结构化 verdict。验证 reviewer 不会写工作区。
+5. **主分配器与 Reviewer**：实现候选过滤、Codex 结构化分配、可选 API 协调器、用户模型覆盖、route 快照、Codex 独立只读 review、结构化 verdict。验证 reviewer 不会写工作区。
 6. **返工闭环**：测试或审核失败后生成 revision brief；达到 `max_revisions` 准确 FAILED；通过后重跑门禁再 DONE。
 7. **应用界面与无人值守部署**：同一服务托管 React 界面，提供提交、状态看板、任务详情、日志与报告下载；做成单一安装体验。后台进程开机自启，使用专用低权限执行环境、健康检查、磁盘/配额上限、凭据注入与故障恢复；完成一次完整真实仓库任务的端到端演练，公开发布文档和版本。
 
@@ -145,8 +147,8 @@ Codex 做语义判断，Zero 做约束验证和状态推进。质量、速度与
 
 ### v1 放行用例
 
-- 手动指定 Harness、模型、思考强度时，Codex 分配器不能改写这三项；只填其中一项时，它只补全其余字段，并且 Zero 校验组合确实可运行。
-- 三项都留空时，Codex 分配器给出结构化选择与理由；无健康 binding、无有效模型或输出无效时任务失败并留下诊断，不会静默使用 CLI 默认值。
+- 手动指定 Harness、模型、思考强度时，主分配器不能改写这三项；只填其中一项时，它只补全其余字段，并且 Zero 校验组合确实可运行。
+- 三项都留空时，主分配器给出结构化选择与理由；无健康 binding、无有效模型或输出无效时任务失败并留下诊断，不会静默使用 CLI 默认值。
 - 实施为 Codex、DSH 或 ZCode 时，审核始终启动**另一个只读 Codex 会话**；测试红灯、审核未完成或 verdict 为 `changes_requested` 时不能 DONE。
 - `max_revisions=0` 时首次失败直接 FAILED；`max_revisions=2` 时最多执行三轮。断电或 worker 重启不会产生重复提交、重复报告或丢失任务。
 - 同一仓库两项任务同时运行时各自 worktree 与模型配置互不覆盖；任务成功后可从报告定位结果分支、commit、diff、测试和审核证据。

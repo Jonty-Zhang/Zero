@@ -4,7 +4,7 @@ import type { RunRequest } from '../../domain/types.js';
 import type { ModelBinding } from '../types.js';
 import { ZCodeAppServerAdapter } from '../zcode-app-server-adapter.js';
 import type { ProbeCommandResult } from '../zcode-app-server-adapter.js';
-import type { ZCodeAppServerPeerOptions } from '../zcode-app-server-peer.js';
+import type { ZCodeAppServerDiagnosticEvent, ZCodeAppServerPeerOptions } from '../zcode-app-server-peer.js';
 import type { ZCodeProtocolPeer } from '../zcode-protocol-session.js';
 
 const binding = (overrides: Record<string, unknown> = {}): ModelBinding => ({
@@ -125,6 +125,117 @@ test('probe is limited to help/version and reports only version-matched selector
   assert.deepEqual(result.models, ['glm-flash']);
   assert.equal(result.probeEvidence?.authentication, 'not_checked');
   assert.equal(result.probeEvidence?.modelSmokeTest, 'not_checked');
+});
+
+test('desktop diagnostic reports lifecycle categories and a model count without identities', async () => {
+  const cli = probeCommand();
+  const calls: string[] = [];
+  let closed = false;
+  const secret = 'fake-provider-key-diagnostic-test';
+  const adapter = new ZCodeAppServerAdapter({
+    zcodeEntry: 'C:/tools/zcode/cli.mjs',
+    runProbeCommand: cli.run,
+    launchPeer: async () => ({
+      async request(method) {
+        calls.push(method);
+        return {
+          session: { sessionId: 'session-secret-id' },
+          settings: { model: { available: [
+            { ref: { providerId: secret, modelId: 'private-model-name' } },
+            { ref: { providerId: 'private-provider-name', modelId: 'private-model-name-2' } },
+          ] } },
+        };
+      },
+      async readPendingInteractions() { throw new Error('diagnostic must not inspect interactions'); },
+      async close() { closed = true; },
+    }),
+  });
+
+  const diagnostic = await adapter.diagnoseExistingDesktop('C:/zero/worktree');
+  const stdout = `${JSON.stringify(diagnostic)}\n`;
+  const stderr = '';
+
+  assert.deepEqual(diagnostic, {
+    version: 'reported', childSpawn: 'started', sessionCreate: 'acknowledged',
+    failureStage: 'none',
+    preferenceAckFailure: 'none',
+    preferenceAckRpcFailure: 'not_applicable',
+    modelRegistry: 'populated', modelCount: 2,
+  });
+  assert.deepEqual(calls, ['session/create']);
+  assert.equal(closed, true);
+  assert.equal(stdout.includes(secret), false);
+  assert.equal(stdout.includes('private-model-name'), false);
+  assert.equal(stdout.includes('session-secret-id'), false);
+  assert.equal(stderr.includes(secret), false);
+});
+
+test('desktop diagnostic converts child launch errors with fake credentials to fixed categories', async () => {
+  const secret = 'fake-provider-key-never-print-this';
+  const cli = probeCommand();
+  const adapter = new ZCodeAppServerAdapter({
+    zcodeEntry: 'C:/tools/zcode/cli.mjs',
+    runProbeCommand: cli.run,
+    launchPeer: async () => { throw new Error(`spawn failed with ${secret}`); },
+  });
+
+  const diagnostic = await adapter.diagnoseExistingDesktop('C:/zero/worktree');
+  const stdout = `${JSON.stringify(diagnostic)}\n`;
+  const stderr = '';
+
+  assert.deepEqual(diagnostic, {
+    version: 'reported', childSpawn: 'failed', sessionCreate: 'not_run',
+    failureStage: 'launch',
+    preferenceAckFailure: 'none',
+    preferenceAckRpcFailure: 'not_applicable',
+    modelRegistry: 'not_checked', modelCount: null,
+  });
+  assert.equal(stdout.includes(secret), false);
+  assert.equal(stderr.includes(secret), false);
+});
+
+test('desktop diagnostic maps safe peer events to categorical failure stages', async () => {
+  const cli = probeCommand();
+  const cases: Array<{
+    event: ZCodeAppServerDiagnosticEvent;
+    response?: unknown;
+    failureStage: 'preference_ack' | 'session_create' | 'response_shape';
+    preferenceAckFailure: 'none' | 'rpc_failed' | 'ack_invalid';
+    preferenceAckRpcFailure: 'not_applicable' | 'method_not_found' | 'invalid_params' | 'other_protocol_error' | 'no_code';
+  }> = [
+    { event: { stage: 'preference_ack', outcome: 'failed', code: 'ack_invalid', elapsedMs: 2 }, failureStage: 'preference_ack', preferenceAckFailure: 'ack_invalid', preferenceAckRpcFailure: 'not_applicable' },
+    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'method_not_found', elapsedMs: 3 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'method_not_found' },
+    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'invalid_params', elapsedMs: 4 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'invalid_params' },
+    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'other_protocol_error', elapsedMs: 5 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'other_protocol_error' },
+    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'no_code', elapsedMs: 6 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'no_code' },
+    { event: { stage: 'session_create_rpc', outcome: 'failed', code: 'rpc_failed', elapsedMs: 7 }, failureStage: 'session_create', preferenceAckFailure: 'none', preferenceAckRpcFailure: 'not_applicable' },
+    { event: { stage: 'session_create_rpc', outcome: 'failed', code: 'response_invalid', elapsedMs: 8 }, response: { session: {} }, failureStage: 'response_shape', preferenceAckFailure: 'none', preferenceAckRpcFailure: 'not_applicable' },
+  ];
+
+  for (const current of cases) {
+    const secret = 'CANARY_PRIVATE_ERROR_TEXT';
+    const adapter = new ZCodeAppServerAdapter({
+      zcodeEntry: 'C:/tools/zcode/cli.mjs',
+      runProbeCommand: cli.run,
+      launchPeer: async options => {
+        options.onDiagnostic?.(current.event);
+        return {
+          async request() {
+            if (current.response !== undefined) return current.response;
+            throw new Error(secret);
+          },
+          async readPendingInteractions() { return []; },
+          async close() {},
+        };
+      },
+    });
+
+    const diagnostic = await adapter.diagnoseExistingDesktop('C:/zero/worktree');
+    assert.equal(diagnostic.failureStage, current.failureStage);
+    assert.equal(diagnostic.preferenceAckFailure, current.preferenceAckFailure);
+    assert.equal(diagnostic.preferenceAckRpcFailure, current.preferenceAckRpcFailure);
+    assert.equal(JSON.stringify(diagnostic).includes(secret), false);
+  }
 });
 
 test('run uses the exact provider/model in one existing-desktop task-worktree session and reports selector_only', async () => {

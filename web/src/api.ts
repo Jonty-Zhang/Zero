@@ -1,4 +1,4 @@
-import type { Capabilities, Config, Task } from './types';
+import type { Capabilities, Config, Task, TaskSequence } from './types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -18,6 +18,9 @@ export const api = {
   tasks: () => request<Task[]>('/api/tasks'),
   task: (id: string) => request<Task>(`/api/tasks/${encodeURIComponent(id)}`),
   createTask: (payload: unknown) => request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(payload) }),
+  sequences: () => request<TaskSequence[] | { sequences: TaskSequence[] }>('/api/sequences'),
+  sequence: (id: string) => request<TaskSequence>(`/api/sequences/${encodeURIComponent(id)}`),
+  createSequence: (payload: unknown) => request<TaskSequence>('/api/sequences', { method: 'POST', body: JSON.stringify(payload) }),
   cancelTask: (id: string) => request<void>(`/api/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
   config: () => request<Config>('/api/config'),
   saveConfig: (config: Config) => request<Config>('/api/config', { method: 'PUT', body: JSON.stringify(config) }),

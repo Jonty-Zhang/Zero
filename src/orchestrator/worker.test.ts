@@ -448,6 +448,71 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
   }
 });
 
+test("sequence handoff starts the next same-repository task at the prior DONE result commit after restart", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-sequence-worktree-handoff-"));
+  const repo = join(root, "repo");
+  const db = join(root, "tasks.sqlite");
+  const artifacts = join(root, "artifacts");
+  const worktreeRoot = join(root, "worktrees");
+  await initRepo(repo);
+  let store = new TaskStore(db);
+  try {
+    const check = (source: string) => ({ id: "files-exist", argv: [process.execPath, "-e", source] });
+    const sequence = store.createSequence([
+      { repoPath: repo, baseRef: "main", prompt: "Create first.txt", maxRevisions: 0,
+        checks: [check("require('node:fs').accessSync('first.txt')")] },
+      { repoPath: repo, baseRef: "main", prompt: "Create second.txt while retaining first.txt", maxRevisions: 0,
+        checks: [check("const fs=require('node:fs'); fs.accessSync('first.txt'); fs.accessSync('second.txt')")] },
+    ], "worker-worktree-handoff");
+    const first = sequence.steps[0]!.task;
+    const second = sequence.steps[1]!.task;
+    const firstOwner = "sequence-step-one";
+    assert.equal(store.claimNext(firstOwner)?.id, first.id);
+
+    const adapter: HarnessAdapter = {
+      id: "fake",
+      async probe() { return { harness: "fake", available: true, models: ["model"], roles: ["implement", "revise"] }; },
+      async run(request) {
+        await writeFile(join(request.cwd, request.taskId === first.id ? "first.txt" : "second.txt"), "approved\n");
+        return { status: "completed", exitCode: 0, requestedModel: request.model, actualModel: request.model, durationMs: 1 };
+      },
+    };
+    const makeWorker = () => new TaskWorker({ store, worktrees: new GitWorktreeManager(worktreeRoot),
+      testRunner: new TestRunner({ logDirectory: join(artifacts, "checks") }),
+      router: { async route(current) { return routeFor(current); } },
+      reviewer: { async review() { return { harness: "codex", model: "review-model", exitCode: 0,
+        result: { verdict: "pass", summary: "Step is complete and reviewed.", findings: [] } }; } },
+      adapters: new Map([["fake", adapter]]), artifactRoot: artifacts });
+
+    const firstDone = await makeWorker().runClaimed(first.id, firstOwner);
+    assert.equal(firstDone.status, "done");
+    const firstReport = await makeWorker().readReport(first.id);
+    const firstResultCommit = firstReport?.resultCommit;
+    assert.match(firstResultCommit ?? "", /^[a-f0-9]{40,64}$/);
+    store.close();
+
+    store = new TaskStore(db);
+    const secondOwner = "sequence-step-two-after-restart";
+    const claimedSecond = store.claimNext(secondOwner);
+    assert.equal(claimedSecond?.id, second.id);
+    assert.equal(claimedSecond?.sequenceBaseCommit, firstResultCommit);
+    assert.equal(claimedSecond?.baseRef, "main");
+    const secondDone = await makeWorker().runClaimed(second.id, secondOwner);
+    assert.equal(secondDone.status, "done");
+    const secondCreation = store.getWorktreeCreation(second.id);
+    const secondPlan = secondCreation?.plan as WorktreeCreationPlan | undefined;
+    assert.equal(secondPlan?.baseCommit, firstResultCommit);
+    const secondReport = await makeWorker().readReport(second.id);
+    assert.equal(secondReport?.baseCommit, firstResultCommit);
+    const secondHead = await exec("git", ["rev-parse", "HEAD"], { cwd: secondPlan?.path });
+    assert.equal(secondHead.stdout.trim(), secondReport?.resultCommit);
+    assert.equal(store.getSequence(sequence.id)?.status, "completed");
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("worker leaves a raced reviewed branch failed with its candidate intent and never marks DONE", async () => {
   const root = await mkdtemp(join(process.cwd(), ".zero-worker-commit-race-test-"));
   const repo = join(root, "repo");

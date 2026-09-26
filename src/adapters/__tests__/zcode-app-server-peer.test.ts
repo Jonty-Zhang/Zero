@@ -85,8 +85,14 @@ rl.on('line', raw => {
     return;
   }
   if (method === 'workspace/updateInteractionPreferences') {
-    if (mode === 'pref-error') {
-      write({ id, error: { code: 777, message: 'prompt=CANARY_PROMPT token=CANARY_TOKEN config=CANARY_CONFIG profile=C:/private/profile proxy=http://private-proxy.invalid' } });
+    if (mode.startsWith('pref-error')) {
+      const codes = {
+        'pref-error': 777,
+        'pref-error-method-not-found': -32601,
+        'pref-error-invalid-params': -32602,
+      };
+      const code = codes[mode];
+      write({ id, error: { ...(code === undefined ? {} : { code }), message: 'prompt=CANARY_PROMPT token=CANARY_TOKEN config=CANARY_CONFIG profile=C:/private/profile proxy=http://private-proxy.invalid' } });
       return;
     }
     if (mode === 'pref-malformed') {
@@ -325,9 +331,11 @@ test('diagnostics expose bounded safe lifecycle enums and omit RPC text and user
   assert.ok(events.some(event => event.stage === 'subscribe_ack' && event.outcome === 'acknowledged'));
   assert.ok(events.some(event => event.stage === 'child_exit' && event.outcome === 'exited'));
   for (const event of events) {
-    assert.deepEqual(Object.keys(event).sort(), event.code === undefined
-      ? ['elapsedMs', 'outcome', 'stage']
-      : ['code', 'elapsedMs', 'outcome', 'stage']);
+    assert.deepEqual(Object.keys(event).sort(), [
+      ...(event.code === undefined ? [] : ['code']),
+      ...(event.rpcErrorCategory === undefined ? [] : ['rpcErrorCategory']),
+      'elapsedMs', 'outcome', 'stage',
+    ].sort());
     assert.equal(Number.isInteger(event.elapsedMs), true);
     assert.ok(Number(event.elapsedMs) >= 0 && Number(event.elapsedMs) <= 86_400_000);
   }
@@ -375,6 +383,31 @@ test('diagnostics expose bounded safe lifecycle enums and omit RPC text and user
   const diagnosticText = JSON.stringify([...events, ...failedEvents, ...malformedPreferenceEvents, ...invalidSubscriptionEvents, ...invalidSessionEvents, ...timeoutEvents]);
   for (const canary of ['CANARY_PROMPT', 'CANARY_STDERR', 'CANARY_TOKEN', 'CANARY_CONFIG', 'C:/private/profile', 'private-proxy.invalid']) {
     assert.equal(diagnosticText.includes(canary), false);
+  }
+});
+
+test('preference RPC failures expose only fixed JSON-RPC numeric-code categories', async () => {
+  const cases = [
+    ['pref-error-method-not-found', 'method_not_found'],
+    ['pref-error-invalid-params', 'invalid_params'],
+    ['pref-error', 'other_protocol_error'],
+    ['pref-error-no-code', 'no_code'],
+  ] as const;
+
+  for (const [mode, category] of cases) {
+    const events: ZCodeAppServerDiagnosticEvent[] = [];
+    await withFakeServer(async peer => {
+      await debugRequest(peer, 'test/set-mode', { mode });
+      await assert.rejects(createSession(peer));
+    }, event => events.push(event));
+
+    const event = events.find(candidate => candidate.stage === 'preference_ack' && candidate.outcome === 'failed');
+    assert.equal(event?.code, 'rpc_failed');
+    assert.equal(event?.rpcErrorCategory, category);
+    const serialized = JSON.stringify(events);
+    for (const canary of ['CANARY_PROMPT', 'CANARY_TOKEN', 'CANARY_CONFIG', 'C:/private/profile', 'private-proxy.invalid', '-32601', '-32602', '777']) {
+      assert.equal(serialized.includes(canary), false);
+    }
   }
 });
 

@@ -37,11 +37,18 @@ export type ZCodeAppServerDiagnosticCode =
   | 'child_exit_unexpected'
   | 'child_exit_during_close';
 
+export type ZCodeAppServerRpcErrorCategory =
+  | 'method_not_found'
+  | 'invalid_params'
+  | 'other_protocol_error'
+  | 'no_code';
+
 /** Deliberately contains no app-server, process, profile, or task supplied data. */
 export interface ZCodeAppServerDiagnosticEvent {
   readonly stage: ZCodeAppServerDiagnosticStage;
   readonly outcome: ZCodeAppServerDiagnosticOutcome;
   readonly code?: ZCodeAppServerDiagnosticCode;
+  readonly rpcErrorCategory?: ZCodeAppServerRpcErrorCategory;
   readonly elapsedMs: number;
 }
 
@@ -69,7 +76,12 @@ interface PendingRequest {
   resolve(value: unknown): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout>;
-  method: string;
+}
+
+class ZCodeAppServerRpcError extends Error {
+  constructor(readonly rpcCode: number | undefined) {
+    super('ZCode app-server RPC failed');
+  }
 }
 
 interface SubscriptionState {
@@ -207,7 +219,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
           preferences: { askUserQuestionAutoResolutionEnabled: false },
         });
       } catch (error) {
-        this.emitDiagnostic('preference_ack', 'failed', 'rpc_failed', elapsedMs(preferenceStartedAt));
+        this.emitDiagnostic('preference_ack', 'failed', 'rpc_failed', elapsedMs(preferenceStartedAt), rpcErrorCategory(error));
         throw error;
       }
       let preference: Record<string, unknown>;
@@ -285,7 +297,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
         rejectResponse(error);
         this.fail(error);
       }, this.requestTimeoutMs);
-      this.pending.set(key, { resolve: resolveResponse, reject: rejectResponse, timer, method });
+      this.pending.set(key, { resolve: resolveResponse, reject: rejectResponse, timer });
     });
     try {
       await this.writeMessage({ id, method, params });
@@ -479,8 +491,8 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     clearTimeout(pending.timer);
     if (Object.hasOwn(message, 'error')) {
       const rpcError = isRecord(message.error) ? message.error : undefined;
-      const code = typeof rpcError?.code === 'number' ? ` (${rpcError.code})` : '';
-      pending.reject(new Error(`ZCode app-server RPC failed${code} (${pending.method})`));
+      const rpcCode = typeof rpcError?.code === 'number' ? rpcError.code : undefined;
+      pending.reject(new ZCodeAppServerRpcError(rpcCode));
       return;
     }
     pending.resolve(message.result);
@@ -664,8 +676,14 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     void terminateChildTree(this.child).catch(() => undefined);
   }
 
-  private emitDiagnostic(stage: ZCodeAppServerDiagnosticStage, outcome: ZCodeAppServerDiagnosticOutcome, code: ZCodeAppServerDiagnosticCode | undefined, elapsed: number): void {
-    emitDiagnostic(this.diagnosticSink, stage, outcome, code, elapsed);
+  private emitDiagnostic(
+    stage: ZCodeAppServerDiagnosticStage,
+    outcome: ZCodeAppServerDiagnosticOutcome,
+    code: ZCodeAppServerDiagnosticCode | undefined,
+    elapsed: number,
+    rpcErrorCategory?: ZCodeAppServerRpcErrorCategory,
+  ): void {
+    emitDiagnostic(this.diagnosticSink, stage, outcome, code, elapsed, rpcErrorCategory);
   }
 
   private async waitForSpawn(): Promise<void> {
@@ -881,17 +899,26 @@ function emitDiagnostic(
   outcome: ZCodeAppServerDiagnosticOutcome,
   code: ZCodeAppServerDiagnosticCode | undefined,
   elapsed: number,
+  rpcErrorCategory?: ZCodeAppServerRpcErrorCategory,
 ): void {
   if (typeof sink !== 'function') return;
   const event: ZCodeAppServerDiagnosticEvent = {
     stage,
     outcome,
     ...(code === undefined ? {} : { code }),
+    ...(rpcErrorCategory === undefined ? {} : { rpcErrorCategory }),
     elapsedMs: Math.min(24 * 60 * 60 * 1_000, Math.max(0, Math.floor(elapsed))),
   };
   try { sink(event); } catch {
     // Diagnostics are observational and cannot change protocol behavior.
   }
+}
+
+function rpcErrorCategory(error: unknown): ZCodeAppServerRpcErrorCategory {
+  if (!(error instanceof ZCodeAppServerRpcError) || error.rpcCode === undefined) return 'no_code';
+  if (error.rpcCode === -32601) return 'method_not_found';
+  if (error.rpcCode === -32602) return 'invalid_params';
+  return 'other_protocol_error';
 }
 
 function waitForDrain(stream: NodeJS.WritableStream): Promise<void> {

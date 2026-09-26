@@ -13,6 +13,9 @@ import type {
   StageStatus,
   TaskEvent,
   TaskRecord,
+  TaskSequenceMetadata,
+  TaskSequenceRecord,
+  TaskSequenceStatus,
   TaskStatus,
   TaskSubmission,
 } from "../domain/types.js";
@@ -28,6 +31,7 @@ type TaskRow = {
   recovery_reason?: string | null; recovery_evidence?: string | null;
   lease_protocol_version?: number | null;
   claim_generation_id?: string | null;
+  sequence_base_commit?: string | null;
 };
 type StageRow = Record<string, unknown>;
 type HandoffRow = { id: string; task_id: string; stage_id: string; attempt_id: string; schema_version: number; created_at: string; payload: string; payload_bytes: number };
@@ -199,6 +203,22 @@ export interface ReportOperationRecord {
   createdAt: string;
   completedAt?: string;
 }
+
+export interface SequenceGoalReviewRecord {
+  sequenceId: string;
+  attemptId: string;
+  generationId: string;
+  evidenceFingerprint: string;
+  state: "running" | "quota" | "verdict";
+  result?: ReviewResult;
+  retryAt?: string;
+  createdAt: string;
+  completedAt?: string;
+}
+
+export type ReviewedTaskSequenceRecord = TaskSequenceRecord & {
+  goalReview?: SequenceGoalReviewRecord;
+};
 
 export interface CreateReportOperationInput {
   operationId: string;
@@ -466,6 +486,21 @@ export function configureTaskStorePragmas(db: DatabaseSync, path: string): void 
   db.exec("PRAGMA foreign_keys = ON;");
 }
 
+function validateExecutionStages(submission: TaskSubmission): void {
+  if (submission.executionStages === undefined) return;
+  if (!Array.isArray(submission.executionStages) || submission.executionStages.length === 0 || submission.executionStages.length > 16) {
+    throw new Error("executionStages must contain 1 to 16 execution stages");
+  }
+  for (const [index, stage] of submission.executionStages.entries()) {
+    if (!stage || typeof stage !== "object" || Array.isArray(stage)) throw new Error(`executionStages[${index}] must be an object`);
+    for (const [field, value] of Object.entries(stage)) {
+      if (!["harness", "model", "reasoningEffort"].includes(field) || typeof value !== "string" || !value.trim() || value !== value.trim()) {
+        throw new Error(`executionStages[${index}].${field} must be a non-empty supported selection field`);
+      }
+    }
+  }
+}
+
 /** SQLite-backed source of truth. Methods are synchronous and each state change is transactional. */
 export class TaskStore {
   readonly #db: DatabaseSync;
@@ -483,6 +518,20 @@ export class TaskStore {
         recovery_reason TEXT, recovery_evidence TEXT, lease_protocol_version INTEGER,
         claim_generation_id TEXT REFERENCES startup_generations(id)
       );
+      CREATE TABLE IF NOT EXISTS task_sequences (
+        id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, objective TEXT, acceptance_criteria TEXT
+      );
+      CREATE TABLE IF NOT EXISTS task_sequence_steps (
+        sequence_id TEXT NOT NULL REFERENCES task_sequences(id), task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+        position INTEGER NOT NULL CHECK(position >= 0), effective_base_commit TEXT, PRIMARY KEY(sequence_id, position)
+      );
+      CREATE INDEX IF NOT EXISTS task_sequence_steps_task ON task_sequence_steps(task_id);
+      CREATE TABLE IF NOT EXISTS task_sequence_goal_reviews (
+        attempt_id TEXT PRIMARY KEY, sequence_id TEXT NOT NULL REFERENCES task_sequences(id), generation_id TEXT NOT NULL REFERENCES startup_generations(id),
+        evidence_fingerprint TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('running','quota','verdict')),
+        result TEXT, retry_at TEXT, created_at TEXT NOT NULL, completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS task_sequence_goal_reviews_sequence ON task_sequence_goal_reviews(sequence_id,created_at,attempt_id);
       CREATE TABLE IF NOT EXISTS startup_generations (
         id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE, lock_id TEXT, predecessor_drained INTEGER NOT NULL CHECK(predecessor_drained IN (0,1)),
         member_verified INTEGER NOT NULL DEFAULT 0 CHECK(member_verified IN (0,1)), evidence_kind TEXT NOT NULL,
@@ -692,6 +741,11 @@ export class TaskStore {
       CREATE TRIGGER IF NOT EXISTS rework_continuation_claims_no_update BEFORE UPDATE ON rework_continuation_claims BEGIN SELECT RAISE(ABORT,'rework continuation claims are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS rework_continuation_claims_no_delete BEFORE DELETE ON rework_continuation_claims BEGIN SELECT RAISE(ABORT,'rework continuation claims are immutable'); END;
     `);
+    const sequenceColumns = this.#db.prepare("PRAGMA table_info(task_sequences)").all() as Array<{ name: string }>;
+    if (!sequenceColumns.some(column => column.name === "objective")) this.#db.exec("ALTER TABLE task_sequences ADD COLUMN objective TEXT");
+    if (!sequenceColumns.some(column => column.name === "acceptance_criteria")) this.#db.exec("ALTER TABLE task_sequences ADD COLUMN acceptance_criteria TEXT");
+    const sequenceStepColumns = this.#db.prepare("PRAGMA table_info(task_sequence_steps)").all() as Array<{ name: string }>;
+    if (!sequenceStepColumns.some(column => column.name === "effective_base_commit")) this.#db.exec("ALTER TABLE task_sequence_steps ADD COLUMN effective_base_commit TEXT");
     // Additive, idempotent migration: old attempts remain valid with a NULL stage_id.
     // Existing databases are not rebuilt or rewritten.
     const attemptColumns = this.#db.prepare("PRAGMA table_info(attempts)").all() as Array<{ name: string }>;
@@ -1069,6 +1123,68 @@ export class TaskStore {
     catch (error) { this.#db.exec("ROLLBACK"); throw error; }
   }
 
+  #authoritativeResultCommit(taskId: string): string {
+    const commits = this.commitOperations(taskId).filter(operation => operation.status === "applied");
+    const reports = this.reportOperations(taskId).filter(operation => operation.status === "complete");
+    for (const reportOperation of [...reports].reverse()) {
+      const commit = commits.find(operation => operation.id === reportOperation.commitOperationId);
+      if (!commit || !commit.candidateSha || !commit.appliedEvidence) continue;
+      let report: Record<string, unknown>;
+      try { report = JSON.parse(reportOperation.reportBytes.toString("utf8")) as Record<string, unknown>; }
+      catch { continue; }
+      const sha = commit.candidateSha.toLowerCase();
+      if (report.taskId === taskId && report.finalStatus === "done" && typeof report.resultCommit === "string" &&
+          report.resultCommit.toLowerCase() === sha && commit.appliedEvidence.worktreeHead.toLowerCase() === sha &&
+          commit.appliedEvidence.refHead.toLowerCase() === sha && commit.appliedEvidence.branchRef === `refs/heads/zero/${taskId}`) {
+        return sha;
+      }
+    }
+    throw new Error(`Task ${taskId} is DONE but has no matching authoritative applied commit and complete report for sequence handoff`);
+  }
+
+  #resolveSequenceBaseCommit(taskId: string): string | undefined {
+    const current = this.#db.prepare(`SELECT s.sequence_id,s.position,t.payload,s.effective_base_commit FROM task_sequence_steps s
+      JOIN tasks t ON t.id=s.task_id WHERE s.task_id=?`).get(taskId) as
+      { sequence_id: string; position: number; payload: string; effective_base_commit: string | null } | undefined;
+    if (!current) return undefined;
+    const submission = JSON.parse(current.payload) as TaskSubmission;
+    const earlier = this.#db.prepare(`SELECT t.id,t.status,t.payload FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id
+      WHERE s.sequence_id=? AND s.position<? ORDER BY s.position DESC`).all(current.sequence_id, current.position) as
+      Array<{ id: string; status: TaskStatus; payload: string }>;
+    const predecessor = earlier.find(row => row.status === "done" && (JSON.parse(row.payload) as TaskSubmission).repoPath === submission.repoPath);
+    const desired = predecessor ? this.#authoritativeResultCommit(predecessor.id) : undefined;
+    if (current.effective_base_commit !== null && current.effective_base_commit !== desired) {
+      throw new Error(`Sequence handoff base commit for task ${taskId} changed after it was persisted`);
+    }
+    if (current.effective_base_commit === null && desired !== undefined) {
+      this.#db.prepare("UPDATE task_sequence_steps SET effective_base_commit=? WHERE task_id=? AND effective_base_commit IS NULL")
+        .run(desired, taskId);
+    }
+    return desired;
+  }
+
+  #sequenceHandoffError(taskId: string): string | undefined {
+    const current = this.#db.prepare(`SELECT s.sequence_id,s.position,s.effective_base_commit,t.payload FROM task_sequence_steps s
+      JOIN tasks t ON t.id=s.task_id WHERE s.task_id=?`).get(taskId) as
+      { sequence_id: string; position: number; effective_base_commit: string | null; payload: string } | undefined;
+    if (!current) return undefined;
+    const submission = JSON.parse(current.payload) as TaskSubmission;
+    const earlier = this.#db.prepare(`SELECT t.id,t.status,t.payload FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id
+      WHERE s.sequence_id=? AND s.position<? ORDER BY s.position DESC`).all(current.sequence_id, current.position) as
+      Array<{ id: string; status: TaskStatus; payload: string }>;
+    const predecessor = earlier.find(row => row.status === "done" && (JSON.parse(row.payload) as TaskSubmission).repoPath === submission.repoPath);
+    if (!predecessor) return current.effective_base_commit === null ? undefined : "Persisted sequence handoff has no matching earlier same-repository task";
+    try {
+      const resultCommit = this.#authoritativeResultCommit(predecessor.id);
+      if (current.effective_base_commit !== null && current.effective_base_commit !== resultCommit) {
+        return `Persisted handoff commit does not match task ${predecessor.id}'s authoritative result commit`;
+      }
+      return undefined;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
   #stageTaskStatus(role: StageRole): TaskStatus {
     return role === "review" ? "reviewing" : "running";
   }
@@ -1084,19 +1200,7 @@ export class TaskStore {
   }
 
   submit(submission: TaskSubmission, id: string = randomUUID()): TaskRecord {
-    if (submission.executionStages !== undefined) {
-      if (!Array.isArray(submission.executionStages) || submission.executionStages.length === 0 || submission.executionStages.length > 16) {
-        throw new Error("executionStages must contain 1 to 16 execution stages");
-      }
-      for (const [index, stage] of submission.executionStages.entries()) {
-        if (!stage || typeof stage !== "object" || Array.isArray(stage)) throw new Error(`executionStages[${index}] must be an object`);
-        for (const [field, value] of Object.entries(stage)) {
-          if (!["harness", "model", "reasoningEffort"].includes(field) || typeof value !== "string" || !value.trim() || value !== value.trim()) {
-            throw new Error(`executionStages[${index}].${field} must be a non-empty supported selection field`);
-          }
-        }
-      }
-    }
+    validateExecutionStages(submission);
     const now = new Date().toISOString();
     this.#transaction(() => {
       this.#db.prepare(`INSERT INTO tasks(id,status,created_at,updated_at,payload) VALUES(?, 'pending', ?, ?, ?)`)
@@ -1106,15 +1210,189 @@ export class TaskStore {
     return this.get(id)!;
   }
 
+  /** Atomically persists a user supplied sequence and all its tasks. The order is exactly the supplied order. */
+  createSequence(submissions: TaskSubmission[], id: string = randomUUID(), metadata: TaskSequenceMetadata = {}): TaskSequenceRecord {
+    if (!Array.isArray(submissions) || submissions.length < 2) throw new Error("A task sequence must contain at least 2 steps");
+    if (metadata.objective !== undefined && (typeof metadata.objective !== "string" || !metadata.objective.trim())) {
+      throw new Error("sequence objective must be a non-empty string when provided");
+    }
+    if (metadata.acceptanceCriteria !== undefined && (!Array.isArray(metadata.acceptanceCriteria) ||
+      metadata.acceptanceCriteria.length === 0 || metadata.acceptanceCriteria.some(item => typeof item !== "string" || !item.trim()))) {
+      throw new Error("sequence acceptanceCriteria must contain non-empty strings when provided");
+    }
+    const acceptanceCriteria = metadata.acceptanceCriteria === undefined ? undefined : JSON.stringify(metadata.acceptanceCriteria);
+    const at = new Date().toISOString();
+    const taskIds = submissions.map(() => randomUUID());
+    this.#transaction(() => {
+      this.#db.prepare("INSERT INTO task_sequences(id,created_at,updated_at,objective,acceptance_criteria) VALUES(?,?,?,?,?)")
+        .run(id, at, at, metadata.objective ?? null, acceptanceCriteria ?? null);
+      const insertTask = this.#db.prepare("INSERT INTO tasks(id,status,created_at,updated_at,payload) VALUES(?, 'pending', ?, ?, ?)");
+      const insertStep = this.#db.prepare("INSERT INTO task_sequence_steps(sequence_id,task_id,position) VALUES(?,?,?)");
+      for (const [position, submission] of submissions.entries()) {
+        validateExecutionStages(submission);
+        const taskId = taskIds[position]!;
+        insertTask.run(taskId, at, at, JSON.stringify(submission));
+        insertStep.run(id, taskId, position);
+        this.#event(taskId, "task.submitted", { submission, sequenceId: id, sequencePosition: position }, at);
+      }
+      this.#event(taskIds[0]!, "task_sequence.created", { sequenceId: id, taskIds, ...metadata }, at);
+    });
+    return this.getSequence(id)!;
+  }
+
+  getSequence(id: string): ReviewedTaskSequenceRecord | undefined {
+    const sequence = this.#db.prepare("SELECT id,created_at,updated_at,objective,acceptance_criteria FROM task_sequences WHERE id=?").get(id) as
+      { id: string; created_at: string; updated_at: string; objective: string | null; acceptance_criteria: string | null } | undefined;
+    if (!sequence) return undefined;
+    const rows = this.#db.prepare(`SELECT s.position,s.effective_base_commit,t.* FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id
+      WHERE s.sequence_id=? ORDER BY s.position`).all(id) as Array<TaskRow & { position: number; effective_base_commit: string | null }>;
+    const steps = rows.map(row => ({ position: Number(row.position), task: this.#task(row),
+      ...(row.effective_base_commit ? { effectiveBaseCommit: row.effective_base_commit } : {}) }));
+    const firstUnfinished = steps.find(step => step.task.status !== "done");
+    const blockedTask = firstUnfinished && ["recovery_required", "failed"].includes(firstUnfinished.task.status)
+      ? firstUnfinished.task : undefined;
+    const handoffError = firstUnfinished ? this.#sequenceHandoffError(firstUnfinished.task.id) : undefined;
+    let status: TaskSequenceStatus;
+    const goalReview = this.sequenceGoalReview(id);
+    if (steps.length > 0 && steps.every(step => step.task.status === "done")) {
+      if (sequence.objective === null && sequence.acceptance_criteria === null) status = "completed";
+      else if (goalReview?.state === "verdict" && goalReview.result?.verdict === "pass") status = "completed";
+      else if (goalReview?.state === "quota") status = "waiting";
+      else if (goalReview?.state === "verdict") status = "blocked";
+      else status = "steps_completed";
+    }
+    else if (handoffError) status = "blocked";
+    else if (firstUnfinished?.task.status === "waiting") status = "waiting";
+    else if (blockedTask) status = "blocked";
+    else if (steps.some(step => ["running", "reviewing", "revision"].includes(step.task.status))) status = "running";
+    else status = "queued";
+    return {
+      id: sequence.id, status,
+      ...(sequence.objective === null ? {} : { objective: sequence.objective }),
+      ...(sequence.acceptance_criteria === null ? {} : { acceptanceCriteria: JSON.parse(sequence.acceptance_criteria) as string[] }),
+      createdAt: sequence.created_at,
+      updatedAt: steps.reduce((latest, step) => step.task.updatedAt > latest ? step.task.updatedAt : latest, sequence.updated_at),
+      steps,
+      ...(goalReview ? { goalReview } : {}),
+      ...(blockedTask || handoffError ? { blockedReason: {
+        taskId: blockedTask?.id ?? firstUnfinished!.task.id,
+        status: blockedTask?.status ?? firstUnfinished!.task.status,
+        reason: handoffError ?? blockedTask?.failureReason ?? blockedTask?.recoveryReason ?? blockedTask?.resumeCheckpoint?.reason as string | undefined,
+      } } : {}),
+      ...(steps.length > 0 && steps.every(step => step.task.status === "done") && goalReview?.state === "verdict" && goalReview.result?.verdict !== "pass"
+        ? { blockedReason: { taskId: steps[0]!.task.id, status: "done" as const, reason: goalReview.result?.summary ?? "Aggregate goal review did not pass." } } : {}),
+      ...(steps.length > 0 && steps.every(step => step.task.status === "done") && goalReview?.state === "quota"
+        ? { blockedReason: { taskId: steps[0]!.task.id, status: "done" as const, reason: `Aggregate goal review is waiting for quota until ${goalReview.retryAt ?? "a later retry"}.` } } : {}),
+    };
+  }
+
+  listSequences(): ReviewedTaskSequenceRecord[] {
+    const rows = this.#db.prepare("SELECT id FROM task_sequences ORDER BY created_at,id").all() as Array<{ id: string }>;
+    return rows.map(row => this.getSequence(row.id)!).filter(Boolean);
+  }
+
+  /** Append-only goal-review attempt history; this review never changes task-level status. */
+  sequenceGoalReview(sequenceId: string): SequenceGoalReviewRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM task_sequence_goal_reviews WHERE sequence_id=? ORDER BY created_at DESC,attempt_id DESC LIMIT 1")
+      .get(sequenceId) as Record<string, unknown> | undefined;
+    return row ? this.#sequenceGoalReview(row) : undefined;
+  }
+
+  startSequenceGoalReview(sequenceId: string, evidenceFingerprint: string, attemptId: string = randomUUID(), now = new Date()): SequenceGoalReviewRecord {
+    if (!/^[a-f0-9]{64}$/.test(evidenceFingerprint)) throw new Error("Aggregate goal evidence fingerprint must be a SHA-256 digest");
+    const createdAt = now.toISOString();
+    this.#transaction(() => {
+      const sequence = this.#db.prepare("SELECT objective,acceptance_criteria FROM task_sequences WHERE id=?").get(sequenceId) as
+        { objective: string | null; acceptance_criteria: string | null } | undefined;
+      const count = this.#db.prepare("SELECT COUNT(*) AS n, SUM(CASE WHEN t.status='done' THEN 1 ELSE 0 END) AS done FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id WHERE s.sequence_id=?")
+        .get(sequenceId) as { n: number; done: number | null } | undefined;
+      if (!sequence || (sequence.objective === null && sequence.acceptance_criteria === null) || !count || count.n < 2 || Number(count.done) !== Number(count.n)) {
+        throw new Error("Aggregate goal review requires goal metadata and every sequence step authoritatively DONE");
+      }
+      const latest = this.#db.prepare("SELECT state,generation_id,created_at,retry_at FROM task_sequence_goal_reviews WHERE sequence_id=? ORDER BY created_at DESC,attempt_id DESC LIMIT 1")
+        .get(sequenceId) as { state: string; generation_id: string; created_at: string; retry_at: string | null } | undefined;
+      if (latest?.state === "running" && latest.generation_id === this.#startupGeneration.id && Date.parse(latest.created_at) + 15 * 60_000 > now.getTime()) {
+        throw new Error("An aggregate goal review attempt is already active for this sequence");
+      }
+      if (latest?.state === "quota" && latest.retry_at && Date.parse(latest.retry_at) > now.getTime()) {
+        throw new Error("An aggregate goal review attempt is waiting for quota");
+      }
+      this.#db.prepare("INSERT INTO task_sequence_goal_reviews(attempt_id,sequence_id,generation_id,evidence_fingerprint,state,created_at) VALUES(?,?,?,?,'running',?)")
+        .run(attemptId, sequenceId, this.#startupGeneration.id, evidenceFingerprint, createdAt);
+      this.#event((this.#db.prepare("SELECT task_id FROM task_sequence_steps WHERE sequence_id=? ORDER BY position LIMIT 1").get(sequenceId) as { task_id: string }).task_id,
+        "task_sequence.goal_review_started", { sequenceId, attemptId, evidenceFingerprint }, createdAt);
+    });
+    return this.sequenceGoalReviewByAttempt(attemptId)!;
+  }
+
+  finishSequenceGoalReview(input: { attemptId: string; result?: ReviewResult; retryAt?: string; verifiedEvidenceFingerprint?: string; now?: Date }): SequenceGoalReviewRecord {
+    const now = input.now ?? new Date();
+    const completedAt = now.toISOString();
+    const row = this.#db.prepare("SELECT * FROM task_sequence_goal_reviews WHERE attempt_id=?").get(input.attemptId) as Record<string, unknown> | undefined;
+    if (!row || row.state !== "running") throw new Error("Aggregate goal review attempt is not running");
+    if (input.retryAt !== undefined) {
+      if (input.result || !Number.isFinite(Date.parse(input.retryAt))) throw new Error("Quota goal review requires only a valid retry time");
+    this.#transaction(() => {
+      const latest = this.#db.prepare("SELECT attempt_id FROM task_sequence_goal_reviews WHERE sequence_id=? ORDER BY created_at DESC,attempt_id DESC LIMIT 1")
+        .get(String(row.sequence_id)) as { attempt_id: string } | undefined;
+      if (latest?.attempt_id !== input.attemptId) throw new Error("Aggregate goal review attempt was superseded");
+        this.#db.prepare("UPDATE task_sequence_goal_reviews SET state='quota',retry_at=?,completed_at=? WHERE attempt_id=? AND state='running'")
+          .run(input.retryAt!, completedAt, input.attemptId);
+        this.#event(this.#goalReviewEventTask(String(row.sequence_id)), "task_sequence.goal_review_quota", { sequenceId: row.sequence_id, attemptId: row.attempt_id, retryAt: input.retryAt }, completedAt);
+      });
+      return this.sequenceGoalReviewByAttempt(input.attemptId)!;
+    }
+    if (!input.result || !isValidReviewResult(input.result)) throw new Error("Aggregate goal review must contain a valid reviewer verdict");
+    let result = input.result;
+    if (input.verifiedEvidenceFingerprint !== row.evidence_fingerprint) {
+      result = { verdict: "blocked", summary: "Aggregate evidence changed during review; a fresh review is required.", findings: [
+        { severity: "high", evidence: "The repository snapshot or persisted step evidence changed while the reviewer was running.", requestedChange: "Run a fresh aggregate goal review against the current evidence." },
+      ] };
+    }
+    this.#transaction(() => {
+      const latest = this.#db.prepare("SELECT attempt_id FROM task_sequence_goal_reviews WHERE sequence_id=? ORDER BY created_at DESC,attempt_id DESC LIMIT 1")
+        .get(String(row.sequence_id)) as { attempt_id: string } | undefined;
+      if (latest?.attempt_id !== input.attemptId) throw new Error("Aggregate goal review attempt was superseded");
+      const sequence = this.#db.prepare("SELECT 1 FROM task_sequences WHERE id=?").get(String(row.sequence_id));
+      const counts = this.#db.prepare("SELECT COUNT(*) AS n,SUM(CASE WHEN t.status='done' THEN 1 ELSE 0 END) AS done FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id WHERE s.sequence_id=?")
+        .get(String(row.sequence_id)) as { n: number; done: number | null };
+      if (!sequence || counts.n < 2 || Number(counts.n) !== Number(counts.done)) throw new Error("Sequence steps changed before aggregate verdict persistence");
+      this.#db.prepare("UPDATE task_sequence_goal_reviews SET state='verdict',result=?,completed_at=? WHERE attempt_id=? AND state='running'")
+        .run(JSON.stringify(result), completedAt, input.attemptId);
+      this.#event(this.#goalReviewEventTask(String(row.sequence_id)), "task_sequence.goal_review_verdict",
+        { sequenceId: row.sequence_id, attemptId: row.attempt_id, evidenceFingerprint: row.evidence_fingerprint, verdict: result.verdict, summary: result.summary }, completedAt);
+    });
+    return this.sequenceGoalReviewByAttempt(input.attemptId)!;
+  }
+
+  sequenceGoalReviewByAttempt(attemptId: string): SequenceGoalReviewRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM task_sequence_goal_reviews WHERE attempt_id=?").get(attemptId) as Record<string, unknown> | undefined;
+    return row ? this.#sequenceGoalReview(row) : undefined;
+  }
+
+  #goalReviewEventTask(sequenceId: string): string {
+    return String((this.#db.prepare("SELECT task_id FROM task_sequence_steps WHERE sequence_id=? ORDER BY position LIMIT 1").get(sequenceId) as { task_id: string }).task_id);
+  }
+
+  #sequenceGoalReview(row: Record<string, unknown>): SequenceGoalReviewRecord {
+    return { sequenceId: String(row.sequence_id), attemptId: String(row.attempt_id), generationId: String(row.generation_id), evidenceFingerprint: String(row.evidence_fingerprint),
+      state: row.state as SequenceGoalReviewRecord["state"], ...(row.result ? { result: JSON.parse(String(row.result)) as ReviewResult } : {}),
+      ...(row.retry_at ? { retryAt: String(row.retry_at) } : {}), createdAt: String(row.created_at),
+      ...(row.completed_at ? { completedAt: String(row.completed_at) } : {}) };
+  }
+
   get(id: string): TaskRecord | undefined {
-    const row = this.#db.prepare("SELECT * FROM tasks WHERE id=?").get(id) as TaskRow | undefined;
+    const row = this.#db.prepare(`SELECT t.*,(SELECT effective_base_commit FROM task_sequence_steps s WHERE s.task_id=t.id) AS sequence_base_commit
+      FROM tasks t WHERE t.id=?`).get(id) as TaskRow | undefined;
     return row ? this.#task(row) : undefined;
   }
 
   list(status?: TaskStatus): TaskRecord[] {
     const rows = (status
-      ? this.#db.prepare("SELECT * FROM tasks WHERE status=? ORDER BY created_at, id").all(status)
-      : this.#db.prepare("SELECT * FROM tasks ORDER BY created_at, id").all()) as TaskRow[];
+      ? this.#db.prepare(`SELECT t.*,(SELECT effective_base_commit FROM task_sequence_steps s WHERE s.task_id=t.id) AS sequence_base_commit
+          FROM tasks t WHERE t.status=? ORDER BY t.created_at,t.id`).all(status)
+      : this.#db.prepare(`SELECT t.*,(SELECT effective_base_commit FROM task_sequence_steps s WHERE s.task_id=t.id) AS sequence_base_commit
+          FROM tasks t ORDER BY t.created_at,t.id`).all()) as TaskRow[];
     return rows.map(row => this.#task(row));
   }
 
@@ -1125,22 +1403,32 @@ export class TaskStore {
     const expires = new Date(now.getTime() + leaseMs).toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const candidates = this.#db.prepare(`SELECT t.id,t.status,q.checkpoint FROM tasks t LEFT JOIN quota_pauses q ON q.task_id=t.id
+      const candidates = this.#db.prepare(`SELECT t.id,t.status,q.checkpoint,
+          NOT EXISTS (SELECT 1 FROM task_sequence_steps current_step
+            JOIN task_sequence_steps earlier_step ON earlier_step.sequence_id=current_step.sequence_id AND earlier_step.position<current_step.position
+            JOIN tasks earlier_task ON earlier_task.id=earlier_step.task_id
+            WHERE current_step.task_id=t.id AND earlier_task.status<>'done') AS sequence_eligible
+        FROM tasks t LEFT JOIN quota_pauses q ON q.task_id=t.id
         WHERE t.status='pending' OR (t.status='waiting' AND q.retry_at<=?) ORDER BY t.created_at,t.id`).all(at) as
-        Array<{ id: string; status: TaskStatus; checkpoint: string | null }>;
+        Array<{ id: string; status: TaskStatus; checkpoint: string | null; sequence_eligible: number }>;
       const row = candidates.find(candidate => {
+        if (!candidate.sequence_eligible) return false;
         try {
           const kind = (JSON.parse(candidate.checkpoint ?? "null") as Record<string, unknown> | null)?.kind;
           if (kind === "review_quota" || kind === "rework_quota") return false;
-          return candidate.status === "pending" || candidate.status === "waiting";
+          if (!(candidate.status === "pending" || candidate.status === "waiting")) return false;
+          this.#resolveSequenceBaseCommit(candidate.id);
+          return true;
         }
         catch { return false; }
       });
       if (!row) { this.#db.exec("COMMIT"); return undefined; }
+      const sequenceBaseCommit = this.#resolveSequenceBaseCommit(row.id);
       const result = this.#db.prepare(`UPDATE tasks SET status='running', updated_at=?, lease_owner=?, lease_expires_at=?, heartbeat_at=?, lease_protocol_version=2, claim_generation_id=?
         WHERE id=? AND status IN ('pending','waiting')`).run(at, owner, expires, at, this.#startupGeneration.id, row.id);
       if (Number(result.changes) !== 1) { this.#db.exec("ROLLBACK"); return undefined; }
-      this.#event(row.id, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2, generationId: this.#startupGeneration.id }, at);
+      this.#event(row.id, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2, generationId: this.#startupGeneration.id,
+        ...(sequenceBaseCommit ? { sequenceBaseCommit } : {}) }, at);
       this.#db.exec("COMMIT");
       return this.get(row.id);
     } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
@@ -4082,6 +4370,7 @@ export class TaskStore {
       claimGenerationId: row.claim_generation_id ?? undefined,
       failureReason: row.failure_reason ?? undefined, activeAttemptId: row.active_attempt_id ?? undefined,
       recoveryReason: row.recovery_reason ?? undefined,
+      sequenceBaseCommit: row.sequence_base_commit ?? undefined,
       recoveryEvidence: row.recovery_evidence ? JSON.parse(row.recovery_evidence) as Record<string, unknown> : undefined,
       ...(quota ? { retryAt: quota.retry_at, resumeCheckpoint: JSON.parse(quota.checkpoint) as Record<string, unknown>, quotaRetryCount: quota.retry_count,
         ...(typeof (JSON.parse(quota.checkpoint) as Record<string, unknown>).stage === "string" ? { resumeStage: (JSON.parse(quota.checkpoint) as Record<string, unknown>).stage as TaskRecord["resumeStage"] } : {}) } : {}),

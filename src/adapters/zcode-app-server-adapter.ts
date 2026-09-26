@@ -2,7 +2,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { HarnessAdapter, HarnessCapabilities, RunRequest, RunResult } from '../domain/types.js';
 import { ZCodeAppServerPeer } from './zcode-app-server-peer.js';
-import type { ZCodeAppServerPeerOptions } from './zcode-app-server-peer.js';
+import type { ZCodeAppServerDiagnosticEvent, ZCodeAppServerPeerOptions } from './zcode-app-server-peer.js';
 import { runZCodeProtocolSession, ZCodeQuotaError } from './zcode-protocol-session.js';
 import type { ZCodeProtocolPeer } from './zcode-protocol-session.js';
 import type { ModelBinding, ModelConfig, ReasoningEffort } from './types.js';
@@ -27,6 +27,17 @@ export interface ProbeCommandResult {
   stdout: string;
   stderr: string;
   error?: string;
+}
+
+export interface ZCodeDesktopDiagnostic {
+  version: 'not_run' | 'reported' | 'unavailable';
+  childSpawn: 'not_run' | 'started' | 'failed';
+  sessionCreate: 'not_run' | 'acknowledged' | 'failed';
+  failureStage: 'not_checked' | 'none' | 'launch' | 'preference_ack' | 'session_create' | 'response_shape' | 'model_registry';
+  preferenceAckFailure: 'not_checked' | 'none' | 'rpc_failed' | 'ack_invalid' | 'other';
+  preferenceAckRpcFailure: 'not_checked' | 'not_applicable' | 'method_not_found' | 'invalid_params' | 'other_protocol_error' | 'no_code';
+  modelRegistry: 'not_checked' | 'unavailable' | 'empty' | 'populated';
+  modelCount: number | null;
 }
 
 const MAX_PROBE_OUTPUT = 64 * 1024;
@@ -74,6 +85,80 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
       },
       ...(!result.available ? { unavailableReason: result.reason ?? 'ZCode version/help probe failed' } : {}),
     };
+  }
+
+  /**
+   * Checks the existing-desktop app-server lifecycle without sending model
+   * input. The only returned values are fixed stage categories and a count.
+   */
+  async diagnoseExistingDesktop(cwd: string): Promise<ZCodeDesktopDiagnostic> {
+    const result: ZCodeDesktopDiagnostic = {
+      version: 'unavailable',
+      childSpawn: 'not_run',
+      sessionCreate: 'not_run',
+      failureStage: 'not_checked',
+      preferenceAckFailure: 'not_checked',
+      preferenceAckRpcFailure: 'not_checked',
+      modelRegistry: 'not_checked',
+      modelCount: null,
+    };
+    const probe = await this.probeCli();
+    if (probe.version) result.version = 'reported';
+    if (!probe.available) return result;
+    result.failureStage = 'none';
+    result.preferenceAckFailure = 'none';
+    result.preferenceAckRpcFailure = 'not_applicable';
+
+    let peer: ZCodeProtocolPeer;
+    try {
+      peer = await this.launchPeer({
+        entry: this.entry!, taskWorktree: cwd, profileMode: 'existing-desktop',
+        onDiagnostic: event => applyFailureStage(result, event),
+      });
+      result.childSpawn = 'started';
+    } catch {
+      result.childSpawn = 'failed';
+      if (result.failureStage === 'none') result.failureStage = 'launch';
+      return result;
+    }
+
+    try {
+      const created = await peer.request('session/create', {
+        workspace: {
+          workspacePath: cwd,
+          workspaceIdentity: cwd,
+          workspaceKey: safeWorkspaceKey('zcode-diagnostic'),
+        },
+        persistence: 'deferred',
+      });
+      const createdRecord = isRecord(created) ? created : undefined;
+      const createdSession = createdRecord && isRecord(createdRecord.session) ? createdRecord.session : undefined;
+      if (!createdSession || typeof createdSession.sessionId !== 'string' || !validIdentity(createdSession.sessionId)) {
+        result.sessionCreate = 'failed';
+        result.failureStage = 'response_shape';
+        result.modelRegistry = 'unavailable';
+        return result;
+      }
+      result.sessionCreate = 'acknowledged';
+      const settings = createdRecord && isRecord(createdRecord.settings) ? createdRecord.settings : undefined;
+      const modelSettings = settings && isRecord(settings.model) ? settings.model : undefined;
+      const available = modelSettings?.available;
+      if (!Array.isArray(available)) {
+        result.failureStage = 'model_registry';
+        result.modelRegistry = 'unavailable';
+        return result;
+      }
+      result.modelCount = available.length;
+      result.modelRegistry = available.length ? 'populated' : 'empty';
+      return result;
+    } catch {
+      result.sessionCreate = 'failed';
+      result.modelRegistry = 'unavailable';
+      if (result.failureStage === 'none') result.failureStage = 'session_create';
+      return result;
+    } finally {
+      await peer.close().catch(() => undefined);
+    }
   }
 
   async run(request: RunRequest): Promise<RunResult> {
@@ -213,6 +298,29 @@ function isBindingEvidenceValid(binding: ExistingDesktopBinding): boolean {
 
 function validIdentity(value: string): boolean {
   return typeof value === 'string' && value === value.trim() && SAFE_MODEL_ID.test(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function applyFailureStage(result: ZCodeDesktopDiagnostic, event: ZCodeAppServerDiagnosticEvent): void {
+  if (!['failed', 'timeout', 'exited'].includes(event.outcome)) return;
+  if (event.stage === 'launch') result.failureStage = 'launch';
+  else if (event.stage === 'preference_ack') {
+    result.failureStage = 'preference_ack';
+    result.preferenceAckFailure = event.code === 'rpc_failed' || event.code === 'ack_invalid'
+      ? event.code
+      : 'other';
+    if (event.code === 'rpc_failed') {
+      result.preferenceAckRpcFailure = event.rpcErrorCategory ?? 'no_code';
+    }
+  }
+  else if (event.stage === 'session_create_rpc') {
+    result.failureStage = event.code === 'response_invalid' ? 'response_shape' : 'session_create';
+  } else if (event.stage === 'subscribe_ack' || event.stage === 'initial_frame_timeout') {
+    result.failureStage = 'model_registry';
+  }
 }
 
 function isJavaScriptEntry(value: string): boolean {

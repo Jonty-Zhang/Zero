@@ -10,12 +10,15 @@ import type { AdapterConfig } from '../adapters/base.js';
 import { DshAdapter } from '../adapters/dsh.js';
 import { ZCodeCompositeAdapter } from '../adapters/zcode-composite.js';
 import type { ModelBinding } from '../adapters/types.js';
-import type { Attempt, CheckDefinition, CheckResult, HarnessAdapter, ReviewResult, RouteDecision, TaskEvent, TaskRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
+import type { Attempt, CheckDefinition, CheckResult, HarnessAdapter, ReviewResult, RouteDecision, SequenceGoalReview, TaskEvent, TaskRecord, TaskSequenceMetadata, TaskSequenceRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
 
 type HarnessName = 'codex' | 'dsh' | 'zcode';
 export type AdapterMap = Partial<Record<HarnessName, HarnessAdapter>>;
 export interface TaskStorePort {
   submit(submission: TaskSubmission): TaskRecord;
+  createSequence(submissions: TaskSubmission[], id?: string, metadata?: TaskSequenceMetadata): TaskSequenceRecord;
+  getSequence(id: string): (TaskSequenceRecord & { goalReview?: SequenceGoalReview }) | undefined;
+  listSequences(): Array<TaskSequenceRecord & { goalReview?: SequenceGoalReview }>;
   get(id: string): TaskRecord | undefined;
   list(status?: TaskStatus): TaskRecord[];
   fail(id: string, expected: TaskStatus | TaskStatus[], reason: string, owner?: string): TaskRecord;
@@ -45,6 +48,7 @@ export interface ZeroServerOptions {
 }
 
 const REASONING = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+const MAX_SEQUENCE_STEPS = 20;
 const KNOWN_HARNESSES: HarnessName[] = ['codex', 'dsh', 'zcode'];
 const SECURITY_HEADERS = { 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'" };
 const JSON_HEADERS = { ...SECURITY_HEADERS, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
@@ -85,6 +89,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
       if (req.method === 'GET' && url.pathname === '/api/capabilities') return json(res, 200, await capabilities(options));
       if (url.pathname === '/api/config' && req.method === 'GET') return json(res, 200, await readPublicConfig(options));
       if (url.pathname === '/api/config' && req.method === 'PUT') return json(res, 200, await updatePublicConfig(options, await bodyJson(req, options.maxBodyBytes)));
+      if (url.pathname === '/api/sequences' && req.method === 'GET') return json(res, 200, options.store.listSequences().map(mapSequence));
+      if (url.pathname === '/api/sequences' && req.method === 'POST') {
+        const { submissions, metadata } = await parseSequence(await bodyJson(req, options.maxBodyBytes), options);
+        const sequence = options.store.createSequence(submissions, undefined, metadata);
+        if (options.enqueue) {
+          for (const step of sequence.steps) void Promise.resolve().then(() => options.enqueue!(step.task.id)).catch((error: unknown) => {
+            try { options.store.fail(step.task.id, 'pending', `Scheduler enqueue failed: ${message(error)}`); } catch { /* A worker may have claimed it already. */ }
+          });
+        }
+        return json(res, 201, mapSequence(sequence));
+      }
+      const sequencePath = url.pathname.match(/^\/api\/sequences\/([^/]+)$/);
+      if (sequencePath && req.method === 'GET') {
+        const id = decodeURIComponent(sequencePath[1]!);
+        const sequence = options.store.getSequence(id);
+        if (!sequence) throw new HttpError(404, '任务序列不存在');
+        return json(res, 200, mapSequence(sequence));
+      }
       if (url.pathname === '/api/tasks' && req.method === 'GET') return json(res, 200, options.store.list().map(mapTaskList));
       if (url.pathname === '/api/tasks' && req.method === 'POST') {
         const submission = await parseSubmission(await bodyJson(req, options.maxBodyBytes), options);
@@ -108,6 +130,35 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     const code = error instanceof HttpError ? error.status : 500;
     json(res, code, { error: message(error) });
   }
+}
+
+async function parseSequence(raw: unknown, options: ZeroServerOptions): Promise<{ submissions: TaskSubmission[]; metadata: TaskSequenceMetadata }> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, '任务序列内容必须是 JSON 对象');
+  const input = raw as Record<string, unknown>;
+  if (!Array.isArray(input.tasks) || input.tasks.length < 2 || input.tasks.length > MAX_SEQUENCE_STEPS) {
+    throw new HttpError(400, `tasks 必须包含 2 到 ${MAX_SEQUENCE_STEPS} 个任务`);
+  }
+  const metadata: TaskSequenceMetadata = {};
+  if (input.objective !== undefined && input.objective !== null && input.objective !== '') {
+    metadata.objective = stringField(input.objective, 'objective', 1, 10_000);
+  }
+  if (input.acceptanceCriteria !== undefined && input.acceptanceCriteria !== null) {
+    const criteria = typeof input.acceptanceCriteria === 'string'
+      ? input.acceptanceCriteria.split(/\r?\n/).map(item => item.trim()).filter(Boolean)
+      : Array.isArray(input.acceptanceCriteria) && input.acceptanceCriteria.every(item => typeof item === 'string')
+        ? (input.acceptanceCriteria as string[]).map(item => item.trim()).filter(Boolean)
+        : undefined;
+    if (!criteria || !criteria.length || criteria.length > 100 || criteria.some(item => item.length > 4000)) {
+      throw new HttpError(400, 'acceptanceCriteria 必须包含 1 到 100 条有效文本，每条不超过 4000 个字符');
+    }
+    metadata.acceptanceCriteria = criteria;
+  }
+  // Validate every submission first. createSequence is called only after the entire
+  // batch has passed the same checks as an individual task submission.
+  const capability = await capabilities(options);
+  const submissions: TaskSubmission[] = [];
+  for (const task of input.tasks) submissions.push(await parseSubmission(task, options, capability));
+  return { submissions, metadata };
 }
 
 async function capabilities(options: ZeroServerOptions) {
@@ -151,8 +202,10 @@ async function readPublicConfig(options: ZeroServerOptions) {
   const modelIds = new Set(active.allocator.models.map((choice: { id: string }) => choice.id));
   const efforts = new Set(active.allocator.reasoningEfforts.map((choice: { id: string }) => choice.id));
   return {
-    allocator: { modelId: config.allocator.modelId && modelIds.has(config.allocator.modelId) ? config.allocator.modelId : null,
-      reasoningEffort: config.allocator.reasoningEffort && efforts.has(config.allocator.reasoningEffort) ? config.allocator.reasoningEffort : null },
+    allocator: { kind: config.allocator.kind ?? 'codex',
+      modelId: config.allocator.modelId && modelIds.has(config.allocator.modelId) ? config.allocator.modelId : null,
+      reasoningEffort: config.allocator.reasoningEffort && efforts.has(config.allocator.reasoningEffort) ? config.allocator.reasoningEffort : null,
+      ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) },
     reviewer: { modelId: config.reviewer.modelId && modelIds.has(config.reviewer.modelId) ? config.reviewer.modelId : null,
       reasoningEffort: config.reviewer.reasoningEffort && efforts.has(config.reviewer.reasoningEffort) ? config.reviewer.reasoningEffort : null },
   };
@@ -176,12 +229,34 @@ async function updatePublicConfig(options: ZeroServerOptions, raw: unknown) {
     return { modelId, reasoningEffort: reasoningEffort as LocalZeroConfig['allocator']['reasoningEffort'] };
   };
   const config = await options.config.read();
-  config.allocator = pick('allocator'); config.reviewer = pick('reviewer');
+  const allocatorRaw = input.allocator;
+  if (!allocatorRaw || typeof allocatorRaw !== 'object' || Array.isArray(allocatorRaw)) throw new HttpError(400, 'allocator 必须是对象');
+  const allocatorInput = allocatorRaw as Record<string, unknown>;
+  const kind = allocatorInput.kind == null ? (config.allocator.kind ?? 'codex') : allocatorInput.kind;
+  if (kind !== 'codex' && kind !== 'api') throw new HttpError(400, 'allocator.kind 必须是 codex 或 api');
+  let api = config.allocator.api;
+  if (kind === 'api') {
+    const rawApi = allocatorInput.api;
+    if (!rawApi || typeof rawApi !== 'object' || Array.isArray(rawApi)) throw new HttpError(400, 'allocator.api 必须是对象');
+    const value = rawApi as Record<string, unknown>;
+    const baseUrl = stringField(value.baseUrl, 'allocator.api.baseUrl', 1, 2048);
+    let parsedUrl: URL;
+    try { parsedUrl = new URL(baseUrl); } catch { throw new HttpError(400, 'allocator.api.baseUrl 必须是有效 HTTPS URL'); }
+    if (parsedUrl.protocol !== 'https:' || parsedUrl.username || parsedUrl.password || parsedUrl.search || parsedUrl.hash) throw new HttpError(400, 'allocator.api.baseUrl 必须是无凭据、查询或片段的 HTTPS URL');
+    const model = stringField(value.model, 'allocator.api.model', 1, 200);
+    const keyEnv = stringField(value.keyEnv, 'allocator.api.keyEnv', 1, 128);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyEnv)) throw new HttpError(400, 'allocator.api.keyEnv 必须是环境变量名');
+    api = { baseUrl, model, keyEnv };
+  }
+  config.allocator = kind === 'api'
+    ? { kind, modelId: null, reasoningEffort: null, api: api! }
+    : { ...pick('allocator'), kind, ...(api ? { api } : {}) };
+  config.reviewer = pick('reviewer');
   await options.config.write(config);
-  return { allocator: config.allocator, reviewer: config.reviewer };
+  return { allocator: { ...config.allocator, ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) }, reviewer: config.reviewer };
 }
 
-async function parseSubmission(raw: unknown, options: ZeroServerOptions): Promise<TaskSubmission> {
+async function parseSubmission(raw: unknown, options: ZeroServerOptions, capabilitySnapshot?: Awaited<ReturnType<typeof capabilities>>): Promise<TaskSubmission> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, '任务内容必须是 JSON 对象');
   const input = raw as Record<string, unknown>;
   const repoInput = stringField(input.repoPath, 'repoPath', 1, 4096);
@@ -205,7 +280,7 @@ async function parseSubmission(raw: unknown, options: ZeroServerOptions): Promis
   const maxRevisions = input.maxRevisions == null ? 2 : Number(input.maxRevisions);
   if (!Number.isInteger(maxRevisions) || maxRevisions < 0 || maxRevisions > 10) throw new HttpError(400, 'maxRevisions 必须在 0 到 10 之间');
   const checks = parseChecks(input.checkCommands);
-  const capability = await capabilities(options);
+  const capability = capabilitySnapshot ?? await capabilities(options);
   if (input.executionStages !== undefined) {
     const global = input.execution == null ? {} : parsePublicSelection(input.execution, 'execution');
     const stages = validateExecutionStages(input.executionStages, global, capability);
@@ -350,6 +425,32 @@ function mapTaskList(task: TaskRecord) {
     maxRevisions: task.maxRevisions, route: route ? mapRoute(route as unknown as Record<string, unknown>) : undefined,
     retryAt: task.status === 'waiting' ? task.retryAt : undefined, error: task.failureReason,
     recoveryReason: task.recoveryReason, recoveryEvidence: task.recoveryEvidence };
+}
+function mapSequence(sequence: TaskSequenceRecord & { goalReview?: SequenceGoalReview }) {
+  return {
+    id: sequence.id,
+    status: sequence.status,
+    objective: sequence.objective,
+    acceptanceCriteria: sequence.acceptanceCriteria,
+    createdAt: sequence.createdAt,
+    updatedAt: sequence.updatedAt,
+    blockedReason: sequence.blockedReason,
+    ...(sequence.goalReview ? { goalReview: mapSequenceGoalReview(sequence.goalReview) } : {}),
+    steps: sequence.steps.map(step => ({
+      position: step.position,
+      task: mapTaskList(step.task),
+      ...(step.effectiveBaseCommit ? { effectiveBaseCommit: step.effectiveBaseCommit } : {}),
+    })),
+  };
+}
+function mapSequenceGoalReview(review: SequenceGoalReview) {
+  return {
+    state: review.state,
+    ...(review.result ? { result: mapReview(review.result) } : {}),
+    ...(review.retryAt ? { retryAt: review.retryAt } : {}),
+    createdAt: review.createdAt,
+    ...(review.completedAt ? { completedAt: review.completedAt } : {}),
+  };
 }
 function mapRoute(route: Record<string, unknown> | RouteDecision) { const value = route as Record<string, unknown>; return { harnessId: value.harness, modelId: value.model, reasoningEffort: value.effectiveReasoningEffort ?? value.reasoningEffort, selectionSource: value.selectionSource, reason: value.reason }; }
 function mapAttempt(value: Attempt) {

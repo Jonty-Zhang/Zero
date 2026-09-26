@@ -6,7 +6,7 @@ import type { ModelBinding, ModelConfig, ReasoningEffort } from '../adapters/typ
 export interface LocalZeroConfig {
   models: ModelConfig[];
   bindings: ModelBinding[];
-  allocator: { modelId: string | null; reasoningEffort: ReasoningEffort | null };
+  allocator: { kind?: 'codex' | 'api'; modelId: string | null; reasoningEffort: ReasoningEffort | null; api?: { baseUrl: string; model: string; keyEnv: string } };
   reviewer: { modelId: string | null; reasoningEffort: ReasoningEffort | null };
   verifications: Record<string, { verifiedAt: string; cliVersion: string; requestedModel: string; exitCode: 0; level: 'selector_only' | 'event_confirmed'; actualModel?: string; profile?: string; configDir?: string; mode?: string; reasoningEfforts: ReasoningEffort[]; effortEvidence?: Record<string, { verifiedAt: string; cliVersion: string; exitCode: 0 }> }>;
   /** Environment variable name -> secret reference; never returned by HTTP APIs. */
@@ -46,7 +46,9 @@ export class ConfigStore {
       return {
         models: Array.isArray(parsed.models) ? parsed.models : [],
         bindings: Array.isArray(parsed.bindings) ? parsed.bindings : [],
-        allocator: { modelId: parsed.allocator?.modelId ?? null, reasoningEffort: parsed.allocator?.reasoningEffort ?? null },
+        allocator: { ...(parsed.allocator?.kind === 'api' || parsed.allocator?.kind === 'codex' ? { kind: parsed.allocator.kind } : {}),
+          modelId: parsed.allocator?.modelId ?? null, reasoningEffort: parsed.allocator?.reasoningEffort ?? null,
+          ...(parsed.allocator?.api ? { api: parsed.allocator.api } : {}) },
         reviewer: { modelId: parsed.reviewer?.modelId ?? null, reasoningEffort: parsed.reviewer?.reasoningEffort ?? null },
         verifications: parsed.verifications ?? {},
         ...(parsed.secretRefs ? { secretRefs: parsed.secretRefs } : {}),

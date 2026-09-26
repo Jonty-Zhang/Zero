@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFile, stat } from 'node:fs/promises';
 import { startZeroServer, runBindingVerification, runDshBindingVerification, runZCodeBindingVerification, runZCodeDesktopBindingVerification } from './server/main.js';
+import { ZCodeAppServerAdapter } from './adapters/zcode-app-server-adapter.js';
 
 const args = process.argv.slice(2);
 const command = args.shift() ?? 'help';
@@ -44,6 +45,33 @@ async function main() {
     }
     throw new Error('Usage: zero verify-binding codex <model-id> [--effort high] | dsh <model-id> --profile <safe-profile> | zcode <model-id> --config-dir <absolute-path> --mode <build|yolo> | zcode-desktop <local-model-id>');
   }
+  if (command === 'diagnose-zcode-desktop') {
+    if (args.length) {
+      process.stdout.write(`${JSON.stringify({
+        version: 'not_run', childSpawn: 'not_run', sessionCreate: 'not_run',
+        failureStage: 'not_checked', preferenceAckFailure: 'not_checked', preferenceAckRpcFailure: 'not_checked',
+        modelRegistry: 'not_checked', modelCount: null,
+      }, null, 2)}\n`);
+      return;
+    }
+    try {
+      const diagnostic = await new ZCodeAppServerAdapter().diagnoseExistingDesktop(process.cwd());
+      process.stdout.write(`${JSON.stringify(diagnostic, null, 2)}\n`);
+    } catch {
+      // This command must never expose child errors, process output, or config data.
+      process.stdout.write(`${JSON.stringify({
+        version: 'not_run',
+        childSpawn: 'not_run',
+        sessionCreate: 'not_run',
+        failureStage: 'not_checked',
+        preferenceAckFailure: 'not_checked',
+        preferenceAckRpcFailure: 'not_checked',
+        modelRegistry: 'not_checked',
+        modelCount: null,
+      }, null, 2)}\n`);
+    }
+    return;
+  }
   if (command === 'submit') {
     const repoPath = requiredOption(args, '--repo');
     const prompt = requiredOption(args, '--prompt');
@@ -58,6 +86,23 @@ async function main() {
     const executionStages = stagesFile ? await readExecutionStages(stagesFile) : undefined;
     assertNoArguments(args);
     const result = await request('/api/tasks', { method: 'POST', body: JSON.stringify({ repoPath, baseRef, prompt, acceptanceCriteria: acceptanceCriteria.join('\n'), checkCommands, maxRevisions, execution: { harnessId, modelId, reasoningEffort }, ...(executionStages ? { executionStages } : {}) }) });
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`); return;
+  }
+  if (command === 'submit-sequence') {
+    const file = requiredOption(args, '--file');
+    assertNoArguments(args);
+    const sequence = await readSequence(file);
+    const result = await request('/api/sequences', { method: 'POST', body: JSON.stringify(sequence) });
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`); return;
+  }
+  if (command === 'sequences') {
+    assertNoArguments(args);
+    const result = await request('/api/sequences');
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`); return;
+  }
+  if (command === 'sequence') {
+    const id = args.shift(); if (!id) throw new Error('Usage: zero sequence <sequence-id>'); assertNoArguments(args);
+    const result = await request(`/api/sequences/${encodeURIComponent(id)}`);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`); return;
   }
   if (command === 'status') {
@@ -103,6 +148,16 @@ async function readExecutionStages(file: string): Promise<unknown[]> {
   if (!Array.isArray(parsed)) throw new Error('--stages-file JSON root must be an array of execution stage objects');
   return parsed;
 }
+async function readSequence(file: string): Promise<Record<string, unknown>> {
+  const info = await stat(file);
+  if (!info.isFile()) throw new Error('--file must point to a regular JSON file');
+  if (info.size > 900 * 1024) throw new Error('--file must be no larger than 900 KiB');
+  let parsed: unknown;
+  try { parsed = JSON.parse(await readFile(file, 'utf8')) as unknown; }
+  catch { throw new Error('--file must contain valid JSON'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('--file JSON root must be a sequence object');
+  return parsed as Record<string, unknown>;
+}
 async function request(path: string, init?: RequestInit) {
   const base = process.env.ZERO_URL ?? 'http://127.0.0.1:4179';
   const response = await fetch(new URL(path, base), { ...init, headers: { ...(init?.body ? { 'content-type': 'application/json' } : {}), ...init?.headers } });
@@ -111,7 +166,9 @@ async function request(path: string, init?: RequestInit) {
   return text ? JSON.parse(text) as unknown : undefined;
 }
 function printHelp() {
-  process.stdout.write(`Zero task node\n\nCommands:\n  zero serve [--host 127.0.0.1] [--port 4179]\n  zero verify-binding codex <model-id> [--effort high]\n  zero verify-binding dsh <model-id> --profile <safe-profile>\n  zero verify-binding zcode <model-id> --config-dir <absolute-path> --mode <build|yolo>\n  zero verify-binding zcode-desktop <local-model-id>\n  zero submit --repo <path> --prompt <text> [--base <ref>] [--acceptance <text>] [--check <command>] [--max-revisions 2] [--harness <id>] [--model <id>] [--effort <level>] [--stages-file <JSON-file>]\n  zero status [task-id]\n  zero cancel <task-id>\n\nVerify runs a minimal model-binding check. Codex effort levels are registered only after passing that exact effort. DSH and ZCode bindings are pinned to the installed CLI version. ZCode isolated bindings require an explicit build or yolo mode; zcode-desktop verifies the selected local provider/model tuple through an existing-desktop app-server session.\nHarness, model and effort are independent optional task overrides. A stages file is a JSON array of ordered stage objects using harnessId, modelId, and reasoningEffort; each field is optional.\nSet ZERO_URL to use a non-default local server URL.\n`);
+  process.stdout.write(`Zero task node\n\nCommands:\n  zero serve [--host 127.0.0.1] [--port 4179]\n  zero verify-binding codex <model-id> [--effort high]\n  zero verify-binding dsh <model-id> --profile <safe-profile>\n  zero verify-binding zcode <model-id> --config-dir <absolute-path> --mode <build|yolo>\n  zero verify-binding zcode-desktop <local-model-id>\n  zero diagnose-zcode-desktop
+  zero submit --repo <path> --prompt <text> [--base <ref>] [--acceptance <text>] [--check <command>] [--max-revisions 2] [--harness <id>] [--model <id>] [--effort <level>] [--stages-file <JSON-file>]\n  zero submit-sequence --file <JSON-file>\n  zero sequences\n  zero sequence <sequence-id>\n  zero status [task-id]\n  zero cancel <task-id>\n\nVerify runs a minimal model-binding check. Codex effort levels are registered only after passing that exact effort. DSH and ZCode bindings are pinned to the installed CLI version. ZCode isolated bindings require an explicit build or yolo mode; zcode-desktop verifies the selected local provider/model tuple through an existing-desktop app-server session.\ndiagnose-zcode-desktop reports only categorical app-server stages and a model count; it creates a deferred session but sends no model input.
+Harness, model and effort are independent optional task overrides. A stages file is a JSON array of ordered stage objects using harnessId, modelId, and reasoningEffort; each field is optional.\nSet ZERO_URL to use a non-default local server URL.\n`);
 }
 
 void main().catch(error => { console.error(`zero: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; });

@@ -31,20 +31,58 @@ export interface TaskSubmission {
   maxRevisions?: number;
   allowedPaths?: string[];
   checks?: CheckDefinition[];
-  /** Any omitted field is selected by the Codex coordinator. */
+  /** Any omitted field is selected by the configured coordinator. */
   selection?: ExecutionSelection;
-  /** Ordered execution stages in one task worktree. Omitted fields are completed by the Codex coordinator. */
+  /** Ordered execution stages in one task worktree. Omitted fields are completed by the configured coordinator. */
   executionStages?: ExecutionSelection[];
 }
 
-export type SelectionSource = "task" | "project" | "global" | "codex";
+/** A durable user-authored ordered collection of tasks. Sequence completion is derived from task records. */
+export type TaskSequenceStatus = "queued" | "running" | "waiting" | "blocked" | "steps_completed" | "completed";
+
+export interface TaskSequenceMetadata {
+  /** The user-authored overarching objective. It is never expanded into tasks by the store. */
+  objective?: string;
+  /** User-authored goal-level criteria; these require aggregate verification beyond task completion. */
+  acceptanceCriteria?: string[];
+}
+
+export interface TaskSequenceStep {
+  position: number;
+  task: TaskRecord;
+  /** Effective starting commit persisted before this step's worktree is created, when handed off. */
+  effectiveBaseCommit?: string;
+}
+
+export interface TaskSequenceRecord {
+  id: string;
+  status: TaskSequenceStatus;
+  objective?: string;
+  acceptanceCriteria?: string[];
+  createdAt: string;
+  updatedAt: string;
+  steps: TaskSequenceStep[];
+  /** Present when the first unfinished step is waiting, failed, or requires recovery. */
+  blockedReason?: { taskId: string; status: TaskStatus; reason?: string };
+}
+
+/** Publicly useful aggregate goal-review state retained with a sequence. */
+export interface SequenceGoalReview {
+  state: "running" | "quota" | "verdict";
+  result?: ReviewResult;
+  retryAt?: string;
+  createdAt: string;
+  completedAt?: string;
+}
+
+export type SelectionSource = "task" | "project" | "global" | "codex" | "api";
 
 export interface RouteDecision {
   taskId: string;
   harness: string;
   model: string;
   reasoningEffort?: string;
-  /** Effective value after user selection and Codex completion. */
+  /** Effective value after user selection and coordinator completion. */
   effectiveReasoningEffort?: string;
   selectionSource: SelectionSource;
   /** Per-field source is retained because a task may specify only some fields. */
@@ -64,6 +102,8 @@ export interface RouteDecision {
 export interface TaskRecord extends TaskSubmission {
   id: string;
   status: TaskStatus;
+  /** Verified prior sequence step result used as this task's effective base commit. */
+  sequenceBaseCommit?: string;
   createdAt: string;
   updatedAt: string;
   revisionCount: number;
