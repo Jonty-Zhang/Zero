@@ -256,6 +256,22 @@ export interface ReviewRecoveryClaimRecord {
   /** Operation ownership at claim time, including completed reports retained as audit evidence. */
   commitOperation?: Record<string, unknown>;
   reportOperation?: Record<string, unknown>;
+  /** Verified adjacent guardian startup generations traversed for a quota wait spanning restarts. */
+  guardianLineage?: string[];
+  claimedAt: string;
+}
+
+export interface ReviewQuotaResumeClaimRecord {
+  taskId: string;
+  packageId: string;
+  checkRunId: string;
+  sourceGenerationId: string;
+  claimGenerationId: string;
+  owner: string;
+  recoveredGeneration: boolean;
+  reviewRecoveryClaimId?: string;
+  identity: ClaimReviewRecoveryInput["identity"];
+  gitState: Extract<ReviewRecoveryGitState, { kind: "pre_commit" }>;
   claimedAt: string;
 }
 
@@ -536,6 +552,10 @@ export class TaskStore {
     if (!currentGenerationColumns.some(column => column.name === "member_verified")) {
       this.#db.exec("ALTER TABLE startup_generations ADD COLUMN member_verified INTEGER NOT NULL DEFAULT 0 CHECK(member_verified IN (0,1))");
     }
+    const reviewRecoveryColumns = this.#db.prepare("PRAGMA table_info(review_recovery_claims)").all() as Array<{ name: string }>;
+    if (!reviewRecoveryColumns.some(column => column.name === "guardian_lineage")) {
+      this.#db.exec("ALTER TABLE review_recovery_claims ADD COLUMN guardian_lineage TEXT");
+    }
     this.#db.exec("CREATE INDEX IF NOT EXISTS attempts_stage_sequence ON attempts(stage_id, sequence)");
     const attestation = startupAttestation ?? { id: randomUUID(), predecessorDrained: false, evidenceKind: "unguarded" as const };
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(attestation.id) || typeof attestation.predecessorDrained !== "boolean" ||
@@ -610,6 +630,33 @@ export class TaskStore {
       row.parent_evidence_kind === "guardian_startup_verified" && row.parent_lock_id === row.lock_id);
   }
 
+  #verifiedGuardianLineage(fromGenerationId: string, toGenerationId: string): string[] | undefined {
+    const rows = this.#db.prepare(`SELECT id,lock_id,predecessor_drained,evidence_kind,predecessor_generation_id
+      FROM startup_generations ORDER BY sequence`).all() as Array<{
+        id: string; lock_id: string | null; predecessor_drained: number; evidence_kind: string; predecessor_generation_id: string | null;
+      }>;
+    const fromIndex = rows.findIndex(row => row.id === fromGenerationId);
+    const toIndex = rows.findIndex(row => row.id === toGenerationId);
+    if (fromIndex < 0 || toIndex <= fromIndex) return undefined;
+    const path = rows.slice(fromIndex, toIndex + 1);
+    if (path.length < 2 || path[0]?.evidence_kind !== "guardian_startup_verified" || !path[0]?.lock_id) return undefined;
+    const lockId = path[0].lock_id;
+    for (let index = 1; index < path.length; index++) {
+      const parent = path[index - 1]!;
+      const child = path[index]!;
+      if (child.evidence_kind !== "guardian_startup_verified" || child.predecessor_drained !== 1 || child.lock_id !== lockId ||
+          child.predecessor_generation_id !== parent.id || parent.lock_id !== lockId) return undefined;
+    }
+    return path.map(row => row.id);
+  }
+
+  #guardianLineageIsValid(lineage: unknown, fromGenerationId: string, toGenerationId: string): boolean {
+    if (!Array.isArray(lineage) || lineage.some(id => typeof id !== "string") || new Set(lineage).size !== lineage.length ||
+        lineage[0] !== fromGenerationId || lineage.at(-1) !== toGenerationId) return false;
+    const verified = this.#verifiedGuardianLineage(fromGenerationId, toGenerationId);
+    return Boolean(verified && JSON.stringify(lineage) === JSON.stringify(verified));
+  }
+
   #taskClaimOwnersForGeneration(taskId: string, generationId: string): Set<string> {
     const rows = this.#db.prepare("SELECT payload FROM events WHERE task_id=? AND type='task.claimed' ORDER BY id")
       .all(taskId) as Array<{ payload: string | null }>;
@@ -643,7 +690,8 @@ export class TaskStore {
       try {
         const payload = decode<Record<string, unknown>>(row.payload);
         if (payload && payload.id === claim.id && payload.priorClaimGenerationId === claim.prior_claim_generation_id &&
-            payload.claimGenerationId === claim.claim_generation_id && payload.owner === claim.owner) return true;
+            payload.claimGenerationId === claim.claim_generation_id && payload.owner === claim.owner &&
+            JSON.stringify(payload.guardianLineage ?? null) === JSON.stringify(claim.guardian_lineage ? JSON.parse(String(claim.guardian_lineage)) : null)) return true;
       } catch { return false; }
     }
     return false;
@@ -695,6 +743,12 @@ export class TaskStore {
         WHERE p.id=? AND p.task_id=?`).get(String(claim.package_id), taskId) as
         { id: string; package_rowid: number; source_generation_id: string; check_status: string } | undefined;
       const claimSourceGeneration = String(claim.source_generation_id ?? "");
+      let guardianLineage: unknown;
+      try { guardianLineage = claim.guardian_lineage ? JSON.parse(String(claim.guardian_lineage)) : undefined; }
+      catch { return undefined; }
+      const hasValidGenerationEdge = guardianLineage === undefined
+        ? this.#startupGenerationProvesPredecessorDrained(String(claim.claim_generation_id), expectedGeneration)
+        : this.#guardianLineageIsValid(guardianLineage, expectedGeneration, String(claim.claim_generation_id));
       const packageEpochIsForward = previousPackageId === undefined || claim.package_id === previousPackageId
         ? claimPackage?.source_generation_id === previousPackageSource || previousPackageId === undefined
         : claimSourceGeneration === expectedGeneration && Number(claimPackage?.package_rowid) > previousPackageRowid;
@@ -703,7 +757,7 @@ export class TaskStore {
           !claimPackage || claim.source_generation_id !== claimPackage.source_generation_id ||
           !generationOwners.has(claimSourceGeneration) || !packageEpochIsForward ||
           claimPackage.check_status !== "completed" ||
-          !this.#startupGenerationProvesPredecessorDrained(String(claim.claim_generation_id), expectedGeneration)) return undefined;
+          !hasValidGenerationEdge) return undefined;
       const claimOwner = String(claim.owner ?? "");
       const claimGenerationId = String(claim.claim_generation_id);
       const claimGenerationOwners = this.#taskClaimOwnersForGeneration(taskId, claimGenerationId);
@@ -789,8 +843,16 @@ export class TaskStore {
     const expires = new Date(now.getTime() + leaseMs).toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.#db.prepare(`SELECT id FROM tasks WHERE status='pending' OR (status='waiting' AND id IN
-        (SELECT task_id FROM quota_pauses WHERE retry_at<=?)) ORDER BY created_at, id LIMIT 1`).get(at) as { id: string } | undefined;
+      const candidates = this.#db.prepare(`SELECT t.id,t.status,q.checkpoint FROM tasks t LEFT JOIN quota_pauses q ON q.task_id=t.id
+        WHERE t.status='pending' OR (t.status='waiting' AND q.retry_at<=?) ORDER BY t.created_at,t.id`).all(at) as
+        Array<{ id: string; status: TaskStatus; checkpoint: string | null }>;
+      const row = candidates.find(candidate => {
+        try {
+          if ((JSON.parse(candidate.checkpoint ?? "null") as Record<string, unknown> | null)?.kind === "review_quota") return false;
+          return candidate.status === "pending" || candidate.status === "waiting";
+        }
+        catch { return false; }
+      });
       if (!row) { this.#db.exec("COMMIT"); return undefined; }
       const result = this.#db.prepare(`UPDATE tasks SET status='running', updated_at=?, lease_owner=?, lease_expires_at=?, heartbeat_at=?, lease_protocol_version=2, claim_generation_id=?
         WHERE id=? AND status IN ('pending','waiting')`).run(at, owner, expires, at, this.#startupGeneration.id, row.id);
@@ -1417,6 +1479,237 @@ export class TaskStore {
       this.#event(taskId, "task.quota_waiting", { retryAt: retryAt.toISOString(), retryCount: count, checkpoint: input.checkpoint, source: input.source ?? "fallback", reason: input.reason }, at);
     });
     return this.get(taskId)!;
+  }
+
+  /** Persist a quota pause at the exact Codex review package boundary. Generic claimNext cannot resume this checkpoint. */
+  pauseReviewForQuota(taskId: string, owner: string, input: {
+    packageId: string; attemptId: string; retryAt: string; reason: string;
+    checkpoint?: Record<string, unknown>; source?: "provider_message" | "retry_after" | "fallback"; now?: Date;
+  }): TaskRecord {
+    const now = input.now ?? new Date();
+    const retryAt = new Date(input.retryAt);
+    if (!owner?.trim() || !input.packageId || !input.attemptId || typeof input.reason !== "string" || !input.reason.trim() ||
+        !(now instanceof Date) || !Number.isFinite(now.getTime()) || !Number.isFinite(retryAt.getTime()) || retryAt.getTime() <= now.getTime()) {
+      throw new Error("Review quota pause requires package/attempt identity, reason, and a future retryAt");
+    }
+    const at = now.toISOString();
+    this.#transaction(() => {
+      const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,active_attempt_id
+        FROM tasks WHERE id=?`).get(taskId) as {
+          status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null;
+          claim_generation_id: string | null; active_attempt_id: string | null;
+        } | undefined;
+      if (!task || task.status !== "reviewing" || task.lease_owner !== owner || !task.claim_generation_id ||
+          !task.lease_expires_at || Date.parse(task.lease_expires_at) <= now.getTime()) {
+        throw new Error(`Task ${taskId} is not actively reviewing under ${owner}`);
+      }
+      const pkg = this.#db.prepare(`SELECT p.id,p.check_run_id,c.generation_id AS source_generation_id
+        FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id
+        WHERE p.id=? AND p.task_id=? AND p.id=(SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1)`)
+        .get(input.packageId, taskId, taskId) as { id: string; check_run_id: string; source_generation_id: string } | undefined;
+      if (!pkg) throw new Error("Review quota pause must target the latest sealed review package");
+      const attempt = this.#db.prepare(`SELECT id,status,role,harness,metadata FROM attempts WHERE id=? AND task_id=?`)
+        .get(input.attemptId, taskId) as { id: string; status: string; role: string; harness: string | null; metadata: string | null } | undefined;
+      let metadata: Record<string, unknown>;
+      try { metadata = attempt?.metadata ? JSON.parse(attempt.metadata) as Record<string, unknown> : {}; }
+      catch { throw new Error("Review quota attempt metadata is malformed"); }
+      const latestAttempt = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? ORDER BY sequence DESC LIMIT 1").get(taskId) as { id: string } | undefined;
+      if (!attempt || task.active_attempt_id !== null || latestAttempt?.id !== attempt.id || !["failed", "interrupted"].includes(attempt.status) ||
+          attempt.role !== "review" || attempt.harness !== "codex" || metadata.packageId !== pkg.id ||
+          metadata.generationId !== task.claim_generation_id) {
+        throw new Error("Review quota pause requires the terminal failed Codex attempt bound to the latest package and current generation");
+      }
+      if (this.#db.prepare("SELECT 1 FROM review_verdicts WHERE task_id=? AND package_id=?").get(taskId, pkg.id)) {
+        throw new Error("A completed verdict already exists for the review quota package");
+      }
+      const baseCheckpoint = input.checkpoint ?? {};
+      if (!baseCheckpoint || typeof baseCheckpoint !== "object" || Array.isArray(baseCheckpoint)) {
+        throw new Error("Review quota worker checkpoint must be an object");
+      }
+      const checkpoint = { ...baseCheckpoint, kind: "review_quota", packageId: pkg.id, checkRunId: pkg.check_run_id,
+        sourceGenerationId: pkg.source_generation_id, claimGenerationId: task.claim_generation_id,
+        owner, attemptId: attempt.id };
+      const checkpointJson = JSON.stringify(checkpoint);
+      if (Buffer.byteLength(checkpointJson, "utf8") > 65_536) throw new Error("Review quota checkpoint exceeds 64 KiB");
+      const previous = this.#db.prepare("SELECT retry_count FROM quota_pauses WHERE task_id=?").get(taskId) as { retry_count: number } | undefined;
+      const retryCount = (previous?.retry_count ?? 0) + 1;
+      this.#db.prepare(`INSERT INTO quota_pauses(task_id,retry_at,retry_count,checkpoint,reason,source) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(task_id) DO UPDATE SET retry_at=excluded.retry_at,retry_count=excluded.retry_count,
+          checkpoint=excluded.checkpoint,reason=excluded.reason,source=excluded.source`)
+        .run(taskId, retryAt.toISOString(), retryCount, checkpointJson, input.reason, input.source ?? "fallback");
+      const changed = this.#db.prepare(`UPDATE tasks SET status='waiting',updated_at=?,failure_reason=?,lease_owner=NULL,
+        lease_expires_at=NULL,heartbeat_at=NULL,active_attempt_id=NULL WHERE id=? AND status='reviewing' AND lease_owner=?
+        AND claim_generation_id=?`).run(at, input.reason, taskId, owner, task.claim_generation_id);
+      if (Number(changed.changes) !== 1) throw new Error("Review task lease or generation changed before quota pause");
+      this.#disableExecutionRecoveryCheckpoint(taskId, at, "quota_waiting");
+      this.#event(taskId, "task.quota_waiting", { retryAt: retryAt.toISOString(), retryCount, checkpoint,
+        source: input.source ?? "fallback", reason: input.reason, reviewPackageId: pkg.id }, at);
+    });
+    return this.get(taskId)!;
+  }
+
+  /** Reclaims a due review quota checkpoint after fresh Git inspection, within the same generation or a guardian-backed successor. */
+  claimReviewQuotaResume(taskId: string, owner: string, input: ClaimReviewRecoveryInput): ReviewQuotaResumeClaimRecord | undefined {
+    if (!owner?.trim() || !input?.identity || !input.gitState || !/^[a-f0-9]{64}$/i.test(input.identity.fingerprint ?? "")) {
+      throw new Error("Review quota resume requires an owner, fresh worktree identity, and valid fingerprint");
+    }
+    const now = input.now ?? new Date();
+    const leaseMs = input.leaseMs ?? 60_000;
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || !Number.isFinite(leaseMs) || leaseMs <= 0) {
+      throw new Error("Review quota resume requires valid now and positive leaseMs values");
+    }
+    this.#assertFreshRecoveryCheck(input.identity.checkedAt, now);
+    const gitState = input.gitState;
+    this.#assertFreshRecoveryCheck(gitState.checkedAt, now);
+    if (gitState.kind !== "pre_commit") throw new Error("Review quota resume requires fresh pre-commit Git inspection");
+    const identityJson = JSON.stringify(input.identity.observed);
+    const gitStateJson = JSON.stringify(gitState);
+    if (!identityJson || identityJson === "null" || Buffer.byteLength(identityJson) > 65_536 ||
+        !gitStateJson || Buffer.byteLength(gitStateJson) > 65_536) {
+      throw new Error("Fresh review quota inspection must be non-empty and at most 64 KiB");
+    }
+    const at = now.toISOString();
+    const expires = new Date(now.getTime() + leaseMs).toISOString();
+    let result: ReviewQuotaResumeClaimRecord | undefined;
+    this.#transaction(() => {
+      const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,payload
+        FROM tasks WHERE id=?`).get(taskId) as {
+          status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null;
+          claim_generation_id: string | null; payload: string;
+        } | undefined;
+      const quota = this.#db.prepare("SELECT retry_at,checkpoint FROM quota_pauses WHERE task_id=?").get(taskId) as
+        { retry_at: string; checkpoint: string } | undefined;
+      if (!task || task.status !== "waiting" || task.lease_owner !== null || task.lease_expires_at !== null || !quota ||
+          Date.parse(quota.retry_at) > now.getTime() || !task.claim_generation_id) return;
+      let checkpoint: Record<string, unknown>;
+      try { checkpoint = JSON.parse(quota.checkpoint) as Record<string, unknown>; }
+      catch { return; }
+      if (checkpoint.kind !== "review_quota" || checkpoint.claimGenerationId !== task.claim_generation_id ||
+          typeof checkpoint.packageId !== "string" || typeof checkpoint.checkRunId !== "string" ||
+          typeof checkpoint.owner !== "string" || typeof checkpoint.sourceGenerationId !== "string" || typeof checkpoint.attemptId !== "string") return;
+      const priorGenerationId = task.claim_generation_id;
+      const recoveredGeneration = this.#startupGeneration.id !== priorGenerationId;
+      const guardianLineage = recoveredGeneration ? this.#verifiedGuardianLineage(priorGenerationId, this.#startupGeneration.id) : undefined;
+      if (recoveredGeneration && !guardianLineage) return;
+
+      const worktree = this.#db.prepare("SELECT * FROM worktree_creations WHERE task_id=?").get(taskId) as {
+        status: string; plan: string; observed: string | null; fingerprint: string | null;
+      } | undefined;
+      let plan: Record<string, unknown>;
+      let savedObserved: { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown };
+      try {
+        if (!worktree || worktree.status !== "created" || !worktree.observed || !worktree.fingerprint ||
+            !/^[a-f0-9]{64}$/i.test(worktree.fingerprint)) throw new Error("missing registered worktree");
+        plan = JSON.parse(worktree.plan) as Record<string, unknown>;
+        savedObserved = JSON.parse(worktree.observed) as typeof savedObserved;
+      } catch { return; }
+      const freshObserved = input.identity.observed as { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown; fingerprint?: unknown };
+      if (!savedObserved.info || !freshObserved?.info ||
+          !["taskId", "repoPath", "path", "branch", "baseCommit"].every(key => plan[key] === savedObserved.info![key] && savedObserved.info![key] === freshObserved.info![key]) ||
+          plan.taskId !== taskId || plan.commonGitDir !== savedObserved.commonGitDir || savedObserved.commonGitDir !== freshObserved.commonGitDir ||
+          savedObserved.head !== plan.baseCommit || freshObserved.head !== input.gitState.head || freshObserved.fingerprint !== input.identity.fingerprint) {
+        throw new Error("Fresh review quota identity does not match the registered worktree or Git HEAD");
+      }
+      const pkg = this.#db.prepare(`SELECT p.id,p.check_run_id,p.snapshot,p.branch_ref,p.execution_attempt_id,p.execution_stage_id,
+          p.route_attempt_id,p.check_definition_hash,p.expected_check_ids,c.generation_id AS source_generation_id,
+          c.status AS check_status,c.snapshot AS run_snapshot,c.check_definition_hash AS run_check_definition_hash,
+          c.expected_check_ids AS run_expected_check_ids
+        FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id
+        WHERE p.task_id=? AND p.id=(SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1)`)
+        .get(taskId, taskId) as Record<string, unknown> | undefined;
+      if (!pkg || pkg.id !== checkpoint.packageId || pkg.check_run_id !== checkpoint.checkRunId ||
+          pkg.source_generation_id !== checkpoint.sourceGenerationId || pkg.check_status !== "completed" ||
+          pkg.snapshot !== pkg.run_snapshot || pkg.check_definition_hash !== pkg.run_check_definition_hash ||
+          pkg.expected_check_ids !== pkg.run_expected_check_ids) return;
+      let snapshot: CheckRunSnapshot;
+      try { snapshot = JSON.parse(String(pkg.snapshot)) as CheckRunSnapshot; }
+      catch { return; }
+      let submission: TaskSubmission;
+      let expectedCheckIds: string[];
+      let runSnapshot: CheckRunSnapshot;
+      try {
+        submission = JSON.parse(task.payload) as TaskSubmission;
+        expectedCheckIds = JSON.parse(String(pkg.expected_check_ids)) as string[];
+        runSnapshot = JSON.parse(String(pkg.run_snapshot)) as CheckRunSnapshot;
+      } catch { return; }
+      const checks = submission.checks ?? [];
+      const checkDefinitionHash = createHash("sha256").update(JSON.stringify(checks), "utf8").digest("hex");
+      const checkRows = this.#db.prepare("SELECT check_id,result FROM check_run_results WHERE run_id=? ORDER BY id")
+        .all(String(pkg.check_run_id)) as Array<{ check_id: string; result: string }>;
+      let checkResults: CheckResult[];
+      try { checkResults = checkRows.map(row => JSON.parse(row.result) as CheckResult); }
+      catch { return; }
+      if (!Array.isArray(expectedCheckIds) || expectedCheckIds.length !== checks.length ||
+          !sameStringSet(expectedCheckIds, checks.map(check => check.id)) ||
+          String(pkg.check_definition_hash) !== checkDefinitionHash ||
+          !sameStringSet(checkRows.map(row => row.check_id), expectedCheckIds) || checkRows.length !== expectedCheckIds.length ||
+          checkResults.some((result, index) => result.id !== checkRows[index]?.check_id || result.status !== "passed" || result.exitCode !== 0) ||
+          !sameReviewRecoverySnapshot(snapshot, runSnapshot)) return;
+      const quotaAttempt = this.#db.prepare("SELECT id,status,role,harness,metadata FROM attempts WHERE id=? AND task_id=?")
+        .get(checkpoint.attemptId, taskId) as { id: string; status: string; role: string; harness: string | null; metadata: string | null } | undefined;
+      let quotaAttemptMetadata: Record<string, unknown>;
+      try { quotaAttemptMetadata = quotaAttempt?.metadata ? JSON.parse(quotaAttempt.metadata) as Record<string, unknown> : {}; }
+      catch { return; }
+      const latestAttempt = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? ORDER BY sequence DESC LIMIT 1").get(taskId) as { id: string } | undefined;
+      if (!quotaAttempt || quotaAttempt.id !== latestAttempt?.id || !["failed", "interrupted"].includes(quotaAttempt.status) ||
+          quotaAttempt.role !== "review" || quotaAttempt.harness !== "codex" || quotaAttemptMetadata.packageId !== pkg.id ||
+          quotaAttemptMetadata.generationId !== priorGenerationId || checkpoint.attemptId !== quotaAttempt.id || checkpoint.owner !== this.#latestTaskClaimOwnerForGeneration(taskId, priorGenerationId)) return;
+      const state = gitState;
+      if (state.branchRef !== String(pkg.branch_ref) || state.head.toLowerCase() !== snapshot.preHead.toLowerCase() ||
+          !sameReviewRecoverySnapshot(state.snapshot, snapshot) || state.treeId.toLowerCase() !== snapshot.treeId.toLowerCase() ||
+          state.diffHash.toLowerCase() !== snapshot.diffHash.toLowerCase()) {
+        throw new Error("Fresh review quota Git state does not match the exact sealed package snapshot");
+      }
+      const reviewVerdict = this.#db.prepare("SELECT 1 FROM review_verdicts WHERE task_id=? AND package_id=?").get(taskId, pkg.id);
+      const commitOrReport = this.#db.prepare("SELECT 1 FROM commit_operations WHERE task_id=? UNION ALL SELECT 1 FROM report_operations WHERE task_id=? LIMIT 1")
+        .get(taskId, taskId);
+      if (reviewVerdict || commitOrReport) return;
+      const claims = this.#db.prepare("SELECT * FROM review_recovery_claims WHERE task_id=? ORDER BY rowid").all(taskId) as Array<Record<string, unknown>>;
+      const previousClaim = claims.at(-1);
+      let priorCheckpointId: string | undefined;
+      if (previousClaim) {
+        if (!this.#verifiedReviewRecoveryGenerationChain(taskId, String(pkg.id), String(pkg.source_generation_id),
+          priorGenerationId, String(checkpoint.owner))) return;
+        if (recoveredGeneration) priorCheckpointId = String(previousClaim.id);
+      } else if (pkg.source_generation_id !== priorGenerationId ||
+          this.#latestTaskClaimOwnerForGeneration(taskId, priorGenerationId) !== checkpoint.owner) {
+        return;
+      }
+      const checkpointId = recoveredGeneration ? randomUUID() : undefined;
+      const recoveryCheckpoint: ReviewRecoveryClaimRecord | undefined = checkpointId ? {
+        id: checkpointId, taskId, priorClaimGenerationId: priorGenerationId, claimGenerationId: this.#startupGeneration.id,
+        owner, leaseExpiresAt: expires, ...(priorCheckpointId ? { priorCheckpointId } : {}), packageId: String(pkg.id),
+        sourceGenerationId: String(pkg.source_generation_id),
+        identity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint },
+        gitState, ...(guardianLineage ? { guardianLineage } : {}), claimedAt: at,
+      } : undefined;
+      const changed = this.#db.prepare(`UPDATE tasks SET status='reviewing',updated_at=?,lease_owner=?,lease_expires_at=?,heartbeat_at=?,
+          active_attempt_id=NULL,lease_protocol_version=2,claim_generation_id=?,failure_reason=NULL
+        WHERE id=? AND status='waiting' AND lease_owner IS NULL AND lease_expires_at IS NULL AND claim_generation_id=?`)
+        .run(at, owner, expires, at, this.#startupGeneration.id, taskId, priorGenerationId);
+      if (Number(changed.changes) !== 1) return;
+      if (recoveryCheckpoint) {
+        const payload = JSON.stringify(recoveryCheckpoint);
+        if (Buffer.byteLength(payload, "utf8") > 65_536) throw new Error("Review quota recovery checkpoint exceeds 64 KiB");
+        this.#db.prepare(`INSERT INTO review_recovery_claims(id,task_id,prior_claim_generation_id,claim_generation_id,owner,lease_expires_at,
+            prior_checkpoint_id,package_id,source_generation_id,identity,git_state,payload,claimed_at,guardian_lineage)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(recoveryCheckpoint.id, taskId, priorGenerationId, this.#startupGeneration.id,
+          owner, expires, priorCheckpointId ?? null, String(pkg.id), String(pkg.source_generation_id), identityJson, gitStateJson,
+          payload, at, guardianLineage ? JSON.stringify(guardianLineage) : null);
+        this.#event(taskId, "task.review_recovery_claimed", recoveryCheckpoint, at);
+      }
+      this.#event(taskId, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2,
+        generationId: this.#startupGeneration.id, recovery: recoveredGeneration ? "review_quota" : "review_quota_resume" }, at);
+      this.#event(taskId, "task.review_quota_resumed", { packageId: pkg.id, checkRunId: pkg.check_run_id,
+        priorGenerationId, generationId: this.#startupGeneration.id, owner, recoveredGeneration,
+        reviewRecoveryClaimId: checkpointId }, at);
+      result = { taskId, packageId: String(pkg.id), checkRunId: String(pkg.check_run_id),
+        sourceGenerationId: String(pkg.source_generation_id), claimGenerationId: this.#startupGeneration.id, owner,
+        recoveredGeneration, ...(checkpointId ? { reviewRecoveryClaimId: checkpointId } : {}),
+        identity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint },
+        gitState, claimedAt: at };
+    });
+    return result;
   }
 
   quotaCheckpoint(taskId: string): Record<string, unknown> | undefined {

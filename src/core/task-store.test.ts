@@ -108,8 +108,9 @@ function completeReviewPackage(f: ReturnType<typeof reviewFixture>) {
 }
 
 function startBoundReviewAttempt(f: ReturnType<typeof reviewFixture>, packageId: string) {
-  return f.store.createAttempt(f.task.id, "review", { owner: f.owner, harness: "codex",
-    metadata: { packageId, generationId: f.generationId } });
+  const task = f.store.get(f.task.id)!;
+  return f.store.createAttempt(f.task.id, "review", { owner: task.leaseOwner ?? f.owner, harness: "codex",
+    metadata: { packageId, generationId: task.claimGenerationId ?? f.generationId } });
 }
 
 function completePassingReview(f: ReturnType<typeof reviewFixture>) {
@@ -175,6 +176,145 @@ function reviewRecoveryInput(f: ReturnType<typeof reviewFixture>, observed: unkn
   const observedValue = observed as { info: Record<string, unknown>; commonGitDir: string };
   return { now: at, identity: { checkedAt: at.toISOString(), observed: { ...observedValue, head: state.head, fingerprint: "c".repeat(64) }, fingerprint: "c".repeat(64) }, gitState: state };
 }
+
+function pauseReviewQuota(f: ReturnType<typeof reviewFixture>, packageId: string, at = new Date()) {
+  const attempt = startBoundReviewAttempt(f, packageId);
+  f.store.finishAttempt(attempt.id, { status: "interrupted", error: "Codex usage limit reached" });
+  const retryAt = new Date(at.getTime() + 60_000).toISOString();
+  const task = f.store.pauseReviewForQuota(f.task.id, f.store.get(f.task.id)?.leaseOwner ?? f.owner, { packageId, attemptId: attempt.id,
+    retryAt, reason: "Codex usage limit reached", source: "provider_message", checkpoint: { stage: "review" }, now: at });
+  return { attempt, retryAt, task };
+}
+
+test("review quota checkpoint waits for retryAt and resumes only through its dedicated same-generation claim", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-quota-same-generation-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "8".repeat(64);
+  const g0 = "81818181818181818181818181818181";
+  const now = new Date();
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const paused = pauseReviewQuota(f, pkg.id, now);
+    assert.equal(paused.task.status, "waiting");
+    assert.equal(paused.task.leaseOwner, undefined);
+    assert.equal(paused.task.retryAt, paused.retryAt);
+    assert.equal(paused.task.resumeCheckpoint?.kind, "review_quota");
+    assert.equal(paused.task.resumeCheckpoint?.checkRunId, pkg.checkRunId);
+    assert.equal(f.store.claimNext("generic-worker", 60_000, new Date(now.getTime() + 120_000)), undefined);
+
+    const earlyAt = new Date(now.getTime() + 30_000);
+    assert.equal(f.store.claimReviewQuotaResume(f.task.id, "early-reviewer",
+      reviewRecoveryInput(f, observed, "pre_commit", earlyAt)), undefined);
+    const dueAt = new Date(now.getTime() + 120_000);
+    const resumed = f.store.claimReviewQuotaResume(f.task.id, "same-generation-reviewer",
+      reviewRecoveryInput(f, observed, "pre_commit", dueAt));
+    assert.equal(resumed?.recoveredGeneration, false);
+    assert.equal(resumed?.reviewRecoveryClaimId, undefined);
+    assert.equal(resumed?.packageId, pkg.id);
+    assert.equal(resumed?.checkRunId, pkg.checkRunId);
+    assert.equal(f.store.get(f.task.id)?.status, "reviewing");
+    assert.equal(f.store.get(f.task.id)?.leaseOwner, "same-generation-reviewer");
+    assert.equal(f.store.claimReviewQuotaResume(f.task.id, "double-claimant",
+      reviewRecoveryInput(f, observed, "pre_commit", dueAt)), undefined);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review quota checkpoint resumes after multiple idle restarts through recorded guardian lineage", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-quota-reboot-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "9".repeat(64);
+  const g0 = "91919191919191919191919191919191";
+  const g1 = "92929292929292929292929292929292";
+  const g2 = "93939393939393939393939393939393";
+  const g3 = "94949494949494949494949494949494";
+  const now = new Date();
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const paused = pauseReviewQuota(f, pkg.id, now);
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    f.store.close();
+    f.store = new TaskStore(path, { id: g2, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    f.store.close();
+    f.store = new TaskStore(path, { id: g3, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const dueAt = new Date(now.getTime() + 120_000);
+    const input = reviewRecoveryInput(f, observed, "pre_commit", dueAt);
+    const resumed = f.store.claimReviewQuotaResume(f.task.id, "reboot-reviewer", input);
+    assert.equal(resumed?.recoveredGeneration, true);
+    assert.ok(resumed?.reviewRecoveryClaimId);
+    assert.equal(resumed?.packageId, pkg.id);
+    assert.equal(f.store.reviewRecoveryClaims(f.task.id).length, 1);
+    assert.equal(f.store.reviewRecoveryClaims(f.task.id)[0]?.priorClaimGenerationId, g0);
+    assert.equal(f.store.reviewRecoveryClaims(f.task.id)[0]?.claimGenerationId, g3);
+    assert.deepEqual(f.store.reviewRecoveryClaims(f.task.id)[0]?.guardianLineage, [g0, g1, g2, g3]);
+    assert.equal(f.store.get(f.task.id)?.status, "reviewing");
+    assert.equal(f.store.get(f.task.id)?.claimGenerationId, g3);
+    assert.equal(f.store.get(f.task.id)?.leaseOwner, "reboot-reviewer");
+    assert.equal(paused.task.resumeCheckpoint?.kind, "review_quota");
+
+    const secondPauseAt = new Date(dueAt.getTime() + 1_000);
+    const secondPause = pauseReviewQuota(f, pkg.id, secondPauseAt);
+    f.store.close();
+    const g4 = "95959595959595959595959595959595";
+    f.store = new TaskStore(path, { id: g4, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const secondDueAt = new Date(secondPauseAt.getTime() + 120_000);
+    const secondResume = f.store.claimReviewQuotaResume(f.task.id, "second-reboot-reviewer",
+      reviewRecoveryInput(f, observed, "pre_commit", secondDueAt));
+    assert.equal(secondResume?.recoveredGeneration, true);
+    const chain = f.store.reviewRecoveryClaims(f.task.id);
+    assert.deepEqual(chain.map(claim => [claim.priorClaimGenerationId, claim.claimGenerationId]), [[g0, g3], [g3, g4]]);
+    assert.equal(chain[1]?.priorCheckpointId, chain[0]?.id);
+    assert.equal(secondPause.task.resumeCheckpoint?.kind, "review_quota");
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review quota resume rejects a stale package checkpoint and changed fresh Git snapshot", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-quota-stale-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "a".repeat(64);
+  const g0 = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+  const now = new Date();
+  const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    pauseReviewQuota(f, pkg.id, now);
+    const originalCheckpoint = f.store.quotaCheckpoint(f.task.id)!;
+    const dueAt = new Date(now.getTime() + 120_000);
+    const editor = new DatabaseSync(path);
+    try {
+      editor.prepare("UPDATE quota_pauses SET checkpoint=? WHERE task_id=?").run(JSON.stringify({ kind: "review_quota",
+        packageId: "stale-package", checkRunId: pkg.checkRunId, sourceGenerationId: g0, claimGenerationId: g0, owner: f.owner }), f.task.id);
+    } finally { editor.close(); }
+    assert.equal(f.store.claimReviewQuotaResume(f.task.id, "stale-reviewer",
+      reviewRecoveryInput(f, observed, "pre_commit", dueAt)), undefined);
+
+    const restore = new DatabaseSync(path);
+    try { restore.prepare("UPDATE quota_pauses SET checkpoint=? WHERE task_id=?").run(JSON.stringify(originalCheckpoint), f.task.id); }
+    finally { restore.close(); }
+    const changed = reviewRecoveryInput(f, observed, "pre_commit", dueAt);
+    assert.throws(() => f.store.claimReviewQuotaResume(f.task.id, "changed-reviewer", { ...changed,
+      gitState: { ...(changed.gitState as Extract<import("./task-store.js").ReviewRecoveryGitState, { kind: "pre_commit" }>),
+        snapshot: { ...f.snapshot, diff: "changed" } } }), /does not match the exact sealed package snapshot/);
+    assert.equal(f.store.get(f.task.id)?.status, "waiting");
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("dedicated DONE transaction requires the complete evidence chain and fresh Git verification", () => {
   const f = reviewFixture();

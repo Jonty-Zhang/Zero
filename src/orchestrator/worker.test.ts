@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, mkdir, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { HandoffV1, HarnessAdapter, HarnessCapabilities, RouteDecision, RunRequest, RunResult, TaskRecord } from "../domain/types.js";
 import { GitWorktreeManager, type ReviewedCommitCandidate, type ReviewedCommitMetadata, type WorktreeCreationEvidence, type WorktreeCreationPlan, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
 import { TaskStore } from "../core/task-store.js";
@@ -564,6 +565,107 @@ test("review recovery resumes commit intent, applied candidate, and completed re
       store.close();
       await rm(root, { recursive: true, force: true });
     }
+  }
+});
+
+test("recovered reviewer quota waits until due, then resumes only review under same or guardian generation", async () => {
+  for (const restart of [false, true]) {
+    const root = await mkdtemp(join(process.cwd(), `.zero-worker-review-quota-${restart ? "reboot" : "same-gen"}-`));
+    const repo = join(root, "repo");
+    const db = join(root, "tasks.sqlite");
+    const worktreeRoot = join(root, "worktrees");
+    const artifacts = join(root, "artifacts");
+    await initRepo(repo);
+    let store = new TaskStore(db, guardianGeneration("e".repeat(32)));
+    try {
+      const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create result.txt", maxRevisions: 0,
+        checks: [{ id: "pass", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+      const oldOwner = "review-quota-old-owner";
+      store.claimNext(oldOwner, 120_000);
+      const worktrees = new GitWorktreeManager(worktreeRoot);
+      const plan = await worktrees.prepareCreatePlan(task.id, repo, "main");
+      store.recordWorktreeCreationIntent(task.id, oldOwner, plan);
+      const created = await worktrees.executePlan(plan);
+      store.completeWorktreeCreation(task.id, oldOwner, created, created.fingerprint);
+      const stage = store.createStage(task.id, { role: "implement", harness: "fake", model: "model", processStartId: "quota-review-stage" });
+      store.startStage(stage.id, oldOwner, "quota-review-stage");
+      const executionAttempt = store.createAttempt(task.id, "implement", { owner: oldOwner, stageId: stage.id,
+        harness: "fake", model: "model" });
+      await writeFile(join(plan.path, "result.txt"), "approved\n");
+      await worktrees.prepareReview(created.info);
+      store.finishAttempt(executionAttempt.id, { status: "succeeded" }, { owner: oldOwner, processStartId: "quota-review-stage" });
+      const route = routeFor(task);
+      const routeAttempt = store.createAttempt(task.id, "route", { owner: oldOwner, harness: "codex" });
+      store.saveRoute(route);
+      store.finishAttempt(routeAttempt.id, { status: "succeeded", metadata: { decision: route } });
+      const snapshot = await worktrees.captureReviewSnapshot(created.info);
+      const branch = await worktrees.readTaskBranchHead(created.info);
+      const generationId = store.get(task.id)!.claimGenerationId!;
+      const checkRun = store.startCheckRun({ taskId: task.id, owner: oldOwner, generationId,
+        executionAttemptId: executionAttempt.id, executionStageId: stage.id, routeAttemptId: routeAttempt.id, route,
+        branchRef: branch.ref, snapshot: { baseCommit: created.info.baseCommit, preHead: branch.head, ...snapshot },
+        expectedCheckIds: ["pass"], checkDefinitionHash: (await import("node:crypto")).createHash("sha256")
+          .update(JSON.stringify(task.checks)).digest("hex") });
+      store.recordCheckResult(checkRun.id, { owner: oldOwner, generationId },
+        { id: "pass", argv: [], status: "passed", exitCode: 0, durationMs: 1 });
+      store.finishStage(stage.id, oldOwner, "quota-review-stage", "succeeded", await worktrees.fingerprint(created.info));
+      store.completeCheckRun(checkRun.id, { owner: oldOwner, generationId },
+        { baseCommit: created.info.baseCommit, preHead: branch.head, ...snapshot });
+      const reviewPackage = store.reviewPackages(task.id)[0]!;
+      const crashedReviewAttempt = store.createAttempt(task.id, "review", { owner: oldOwner, harness: "codex",
+        metadata: { packageId: reviewPackage.id, generationId } });
+      store.finishAttempt(crashedReviewAttempt.id, { status: "interrupted", error: "process ended before verdict" });
+      assert.deepEqual(store.recoverExpired(new Date(Date.now() + 240_000)), [task.id]);
+      store.close();
+
+      store = new TaskStore(db, guardianGeneration("f".repeat(32)));
+      let reviewCalls = 0;
+      let routes = 0;
+      const reviewer: TaskReviewer = { async review() {
+        reviewCalls++;
+        if (reviewCalls === 1) throw new QuotaLimitError("recovered Codex review limit");
+        return { harness: "codex", model: "review", exitCode: 0,
+          result: { verdict: "pass", summary: "approved", findings: [] } };
+      } };
+      const options = { store, worktrees: new GitWorktreeManager(worktreeRoot), testRunner: new TestRunner(),
+        router: { async route(current: TaskRecord) { routes++; return routeFor(current); } }, reviewer,
+        adapters: new Map([["fake", new FakeAdapter()]]), artifactRoot: artifacts };
+      const waiting = await new TaskWorker(options).runNext("review-quota-first-claim");
+      assert.equal(waiting?.status, "waiting");
+      assert.equal(waiting?.resumeCheckpoint?.kind, "review_quota");
+      assert.ok(Date.parse(waiting!.retryAt!) > Date.now());
+      assert.equal(await new TaskWorker(options).runNext("review-quota-too-early"), undefined);
+      assert.equal(waiting?.resumeCheckpoint?.packageId, reviewPackage.id);
+      const interrupted = store.attempts(task.id).filter(item => item.role === "review");
+      assert.equal(interrupted.length, 2);
+      assert.ok(interrupted.every(item => item.status === "interrupted"));
+      assert.equal(store.reviewRecoveryClaims(task.id).length, 1);
+      if (restart) {
+        store.close();
+      }
+      // Advance only the durable retry timestamp, preserving runNext's real due filter
+      // while keeping this test independent from provider retry windows and CI speed.
+      const quotaDb = new DatabaseSync(db);
+      quotaDb.prepare("UPDATE quota_pauses SET retry_at=? WHERE task_id=?").run(new Date(Date.now() - 1_000).toISOString(), task.id);
+      quotaDb.close();
+      if (restart) {
+        store = new TaskStore(db, guardianGeneration("0".repeat(32)));
+      }
+      const resumedOptions = { ...options, store };
+      const done = await new TaskWorker(resumedOptions).runNext(`review-quota-${restart ? "reboot" : "same-gen"}-resume`);
+      assert.equal(done?.id, task.id);
+      assert.equal(done?.status, "done");
+      assert.equal(reviewCalls, 2);
+      assert.equal(routes, 0);
+      assert.equal(store.reviewPackages(task.id).length, 1);
+      assert.equal(store.checkRuns(task.id).length, 1);
+      assert.equal(store.packageReviewVerdicts(task.id).length, 1);
+      assert.deepEqual(store.attempts(task.id).filter(item => item.role === "review").map(item => item.status),
+        ["interrupted", "interrupted", "succeeded"]);
+      assert.equal(store.commitOperations(task.id).length, 1);
+      assert.equal(store.reportOperations(task.id).length, 1);
+      assert.equal(store.reviewRecoveryClaims(task.id).length, restart ? 2 : 1);
+    } finally { store.close(); await rm(root, { recursive: true, force: true }); }
   }
 });
 
@@ -1361,6 +1463,65 @@ test("Codex allocation and review quota pauses resume at their exact stages", as
     const reviewAttempt = store.attempts(task.id).find(attempt => attempt.id === verdicts[0]?.attemptId);
     assert.equal(reviewAttempt?.status, "succeeded");
     assert.equal(reviewAttempt?.model, "review");
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("normal sealed-package review quota resumes after guardian reboot without repeating writer or checks", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-normal-review-quota-reboot-"));
+  const repo = join(root, "repo");
+  const db = join(root, "tasks.sqlite");
+  const worktreeRoot = join(root, "worktrees");
+  const artifacts = join(root, "artifacts");
+  await initRepo(repo);
+  let store = new TaskStore(db, guardianGeneration("1".repeat(32)));
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create approved result.txt", maxRevisions: 0,
+      checks: [{ id: "approved", argv: [process.execPath, "-e", "process.exit(require('node:fs').readFileSync('result.txt','utf8') === 'approved\\n' ? 0 : 1)"] }] });
+    const owner = "normal-review-quota-owner";
+    assert.equal(store.claimNext(owner)?.id, task.id);
+    let routeCalls = 0;
+    let writeCalls = 0;
+    let reviewCalls = 0;
+    const reviewer: TaskReviewer = { async review() {
+      reviewCalls++;
+      if (reviewCalls === 1) throw new QuotaLimitError("normal review quota");
+      return { harness: "codex", model: "review", exitCode: 0,
+        result: { verdict: "pass", summary: "approved", findings: [] } };
+    } };
+    const adapter: HarnessAdapter = { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+      async run(request) { writeCalls++; await writeFile(join(request.cwd, "result.txt"), "approved\n");
+        return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+    const options = { store, worktrees: new GitWorktreeManager(worktreeRoot), testRunner: new TestRunner(),
+      router: { async route(current: TaskRecord) { routeCalls++; return routeFor(current); } }, reviewer,
+      adapters: new Map([["fake", adapter]]), artifactRoot: artifacts };
+    const waiting = await new TaskWorker(options).runClaimed(task.id, owner);
+    assert.equal(waiting.status, "waiting");
+    assert.equal(waiting.resumeCheckpoint?.kind, "review_quota");
+    assert.equal(waiting.resumeCheckpoint?.packageId, store.reviewPackages(task.id)[0]?.id);
+    assert.equal(store.reviewPackages(task.id).length, 1);
+    assert.equal(store.checkRuns(task.id).length, 1);
+    assert.deepEqual(store.attempts(task.id).filter(attempt => attempt.role === "review").map(attempt => attempt.status), ["interrupted"]);
+    store.close();
+
+    store = new TaskStore(db, guardianGeneration("2".repeat(32)));
+    const quotaDb = new DatabaseSync(db);
+    quotaDb.prepare("UPDATE quota_pauses SET retry_at=? WHERE task_id=?").run(new Date(Date.now() - 1_000).toISOString(), task.id);
+    quotaDb.close();
+    const resumed = await new TaskWorker({ ...options, store, worktrees: new GitWorktreeManager(worktreeRoot) })
+      .runNext("normal-review-quota-guardian-resume");
+    assert.equal(resumed?.id, task.id);
+    assert.equal(resumed?.status, "done");
+    assert.equal(routeCalls, 1);
+    assert.equal(writeCalls, 1);
+    assert.equal(reviewCalls, 2);
+    assert.equal(store.reviewPackages(task.id).length, 1);
+    assert.equal(store.checkRuns(task.id).length, 1);
+    assert.equal(store.packageReviewVerdicts(task.id).length, 1);
+    assert.deepEqual(store.attempts(task.id).filter(attempt => attempt.role === "review").map(attempt => attempt.status),
+      ["interrupted", "succeeded"]);
+    assert.equal(store.commitOperations(task.id).length, 1);
+    assert.equal(store.reportOperations(task.id).length, 1);
+    assert.equal(store.reviewRecoveryClaims(task.id).length, 1);
   } finally { store.close(); await rm(root, { recursive: true, force: true }); }
 });
 

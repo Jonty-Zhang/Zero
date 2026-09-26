@@ -208,6 +208,35 @@ export class TaskWorker {
         // Failed or ambiguous inspection stays quarantined for an operator or later retry.
       }
     }
+    // Review quota checkpoints stay waiting and are resumed only after their
+    // exact package/worktree identity is freshly inspected by this startup.
+    const quotaResumeNow = new Date();
+    for (const candidate of this.#options.store.list("waiting")) {
+      const checkpoint = candidate.resumeCheckpoint;
+      if (checkpoint?.kind !== "review_quota" || !candidate.retryAt
+        || !Number.isFinite(Date.parse(candidate.retryAt)) || Date.parse(candidate.retryAt) > quotaResumeNow.getTime()) continue;
+      try {
+        const packageId = typeof checkpoint.packageId === "string" ? checkpoint.packageId : "";
+        const reviewPackage = packageId ? this.#options.store.getReviewPackage(packageId) : undefined;
+        const creation = this.#options.store.getWorktreeCreation(candidate.id);
+        if (!reviewPackage || !creation || reviewPackage.taskId !== candidate.id) continue;
+        const commitOperation = this.#options.store.commitOperations(candidate.id).at(-1);
+        if (commitOperation) continue;
+        const inspection = await inspectReviewRecovery(this.#options.worktrees, creation, reviewPackage);
+        if (inspection.gitState.kind !== "pre_commit") continue;
+        this.#assertAllowedPaths(candidate, await this.#options.worktrees.changedPaths(inspection.info));
+        const claimed = this.#options.store.claimReviewQuotaResume(candidate.id, owner, {
+          leaseMs: this.#options.leaseMs,
+          identity: inspection.identity,
+          gitState: inspection.gitState,
+        });
+        if (!claimed) continue;
+        if (claimed.packageId !== reviewPackage.id) throw new Error("Review quota claim changed its immutable package binding");
+        return this.#resumeReviewRecovery(candidate.id, owner, claimed.reviewRecoveryClaimId, inspection.info, reviewPackage);
+      } catch {
+        // Stale, not-yet-due, or ambiguous quota evidence remains waiting for a safe retry.
+      }
+    }
     const task = this.#options.store.claimNext(owner, this.#options.leaseMs);
     if (!task) return undefined;
     return this.runClaimed(task.id, owner);
@@ -844,18 +873,53 @@ export class TaskWorker {
         activeCheckRunId = undefined;
       }
       let executionStageFinalizationFailed = false;
+      let failedReviewAttempt: Attempt | undefined;
       if (activeAttempt) {
+        const attemptToFinish = activeAttempt;
+        if (quotaFailure && stage === "review" && attemptToFinish.role === "review") failedReviewAttempt = attemptToFinish;
         try {
-          const linkedStage = activeAttempt.stageId ? this.#options.store.getStage(activeAttempt.stageId) : undefined;
-          this.#options.store.finishAttempt(activeAttempt.id, {
-            status: leaseLost || cancelled ? "interrupted" : "failed",
+          const linkedStage = attemptToFinish.stageId ? this.#options.store.getStage(attemptToFinish.stageId) : undefined;
+          this.#options.store.finishAttempt(attemptToFinish.id, {
+            status: leaseLost || cancelled || quotaFailure && attemptToFinish.role === "review" ? "interrupted" : "failed",
             error: errorMessage,
           }, linkedStage ? { owner, processStartId: linkedStage.processStartId } : undefined);
+          activeAttempt = undefined;
         } catch {
-          if (activeAttempt.stageId) {
+          if (attemptToFinish.stageId) {
             try { this.#assertLease(taskId, owner, () => leaseLost); }
             catch { leaseLost = true; }
           }
+        }
+      }
+      if (quotaFailure && stage === "review" && failedReviewAttempt && reviewPackageId && !leaseLost) {
+        try {
+          this.#assertLease(taskId, owner, () => leaseLost);
+          this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree!));
+          const creation = this.#options.store.getWorktreeCreation(taskId);
+          const sealedPackage = this.#options.store.getReviewPackage(reviewPackageId);
+          if (!creation || !sealedPackage || this.#options.store.reviewPackages(taskId).at(-1)?.id !== reviewPackageId
+            || this.#options.store.commitOperations(taskId).length > 0) {
+            throw new Error("Normal review quota checkpoint no longer has its exact latest pre-commit package boundary");
+          }
+          const inspection = await inspectReviewRecovery(this.#options.worktrees, creation, sealedPackage);
+          if (inspection.gitState.kind !== "pre_commit" || !checksSnapshot
+            || !sameReviewSnapshot(checksSnapshot, inspection.gitState.snapshot)) {
+            throw new Error("Normal review quota checkpoint failed fresh sealed-package inspection");
+          }
+          this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(inspection.info));
+          const source = error.retryAt ? "provider_message" as const : "fallback" as const;
+          const retryAt = quotaRetryAt(task.quotaRetryCount ?? 0, { source, retryAt: error.retryAt });
+          task = this.#options.store.pauseReviewForQuota(taskId, owner, { packageId: reviewPackageId,
+            attemptId: failedReviewAttempt.id, retryAt, reason: errorMessage, source });
+          try {
+            await this.#writeReport(taskId, "waiting", { task, baseCommit, error: errorMessage, diff: sealedPackage.snapshot.diff,
+              checks: finalChecks, authoritativeCheckAttemptId: finalCheckAttemptId });
+          } catch { /* the Store checkpoint remains authoritative */ }
+          return task;
+        } catch {
+          // A sealed package cannot fall back to the generic route/execute checkpoint.
+          // Leave the reviewing lease untouched so expiry enters guardian recovery.
+          return this.#options.store.get(taskId) ?? task;
         }
       }
       if (executionStage && !leaseLost && this.#options.store.getStage(executionStage.id)?.status === "running") {
@@ -955,7 +1019,7 @@ export class TaskWorker {
   }
 
   /** Resume only the immutable review/commit/report boundaries after a proven-drained reviewing claim. */
-  async #resumeReviewRecovery(taskId: string, owner: string, recoveryClaimId: string, worktree: WorktreeInfo,
+  async #resumeReviewRecovery(taskId: string, owner: string, recoveryClaimId: string | undefined, worktree: WorktreeInfo,
     reviewPackage: ReviewPackageRecord): Promise<TaskRecord> {
     const task = this.#requireTask(taskId);
     const generationId = task.claimGenerationId;
@@ -994,7 +1058,8 @@ export class TaskWorker {
           throw new Error("Fresh review recovery snapshot does not match the sealed package");
         }
         reviewAttempt = this.#options.store.createAttempt(taskId, "review", {
-          owner, harness: "codex", metadata: { packageId: reviewPackage.id, generationId, recoveryClaimId },
+          owner, harness: "codex", metadata: { packageId: reviewPackage.id, generationId,
+            ...(recoveryClaimId ? { recoveryClaimId } : {}) },
         });
         const activeWithAttempt = active as typeof active & { adapter?: HarnessAdapter; attempt?: Attempt };
         activeWithAttempt.adapter = this.#options.adapters.get("codex");
@@ -1140,9 +1205,39 @@ export class TaskWorker {
           indexMatchesReviewedTree: true, worktreeClean: true } });
       return this.#requireTask(taskId);
     } catch (error) {
-      if (reviewAttempt) {
+      const activeReviewAttempt = reviewAttempt;
+      if (activeReviewAttempt) {
+        if (error instanceof QuotaLimitError && !leaseLost && !active.cancelRequested) {
+          const quotaAttempt = activeReviewAttempt;
+          try {
+            this.#options.store.finishAttempt(quotaAttempt.id, { status: "interrupted", error: errorText(error) });
+            reviewAttempt = undefined;
+            const latestPackage = this.#options.store.getReviewPackage(reviewPackage.id);
+            const creation = this.#options.store.getWorktreeCreation(taskId);
+            if (!latestPackage || latestPackage.id !== this.#options.store.reviewPackages(taskId).at(-1)?.id || !creation) {
+              throw new Error("Review quota checkpoint package is no longer the latest durable package");
+            }
+            this.#assertLease(taskId, owner, () => leaseLost);
+            this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+            const fresh = await inspectReviewRecovery(this.#options.worktrees, creation, latestPackage);
+            if (fresh.gitState.kind !== "pre_commit") throw new Error("Review quota checkpoint requires the unchanged pre-commit package state");
+            const source = error.retryAt ? "provider_message" as const : "fallback" as const;
+            const retryAt = quotaRetryAt(task.quotaRetryCount ?? 0, { source, retryAt: error.retryAt });
+            const waiting = this.#options.store.pauseReviewForQuota(taskId, owner, {
+              packageId: reviewPackage.id,
+              attemptId: quotaAttempt.id,
+              retryAt,
+              reason: errorText(error),
+              source,
+            });
+            return waiting;
+          } catch {
+            // If the exact review snapshot cannot be checkpointed, preserve the
+            // reviewing lease state for normal lease expiry and guardian recovery.
+          }
+        }
         try {
-          this.#options.store.finishAttempt(reviewAttempt.id, {
+          this.#options.store.finishAttempt(activeReviewAttempt.id, {
             status: error instanceof QuotaLimitError || leaseLost || active.cancelRequested ? "interrupted" : "failed",
             error: errorText(error),
           });
