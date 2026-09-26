@@ -151,7 +151,7 @@ try {
     copyOne(join(root, 'package.json'), 'package.json');
     filesUnder(join(root, 'dist'), join(stage, 'dist'), files, true);
     filesUnder(join(root, 'web', 'dist'), join(stage, 'web', 'dist'), files);
-    for (const script of ['run-zero.ps1', 'install-windows-task.ps1', 'uninstall-windows-task.ps1']) {
+    for (const script of ['run-zero.ps1', 'start-zero.ps1', 'uninstall-windows-task.ps1']) {
       copyOne(join(root, 'scripts', script), `scripts/${script}`);
     }
     const manifestEntries = files.map((path) => {

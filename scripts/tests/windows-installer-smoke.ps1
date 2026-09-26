@@ -57,7 +57,7 @@ function Invoke-BoundedProcess([string]$FilePath, [string[]]$ArgumentList, [stri
 function Wait-ForUninstallState([int]$TimeoutSeconds = 60) {
     $shortcuts = @(
         (Join-Path $startMenu 'Zero Dashboard.url'),
-        (Join-Path $startMenu 'Configure Zero Background Service.lnk'),
+        (Join-Path $startMenu 'Start Zero.lnk'),
         (Join-Path $startMenu 'Uninstall Zero.lnk')
     )
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -96,10 +96,24 @@ try {
     if (-not (Test-Path -LiteralPath $registryKey) -or -not (Test-Path -LiteralPath $uninstallKey)) {
         throw 'Installer did not write per-user install and uninstall markers.'
     }
-    foreach ($shortcut in @('Zero Dashboard.url', 'Configure Zero Background Service.lnk', 'Uninstall Zero.lnk')) {
+    foreach ($shortcut in @('Zero Dashboard.url', 'Start Zero.lnk', 'Uninstall Zero.lnk')) {
         if (-not (Test-Path -LiteralPath (Join-Path $startMenu $shortcut) -PathType Leaf)) {
             throw "Start Menu shortcut is missing: $shortcut"
         }
+    }
+    $startShortcutPath = Join-Path $startMenu 'Start Zero.lnk'
+    $shortcutShell = New-Object -ComObject WScript.Shell
+    $startShortcut = $shortcutShell.CreateShortcut($startShortcutPath)
+    $expectedPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $expectedLauncher = Join-Path $programDir 'scripts\start-zero.ps1'
+    if (-not [System.String]::Equals([System.IO.Path]::GetFullPath($startShortcut.TargetPath),
+        [System.IO.Path]::GetFullPath($expectedPowerShell), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Start Zero shortcut does not target Windows PowerShell: $($startShortcut.TargetPath)"
+    }
+    if ($startShortcut.Arguments -notmatch [regex]::Escape($expectedLauncher) -or
+        $startShortcut.Arguments -notmatch '(?i)(?:^|\s)-File(?:\s|$)' -or
+        $startShortcut.Arguments -match '(?i)install-windows-task|Register-ScheduledTask|NonInteractive') {
+        throw 'Start Zero shortcut arguments do not launch the manual start-zero.ps1 entry point.'
     }
     if (Get-ScheduledTask -TaskName 'Zero Task Node' -ErrorAction SilentlyContinue) {
         throw 'Installer registered a scheduled task without explicit user action.'
@@ -113,7 +127,7 @@ try {
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
         throw 'Uninstaller deleted runtime data; expected it to be retained.'
     }
-    Write-Output 'Windows installer smoke test passed: install, shortcuts, no implicit task, uninstall, and data retention.'
+    Write-Output 'Windows installer smoke test passed: install, manual Start Zero shortcut, no implicit task, uninstall, and data retention.'
 }
 finally {
     if ($markerCreated -and (Test-Path -LiteralPath $marker)) { Remove-Item -LiteralPath $marker -Force }

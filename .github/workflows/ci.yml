@@ -50,9 +50,16 @@ jobs:
       - name: Test guardian process containment
         shell: pwsh
         run: .\guardian_tests.exe (Resolve-Path .\guardian.exe).Path
-      - name: Test Windows task installer dry run
+      - name: Parse Windows PowerShell scripts
         shell: pwsh
-        run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\tests\install-windows-task-tests.ps1 -GuardianPath (Resolve-Path .\guardian.exe).Path
+        run: |
+          $scripts = @('.\scripts\start-zero.ps1', '.\scripts\run-zero.ps1', '.\scripts\uninstall-windows-task.ps1', '.\scripts\tests\windows-installer-smoke.ps1')
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script).Path, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { throw "PowerShell parse failed for $script`: $($errors -join '; ')" }
+          }
       - name: Retain tested guardian executable
         uses: actions/upload-artifact@v4
         with:

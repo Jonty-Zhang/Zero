@@ -52,6 +52,6 @@ commit 完成且再次核验后，以固定输入构造 report operation，先�
 3. 加入 report operation 的内容哈希、双文件核验及最终 DONE 事务。旧数据库没有 package/operation 的行不会被自动升级为可恢复任务。
 4. 故障注入覆盖审核调用前后、审核结果/attempt 事务、commit 对象创建前后、candidate SHA 落库前后、条件 ref 更新前后、报告意图与两个文件 rename 前后、marker 与 DONE 前后；还要覆盖外部移动分支、自提交、残留 Git lock、候选对象丢失、变更检查定义、改动忽略文件、并发 worker，以及 guardian lineage 缺失。旧库缺少 package/operation 的任务不得自动获得 B 恢复资格。
 
-目标电脑上的真实开机、重复进程崩溃、订阅额度重置和 GLM/DeepSeek 接入需要单独验收。Git 忽略的缓存文件不在当前 fingerprint 内，可能影响命令；恢复后的检查应采用可重复构建策略，不能将缓存视为审核证据。
+本文为历史恢复设计记录；其中的目标电脑开机验收设想已被手动启动部署取代。当前 Windows 服务需用户登录后手动启动。目标电脑上的重复进程崩溃、订阅额度重置和 GLM/DeepSeek 接入仍需单独验收。Git 忽略的缓存文件不在当前 fingerprint 内，可能影响命令；恢复后的检查应采用可重复构建策略，不能将缓存视为审核证据。
 
 本协议首先覆盖进程崩溃。持久 SQLite 连接已显式核验 WAL + `synchronous=FULL`；候选 Git 对象和引用写入，以及审核树的 blob/tree 创建，已在相关命令上使用 fsync 设置。隔离 Windows 实验中，Node 文件 `sync()` 可用，但目录 `sync()` 返回 `EPERM`，普通 `rename()` 不能据此宣称断电后目录项必然保留；因此报告文件必须可由 SQLite 固定字节修复。断电和操作系统故障还需要在目标电脑上验证存储设备行为与实际重启流程，完成前不声称具备断电级的 exactly-once 保证。

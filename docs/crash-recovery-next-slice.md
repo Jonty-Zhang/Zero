@@ -91,7 +91,7 @@ report intent 在 commit 成功后、文件写入前持久化：report schema、
 4. 本地 commit（含 HEAD 不再是预期 base）、身份/path/allowedPaths 不匹配、lineage 缺失、inspection evidence 不足或恢复后身份再次变化都会留在 `recovery_required`。正常 quota pause 使用原有独立 checkpoint，不会变成 crash replay；终态会禁用 crash recovery checkpoint。
 5. 没有逐阶段 phase-intent 表，也不逐一恢复 route、check、review、commit 或 report。整个 route/execution/check 不确定窗口按一个安全边界处理；review 和 commit/report 窗口继续隔离。恢复使用原 task/worktree，不恢复 Harness session，不保证外部副作用可撤销或去重。
 
-自动化测试覆盖迭代 A 的主要恢复 gate、worktree 身份变化、重试 lineage、重新 route/execution/check/review 和隔离边界。该改动的 CI 结果需在提交后确认。目标电脑上的 guardian/计划任务重启及真实 Harness 故障注入仍未完成，不能据此宣称实机无人值守验收。迭代 B 的 review/commit/report 故障注入尚待实现。
+自动化测试覆盖迭代 A 的主要恢复 gate、worktree 身份变化、重试 lineage、重新 route/execution/check/review 和隔离边界。该改动的 CI 结果需在提交后确认。目标电脑上的 guardian/launcher 重新启动及真实 Harness 故障注入仍未完成，不能据此宣称实机恢复已验收。迭代 B 的 review/commit/report 故障注入尚待实现。
 
 ### 迭代 B：待实现 snapshot-bound review 和 commit/report 收尾
 
@@ -108,4 +108,4 @@ report intent 在 commit 成功后、文件写入前持久化：report schema、
 - 一个 task 同时只有一个 writer；旧 attempts/stages 保留，任何续跑都有新 ID；worker 不得先把不确定任务放入普通 `pending`。
 - route 可重算；execution 只能以当前 worktree 的新鲜指纹为输入；checks 必须整组、绑定精确 tree/config；review verdict 必须绑定准确审核包；普通崩溃后旧 verdict 一律作废。
 - 只有 DB 中有可核验的 review + commit + report 证据，且最后一次 Git 核验通过，才能转换 `done`。artifact/report/HEAD 任一单独证据都不能替代。
-- 此设计不验证计划任务、登录身份、网络、额度重置或目标机重启；这些仍需部署验收。环境变量 lineage 不提供同账户抗伪造保证。
+- 此设计不验证用户身份、网络、额度重置或目标机重启后的手动启动；这些仍需部署验收。环境变量 lineage 不提供同账户抗伪造保证。

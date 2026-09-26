@@ -57,7 +57,8 @@ try {
     listed.add(name);
   }
   for (const required of ['runtime/node.exe', 'guardian/guardian.exe', 'dist/cli.js', 'web/dist/index.html',
-    'licenses/Node-LICENSE.txt', 'licenses/Zero-LICENSE.txt', 'scripts/run-zero.ps1']) {
+    'licenses/Node-LICENSE.txt', 'licenses/Zero-LICENSE.txt', 'scripts/run-zero.ps1',
+    'scripts/start-zero.ps1', 'scripts/uninstall-windows-task.ps1']) {
     if (!listed.has(required)) fail(`Release is missing required file: ${required}`);
   }
   const actual = collect(stage).filter(name => name !== 'manifest.json');

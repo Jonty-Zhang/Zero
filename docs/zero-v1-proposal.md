@@ -1,5 +1,7 @@
 # Zero v1 架构决策与实施方案
 
+> 早期目标方案；其中的无人值守与 Windows 开机启动设想已被取代。当前 Windows 部署由用户手动启动常驻本地 master agent，不注册 Task Scheduler 任务、开机触发器或账户密码提示。操作说明见 [Windows 手动部署](windows-deployment.md)。
+
 核查日期：2026-09-24。本文区分已由项目官方仓库核实的能力与 Zero 的设计判断。上游功能、CLI 参数及许可证应在实施时锁定具体版本再复核。
 
 **当前决策（2026-09-26）：**主分配器可切换为 Codex 订阅或兼容 OpenAI API 的 HTTPS 协调器。两者只负责从 Zero 已验证的执行绑定中选择路由，不实现任务；Zero 的执行器和状态机负责实际工作，独立 Reviewer 仍固定使用 Codex。API 密钥只通过 Zero 服务进程环境提供，配置中的 `keyEnv` 是环境变量名称。下文中明确标注为 Codex 分配器的部分保留早期 Codex 优先方案的分析；当前路由契约见[主分配与审核契约](route-review-contract.md)。

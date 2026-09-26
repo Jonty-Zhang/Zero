@@ -32,7 +32,7 @@ VIAddVersionKey /LANG=1033 "LegalCopyright" "Zero contributors"
 
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_TITLE "Zero was installed"
-!define MUI_FINISHPAGE_TEXT "Zero was installed for this Windows account.$\r$\n$\r$\nNo background task was registered. To opt in, open Start Menu > Zero > Configure Zero Background Service. That script will ask Windows for the account password needed by Task Scheduler.$\r$\n$\r$\nRuntime data will be stored in $LOCALAPPDATA\Zero and is retained when Zero is uninstalled."
+!define MUI_FINISHPAGE_TEXT "Zero was installed for this Windows account.$\r$\n$\r$\nTo start Zero, open Start Menu > Zero > Start Zero. Keep the PowerShell window open while you use Zero; close it or press Ctrl+C to stop Zero. Zero does not start automatically when Windows starts.$\r$\n$\r$\nRuntime data will be stored in $LOCALAPPDATA\Zero and is retained when Zero is uninstalled."
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -91,7 +91,7 @@ Function .onInstFailed
   SetShellVarContext current
   RMDir /r "$INSTDIR"
   Delete "$SMPROGRAMS\Zero\Zero Dashboard.url"
-  Delete "$SMPROGRAMS\Zero\Configure Zero Background Service.lnk"
+  Delete "$SMPROGRAMS\Zero\Start Zero.lnk"
   Delete "$SMPROGRAMS\Zero\Uninstall Zero.lnk"
   RMDir "$SMPROGRAMS\Zero"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Zero"
@@ -111,9 +111,9 @@ Section "Install Zero" SEC_MAIN
   ClearErrors
   CreateDirectory "$SMPROGRAMS\Zero"
   WriteINIStr "$SMPROGRAMS\Zero\Zero Dashboard.url" "InternetShortcut" "URL" "http://127.0.0.1:4179"
-  CreateShortcut "$SMPROGRAMS\Zero\Configure Zero Background Service.lnk" \
+  CreateShortcut "$SMPROGRAMS\Zero\Start Zero.lnk" \
     "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" \
-    '-NoProfile -ExecutionPolicy RemoteSigned -File "$INSTDIR\scripts\install-windows-task.ps1" -Install -InstallDir "$INSTDIR" -NodePath "$INSTDIR\runtime\node.exe" -GuardianPath "$INSTDIR\guardian\guardian.exe" -DataDir "$LOCALAPPDATA\Zero"' \
+    '-NoProfile -ExecutionPolicy RemoteSigned -File "$INSTDIR\scripts\start-zero.ps1"' \
     "$INSTDIR\guardian\guardian.exe" 0 SW_SHOWNORMAL
   CreateShortcut "$SMPROGRAMS\Zero\Uninstall Zero.lnk" "$INSTDIR\uninstall.exe"
   IfErrors install_failed
@@ -135,7 +135,7 @@ Section "Install Zero" SEC_MAIN
   install_failed:
     RMDir /r "$INSTDIR"
     Delete "$SMPROGRAMS\Zero\Zero Dashboard.url"
-    Delete "$SMPROGRAMS\Zero\Configure Zero Background Service.lnk"
+    Delete "$SMPROGRAMS\Zero\Start Zero.lnk"
     Delete "$SMPROGRAMS\Zero\Uninstall Zero.lnk"
     RMDir "$SMPROGRAMS\Zero"
     DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Zero"
@@ -157,7 +157,7 @@ Section "Uninstall"
   Abort
   uninstall_task_removed:
   Delete "$SMPROGRAMS\Zero\Zero Dashboard.url"
-  Delete "$SMPROGRAMS\Zero\Configure Zero Background Service.lnk"
+  Delete "$SMPROGRAMS\Zero\Start Zero.lnk"
   Delete "$SMPROGRAMS\Zero\Uninstall Zero.lnk"
   RMDir "$SMPROGRAMS\Zero"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Zero"

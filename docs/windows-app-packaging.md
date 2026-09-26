@@ -1,26 +1,28 @@
-# Zero Windows 单应用安装包
+# Zero Windows app package
 
-状态：第一版按用户 NSIS 安装器已在 [Windows CI](https://github.com/Jonty-Zhang/Zero/actions/runs/36148528629) 构建，并通过安装/卸载 smoke 测试。发布产物未签名；真实目标电脑验收、自动更新事务和签名发布仍未完成。
+Status: the first per-user NSIS installer was built in [Windows CI](https://github.com/Jonty-Zhang/Zero/actions/runs/36148528629) and passed install/uninstall smoke tests. The release is unsigned. Target-machine installation and validation of a real Harness task remain outstanding.
 
-## 安装器行为
+## Installer behavior
 
-CI 先构建并运行 `scripts/verify-windows-release.mjs`，成功后才调用 `scripts/package-windows-installer.ps1` 编译 [`installer/zero.nsi`](../installer/zero.nsi)。安装器把已经过 manifest、哈希、无额外文件和 CLI 启动检查的 release stage 放进当前 Windows 用户的 `%LOCALAPPDATA%\Programs\Zero`。它添加开始菜单中的 Zero Dashboard、本机服务配置和卸载入口；配置入口显式运行已有的 `install-windows-task.ps1`。该脚本要求标准非管理员账户，并通过 Windows 凭据提示输入 Task Scheduler 凭据。安装器本身不注册后台任务、不启动服务、不读取 Harness 凭据，也不创建 `%LOCALAPPDATA%\Zero`。
+CI builds and verifies the release stage with `scripts/verify-windows-release.mjs`, then compiles [`installer/zero.nsi`](../installer/zero.nsi) using `scripts/package-windows-installer.ps1`. The installer copies the manifest-checked release into the current user's `%LOCALAPPDATA%\Programs\Zero`. It adds Start Menu shortcuts for **Start Zero**, **Zero Dashboard**, and **Uninstall Zero**. The installer does not start Zero or request an account password. Runtime data is created under `%LOCALAPPDATA%\Zero` when Zero runs.
 
-安装器只接受首次安装。如果 HKCU 安装标记、默认程序目录中的任何文件或 `Zero Task Node` 计划任务已存在，安装器会停止，不覆盖程序文件。首次复制或快捷方式创建失败时，它删除本次程序目录、快捷方式及自己的注册表项。运行数据目录与程序目录分离，卸载会保留 `%LOCALAPPDATA%\Zero`。卸载会先调用现有任务卸载脚本停止并注销 Zero 任务；若该步骤失败，程序文件会保留。
+The package is for manual, foreground launch on an always-on Windows PC. The user starts Zero from Start Menu → Zero → Start Zero, or runs the installed `scripts/start-zero.ps1` launcher from PowerShell. The launcher stays visible while the guardian supervises the service process tree. Closing or interrupting the launcher stops Zero. After a nonzero service exit, the launcher retries with backoff starting at 5 seconds and increasing to at most 5 minutes; a normal exit with code 0 stops retries. Windows boot triggers, sign-in startup entries, Task Scheduler registration, and password prompts are not used. For compatibility, the installer detects a legacy `Zero Task Node` task and refuses installation while it exists; uninstall includes credential-free cleanup for a task left by an older release.
 
-第一版没有更新事务。需要更新时，先用当前卸载入口移除程序，再安装新版本；数据目录会保留。发生安装目录非空时不可选择覆盖安装。卸载及重新安装会中断任务执行，因此请先确认队列无运行任务。部署脚本配置系统启动触发器、每五分钟重复的 watchdog 触发器和 `IgnoreNew` 多实例策略；NSIS 安装器本身不会注册或启动计划任务。脚本/触发器配置检查以及安装器不隐式注册任务的 smoke test 不等于目标电脑验收。签名安装器、升级期间安全停机与回滚、目标机任务注册、开机/重启及重复崩溃恢复验收仍是后续发布门槛。
+The installer supports first installation only. It refuses an existing install marker, a non-empty default program directory, or a running Zero guardian rather than overwrite program files. If copying files or creating shortcuts fails, it removes the program directory, shortcuts, and registry entries created by that attempt. Program files and runtime data are separate; uninstall removes the program and shortcuts while retaining `%LOCALAPPDATA%\Zero`.
 
-## NSIS 来源与校验
+The first version has no in-place update transaction. To update, stop Zero, uninstall the current version, and install the new version; runtime data is retained. The installer does not overwrite a non-empty install directory. Uninstall/reinstall interrupts task execution, so inspect the queue before proceeding. Guardian-backed recovery runs when Zero is manually launched again, subject to the persisted recovery evidence checks described in [Windows deployment](windows-deployment.md).
 
-安装器采用 NSIS MUI2。脚本使用官方文档说明的 `RequestExecutionLevel user` 和 `SetShellVarContext current`：前者要求普通用户权限，后者把开始菜单快捷方式限定在当前用户。相关文档：[RequestExecutionLevel](https://nsis.sourceforge.io/Reference/RequestExecutionLevel)、[SetShellVarContext](https://nsis.sourceforge.io/Reference/SetShellVarContext)、[NSIS 下载页](https://nsis.sourceforge.io/Download)、[NSIS 许可证](https://nsis.sourceforge.io/Docs/AppendixI.html)。
+## NSIS source and verification
 
-CI 固定使用 `windows-2022` GitHub-hosted runner，并定位镜像预装的 NSIS 编译器。工作流运行 `makensis.exe /VERSION`，只接受 `3.10`，然后再构建安装器。GitHub 的 [Windows Server 2022 runner image inventory](https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md)列出 NSIS 3.10。此方案信任 GitHub runner image 的构建与交付；版本检查确认编译器报告的版本，但不校验可执行文件哈希或签名。镜像内容会随 GitHub 更新；若不再提供 NSIS 3.10，CI 会失败关闭，需审查后再更新版本门槛。目标用户电脑不会下载或执行 NSIS、PowerShell 远程脚本或其他构建工具。安装器本身也尚未签名。
+The installer uses NSIS MUI2. It uses the documented `RequestExecutionLevel user` and `SetShellVarContext current`: the first keeps installation at ordinary user privilege, and the second scopes Start Menu shortcuts to the current user. References: [RequestExecutionLevel](https://nsis.sourceforge.io/Reference/RequestExecutionLevel), [SetShellVarContext](https://nsis.sourceforge.io/Reference/SetShellVarContext), [NSIS downloads](https://nsis.sourceforge.io/Download), and [NSIS license](https://nsis.sourceforge.io/Docs/AppendixI.html).
 
-## CI 与本地构建
+CI uses the `windows-2022` GitHub-hosted runner and its preinstalled NSIS compiler. The workflow checks `makensis.exe /VERSION` and accepts `3.10` before packaging. GitHub's [Windows Server 2022 runner inventory](https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md) lists NSIS 3.10. The version check does not verify the compiler's hash or signature. If the runner image stops providing NSIS 3.10, CI fails until the version gate is reviewed. The target user's PC does not download or run NSIS or build tools. The installer is unsigned.
 
-Windows CI 会生成并保留两个可下载产物：未签名的 release stage，以及 `zero-windows-installer-unsigned` 安装器。安装器 smoke 测试在 runner 的进程环境中把 `HOME`、`APPDATA`、`LOCALAPPDATA` 指向临时目录，先检查 runner 当前 Windows 用户配置中没有既有 Zero 安装/任务/数据，再进行静默安装与卸载。测试检查已安装文件和开始菜单入口、没有隐式注册计划任务、卸载移除程序文件及保留运行数据标记；测试结束清理它创建的标记和环境目录。GitHub hosted Windows runner 是一次性环境；若出现任何预存 Zero 状态，测试会失败并停止操作。
+## CI and local build
 
-本地 Windows 构建命令（先按 release-staging 文档完成 Node 与 guardian 产物，并自行提供 NSIS 3.10 `makensis.exe`）：
+Windows CI retains two downloadable artifacts: the unsigned release stage and `zero-windows-installer-unsigned`. Installer smoke tests point `HOME`, `APPDATA`, and `LOCALAPPDATA` at temporary directories, check that the runner has no existing Zero installation or running guardian, then perform silent install and uninstall. They check installed files and Start Menu shortcuts, verify install does not start Zero, and check that uninstall removes program files while preserving a runtime data marker. The GitHub-hosted runner is disposable; tests stop if they detect pre-existing Zero state.
+
+Local Windows build commands (first create a release stage as documented by the release staging workflow and provide NSIS 3.10 `makensis.exe`):
 
 ```powershell
 node .\scripts\verify-windows-release.mjs --stage-dir (Join-Path (Get-Location) 'release-stage')
@@ -31,4 +33,4 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\package-
   -ProductVersion '0.1.0'
 ```
 
-[本轮 CI](https://github.com/Jonty-Zhang/Zero/actions/runs/36148528629) 的 NSIS 编译、安装与卸载 smoke 测试已通过。它们不证明目标电脑的计划任务密码、代理、Harness 登录或真实任务执行已经配置。
+The [CI run](https://github.com/Jonty-Zhang/Zero/actions/runs/36148528629) passed NSIS compilation and install/uninstall smoke tests. These checks do not prove that Harness authentication, proxy access, or real task execution is configured on a target PC.

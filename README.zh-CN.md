@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-Zero 是一个面向编程任务的本地优先执行节点。用户通过本机界面或 CLI 提交任务；Zero 将任务写入持久队列，完成路由，在独立 Git worktree 中执行，运行配置的检查，交给新的 Codex 会话审核，并归档结果。即使关闭浏览器，后台服务仍会继续工作。
+Zero 是一个面向编程任务的本地优先执行节点。用户通过本机界面或 CLI 提交任务；Zero 将任务写入持久队列，完成路由，在独立 Git worktree 中执行，运行配置的检查，交给新的 Codex 会话审核，并归档结果。Windows 上需要从开始菜单快捷方式或启动命令手动启动常驻本地服务。只要启动器窗口保持打开，即使关闭浏览器，服务仍会继续工作。
 
 Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独立应用。服务负责任务状态和执行，界面是该服务的客户端。v1 面向 Windows 优先的单机单用户环境，默认只监听回环地址。
 
@@ -15,12 +15,12 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 - 每个任务使用独立 Git worktree，运行配置的验证命令，限制返工次数，并归档包含执行、测试、审核和 Git 证据的报告。成功任务的分支保留在源代码仓库中；Zero 不会自动合并或推送分支。
 - 有序 `executionStages` 已通过核心、HTTP API 和 CLI 的 `--stages-file` 选项实现，会在同一个任务 worktree 中串行执行。每个阶段会记录关联尝试、工作树指纹，以及由 Zero 实测事实构成的版本化交接单；报告收录这些阶段记录。
 - 可持久保存并按序执行多个任务步骤，可通过 Web 界面或 API 提交，并用 CLI 查询。每一步都是普通任务，可分别手动指定 Harness、模型和思考强度；留空字段由当前分配器从已验证绑定中选择。同一仓库中的步骤会在前一步达到 `done`、并具有权威应用提交和完整报告后，从该步骤的已验证结果提交开始。
-- 序列状态会区分步骤执行和整体目标验收。所有步骤任务完成后，如果提供了整体目标或目标级验收标准，Zero 会运行独立的汇总 Codex 验收。HTTP API 和界面会展示最近一次验收的状态、判定（`PASS`、`changes_requested` 或 `blocked`）、摘要、发现和额度重试时间。`steps_completed` 表示尚无可用的汇总判定；`completed` 表示未提供目标级信息，或汇总验收返回 `PASS`。实现已有自动化测试覆盖，但尚未验证真实目标验收流程；根据发现自动执行目标级返工的功能尚未实现。
+- 序列状态会区分步骤执行和整体目标验收。所有步骤任务完成后，如果提供了整体目标或目标级验收标准，Zero 会运行独立的汇总 Codex 验收。HTTP API 和界面会展示最近一次验收的状态、判定（`PASS`、`changes_requested` 或 `blocked`）、摘要、发现和额度重试时间。`steps_completed` 表示尚无可用的汇总判定；`completed` 表示未提供目标级信息，或汇总验收返回 `PASS`。收到 `changes_requested` 后，Zero 最多可自动追加并执行 `maxGoalRevisions` 个目标级返工任务（默认 `2`，允许 `0`–`5`）；`goalRevisionCount` 显示已使用次数。达到上限但仍未得到 `PASS` 时，序列保持阻塞，并在 API 和界面显示原因。自动化测试已覆盖这些逻辑，但真实端到端目标验收与返工流程尚未验证。
 - 对已验证的模型使用额度限制提供 `waiting` 状态、持久检查点和跨服务重启的定时重试。自动化测试覆盖分配、执行、审核和审核要求返工期间的额度续跑；尚未观察到真实提供方的额度限制事件。普通崩溃时，Zero 先隔离过期租约。原生 guardian 证明上一代进程 Job 已清空后，合格任务可在已登记的同一 worktree 中恢复：首次执行、已封存审核包的审核与提交/报告，以及审核要求的返工。恢复的执行和返工会重新路由、建立新的尝试、重跑检查和审核。恢复必须匹配任务代际、Git 身份、允许修改路径、审核包及结论、返工次数等证据；证据缺失或不符时任务保留在 `recovery_required` 等待检查。
-- 恢复实现已包含自动化测试；但无人值守安装、重启恢复、真实 Harness 执行、真实提供方额度恢复，以及目标电脑上的崩溃故障注入尚未验收。忽略的构建/缓存文件不包含在 Zero 基于 Git 的 worktree 指纹中；它们可能留在 worktree 并影响恢复后的命令，因此应使用可重复的检查，不要依赖隐藏的本地缓存状态。详见[崩溃恢复设计](docs/crash-recovery-design.md)和[恢复实现边界](docs/crash-recovery-next-slice.md)。
+- 恢复实现已包含自动化测试；Windows 手动启动与恢复、真实 Harness 执行、真实提供方额度恢复，以及目标电脑上的崩溃故障注入仍待实机验证。忽略的构建/缓存文件不包含在 Zero 基于 Git 的 worktree 指纹中；它们可能留在 worktree 并影响恢复后的命令，因此应使用可重复的检查，不要依赖隐藏的本地缓存状态。详见[崩溃恢复设计](docs/crash-recovery-design.md)和[恢复实现边界](docs/crash-recovery-next-slice.md)。
 - 创建 worktree 前会持久记录目标仓库、分支、路径和基点；`git worktree add` 成功后再记录实测身份与指纹。创建结果不确定时保留这些证据并等待检查。
-- 原生 Windows 进程 guardian 已在 CI 中通过构建和进程包含测试；目标机器部署及启动测试仍未验证。详见 [Windows 部署](docs/windows-deployment.md)。
-- Windows 发布目录脚本可打包已构建的服务、界面、CLI、显式指定的 Node 运行时与 guardian，并生成文件哈希清单。独立校验器在 CI 中核对所有文件并启动包内 CLI。未签名 NSIS 安装包已在 GitHub Windows runner 上通过安装/卸载冒烟测试，详见 [Windows 单应用安装包](docs/windows-app-packaging.md)；目标电脑上的安装和无人值守运行仍未验收。
+- 原生 Windows 进程 guardian 已在 CI 中通过构建和进程包含测试。用户手动启动受监督服务；非零退出时启动器会退避重试，用户也可在主动停止或 Windows 重启后重新启动；目标机器部署和恢复仍未验证。详见 [Windows 部署](docs/windows-deployment.md)。
+- Windows 发布目录脚本可打包已构建的服务、界面、CLI、显式指定的 Node 运行时与 guardian，并生成文件哈希清单。独立校验器在 CI 中核对所有文件并启动包内 CLI。未签名 NSIS 安装包已在 GitHub Windows runner 上通过安装/卸载冒烟测试，并提供手动启动 Zero 和打开仪表板的快捷方式；目标电脑上的安装和真实 Harness 任务仍未验收，详见 [Windows 单应用安装包](docs/windows-app-packaging.md)。
 
 ## 尚属设计或待验证的目标
 
@@ -109,7 +109,7 @@ CLI 还提供 `node dist/cli.js cancel <task-id>`。不带参数运行 `node dis
 
 默认情况下，Zero 将 SQLite 数据库、本地配置、worktree、日志、验证记录和报告保存在源码目录之外：Windows 使用 `%LOCALAPPDATA%/Zero`，其他平台使用 `~/.local/share/zero`。开发时可将 `ZERO_DATA_DIR` 指向源码目录中的位置；`data/.zero/` 已被 Git 忽略。请保护此数据目录，其中的任务提示、diff、命令输出和报告可能包含项目敏感信息。
 
-HTTP 服务默认绑定 `127.0.0.1:4179`，v1 不支持远程绑定。Git worktree 可以将任务改动与主工作区分开，但它**不是操作系统安全沙箱**。无人值守任务应使用权限较低、只能访问指定仓库和凭据的账户运行。验证命令以子进程运行，应视为代码执行。
+HTTP 服务默认绑定 `127.0.0.1:4179`，v1 不支持远程绑定。Git worktree 可以将任务改动与主工作区分开，但它**不是操作系统安全沙箱**。Zero 服务和验证命令使用启动器所在的 Windows 用户权限，因此应使用仅能访问指定仓库和凭据的低权限账户。验证命令以子进程运行，应视为代码执行。
 
 ## 架构
 
@@ -144,6 +144,6 @@ SQLite 是任务状态的权威来源。Zero 记录尝试和证据、运行配�
 - [工作区与跨 Harness 接力设计](docs/workspace-handoff-design.md)
 - [路由与审核契约](docs/route-review-contract.md)
 - [本地服务配置与绑定验证](src/server/README.md)
-- [Windows 无人值守部署](docs/windows-deployment.md)
+- [Windows 手动部署](docs/windows-deployment.md)
 - [Super Plumber 评估](docs/super-plumber-assessment.md)
 - [真实任务验证记录](docs/live-validation.md)
