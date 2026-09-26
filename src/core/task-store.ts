@@ -275,6 +275,75 @@ export interface ReviewQuotaResumeClaimRecord {
   claimedAt: string;
 }
 
+export interface ReviewReworkContinuationRecord {
+  id: string;
+  taskId: string;
+  packageId: string;
+  verdictId: string;
+  sourceGenerationId: string;
+  beginGenerationId: string;
+  owner: string;
+  revisionBefore: number;
+  revisionAfter: number;
+  stageHighWater: number;
+  beganAt: string;
+}
+
+export interface ReviewReworkProgressRecord {
+  id: string;
+  continuationId: string;
+  taskId: string;
+  sequence: number;
+  generationId: string;
+  owner: string;
+  phase: "route_started" | "writer_started" | "writer_finished" | "checks_started" | "checks_finished";
+  stageId?: string;
+  checkpoint: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface ReviewReworkGitInspection {
+  checkedAt: string;
+  branchRef: string;
+  head: string;
+  snapshot: CheckRunSnapshot;
+  changedPaths: string[];
+  allowedPathsVerified: true;
+}
+
+export interface BeginReviewReworkInput {
+  packageId: string;
+  verdictId: string;
+  owner: string;
+  generationId: string;
+  now?: Date;
+}
+
+export type BeginReviewReworkResult =
+  | { kind: "started"; continuation: ReviewReworkContinuationRecord; task: TaskRecord }
+  | { kind: "revision_limit"; reason: string; task: TaskRecord };
+
+export interface ClaimReviewReworkContinuationInput {
+  now?: Date;
+  leaseMs?: number;
+  identity: { checkedAt: string; observed: unknown; fingerprint: string };
+  gitState: ReviewReworkGitInspection;
+}
+
+export interface ReviewReworkClaimRecord {
+  id: string;
+  taskId: string;
+  continuationId: string;
+  priorClaimGenerationId: string;
+  claimGenerationId: string;
+  owner: string;
+  leaseExpiresAt: string;
+  priorClaimId?: string;
+  identity: { checkedAt: string; observed: unknown; fingerprint: string };
+  gitState: ReviewReworkGitInspection;
+  claimedAt: string;
+}
+
 const ZERO_COMMIT_IDENTITY = {
   authorName: "Zero" as const, authorEmail: "zero@localhost" as const,
   committerName: "Zero" as const, committerEmail: "zero@localhost" as const, encoding: "UTF-8" as const,
@@ -524,6 +593,35 @@ export class TaskStore {
       CREATE INDEX IF NOT EXISTS review_recovery_claims_task_chain ON review_recovery_claims(task_id,claimed_at,id);
       CREATE TRIGGER IF NOT EXISTS review_recovery_claims_no_update BEFORE UPDATE ON review_recovery_claims BEGIN SELECT RAISE(ABORT,'review recovery claims are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS review_recovery_claims_no_delete BEFORE DELETE ON review_recovery_claims BEGIN SELECT RAISE(ABORT,'review recovery claims are immutable'); END;
+      CREATE TABLE IF NOT EXISTS rework_continuations (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), package_id TEXT NOT NULL REFERENCES review_packages(id),
+        verdict_id TEXT NOT NULL UNIQUE REFERENCES review_verdicts(id), source_generation_id TEXT NOT NULL REFERENCES startup_generations(id),
+        begin_generation_id TEXT NOT NULL REFERENCES startup_generations(id), owner TEXT NOT NULL,
+        revision_before INTEGER NOT NULL, revision_after INTEGER NOT NULL, stage_high_water INTEGER NOT NULL,
+        payload TEXT NOT NULL, began_at TEXT NOT NULL, UNIQUE(task_id,package_id,verdict_id)
+      );
+      CREATE INDEX IF NOT EXISTS rework_continuations_task_created ON rework_continuations(task_id,began_at,id);
+      CREATE TRIGGER IF NOT EXISTS rework_continuations_no_update BEFORE UPDATE ON rework_continuations BEGIN SELECT RAISE(ABORT,'rework continuations are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS rework_continuations_no_delete BEFORE DELETE ON rework_continuations BEGIN SELECT RAISE(ABORT,'rework continuations are immutable'); END;
+      CREATE TABLE IF NOT EXISTS rework_progress (
+        id TEXT PRIMARY KEY, continuation_id TEXT NOT NULL REFERENCES rework_continuations(id), task_id TEXT NOT NULL REFERENCES tasks(id),
+        sequence INTEGER NOT NULL, generation_id TEXT NOT NULL REFERENCES startup_generations(id), owner TEXT NOT NULL,
+        phase TEXT NOT NULL CHECK(phase IN ('route_started','writer_started','writer_finished','checks_started','checks_finished')),
+        stage_id TEXT REFERENCES stages(id), checkpoint TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(continuation_id,sequence)
+      );
+      CREATE INDEX IF NOT EXISTS rework_progress_continuation_sequence ON rework_progress(continuation_id,sequence);
+      CREATE TRIGGER IF NOT EXISTS rework_progress_no_update BEFORE UPDATE ON rework_progress BEGIN SELECT RAISE(ABORT,'rework progress is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS rework_progress_no_delete BEFORE DELETE ON rework_progress BEGIN SELECT RAISE(ABORT,'rework progress is immutable'); END;
+      CREATE TABLE IF NOT EXISTS rework_continuation_claims (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), continuation_id TEXT NOT NULL REFERENCES rework_continuations(id),
+        prior_claim_generation_id TEXT NOT NULL REFERENCES startup_generations(id), claim_generation_id TEXT NOT NULL REFERENCES startup_generations(id),
+        owner TEXT NOT NULL, lease_expires_at TEXT NOT NULL, prior_claim_id TEXT REFERENCES rework_continuation_claims(id),
+        identity TEXT NOT NULL, git_state TEXT NOT NULL, payload TEXT NOT NULL, claimed_at TEXT NOT NULL,
+        UNIQUE(continuation_id,claim_generation_id)
+      );
+      CREATE INDEX IF NOT EXISTS rework_continuation_claims_task_chain ON rework_continuation_claims(task_id,claimed_at,id);
+      CREATE TRIGGER IF NOT EXISTS rework_continuation_claims_no_update BEFORE UPDATE ON rework_continuation_claims BEGIN SELECT RAISE(ABORT,'rework continuation claims are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS rework_continuation_claims_no_delete BEFORE DELETE ON rework_continuation_claims BEGIN SELECT RAISE(ABORT,'rework continuation claims are immutable'); END;
     `);
     // Additive, idempotent migration: old attempts remain valid with a NULL stage_id.
     // Existing databases are not rebuilt or rewritten.
@@ -628,6 +726,115 @@ export class TaskStore {
     return Boolean(row && row.predecessor_drained === 1 && row.evidence_kind === "guardian_startup_verified" &&
       row.lock_id && row.predecessor_generation_id === predecessorGenerationId && row.parent_id === predecessorGenerationId &&
       row.parent_evidence_kind === "guardian_startup_verified" && row.parent_lock_id === row.lock_id);
+  }
+
+  #latestReworkAnchor(taskId: string, packageId: string, verdictId: string): {
+    result: ReviewResult; verdictGenerationId: string; reviewOwner: string; snapshot: CheckRunSnapshot;
+  } | undefined {
+    const row = this.#db.prepare(`SELECT v.id,v.package_id,v.attempt_id,v.generation_id,v.snapshot,v.result,
+        a.status AS attempt_status,a.role AS attempt_role,a.harness AS attempt_harness,a.metadata AS attempt_metadata,
+        p.snapshot AS package_snapshot,c.snapshot AS run_snapshot,c.status AS check_status,
+        c.check_definition_hash,c.expected_check_ids
+      FROM review_verdicts v JOIN attempts a ON a.id=v.attempt_id
+      JOIN review_packages p ON p.id=v.package_id AND p.task_id=v.task_id
+      JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id
+      WHERE v.id=? AND v.task_id=? AND v.package_id=?
+        AND v.id=(SELECT id FROM review_verdicts WHERE task_id=? ORDER BY rowid DESC LIMIT 1)
+        AND p.id=(SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1)`)
+      .get(verdictId, taskId, packageId, taskId, taskId) as Record<string, unknown> | undefined;
+    if (!row || row.id !== verdictId || row.package_id !== packageId || row.attempt_status !== "succeeded" ||
+        row.attempt_role !== "review" || row.attempt_harness !== "codex" || row.check_status !== "completed") return undefined;
+    let result: ReviewResult;
+    let metadata: Record<string, unknown>;
+    let snapshot: CheckRunSnapshot;
+    let packageSnapshot: CheckRunSnapshot;
+    let runSnapshot: CheckRunSnapshot;
+    let submission: TaskSubmission;
+    let expectedIds: string[];
+    try {
+      result = JSON.parse(String(row.result)) as ReviewResult;
+      metadata = row.attempt_metadata ? JSON.parse(String(row.attempt_metadata)) as Record<string, unknown> : {};
+      snapshot = JSON.parse(String(row.snapshot)) as CheckRunSnapshot;
+      packageSnapshot = JSON.parse(String(row.package_snapshot)) as CheckRunSnapshot;
+      runSnapshot = JSON.parse(String(row.run_snapshot)) as CheckRunSnapshot;
+      const taskPayload = this.#db.prepare("SELECT payload FROM tasks WHERE id=?").get(taskId) as { payload: string };
+      submission = JSON.parse(taskPayload.payload) as TaskSubmission;
+      expectedIds = JSON.parse(String(row.expected_check_ids)) as string[];
+    } catch { return undefined; }
+    const checks = submission.checks ?? [];
+    const checkHash = createHash("sha256").update(JSON.stringify(checks), "utf8").digest("hex");
+    const checkRows = this.#db.prepare("SELECT check_id,result FROM check_run_results WHERE run_id=(SELECT check_run_id FROM review_packages WHERE id=?) ORDER BY id")
+      .all(packageId) as Array<{ check_id: string; result: string }>;
+    let results: CheckResult[];
+    try { results = checkRows.map(checkRow => JSON.parse(checkRow.result) as CheckResult); }
+    catch { return undefined; }
+    if (!isValidReviewResult(result) || metadata.packageId !== packageId || metadata.generationId !== row.generation_id ||
+        row.check_definition_hash !== checkHash || !Array.isArray(expectedIds) ||
+        !sameStringSet(expectedIds, checks.map(check => check.id)) || !sameReviewRecoverySnapshot(snapshot, packageSnapshot) ||
+        !sameReviewRecoverySnapshot(snapshot, runSnapshot) || !sameStringSet(checkRows.map(checkRow => checkRow.check_id), expectedIds) ||
+        checkRows.length !== expectedIds.length || results.some((checkResult, index) => checkResult.id !== checkRows[index]?.check_id ||
+          checkResult.status !== "passed" || checkResult.exitCode !== 0)) return undefined;
+    const owner = this.#reviewVerdictOwner(taskId, String(row.attempt_id), packageId, String(row.generation_id));
+    if (!owner) return undefined;
+    return { result, verdictGenerationId: String(row.generation_id), reviewOwner: owner, snapshot };
+  }
+
+  #insertReviewReworkContinuation(taskId: string, packageId: string, verdictId: string, sourceGenerationId: string,
+    beginGenerationId: string, owner: string, revisionBefore: number, at: string): ReviewReworkContinuationRecord {
+    const stageHighWater = Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0) AS n FROM stages WHERE task_id=?")
+      .get(taskId) as { n: number }).n);
+    const continuation: ReviewReworkContinuationRecord = { id: randomUUID(), taskId, packageId, verdictId,
+      sourceGenerationId, beginGenerationId, owner, revisionBefore, revisionAfter: revisionBefore + 1,
+      stageHighWater, beganAt: at };
+    const payload = JSON.stringify(continuation);
+    this.#db.prepare(`INSERT INTO rework_continuations(id,task_id,package_id,verdict_id,source_generation_id,begin_generation_id,
+        owner,revision_before,revision_after,stage_high_water,payload,began_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(continuation.id, taskId, packageId, verdictId, sourceGenerationId, beginGenerationId, owner,
+        revisionBefore, revisionBefore + 1, stageHighWater, payload, at);
+    return continuation;
+  }
+
+  #getReviewReworkContinuationByVerdict(taskId: string, verdictId: string): ReviewReworkContinuationRecord | undefined {
+    const row = this.#db.prepare("SELECT payload FROM rework_continuations WHERE task_id=? AND verdict_id=?")
+      .get(taskId, verdictId) as { payload: string } | undefined;
+    return row ? JSON.parse(row.payload) as ReviewReworkContinuationRecord : undefined;
+  }
+
+  #reworkClaimEventMatches(taskId: string, claim: Record<string, unknown>): boolean {
+    const rows = this.#db.prepare("SELECT payload FROM events WHERE task_id=? AND type='task.review_rework_claimed' ORDER BY id")
+      .all(taskId) as Array<{ payload: string | null }>;
+    for (const row of rows) {
+      try {
+        const payload = decode<Record<string, unknown>>(row.payload);
+        if (payload && payload.id === claim.id && payload.continuationId === claim.continuation_id &&
+            payload.priorClaimGenerationId === claim.prior_claim_generation_id &&
+            payload.claimGenerationId === claim.claim_generation_id && payload.owner === claim.owner) return true;
+      } catch { return false; }
+    }
+    return false;
+  }
+
+  #verifiedReworkClaimChain(continuation: ReviewReworkContinuationRecord, expectedTailGenerationId: string,
+    expectedTailOwner: string): boolean {
+    const claims = this.#db.prepare("SELECT * FROM rework_continuation_claims WHERE continuation_id=? ORDER BY rowid")
+      .all(continuation.id) as Array<Record<string, unknown>>;
+    let expectedGeneration = continuation.beginGenerationId;
+    let previousClaimId: string | undefined;
+    if (!this.#taskClaimOwnersForGeneration(continuation.taskId, expectedGeneration).has(continuation.owner)) return false;
+    for (const claim of claims) {
+      const claimGeneration = String(claim.claim_generation_id);
+      const claimOwner = String(claim.owner ?? "");
+      if (claim.task_id !== continuation.taskId || claim.continuation_id !== continuation.id ||
+          claim.prior_claim_generation_id !== expectedGeneration || (claim.prior_claim_id ?? undefined) !== previousClaimId ||
+          !this.#startupGenerationProvesPredecessorDrained(claimGeneration, expectedGeneration) || !claimOwner ||
+          !this.#taskClaimOwnersForGeneration(continuation.taskId, claimGeneration).has(claimOwner) ||
+          !this.#reworkClaimEventMatches(continuation.taskId, claim)) return false;
+      expectedGeneration = claimGeneration;
+      previousClaimId = String(claim.id);
+    }
+    const latest = claims.at(-1);
+    return Boolean(latest && expectedGeneration === expectedTailGenerationId && latest.claim_generation_id === expectedTailGenerationId &&
+      this.#latestTaskClaimOwnerForGeneration(continuation.taskId, expectedTailGenerationId) === expectedTailOwner);
   }
 
   #verifiedGuardianLineage(fromGenerationId: string, toGenerationId: string): string[] | undefined {
@@ -2159,6 +2366,348 @@ export class TaskStore {
   packageReviewVerdicts(taskId: string): PackageReviewVerdictRecord[] {
     return (this.#db.prepare("SELECT * FROM review_verdicts WHERE task_id=? ORDER BY created_at,id").all(taskId) as Record<string, unknown>[])
       .map(row => this.#packageReviewVerdict(row));
+  }
+
+  /** Atomically consumes the latest changes-requested verdict and enters the next revision exactly once. */
+  beginReviewRework(taskId: string, input: BeginReviewReworkInput): BeginReviewReworkResult {
+    if (!input?.owner?.trim() || !input.packageId || !input.verdictId || !input.generationId) {
+      throw new Error("Review rework requires package, verdict, owner, and generation bindings");
+    }
+    const now = input.now ?? new Date();
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new Error("Review rework requires a valid timestamp");
+    const at = now.toISOString();
+    let result!: BeginReviewReworkResult;
+    this.#transaction(() => {
+      const existing = this.#db.prepare(`SELECT * FROM rework_continuations WHERE task_id=? AND package_id=? AND verdict_id=?`)
+        .get(taskId, input.packageId, input.verdictId) as Record<string, unknown> | undefined;
+      const task = this.#db.prepare(`SELECT status,revision_count,lease_owner,lease_expires_at,claim_generation_id,payload
+        FROM tasks WHERE id=?`).get(taskId) as {
+          status: TaskStatus; revision_count: number; lease_owner: string | null; lease_expires_at: string | null;
+          claim_generation_id: string | null; payload: string;
+        } | undefined;
+      if (!task) throw new Error(`Unknown task ${taskId}`);
+      if (existing) {
+        const continuation = JSON.parse(String(existing.payload)) as ReviewReworkContinuationRecord;
+        if (continuation.taskId !== taskId || continuation.packageId !== input.packageId || continuation.verdictId !== input.verdictId ||
+            continuation.beginGenerationId !== input.generationId || continuation.owner !== input.owner ||
+            task.revision_count < continuation.revisionAfter) throw new Error("Existing review rework continuation does not match its immutable verdict binding");
+        const anchor = this.#latestReworkAnchor(taskId, input.packageId, input.verdictId);
+        if (!anchor || anchor.result.verdict !== "changes_requested" || anchor.verdictGenerationId !== continuation.sourceGenerationId ||
+            anchor.reviewOwner !== continuation.owner) throw new Error("Existing review rework continuation is no longer the latest verdict/package boundary");
+        result = { kind: "started", continuation, task: this.get(taskId)! };
+        return;
+      }
+      const expiresAt = task.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
+      if (task.status !== "reviewing" || task.lease_owner !== input.owner || task.claim_generation_id !== input.generationId ||
+          !Number.isFinite(expiresAt) || expiresAt <= now.getTime()) {
+        throw new Error(`Task ${taskId} is not reviewing under live owner ${input.owner} and generation ${input.generationId}`);
+      }
+      const anchor = this.#latestReworkAnchor(taskId, input.packageId, input.verdictId);
+      if (!anchor || anchor.result.verdict !== "changes_requested" || anchor.verdictGenerationId !== input.generationId ||
+          anchor.reviewOwner !== input.owner || this.#latestTaskClaimOwnerForGeneration(taskId, input.generationId) !== input.owner) {
+        throw new Error("Review rework requires the latest Codex changes_requested verdict for the current task claim");
+      }
+      if (this.#db.prepare("SELECT 1 FROM commit_operations WHERE task_id=? UNION ALL SELECT 1 FROM report_operations WHERE task_id=? LIMIT 1")
+        .get(taskId, taskId)) throw new Error("Review rework cannot begin after commit or report operations exist");
+      let submission: TaskSubmission;
+      try { submission = JSON.parse(task.payload) as TaskSubmission; }
+      catch { throw new Error("Review rework task submission is malformed"); }
+      const revisionLimit = Math.max(0, submission.maxRevisions ?? 0);
+      if (!Number.isSafeInteger(revisionLimit) || task.revision_count >= revisionLimit) {
+        const reason = `Review requested changes after ${task.revision_count} content revisions: ${anchor.result.summary}`;
+        const failed = this.#db.prepare(`UPDATE tasks SET status='failed',updated_at=?,failure_reason=?,lease_owner=NULL,
+          lease_expires_at=NULL,heartbeat_at=NULL,active_attempt_id=NULL WHERE id=? AND status='reviewing' AND lease_owner=? AND claim_generation_id=?`)
+          .run(at, reason, taskId, input.owner, input.generationId);
+        if (Number(failed.changes) !== 1) throw new Error("Task changed before review revision limit could be recorded");
+        this.#event(taskId, "task.transition", { from: "reviewing", to: "failed", reason }, at);
+        result = { kind: "revision_limit", reason, task: this.get(taskId)! };
+        return;
+      }
+      const continuation = this.#insertReviewReworkContinuation(taskId, input.packageId, input.verdictId,
+        anchor.verdictGenerationId, input.generationId, input.owner, task.revision_count, at);
+      const changed = this.#db.prepare(`UPDATE tasks SET status='revision',revision_count=revision_count+1,updated_at=?,failure_reason=NULL
+        WHERE id=? AND status='reviewing' AND lease_owner=? AND claim_generation_id=? AND revision_count=?`)
+        .run(at, taskId, input.owner, input.generationId, task.revision_count);
+      if (Number(changed.changes) !== 1) throw new Error("Task state or revision count changed before review rework began");
+      const resumed = this.#db.prepare("UPDATE tasks SET status='running' WHERE id=? AND status='revision' AND lease_owner=? AND claim_generation_id=?")
+        .run(taskId, input.owner, input.generationId);
+      if (Number(resumed.changes) !== 1) throw new Error("Task could not enter running state after review rework began");
+      this.#event(taskId, "task.transition", { from: "reviewing", to: "revision", reason: "review requested changes", continuationId: continuation.id }, at);
+      this.#event(taskId, "task.transition", { from: "revision", to: "running", reason: "starting review revision", continuationId: continuation.id }, at);
+      this.#event(taskId, "task.review_rework_begun", continuation, at);
+      result = { kind: "started", continuation, task: this.get(taskId)! };
+    });
+    return result;
+  }
+
+  getReviewReworkContinuation(taskId: string, continuationId?: string): ReviewReworkContinuationRecord | undefined {
+    const row = continuationId
+      ? this.#db.prepare("SELECT payload FROM rework_continuations WHERE task_id=? AND id=?").get(taskId, continuationId) as { payload: string } | undefined
+      : this.#db.prepare("SELECT payload FROM rework_continuations WHERE task_id=? ORDER BY rowid DESC LIMIT 1").get(taskId) as { payload: string } | undefined;
+    return row ? JSON.parse(row.payload) as ReviewReworkContinuationRecord : undefined;
+  }
+
+  /** Append a stage/progress checkpoint while the continuation owner holds its live task lease. */
+  checkpointReviewRework(taskId: string, continuationId: string, guard: CheckRunGuard, input: {
+    phase: ReviewReworkProgressRecord["phase"]; stageId?: string; checkpoint?: Record<string, unknown>; now?: Date;
+  }): ReviewReworkProgressRecord {
+    const now = input.now ?? new Date();
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || !guard?.owner || !guard.generationId ||
+        !["route_started", "writer_started", "writer_finished", "checks_started", "checks_finished"].includes(input.phase)) {
+      throw new Error("Review rework progress requires a valid phase and live claim guard");
+    }
+    const at = now.toISOString();
+    let record!: ReviewReworkProgressRecord;
+    this.#transaction(() => {
+      const continuation = this.getReviewReworkContinuation(taskId, continuationId);
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id FROM tasks WHERE id=?")
+        .get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null } | undefined;
+      const expires = task?.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
+      if (!continuation || continuation.id !== this.getReviewReworkContinuation(taskId)?.id || !task ||
+          !["running", "revision"].includes(task.status) || task.lease_owner !== guard.owner || task.claim_generation_id !== guard.generationId ||
+          !Number.isFinite(expires) || expires <= now.getTime()) throw new Error("Review rework continuation does not have this live task claim");
+      if (input.stageId) {
+        const stage = this.getStage(input.stageId);
+        if (!stage || stage.taskId !== taskId || stage.generationId !== guard.generationId) throw new Error("Review rework progress stage is outside this task claim");
+        const invalidStagePhase = input.phase === "route_started"
+          ? stage.role !== "route" || stage.status !== "running"
+          : input.phase === "writer_started"
+            ? !["implement", "revise"].includes(stage.role) || stage.status !== "running"
+            : input.phase === "writer_finished"
+              ? !["implement", "revise"].includes(stage.role) || stage.status !== "succeeded"
+              : !["implement", "revise"].includes(stage.role) || stage.status !== "succeeded";
+        if (invalidStagePhase) {
+          throw new Error("Review rework progress stage role or status does not match its phase");
+        }
+      } else if (input.phase !== "route_started") {
+        throw new Error("Writer and check progress require their execution stage ID");
+      }
+      const checkpoint = input.checkpoint ?? {};
+      if (!checkpoint || typeof checkpoint !== "object" || Array.isArray(checkpoint) || Buffer.byteLength(JSON.stringify(checkpoint), "utf8") > 65_536) {
+        throw new Error("Review rework progress checkpoint must be an object no larger than 64 KiB");
+      }
+      const sequence = Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0)+1 AS n FROM rework_progress WHERE continuation_id=?")
+        .get(continuationId) as { n: number }).n);
+      record = { id: randomUUID(), continuationId, taskId, sequence, generationId: guard.generationId, owner: guard.owner,
+        phase: input.phase, ...(input.stageId ? { stageId: input.stageId } : {}), checkpoint, createdAt: at };
+      this.#db.prepare(`INSERT INTO rework_progress(id,continuation_id,task_id,sequence,generation_id,owner,phase,stage_id,checkpoint,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`).run(record.id, continuationId, taskId, sequence, guard.generationId, guard.owner,
+        input.phase, input.stageId ?? null, JSON.stringify(checkpoint), at);
+      this.#event(taskId, "task.review_rework_progress", record, at);
+    });
+    return record;
+  }
+
+  reviewReworkProgress(taskId: string, continuationId: string): ReviewReworkProgressRecord[] {
+    return (this.#db.prepare(`SELECT * FROM rework_progress WHERE task_id=? AND continuation_id=? ORDER BY sequence`)
+      .all(taskId, continuationId) as Array<Record<string, unknown>>).map(row => ({ id: String(row.id), continuationId: String(row.continuation_id),
+        taskId: String(row.task_id), sequence: Number(row.sequence), generationId: String(row.generation_id), owner: String(row.owner),
+        phase: row.phase as ReviewReworkProgressRecord["phase"], ...(row.stage_id ? { stageId: String(row.stage_id) } : {}),
+        checkpoint: JSON.parse(String(row.checkpoint)) as Record<string, unknown>, createdAt: String(row.created_at) }));
+  }
+
+  /** Freshly inspects and reclaims the pending continuation after a guardian proves the previous worker drained. */
+  claimReviewReworkContinuation(taskId: string, owner: string, input: ClaimReviewReworkContinuationInput): ReviewReworkClaimRecord | undefined {
+    if (!owner?.trim() || !input?.identity || !input.gitState || !/^[a-f0-9]{64}$/i.test(input.identity.fingerprint ?? "")) {
+      throw new Error("Review rework recovery requires an owner and fresh worktree/Git evidence");
+    }
+    const now = input.now ?? new Date();
+    const leaseMs = input.leaseMs ?? 60_000;
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || !Number.isFinite(leaseMs) || leaseMs <= 0) {
+      throw new Error("Review rework recovery requires valid now and positive leaseMs values");
+    }
+    this.#assertFreshRecoveryCheck(input.identity.checkedAt, now);
+    this.#assertFreshRecoveryCheck(input.gitState.checkedAt, now);
+    const identityJson = JSON.stringify(input.identity.observed);
+    const gitStateJson = JSON.stringify(input.gitState);
+    if (!identityJson || identityJson === "null" || Buffer.byteLength(identityJson) > 65_536 ||
+        !gitStateJson || Buffer.byteLength(gitStateJson) > 65_536 || !Array.isArray(input.gitState.changedPaths) ||
+        Buffer.byteLength(JSON.stringify(input.gitState.changedPaths), "utf8") > 65_536 || input.gitState.allowedPathsVerified !== true) {
+      throw new Error("Fresh rework identity/Git evidence must include verified allowed paths and stay within 64 KiB");
+    }
+    const at = now.toISOString();
+    const expires = new Date(now.getTime() + leaseMs).toISOString();
+    let claimed: ReviewReworkClaimRecord | undefined;
+    this.#transaction(() => {
+      const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,recovery_evidence,payload,revision_count
+        FROM tasks WHERE id=?`).get(taskId) as {
+          status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null;
+          recovery_evidence: string | null; payload: string; revision_count: number;
+        } | undefined;
+      if (!task || task.status !== "recovery_required" || task.lease_owner !== null || task.lease_expires_at !== null ||
+          !task.claim_generation_id || !task.recovery_evidence) return;
+      let evidence: Record<string, unknown>;
+      try { evidence = JSON.parse(task.recovery_evidence) as Record<string, unknown>; }
+      catch { return; }
+      const priorGenerationId = task.claim_generation_id;
+      if (evidence.kind !== "lease_expiry" || evidence.claimProtocolVersion !== 2 ||
+          evidence.claimGenerationId !== priorGenerationId || !["reviewing", "running", "revision"].includes(String(evidence.previousStatus)) ||
+          !this.currentStartupProvesGenerationDrained(priorGenerationId) ||
+          this.#latestTaskClaimOwnerForGeneration(taskId, priorGenerationId) !== evidence.leaseOwner) return;
+
+      const pkg = this.#db.prepare(`SELECT p.id,p.check_run_id,p.snapshot,p.branch_ref,c.generation_id AS source_generation_id,c.status AS check_status
+        FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id
+        WHERE p.task_id=? ORDER BY p.rowid DESC LIMIT 1`).get(taskId) as Record<string, unknown> | undefined;
+      const latestVerdict = this.#db.prepare(`SELECT v.id,v.package_id,v.attempt_id,v.generation_id,v.snapshot,v.result,a.status AS attempt_status,
+          a.role AS attempt_role,a.harness AS attempt_harness,a.metadata AS attempt_metadata
+        FROM review_verdicts v JOIN attempts a ON a.id=v.attempt_id WHERE v.task_id=? ORDER BY v.rowid DESC LIMIT 1`).get(taskId) as Record<string, unknown> | undefined;
+      if (!pkg || !latestVerdict || latestVerdict.package_id !== pkg.id || latestVerdict.attempt_status !== "succeeded" ||
+          latestVerdict.attempt_role !== "review" || latestVerdict.attempt_harness !== "codex") return;
+      const anchor = this.#latestReworkAnchor(taskId, String(pkg.id), String(latestVerdict.id));
+      if (!anchor || anchor.result.verdict !== "changes_requested") return;
+      if (this.#db.prepare("SELECT 1 FROM commit_operations WHERE task_id=? UNION ALL SELECT 1 FROM report_operations WHERE task_id=? LIMIT 1")
+        .get(taskId, taskId)) return;
+      let verdictResult: ReviewResult;
+      let verdictMetadata: Record<string, unknown>;
+      let verdictSnapshot: CheckRunSnapshot;
+      let packageSnapshot: CheckRunSnapshot;
+      try {
+        verdictResult = JSON.parse(String(latestVerdict.result)) as ReviewResult;
+        verdictMetadata = latestVerdict.attempt_metadata ? JSON.parse(String(latestVerdict.attempt_metadata)) as Record<string, unknown> : {};
+        verdictSnapshot = JSON.parse(String(latestVerdict.snapshot)) as CheckRunSnapshot;
+        packageSnapshot = JSON.parse(String(pkg.snapshot)) as CheckRunSnapshot;
+      } catch { return; }
+      if (!isValidReviewResult(verdictResult) || verdictResult.verdict !== "changes_requested" ||
+          verdictMetadata.packageId !== pkg.id || verdictMetadata.generationId !== latestVerdict.generation_id ||
+          !sameReviewRecoverySnapshot(verdictSnapshot, packageSnapshot) || pkg.check_status !== "completed") return;
+
+      const previousStatus = String(evidence.previousStatus);
+      let continuation = this.#getReviewReworkContinuationByVerdict(taskId, String(latestVerdict.id));
+      if (continuation && (continuation.packageId !== pkg.id || continuation.verdictId !== latestVerdict.id)) return;
+      if (continuation) {
+        if (anchor.reviewOwner !== continuation.owner || anchor.verdictGenerationId !== continuation.sourceGenerationId) return;
+      } else if (previousStatus !== "reviewing" || anchor.reviewOwner !== evidence.leaseOwner ||
+          anchor.verdictGenerationId !== priorGenerationId) return;
+      const priorClaims = continuation ? this.#db.prepare("SELECT * FROM rework_continuation_claims WHERE continuation_id=? ORDER BY rowid")
+        .all(continuation.id) as Array<Record<string, unknown>> : [];
+      const latestClaim = priorClaims.at(-1);
+      if (continuation && latestClaim) {
+        if (!this.#verifiedReworkClaimChain(continuation, priorGenerationId, String(evidence.leaseOwner))) return;
+      } else if (continuation && (continuation.beginGenerationId !== priorGenerationId || continuation.owner !== evidence.leaseOwner)) return;
+      const worktree = this.#db.prepare("SELECT * FROM worktree_creations WHERE task_id=?").get(taskId) as {
+        status: string; plan: string; observed: string | null; fingerprint: string | null;
+      } | undefined;
+      let plan: Record<string, unknown>;
+      let savedObserved: { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown };
+      try {
+        if (!worktree || worktree.status !== "created" || !worktree.observed || !worktree.fingerprint ||
+            !/^[a-f0-9]{64}$/i.test(worktree.fingerprint)) throw new Error("missing worktree registration");
+        plan = JSON.parse(worktree.plan) as Record<string, unknown>;
+        savedObserved = JSON.parse(worktree.observed) as typeof savedObserved;
+      } catch { return; }
+      const freshObserved = input.identity.observed as { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown; fingerprint?: unknown };
+      if (!savedObserved.info || !freshObserved?.info ||
+          !["taskId", "repoPath", "path", "branch", "baseCommit"].every(key => plan[key] === savedObserved.info![key] && savedObserved.info![key] === freshObserved.info![key]) ||
+          plan.taskId !== taskId || plan.commonGitDir !== savedObserved.commonGitDir || savedObserved.commonGitDir !== freshObserved.commonGitDir ||
+          savedObserved.head !== plan.baseCommit ||
+          freshObserved.head !== input.gitState.head || freshObserved.fingerprint !== input.identity.fingerprint) {
+        throw new Error("Fresh rework identity does not match the registered worktree or Git HEAD");
+      }
+      const priorPackage = this.#db.prepare(`SELECT p.snapshot,p.branch_ref,c.status AS check_status FROM review_packages p
+        JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id WHERE p.id=? AND p.task_id=?`).get(String(pkg.id), taskId) as
+        { snapshot: string; branch_ref: string; check_status: string } | undefined;
+      if (!priorPackage || input.gitState.branchRef !== String(priorPackage.branch_ref) ||
+          input.gitState.head !== freshObserved.head || input.gitState.snapshot.preHead !== input.gitState.head ||
+          input.gitState.snapshot.baseCommit !== plan.baseCommit ||
+          !SHA256_PATTERN.test(input.gitState.snapshot.diffHash) ||
+          createHash("sha256").update(input.gitState.snapshot.diff, "utf8").digest("hex") !== input.gitState.snapshot.diffHash) {
+        throw new Error("Fresh rework Git evidence does not match its registered task branch or snapshot");
+      }
+      const stageHighWater = continuation?.stageHighWater ?? Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0) AS n FROM stages WHERE task_id=?")
+        .get(taskId) as { n: number }).n);
+      const writerStages = this.#db.prepare(`SELECT * FROM stages WHERE task_id=? AND sequence>? AND role IN ('implement','revise') ORDER BY sequence`)
+        .all(taskId, stageHighWater) as Array<Record<string, unknown>>;
+      const progress = continuation ? this.reviewReworkProgress(taskId, continuation.id) : [];
+      const writerStarted = writerStages.some(stage => stage.started_at !== null && stage.started_at !== undefined) ||
+        progress.some(row => row.phase === "writer_started" || row.phase === "writer_finished" || row.phase.startsWith("checks_"));
+      if (!writerStarted) {
+        if (!sameReviewRecoverySnapshot(input.gitState.snapshot, packageSnapshot)) {
+          throw new Error("Fresh rework Git snapshot changed before a writer stage started");
+        }
+      } else {
+        const currentWriterStages = writerStages.filter(stage => stage.generation_id === priorGenerationId &&
+          stage.started_at !== null && stage.started_at !== undefined);
+        const currentWriterProgress = progress.filter(row => row.generationId === priorGenerationId &&
+          (row.phase === "writer_started" || row.phase === "writer_finished" || row.phase.startsWith("checks_")));
+        if (currentWriterStages.length || currentWriterProgress.length) {
+          const guardedWriter = currentWriterStages.some(stage => ["interrupted", "succeeded", "failed"].includes(String(stage.status)));
+          if (!guardedWriter || (input.gitState.changedPaths.length === 0 &&
+              !sameReviewRecoverySnapshot(input.gitState.snapshot, packageSnapshot))) return;
+        } else {
+          if (!latestClaim) return;
+          let previousInspection: ReviewReworkClaimRecord;
+          try { previousInspection = JSON.parse(String(latestClaim.payload)) as ReviewReworkClaimRecord; }
+          catch { return; }
+          const priorGit = previousInspection.gitState;
+          if (previousInspection.claimGenerationId !== priorGenerationId ||
+              previousInspection.identity.fingerprint !== input.identity.fingerprint ||
+              priorGit.branchRef !== input.gitState.branchRef || priorGit.head !== input.gitState.head ||
+              !sameReviewRecoverySnapshot(priorGit.snapshot, input.gitState.snapshot) ||
+              !sameStringSet(priorGit.changedPaths, input.gitState.changedPaths)) return;
+        }
+      }
+
+      let createdDuringRecovery = false;
+      if (!continuation) {
+        let submission: TaskSubmission;
+        try { submission = JSON.parse(task.payload) as TaskSubmission; }
+        catch { return; }
+        const revisionLimit = Math.max(0, submission.maxRevisions ?? 0);
+        if (!Number.isSafeInteger(revisionLimit) || task.revision_count >= revisionLimit) {
+          const reason = `Review requested changes after ${task.revision_count} content revisions: ${verdictResult.summary}`;
+          this.#db.prepare(`UPDATE tasks SET status='failed',updated_at=?,failure_reason=?,lease_owner=NULL,lease_expires_at=NULL,
+            heartbeat_at=NULL,active_attempt_id=NULL WHERE id=? AND status='recovery_required' AND claim_generation_id=?`)
+            .run(at, reason, taskId, priorGenerationId);
+          this.#event(taskId, "task.transition", { from: "recovery_required", to: "failed", reason }, at);
+          return;
+        }
+        continuation = this.#insertReviewReworkContinuation(taskId, String(pkg.id), String(latestVerdict.id),
+          String(latestVerdict.generation_id), priorGenerationId, String(evidence.leaseOwner), task.revision_count, at);
+        this.#db.prepare("UPDATE tasks SET revision_count=revision_count+1 WHERE id=? AND status='recovery_required' AND claim_generation_id=?")
+          .run(taskId, priorGenerationId);
+        createdDuringRecovery = true;
+      } else if (!["running", "revision"].includes(previousStatus) || task.revision_count !== continuation.revisionAfter) {
+        return;
+      }
+
+      let priorClaimId: string | undefined;
+      if (latestClaim) {
+        const valid = this.#verifiedReworkClaimChain(continuation, priorGenerationId, String(evidence.leaseOwner));
+        if (!valid) return;
+        priorClaimId = String(latestClaim.id);
+      } else if (continuation.beginGenerationId !== priorGenerationId || continuation.owner !== evidence.leaseOwner) return;
+
+      const checkpointId = randomUUID();
+      const claim: ReviewReworkClaimRecord = { id: checkpointId, taskId, continuationId: continuation.id,
+        priorClaimGenerationId: priorGenerationId, claimGenerationId: this.#startupGeneration.id, owner,
+        leaseExpiresAt: expires, ...(priorClaimId ? { priorClaimId } : {}),
+        identity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint },
+        gitState: input.gitState, claimedAt: at };
+      const claimJson = JSON.stringify(claim);
+      if (Buffer.byteLength(claimJson, "utf8") > 65_536) throw new Error("Review rework claim exceeds 64 KiB");
+      const changed = this.#db.prepare(`UPDATE tasks SET status='running',updated_at=?,lease_owner=?,lease_expires_at=?,heartbeat_at=?,
+          active_attempt_id=NULL,lease_protocol_version=2,claim_generation_id=?,recovery_reason=NULL,recovery_evidence=NULL
+        WHERE id=? AND status='recovery_required' AND lease_owner IS NULL AND lease_expires_at IS NULL AND claim_generation_id=?`)
+        .run(at, owner, expires, at, this.#startupGeneration.id, taskId, priorGenerationId);
+      if (Number(changed.changes) !== 1) return;
+      if (createdDuringRecovery) {
+        this.#event(taskId, "task.review_rework_begun", continuation, at);
+        this.#event(taskId, "task.transition", { from: "reviewing", to: "revision", reason: "review requested changes", continuationId: continuation.id }, at);
+        this.#event(taskId, "task.transition", { from: "revision", to: "running", reason: "starting review revision", continuationId: continuation.id }, at);
+      }
+      this.#db.prepare(`INSERT INTO rework_continuation_claims(id,task_id,continuation_id,prior_claim_generation_id,claim_generation_id,
+          owner,lease_expires_at,prior_claim_id,identity,git_state,payload,claimed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(checkpointId, taskId, continuation.id, priorGenerationId, this.#startupGeneration.id, owner, expires,
+          priorClaimId ?? null, identityJson, gitStateJson, claimJson, at);
+      this.#event(taskId, "task.review_rework_claimed", claim, at);
+      this.#event(taskId, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2,
+        generationId: this.#startupGeneration.id, recovery: "review_rework" }, at);
+      this.#event(taskId, "task.review_rework_recovered", { continuationId: continuation.id, claimId: checkpointId,
+        packageId: continuation.packageId, verdictId: continuation.verdictId, priorGenerationId,
+        generationId: this.#startupGeneration.id, owner, writerStarted }, at);
+      claimed = claim;
+    });
+    return claimed;
   }
 
   /** Persist all deterministic commit inputs before the caller creates a Git object or moves a ref. */

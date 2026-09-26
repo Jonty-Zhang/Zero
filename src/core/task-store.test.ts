@@ -30,9 +30,10 @@ test("file-backed task store reopens with WAL and FULL synchronous mode", async 
 });
 
 function reviewFixture(checks = [{ id: "unit", argv: ["node", "test.js"] }], leaseMs = 60_000, path = ":memory:",
-  startup?: import("./task-store.js").StartupGenerationAttestation) {
+  startup?: import("./task-store.js").StartupGenerationAttestation, maxRevisions?: number) {
   const store = new TaskStore(path, startup);
-  const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "review package", checks }, "review_package_store_test");
+  const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "review package", checks,
+    ...(maxRevisions === undefined ? {} : { maxRevisions }) }, "review_package_store_test");
   const owner = "review-worker";
   const claimed = store.claimNext(owner, leaseMs)!;
   const generationId = claimed.claimGenerationId!;
@@ -176,6 +177,211 @@ function reviewRecoveryInput(f: ReturnType<typeof reviewFixture>, observed: unkn
   const observedValue = observed as { info: Record<string, unknown>; commonGitDir: string };
   return { now: at, identity: { checkedAt: at.toISOString(), observed: { ...observedValue, head: state.head, fingerprint: "c".repeat(64) }, fingerprint: "c".repeat(64) }, gitState: state };
 }
+
+function finishChangesRequested(f: ReturnType<typeof reviewFixture>, packageId: string) {
+  const task = f.store.get(f.task.id)!;
+  const attempt = startBoundReviewAttempt(f, packageId);
+  return f.store.finishPackageReview({ packageId, attemptId: attempt.id, owner: task.leaseOwner ?? f.owner,
+    generationId: task.claimGenerationId ?? f.generationId,
+    recheckedSnapshot: f.store.getReviewPackage(packageId)!.snapshot,
+    result: { verdict: "changes_requested", summary: "Please revise this implementation.",
+      findings: [{ severity: "medium", evidence: "The edge case is not handled.", requestedChange: "Handle the empty input case." }] },
+    attemptResult: { exitCode: 0 } });
+}
+
+function reviewReworkRecoveryInput(f: ReturnType<typeof reviewFixture>, observed: unknown, at: Date,
+  snapshot = f.snapshot, changedPaths: string[] = []) {
+  const observedValue = observed as { info: Record<string, unknown>; commonGitDir: string };
+  const identity = { checkedAt: at.toISOString(), observed: { ...observedValue, head: snapshot.preHead, fingerprint: "c".repeat(64) }, fingerprint: "c".repeat(64) };
+  return { now: at, identity, gitState: { checkedAt: at.toISOString(), branchRef: `refs/heads/zero/${f.task.id}`,
+    head: snapshot.preHead, snapshot, changedPaths, allowedPathsVerified: true as const } };
+}
+
+test("beginReviewRework consumes a changes-requested verdict and increments the revision only once", () => {
+  const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, ":memory:", undefined, 1);
+  try {
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const task = f.store.get(f.task.id)!;
+    const input = { packageId: pkg.id, verdictId: verdict.id, owner: f.owner, generationId: f.generationId };
+    const begun = f.store.beginReviewRework(f.task.id, input);
+    assert.equal(begun.kind, "started");
+    if (begun.kind !== "started") return;
+    assert.equal(begun.continuation.packageId, pkg.id);
+    assert.equal(begun.continuation.verdictId, verdict.id);
+    assert.equal(begun.continuation.revisionBefore, 0);
+    assert.equal(begun.continuation.revisionAfter, 1);
+    assert.equal(begun.task.status, "running");
+    assert.equal(begun.task.revisionCount, 1);
+    const repeated = f.store.beginReviewRework(f.task.id, input);
+    assert.equal(repeated.kind, "started");
+    if (repeated.kind === "started") assert.equal(repeated.continuation.id, begun.continuation.id);
+    assert.equal(f.store.get(f.task.id)?.revisionCount, 1);
+    assert.deepEqual(f.store.events(f.task.id).filter(event => event.type === "task.transition").slice(-2)
+      .map(event => (event.payload as { to: string }).to), ["revision", "running"]);
+    const progress = f.store.checkpointReviewRework(f.task.id, begun.continuation.id,
+      { owner: f.owner, generationId: f.generationId }, { phase: "route_started", checkpoint: { routeAttempt: "started" } });
+    assert.equal(progress.phase, "route_started");
+    assert.equal(f.store.reviewReworkProgress(f.task.id, begun.continuation.id)[0]?.id, progress.id);
+  } finally { f.store.close(); }
+});
+
+test("beginReviewRework records a terminal failure when the revision budget is exhausted", () => {
+  const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, ":memory:", undefined, 0);
+  try {
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const result = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: f.owner, generationId: f.generationId });
+    assert.equal(result.kind, "revision_limit");
+    assert.equal(result.task.status, "failed");
+    assert.equal(result.task.revisionCount, 0);
+    assert.match(result.reason, /after 0 content revisions/);
+    assert.equal(f.store.getReviewReworkContinuation(f.task.id), undefined);
+  } finally { f.store.close(); }
+});
+
+test("guardian recovery consumes a changes-requested verdict if the worker crashed before beginReviewRework", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-rework-before-begin-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "b".repeat(64);
+  const g0 = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
+  const g1 = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" }, 1);
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    finishChangesRequested(f, pkg.id);
+    assert.equal(f.store.getReviewReworkContinuation(f.task.id), undefined);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const recovered = f.store.claimReviewReworkContinuation(f.task.id, "rework-recovery-g1",
+      reviewReworkRecoveryInput(f, observed, new Date()));
+    assert.ok(recovered);
+    assert.equal(f.store.get(f.task.id)?.status, "running");
+    assert.equal(f.store.get(f.task.id)?.revisionCount, 1);
+    assert.equal(f.store.get(f.task.id)?.claimGenerationId, g1);
+    const continuation = f.store.getReviewReworkContinuation(f.task.id)!;
+    assert.equal(continuation.packageId, pkg.id);
+    assert.equal(continuation.owner, f.owner);
+    assert.equal(continuation.revisionAfter, 1);
+    assert.equal(recovered.priorClaimGenerationId, g0);
+    assert.equal(recovered.claimGenerationId, g1);
+    assert.equal(f.store.claimReviewReworkContinuation(f.task.id, "double-claimant",
+      reviewReworkRecoveryInput(f, observed, new Date())), undefined);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("guardian recovery resumes a rework after a writer completed by binding fresh changed paths", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-rework-after-writer-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "c".repeat(64);
+  const g0 = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
+  const g1 = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
+  const g2 = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" }, 1);
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const begun = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: f.owner, generationId: g0 });
+    assert.equal(begun.kind, "started");
+    if (begun.kind !== "started") return;
+    const writerStage = f.store.createStage(f.task.id, { role: "revise", processStartId: "rework-writer-g0", harness: "zcode", model: "model-x" });
+    f.store.startStage(writerStage.id, f.owner, "rework-writer-g0");
+    f.store.checkpointReviewRework(f.task.id, begun.continuation.id, { owner: f.owner, generationId: g0 },
+      { phase: "writer_started", stageId: writerStage.id, checkpoint: { attempt: 1 } });
+    const attempt = f.store.createAttempt(f.task.id, "revise", { owner: f.owner, stageId: writerStage.id, harness: "zcode", model: "model-x" });
+    f.store.finishAttempt(attempt.id, { status: "succeeded" }, { owner: f.owner, processStartId: "rework-writer-g0" });
+    f.store.finishStage(writerStage.id, f.owner, "rework-writer-g0", "succeeded", "changed-tree");
+    f.store.checkpointReviewRework(f.task.id, begun.continuation.id, { owner: f.owner, generationId: g0 },
+      { phase: "writer_finished", stageId: writerStage.id, checkpoint: { outputFingerprint: "changed-tree" } });
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const changedDiff = `${f.snapshot.diff}\n+reworked\n`;
+    const changedSnapshot = { ...f.snapshot, fingerprint: "changed-tree", diff: changedDiff,
+      diffHash: createHash("sha256").update(changedDiff, "utf8").digest("hex") };
+    const recovered = f.store.claimReviewReworkContinuation(f.task.id, "rework-recovery-g1",
+      reviewReworkRecoveryInput(f, observed, new Date(), changedSnapshot, ["a.ts"]));
+    assert.ok(recovered);
+    assert.equal(recovered.continuationId, begun.continuation.id);
+    assert.equal(f.store.get(f.task.id)?.status, "running");
+    assert.equal(f.store.get(f.task.id)?.revisionCount, 1);
+    assert.equal(f.store.reviewReworkProgress(f.task.id, begun.continuation.id).at(-1)?.phase, "writer_finished");
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g2, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const recoveredAgain = f.store.claimReviewReworkContinuation(f.task.id, "rework-recovery-g2",
+      reviewReworkRecoveryInput(f, observed, new Date(), changedSnapshot, ["a.ts"]));
+    assert.ok(recoveredAgain);
+    assert.equal(recoveredAgain.priorClaimGenerationId, g1);
+    assert.equal(recoveredAgain.claimGenerationId, g2);
+    const recoveredClaims = new DatabaseSync(path);
+    try {
+      assert.equal((recoveredClaims.prepare("SELECT COUNT(*) AS n FROM rework_continuation_claims WHERE continuation_id=?")
+        .get(begun.continuation.id) as { n: number }).n, 2);
+    } finally { recoveredClaims.close(); }
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("partial G0 writer recovery allows a G2 retry when G1 starts no new writer", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-rework-g0-writer-g2-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "d".repeat(64);
+  const g0 = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
+  const g1 = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
+  const g2 = "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" }, 1);
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const begun = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: f.owner, generationId: g0 });
+    assert.equal(begun.kind, "started");
+    if (begun.kind !== "started") return;
+    const writerStage = f.store.createStage(f.task.id, { role: "revise", processStartId: "partial-writer-g0", harness: "zcode", model: "model-x" });
+    f.store.startStage(writerStage.id, f.owner, "partial-writer-g0");
+    f.store.checkpointReviewRework(f.task.id, begun.continuation.id, { owner: f.owner, generationId: g0 },
+      { phase: "writer_started", stageId: writerStage.id, checkpoint: { attempt: 1 } });
+    f.store.createAttempt(f.task.id, "revise", { owner: f.owner, stageId: writerStage.id, harness: "zcode", model: "model-x" });
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const changedDiff = `${f.snapshot.diff}\n+partial\n`;
+    const changedSnapshot = { ...f.snapshot, fingerprint: "partial-tree", diff: changedDiff,
+      diffHash: createHash("sha256").update(changedDiff, "utf8").digest("hex") };
+    const g1Claim = f.store.claimReviewReworkContinuation(f.task.id, "rework-g1", reviewReworkRecoveryInput(
+      f, observed, new Date(), changedSnapshot, ["partial.ts"]));
+    assert.ok(g1Claim);
+    assert.equal(g1Claim.priorClaimGenerationId, g0);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g2, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const g2Claim = f.store.claimReviewReworkContinuation(f.task.id, "rework-g2", reviewReworkRecoveryInput(
+      f, observed, new Date(), changedSnapshot, ["partial.ts"]));
+    assert.ok(g2Claim);
+    assert.equal(g2Claim.priorClaimGenerationId, g1);
+    assert.equal(g2Claim.claimGenerationId, g2);
+    assert.equal(f.store.get(f.task.id)?.revisionCount, 1);
+    assert.equal(f.store.get(f.task.id)?.claimGenerationId, g2);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function pauseReviewQuota(f: ReturnType<typeof reviewFixture>, packageId: string, at = new Date()) {
   const attempt = startBoundReviewAttempt(f, packageId);
