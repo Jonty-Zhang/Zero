@@ -21,6 +21,7 @@ import { TaskRouter } from '../orchestrator/router.js';
 import { OpenAICompatibleCoordinator } from '../orchestrator/openai-compatible-coordinator.js';
 import { TaskReviewer } from '../orchestrator/reviewer.js';
 import { GoalReviewer } from '../orchestrator/goal-reviewer.js';
+import { buildGoalRevisionSubmission } from '../orchestrator/goal-revision.js';
 import { createTrustedCodexCwd } from '../orchestrator/trusted-codex-cwd.js';
 import { QuotaLimitError } from '../core/quota.js';
 import { TaskWorker } from '../orchestrator/worker.js';
@@ -150,11 +151,15 @@ export async function startZeroServer(options: { host?: string; port?: number } 
     },
   };
   const worker = new TaskWorker({ store, worktrees, testRunner, router, reviewer, adapters: new Map(Object.entries(adapters)), artifactRoot: resolve(dataRoot, 'artifacts') });
+  const warnedGoalRevisionAttempts = new Set<string>();
+  const goalRevisionRetryAfter = new Map<string, number>();
   const reviewReadySequences = async () => {
     for (const sequence of store.listSequences()) {
       if ((!sequence.objective && !sequence.acceptanceCriteria?.length) || !sequence.steps.length || sequence.steps.some(step => step.task.status !== 'done')) continue;
       const reviewRoot = resolve(dataRoot, 'artifacts', 'goal-review');
       const previous = store.sequenceGoalReview(sequence.id);
+      if (previous?.state === 'verdict' && previous.result?.verdict === 'changes_requested' &&
+        (goalRevisionRetryAfter.get(previous.attemptId) ?? 0) > Date.now()) continue;
       if (previous?.state === 'running' && previous.generationId === store.startupGeneration().id &&
         Date.parse(previous.createdAt) + 15 * 60_000 > Date.now()) continue;
       if (previous?.state === 'quota' && previous.retryAt && Date.parse(previous.retryAt) > Date.now()) continue;
@@ -169,7 +174,23 @@ export async function startZeroServer(options: { host?: string; port?: number } 
           result: goalBlockedResult(safeGoalBlockReason(error)) });
         return;
       }
-      if (previous?.evidenceFingerprint === before.fingerprint && previous.state === 'verdict') continue;
+      if (previous?.evidenceFingerprint === before.fingerprint && previous.state === 'verdict') {
+        if (previous.result?.verdict !== 'changes_requested') continue;
+        if (sequence.goalRevisionCount >= sequence.maxGoalRevisions) continue;
+        try {
+          const submission = buildGoalRevisionSubmission(sequence, previous);
+          store.appendSequenceGoalRevision(sequence.id, previous.attemptId, submission);
+          goalRevisionRetryAfter.delete(previous.attemptId);
+          return;
+        } catch {
+          goalRevisionRetryAfter.set(previous.attemptId, Date.now() + 5_000);
+          if (!warnedGoalRevisionAttempts.has(previous.attemptId)) {
+            warnedGoalRevisionAttempts.add(previous.attemptId);
+            console.warn('[zero] Aggregate goal remediation could not be appended safely.');
+          }
+          continue;
+        }
+      }
       if (previous?.evidenceFingerprint === before.fingerprint && previous.state === 'quota' && previous.retryAt && Date.parse(previous.retryAt) > Date.now()) continue;
       const attempt = store.startSequenceGoalReview(sequence.id, before.fingerprint);
       const cfg = await config.read();

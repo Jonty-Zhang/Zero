@@ -519,7 +519,8 @@ export class TaskStore {
         claim_generation_id TEXT REFERENCES startup_generations(id)
       );
       CREATE TABLE IF NOT EXISTS task_sequences (
-        id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, objective TEXT, acceptance_criteria TEXT
+        id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, objective TEXT, acceptance_criteria TEXT,
+        max_goal_revisions INTEGER NOT NULL DEFAULT 2 CHECK(max_goal_revisions BETWEEN 0 AND 5)
       );
       CREATE TABLE IF NOT EXISTS task_sequence_steps (
         sequence_id TEXT NOT NULL REFERENCES task_sequences(id), task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
@@ -532,6 +533,16 @@ export class TaskStore {
         result TEXT, retry_at TEXT, created_at TEXT NOT NULL, completed_at TEXT
       );
       CREATE INDEX IF NOT EXISTS task_sequence_goal_reviews_sequence ON task_sequence_goal_reviews(sequence_id,created_at,attempt_id);
+      CREATE TABLE IF NOT EXISTS task_sequence_goal_revisions (
+        sequence_id TEXT NOT NULL REFERENCES task_sequences(id),
+        review_attempt_id TEXT NOT NULL UNIQUE REFERENCES task_sequence_goal_reviews(attempt_id),
+        task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id), created_at TEXT NOT NULL,
+        PRIMARY KEY(sequence_id,review_attempt_id), UNIQUE(sequence_id,task_id)
+      );
+      CREATE TRIGGER IF NOT EXISTS task_sequence_goal_revisions_no_update BEFORE UPDATE ON task_sequence_goal_revisions
+        BEGIN SELECT RAISE(ABORT,'goal revision links are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS task_sequence_goal_revisions_no_delete BEFORE DELETE ON task_sequence_goal_revisions
+        BEGIN SELECT RAISE(ABORT,'goal revision links are immutable'); END;
       CREATE TABLE IF NOT EXISTS startup_generations (
         id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE, lock_id TEXT, predecessor_drained INTEGER NOT NULL CHECK(predecessor_drained IN (0,1)),
         member_verified INTEGER NOT NULL DEFAULT 0 CHECK(member_verified IN (0,1)), evidence_kind TEXT NOT NULL,
@@ -744,6 +755,7 @@ export class TaskStore {
     const sequenceColumns = this.#db.prepare("PRAGMA table_info(task_sequences)").all() as Array<{ name: string }>;
     if (!sequenceColumns.some(column => column.name === "objective")) this.#db.exec("ALTER TABLE task_sequences ADD COLUMN objective TEXT");
     if (!sequenceColumns.some(column => column.name === "acceptance_criteria")) this.#db.exec("ALTER TABLE task_sequences ADD COLUMN acceptance_criteria TEXT");
+    if (!sequenceColumns.some(column => column.name === "max_goal_revisions")) this.#db.exec("ALTER TABLE task_sequences ADD COLUMN max_goal_revisions INTEGER NOT NULL DEFAULT 2 CHECK(max_goal_revisions BETWEEN 0 AND 5)");
     const sequenceStepColumns = this.#db.prepare("PRAGMA table_info(task_sequence_steps)").all() as Array<{ name: string }>;
     if (!sequenceStepColumns.some(column => column.name === "effective_base_commit")) this.#db.exec("ALTER TABLE task_sequence_steps ADD COLUMN effective_base_commit TEXT");
     // Additive, idempotent migration: old attempts remain valid with a NULL stage_id.
@@ -1220,12 +1232,15 @@ export class TaskStore {
       metadata.acceptanceCriteria.length === 0 || metadata.acceptanceCriteria.some(item => typeof item !== "string" || !item.trim()))) {
       throw new Error("sequence acceptanceCriteria must contain non-empty strings when provided");
     }
+    if (metadata.maxGoalRevisions !== undefined && (!Number.isInteger(metadata.maxGoalRevisions) || metadata.maxGoalRevisions < 0 || metadata.maxGoalRevisions > 5)) {
+      throw new Error("sequence maxGoalRevisions must be an integer from 0 to 5");
+    }
     const acceptanceCriteria = metadata.acceptanceCriteria === undefined ? undefined : JSON.stringify(metadata.acceptanceCriteria);
     const at = new Date().toISOString();
     const taskIds = submissions.map(() => randomUUID());
     this.#transaction(() => {
-      this.#db.prepare("INSERT INTO task_sequences(id,created_at,updated_at,objective,acceptance_criteria) VALUES(?,?,?,?,?)")
-        .run(id, at, at, metadata.objective ?? null, acceptanceCriteria ?? null);
+      this.#db.prepare("INSERT INTO task_sequences(id,created_at,updated_at,objective,acceptance_criteria,max_goal_revisions) VALUES(?,?,?,?,?,?)")
+        .run(id, at, at, metadata.objective ?? null, acceptanceCriteria ?? null, metadata.maxGoalRevisions ?? 2);
       const insertTask = this.#db.prepare("INSERT INTO tasks(id,status,created_at,updated_at,payload) VALUES(?, 'pending', ?, ?, ?)");
       const insertStep = this.#db.prepare("INSERT INTO task_sequence_steps(sequence_id,task_id,position) VALUES(?,?,?)");
       for (const [position, submission] of submissions.entries()) {
@@ -1241,8 +1256,10 @@ export class TaskStore {
   }
 
   getSequence(id: string): ReviewedTaskSequenceRecord | undefined {
-    const sequence = this.#db.prepare("SELECT id,created_at,updated_at,objective,acceptance_criteria FROM task_sequences WHERE id=?").get(id) as
-      { id: string; created_at: string; updated_at: string; objective: string | null; acceptance_criteria: string | null } | undefined;
+    const sequence = this.#db.prepare(`SELECT id,created_at,updated_at,objective,acceptance_criteria,max_goal_revisions,
+      (SELECT COUNT(*) FROM task_sequence_goal_revisions r WHERE r.sequence_id=task_sequences.id) AS goal_revision_count
+      FROM task_sequences WHERE id=?`).get(id) as
+      { id: string; created_at: string; updated_at: string; objective: string | null; acceptance_criteria: string | null; max_goal_revisions: number; goal_revision_count: number } | undefined;
     if (!sequence) return undefined;
     const rows = this.#db.prepare(`SELECT s.position,s.effective_base_commit,t.* FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id
       WHERE s.sequence_id=? ORDER BY s.position`).all(id) as Array<TaskRow & { position: number; effective_base_commit: string | null }>;
@@ -1270,6 +1287,7 @@ export class TaskStore {
       id: sequence.id, status,
       ...(sequence.objective === null ? {} : { objective: sequence.objective }),
       ...(sequence.acceptance_criteria === null ? {} : { acceptanceCriteria: JSON.parse(sequence.acceptance_criteria) as string[] }),
+      maxGoalRevisions: Number(sequence.max_goal_revisions), goalRevisionCount: Number(sequence.goal_revision_count),
       createdAt: sequence.created_at,
       updatedAt: steps.reduce((latest, step) => step.task.updatedAt > latest ? step.task.updatedAt : latest, sequence.updated_at),
       steps,
@@ -1363,6 +1381,56 @@ export class TaskStore {
         { sequenceId: row.sequence_id, attemptId: row.attempt_id, evidenceFingerprint: row.evidence_fingerprint, verdict: result.verdict, summary: result.summary }, completedAt);
     });
     return this.sequenceGoalReviewByAttempt(input.attemptId)!;
+  }
+
+  /**
+   * Append one bounded remediation task for the latest aggregate changes_requested verdict.
+   * The task, ordered step, event, and immutable attempt link commit together.
+   */
+  appendSequenceGoalRevision(sequenceId: string, reviewAttemptId: string, submission: TaskSubmission,
+    taskId: string = randomUUID(), now = new Date()): TaskRecord {
+    validateExecutionStages(submission);
+    const at = now.toISOString();
+    return this.#transaction(() => {
+      const existing = this.#db.prepare("SELECT task_id FROM task_sequence_goal_revisions WHERE sequence_id=? AND review_attempt_id=?")
+        .get(sequenceId, reviewAttemptId) as { task_id: string } | undefined;
+      if (existing) return this.get(existing.task_id)!;
+
+      const sequence = this.#db.prepare("SELECT objective,acceptance_criteria,max_goal_revisions FROM task_sequences WHERE id=?").get(sequenceId) as
+        { objective: string | null; acceptance_criteria: string | null; max_goal_revisions: number } | undefined;
+      const review = this.#db.prepare("SELECT sequence_id,state,result FROM task_sequence_goal_reviews WHERE attempt_id=?").get(reviewAttemptId) as
+        { sequence_id: string; state: string; result: string | null } | undefined;
+      const latest = this.#db.prepare("SELECT attempt_id FROM task_sequence_goal_reviews WHERE sequence_id=? ORDER BY created_at DESC,attempt_id DESC LIMIT 1")
+        .get(sequenceId) as { attempt_id: string } | undefined;
+      if (!sequence || !review || review.sequence_id !== sequenceId || latest?.attempt_id !== reviewAttemptId || review.state !== "verdict" ||
+          !review.result || (JSON.parse(review.result) as ReviewResult).verdict !== "changes_requested") {
+        throw new Error("Goal revision requires the latest aggregate changes_requested verdict for this sequence");
+      }
+      if (sequence.objective === null && sequence.acceptance_criteria === null) throw new Error("Goal revision requires aggregate goal metadata");
+      const count = this.#db.prepare(`SELECT COUNT(*) AS n,SUM(CASE WHEN t.status='done' THEN 1 ELSE 0 END) AS done
+        FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id WHERE s.sequence_id=?`).get(sequenceId) as { n: number; done: number | null };
+      if (count.n < 2 || Number(count.done) !== Number(count.n)) {
+        throw new Error("Goal revision requires every current sequence step to be authoritatively DONE");
+      }
+      const revisionCount = Number((this.#db.prepare("SELECT COUNT(*) AS n FROM task_sequence_goal_revisions WHERE sequence_id=?").get(sequenceId) as { n: number }).n);
+      if (revisionCount >= Number(sequence.max_goal_revisions)) throw new Error("Goal revision limit reached");
+      const finalStep = this.#db.prepare(`SELECT t.id,t.payload FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id
+        WHERE s.sequence_id=? ORDER BY s.position DESC LIMIT 1`).get(sequenceId) as { id: string; payload: string } | undefined;
+      if (!finalStep || (JSON.parse(finalStep.payload) as TaskSubmission).repoPath !== submission.repoPath) {
+        throw new Error("Goal revision must target the final sequence step's repository");
+      }
+      const effectiveBaseCommit = this.#authoritativeResultCommit(finalStep.id);
+      const position = Number((this.#db.prepare("SELECT COALESCE(MAX(position),-1)+1 AS position FROM task_sequence_steps WHERE sequence_id=?").get(sequenceId) as { position: number }).position);
+      this.#db.prepare("INSERT INTO tasks(id,status,created_at,updated_at,payload) VALUES(?, 'pending', ?, ?, ?)")
+        .run(taskId, at, at, JSON.stringify(submission));
+      this.#db.prepare("INSERT INTO task_sequence_steps(sequence_id,task_id,position,effective_base_commit) VALUES(?,?,?,?)")
+        .run(sequenceId, taskId, position, effectiveBaseCommit);
+      this.#db.prepare("INSERT INTO task_sequence_goal_revisions(sequence_id,review_attempt_id,task_id,created_at) VALUES(?,?,?,?)")
+        .run(sequenceId, reviewAttemptId, taskId, at);
+      this.#event(taskId, "task.submitted", { submission, sequenceId, sequencePosition: position, goalReviewAttemptId: reviewAttemptId }, at);
+      this.#event(taskId, "task_sequence.goal_revision_appended", { sequenceId, reviewAttemptId, taskId, position, effectiveBaseCommit }, at);
+      return this.get(taskId)!;
+    });
   }
 
   sequenceGoalReviewByAttempt(attemptId: string): SequenceGoalReviewRecord | undefined {

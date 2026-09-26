@@ -237,6 +237,7 @@ test('POST /api/sequences validates the full batch before atomically persisting 
       body: JSON.stringify({
         objective: 'Deliver the parser improvement',
         acceptanceCriteria: ['All ordered steps finish', 'Aggregate behavior is checked'],
+        maxGoalRevisions: 3,
         tasks: [task('First, inspect the current parser.'), task('Then, implement UTF-8 validation.'), task('Finally, document the behavior.')],
       }),
     });
@@ -244,11 +245,14 @@ test('POST /api/sequences validates the full batch before atomically persisting 
     assert.equal(f.adapter.probeCalls, 2, 'the second POST adds only one more adapter probe set regardless of step count');
     const created = await createdResponse.json() as {
       id: string; status: string; objective: string; acceptanceCriteria: string[];
+      maxGoalRevisions: number; goalRevisionCount: number;
       steps: Array<{ position: number; task: { id: string; status: string; title: string; repoPath: string } }>;
     };
     assert.equal(created.status, 'queued');
     assert.equal(created.objective, 'Deliver the parser improvement');
     assert.deepEqual(created.acceptanceCriteria, ['All ordered steps finish', 'Aggregate behavior is checked']);
+    assert.equal(created.maxGoalRevisions, 3);
+    assert.equal(created.goalRevisionCount, 0);
     assert.deepEqual(created.steps.map(step => step.position), [0, 1, 2]);
     assert.deepEqual(created.steps.map(step => step.task.title), [
       'First, inspect the current parser.', 'Then, implement UTF-8 validation.', 'Finally, document the behavior.',
@@ -265,11 +269,31 @@ test('POST /api/sequences validates the full batch before atomically persisting 
     assert.deepEqual(await detailResponse.json(), created);
     const listResponse = await fetch(`${f.url}/api/sequences`);
     assert.equal(listResponse.status, 200);
-    const listed = await listResponse.json() as Array<{ id: string; objective: string; steps: unknown[] }>;
+    const listed = await listResponse.json() as Array<{ id: string; objective: string; maxGoalRevisions: number; goalRevisionCount: number; steps: unknown[] }>;
     assert.equal(listed.length, 1);
     assert.equal(listed[0]?.id, created.id);
     assert.equal(listed[0]?.objective, 'Deliver the parser improvement');
+    assert.equal(listed[0]?.maxGoalRevisions, 3);
+    assert.equal(listed[0]?.goalRevisionCount, 0);
     assert.equal(listed[0]?.steps.length, 3);
+  } finally { await f.close(); }
+});
+
+test('POST /api/sequences validates maxGoalRevisions as an integer from 0 through 5', async () => {
+  const f = await createFixture();
+  try {
+    const task = (prompt: string) => ({ repoPath: f.repoPath, baseRef: 'main', prompt });
+    for (const value of [-1, 6, 1.5, '2', null]) {
+      const response = await fetch(`${f.url}/api/sequences`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ maxGoalRevisions: value, tasks: [task('A valid first step.'), task('A valid second step.')] }),
+      });
+      assert.equal(response.status, 400, `value ${String(value)} must be rejected`);
+      assert.match((await response.json() as { error: string }).error, /maxGoalRevisions/);
+    }
+    assert.equal(f.store.listSequences().length, 0);
+    assert.equal(f.store.list().length, 0);
+    assert.equal(f.adapter.probeCalls, 0, 'the cap is validated before capability probes and persistence');
   } finally { await f.close(); }
 });
 

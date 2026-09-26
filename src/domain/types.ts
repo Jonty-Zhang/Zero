@@ -45,6 +45,8 @@ export interface TaskSequenceMetadata {
   objective?: string;
   /** User-authored goal-level criteria; these require aggregate verification beyond task completion. */
   acceptanceCriteria?: string[];
+  /** Maximum automatic aggregate-goal remediation tasks appended after changes_requested reviews. */
+  maxGoalRevisions?: number;
 }
 
 export interface TaskSequenceStep {
@@ -59,6 +61,8 @@ export interface TaskSequenceRecord {
   status: TaskSequenceStatus;
   objective?: string;
   acceptanceCriteria?: string[];
+  maxGoalRevisions: number;
+  goalRevisionCount: number;
   createdAt: string;
   updatedAt: string;
   steps: TaskSequenceStep[];

@@ -139,6 +139,12 @@ async function parseSequence(raw: unknown, options: ZeroServerOptions): Promise<
     throw new HttpError(400, `tasks 必须包含 2 到 ${MAX_SEQUENCE_STEPS} 个任务`);
   }
   const metadata: TaskSequenceMetadata = {};
+  if (input.maxGoalRevisions !== undefined) {
+    if (!Number.isInteger(input.maxGoalRevisions) || (input.maxGoalRevisions as number) < 0 || (input.maxGoalRevisions as number) > 5) {
+      throw new HttpError(400, 'maxGoalRevisions 必须是 0 到 5 之间的整数');
+    }
+    metadata.maxGoalRevisions = input.maxGoalRevisions as number;
+  }
   if (input.objective !== undefined && input.objective !== null && input.objective !== '') {
     metadata.objective = stringField(input.objective, 'objective', 1, 10_000);
   }
@@ -432,6 +438,8 @@ function mapSequence(sequence: TaskSequenceRecord & { goalReview?: SequenceGoalR
     status: sequence.status,
     objective: sequence.objective,
     acceptanceCriteria: sequence.acceptanceCriteria,
+    maxGoalRevisions: sequence.maxGoalRevisions,
+    goalRevisionCount: sequence.goalRevisionCount,
     createdAt: sequence.createdAt,
     updatedAt: sequence.updatedAt,
     blockedReason: sequence.blockedReason,

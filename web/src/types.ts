@@ -69,6 +69,8 @@ export type SequenceGoalReview = {
 export type TaskSequence = {
   id: string;
   status: TaskSequenceStatus;
+  maxGoalRevisions: number;
+  goalRevisionCount: number;
   objective?: string;
   acceptanceCriteria?: string[];
   goalReview?: SequenceGoalReview;

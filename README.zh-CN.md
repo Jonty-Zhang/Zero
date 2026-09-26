@@ -65,6 +65,7 @@ node dist/cli.js sequence <sequence-id>
 {
   "objective": "为应用添加账户恢复功能",
   "acceptanceCriteria": ["用户可以申请恢复", "恢复链接会安全过期"],
+  "maxGoalRevisions": 2,
   "tasks": [
     {
       "repoPath": "ABSOLUTE_PATH_TO_GIT_REPOSITORY",
@@ -87,7 +88,7 @@ node dist/cli.js sequence <sequence-id>
 }
 ```
 
-请将仓库路径和绑定占位符替换为实际值。手动指定的 Harness、模型和思考强度组合必须当前可用并已验证；步骤按文件中的顺序保存。同一仓库中的后续步骤从前一步的已验证结果提交开始。提供整体目标信息时，所有步骤完成后 Zero 会运行汇总 Codex 验收，并在序列 API 和界面中展示当前状态与结果。验收 `PASS` 后状态为 `completed`；`changes_requested` 或 `blocked` 会使序列保持阻塞，额度等待会显示为 `waiting`。真实目标验收流程仍未验证，发现也不会自动触发目标级返工。
+请将仓库路径和绑定占位符替换为实际值。手动指定的 Harness、模型和思考强度组合必须当前可用并已验证；步骤按文件中的顺序保存。同一仓库中的后续步骤从前一步的已验证结果提交开始。提供整体目标信息时，所有步骤完成后 Zero 会运行汇总 Codex 验收，并在序列 API 和界面中展示当前状态与结果。验收 `PASS` 后状态为 `completed`；`changes_requested` 可触发自动追加的整体目标返工任务，最多为 `maxGoalRevisions` 次（默认 `2`，允许范围 `0`–`5`），`goalRevisionCount` 展示已使用次数。返工上限用尽仍未通过时，序列保持阻塞并显示原因；`blocked` 也会使序列保持阻塞，额度等待会显示为 `waiting`。`maxGoalRevisions` 与每个任务的 `maxRevisions` 相互独立。自动目标返工已有自动化覆盖，但真实端到端验收和返工流程尚未验证。
 
 如需在单个任务内提交有序执行阶段，可通过 `--stages-file` 指定 JSON 数组。每个阶段可按需设置 `harnessId`、`modelId` 和 `reasoningEffort`；未指定的字段仍由当前分配器补全。现有的 `--harness`、`--model` 和 `--effort` 选项会设置任务级默认值，阶段中单独指定的字段可以覆盖默认值。每个阶段的最终选择都必须匹配当前可用且已在本机验证的绑定。
 
