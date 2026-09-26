@@ -1,12 +1,12 @@
 # ZCode 现有桌面提供方接入决策
 
-状态：实施设计，2026-09-25。现有 `isolated_config` CLI 绑定仍是 Zero 自己管理的隔离配置；它不能代表用户已经在 ZCode 桌面界面接好的 GLM 和 DeepSeek。
+状态：实施与诊断记录，2026-09-27。现有 `isolated_config` CLI 绑定仍是 Zero 自己管理的隔离配置；它不能代表用户已经在 ZCode 桌面界面接好的 GLM 和 DeepSeek。
 
 ## 身份与边界
 
 每个执行绑定都须包含 `harness=zcode`、Zero 内部模型 ID、ZCode 协议的精确 `providerId/modelId`、可选且独立验证的思考等级、CLI 版本、验证证据。一个 Harness 对应多个模型。配置新增 `app_server_existing_desktop` selector，表示 Zero 启动自己的 app-server 进程、使用现有桌面 profile 的提供方，但不搬运、覆盖或解析桌面凭据/模型默认配置。`isolated_config` 继续作为另一种显式选择，不能悄悄回退到它。
 
-从 `session/create.settings.model.available[]` 读取目录的诊断仍未成功，因此当前命令**不以目录为验证证据**。用户必须在 Zero 本地注册表中明确填写精确的 `providerId/modelId`；显示名、GLM/DeepSeek 字样或当前 ZCode 界面选中项均不能代替这两个 ID。同名模型可能属于不同提供方。一次 nonce 成功只证明向该 tuple 发出的请求得到响应，不能独立确认实际服务模型或计费来源，所以记录仅为 `selector_only`。思考等级当前保持禁用，不能从界面选项推断为已验证。
+`session/create.settings.model.available[]` 的空会话目录诊断现已成功，但目录本身仍**不作为执行绑定的验证证据**。用户必须在 Zero 本地注册表中明确填写精确的 `providerId/modelId`；显示名、GLM/DeepSeek 字样或当前 ZCode 界面选中项均不能代替这两个 ID。同名模型可能属于不同提供方。一次 nonce 成功只证明向该 tuple 发出的请求得到响应，不能独立确认实际服务模型或计费来源，所以记录仅为 `selector_only`。思考等级当前保持禁用，不能从界面选项推断为已验证。
 
 ## 进程与验证
 
@@ -21,6 +21,8 @@
 
 ## 当前实测与下一步
 
-本机 0.16.9 的空会话目录探测没有得到 session snapshot；现有记录只证明请求在返回前失败、进程正常退出、没有模型请求，**不能**区分偏好回执、会话创建或目录初始化哪一步出错。当前 nonce 绑定命令和适配器仅经过 fake peer 测试，本机尚无成功的真实绑定。用户指定的 Start Plan GLM-5.3-Flash 因精确提供方 tuple 未确认而不调用；按用户要求，直接调用不可用时保留手动转发。后续逐个验证 ZCode 的其他 GLM/DeepSeek 组合，不共用一个模型的 nonce 证据。
+本机 0.16.9 的 GUI 安装把 CLI 放在 `resources/glm`、内置 Provider 文件放在兄弟目录 `resources/config/provider`；CLI 自身的两个默认候选路径没有覆盖这个布局，导致它在协议握手前以退出码 1 结束。Zero 现在只在发现该随安装包提供的文件时，向独立子进程传入内置文件和对应 profile 的个人 Provider 文件路径，不读取或复制配置内容。隔离模式还须给 Windows 的 `APPDATA`、`LOCALAPPDATA`、`USERPROFILE`、`HOME` 提供 Zero 自有的有效目录；空值会使 ZCode 的 `uv_os_homedir` 初始化失败。修复后，隔离 profile 完成偏好回执和空会话创建；现有桌面 profile 的无模型诊断也完成空会话创建，返回 4 项可用模型，诊断前后个人 Provider 文件哈希一致。
+
+这些诊断没有发送模型输入，不能证明任何 GLM 或 DeepSeek 绑定可执行。当前 nonce 绑定命令和实际任务执行仍未获得本机真实模型回合的验收。用户指定的 Start Plan GLM-5.3-Flash 因精确提供方 tuple 和可用额度未确认而不调用；按用户要求，直接调用不可用时保留手动转发。后续逐个验证 ZCode 的其他 GLM/DeepSeek 组合，不共用一个模型的 nonce 证据。
 
 验收测试须覆盖目录缺失/重复/禁用、同名不同提供方、思考等级不支持、错误 nonce、超时、额度失败、反向权限请求、进程退出不确定、版本变化、旧绑定保留、Router 在验证前后候选变化、两个 ZCode 模型在同一任务 worktree 串行接力。

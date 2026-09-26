@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { access, mkdir, realpath, stat } from 'node:fs/promises';
-import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { ZCodeProtocolPeer } from './zcode-protocol-session.js';
 
@@ -172,6 +173,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     try {
       validateOptions(options);
       await access(options.entry);
+      const bundledProviderConfig = await findBundledProviderConfig(options.entry);
       const taskStat = await stat(options.taskWorktree);
       if (!taskStat.isDirectory()) throw new Error('ZCode taskWorktree must be an existing directory');
       if (options.profileMode === 'isolated') {
@@ -188,11 +190,17 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
         if (realWorktree === realDataDir || isPathInside(realWorktree, realDataDir) || isPathInside(realDataDir, realWorktree)) {
           throw new Error('ZCode app data directory resolves inside the task worktree');
         }
+        const profileDirectories = isolatedProfileDirectories(realDataDir);
+        await Promise.all(Object.values(profileDirectories).map(path => mkdir(path, { recursive: true })));
+        const realProfileDirectories = await Promise.all(Object.values(profileDirectories).map(path => realpath(path)));
+        if (realProfileDirectories.some(path => !isPathInside(realDataDir, path))) {
+          throw new Error('ZCode profile directories resolve outside the Zero-owned data directory');
+        }
       }
 
       const child = spawn(process.execPath, [options.entry, 'app-server'], {
         cwd: options.taskWorktree,
-        env: childEnvironment(options.profileMode, options.dataBaseDir),
+        env: childEnvironment(options.profileMode, options.dataBaseDir, bundledProviderConfig),
         shell: false,
         windowsHide: true,
         stdio: 'pipe',
@@ -836,7 +844,30 @@ function hasSafeSendTextExecution(value: unknown): boolean {
     subagents.foregroundModel === 'submission' && subagents.background === 'deny');
 }
 
-function childEnvironment(profileMode: ZCodeAppServerPeerOptions['profileMode'], dataBaseDir?: string): NodeJS.ProcessEnv {
+async function findBundledProviderConfig(entry: string): Promise<string | undefined> {
+  // Packaged ZCode places its CLI in resources/glm and the built-in provider
+  // config in the sibling resources/config/provider directory.
+  try {
+    const realEntry = await realpath(entry);
+    const resourcesDir = resolve(dirname(realEntry), '..');
+    const candidate = resolve(resourcesDir, 'config', 'provider', 'zcode-builtin.json');
+    const [realResourcesDir, configStat, realConfig] = await Promise.all([
+      realpath(resourcesDir),
+      stat(candidate),
+      realpath(candidate),
+    ]);
+    if (!configStat.isFile() || !isPathInside(realResourcesDir, realConfig)) return undefined;
+    return realConfig;
+  } catch {
+    return undefined;
+  }
+}
+
+function childEnvironment(
+  profileMode: ZCodeAppServerPeerOptions['profileMode'],
+  dataBaseDir?: string,
+  bundledProviderConfig?: string,
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   const allowed = ['PATH', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP'];
   const proxyNames = [
@@ -853,12 +884,11 @@ function childEnvironment(profileMode: ZCodeAppServerPeerOptions['profileMode'],
     if (value !== undefined) env[key] = value;
   }
   if (profileMode === 'isolated') {
-    // Node on Windows synthesizes USERPROFILE even when omitted from env; blank
-    // all profile locators so ZCode cannot accidentally fall back to the desktop.
-    env.APPDATA = '';
-    env.LOCALAPPDATA = '';
-    env.USERPROFILE = '';
-    env.HOME = '';
+    const profileDirectories = isolatedProfileDirectories(dataBaseDir!);
+    env.APPDATA = profileDirectories.APPDATA;
+    env.LOCALAPPDATA = profileDirectories.LOCALAPPDATA;
+    env.USERPROFILE = profileDirectories.USERPROFILE;
+    env.HOME = profileDirectories.HOME;
   } else {
     for (const variants of proxyNames) {
       const found = variants.filter(key => process.env[key] !== undefined);
@@ -871,7 +901,24 @@ function childEnvironment(profileMode: ZCodeAppServerPeerOptions['profileMode'],
     }
   }
   if (profileMode === 'isolated' && dataBaseDir) env.ZCODE_DATA_BASE_DIR = resolve(dataBaseDir);
+  if (bundledProviderConfig) {
+    const personalDataRoot = profileMode === 'isolated'
+      ? resolve(dataBaseDir!)
+      : resolve(process.env.ZCODE_DATA_BASE_DIR?.trim() || homedir());
+    env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = bundledProviderConfig;
+    env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = join(personalDataRoot, '.zcode', 'v2', 'provider_config.json');
+  }
   return env;
+}
+
+function isolatedProfileDirectories(dataBaseDir: string): Record<'APPDATA' | 'LOCALAPPDATA' | 'USERPROFILE' | 'HOME', string> {
+  const root = resolve(dataBaseDir);
+  return {
+    APPDATA: join(root, 'AppData', 'Roaming'),
+    LOCALAPPDATA: join(root, 'AppData', 'Local'),
+    USERPROFILE: join(root, 'profile'),
+    HOME: join(root, 'home'),
+  };
 }
 
 function isPathInside(parent: string, child: string): boolean {

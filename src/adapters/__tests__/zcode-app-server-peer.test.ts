@@ -165,6 +165,12 @@ rl.on('line', raw => {
   if (method === 'test/env') {
     respond(id, {
       dataBaseDir: process.env.ZCODE_DATA_BASE_DIR,
+      appDataDir: process.env.APPDATA,
+      localAppDataDir: process.env.LOCALAPPDATA,
+      userProfileDir: process.env.USERPROFILE,
+      homeDir: process.env.HOME,
+      builtinProviderConfig: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,
+      personalProviderConfig: process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE,
       hasUserHome: Boolean(process.env.USERPROFILE || process.env.HOME),
       hasZcodeHome: Boolean(process.env.ZCODE_HOME),
       hasSecret: Boolean(process.env.ZERO_PEER_TEST_SECRET),
@@ -196,6 +202,20 @@ rl.on('line', raw => {
 });
 rl.on('close', () => {
   if (mode === 'delayed-close') setTimeout(() => process.exit(0), 350);
+});
+`;
+
+const CONFIG_ENV_SERVER_SOURCE = String.raw`
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', raw => {
+  const request = JSON.parse(raw);
+  if (request.method === 'test/provider-config-env') {
+    process.stdout.write(JSON.stringify({ id: request.id, result: {
+      builtin: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,
+      personal: process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE,
+    } }) + '\n');
+  }
 });
 `;
 
@@ -247,8 +267,13 @@ test('public request rejects raw session send/stop and arbitrary methods', async
 });
 
 test('stdio peer matches out-of-order RPC responses and uses isolated env/absolute entry', async () => {
-  const oldSecret = process.env.ZERO_PEER_TEST_SECRET;
+  const keys = ['ZERO_PEER_TEST_SECRET', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'HOME'];
+  const previous = new Map(keys.map(key => [key, process.env[key]]));
   process.env.ZERO_PEER_TEST_SECRET = 'not-forwarded';
+  process.env.APPDATA = 'C:/original-profile/appdata';
+  process.env.LOCALAPPDATA = 'C:/original-profile/localappdata';
+  process.env.USERPROFILE = 'C:/original-profile/user';
+  process.env.HOME = 'C:/original-profile/home';
   try {
     await withFakeServer(async (peer, dirs) => {
       const [slow, fast, env] = await Promise.all([
@@ -259,14 +284,24 @@ test('stdio peer matches out-of-order RPC responses and uses isolated env/absolu
       assert.equal(slow.value, 'slow');
       assert.equal(fast.value, 'fast');
       assert.equal(env.dataBaseDir, dirs.dataBaseDir);
-      assert.equal(env.hasUserHome, false);
+      assert.equal(env.appDataDir, join(dirs.dataBaseDir, 'AppData', 'Roaming'));
+      assert.equal(env.localAppDataDir, join(dirs.dataBaseDir, 'AppData', 'Local'));
+      assert.equal(env.userProfileDir, join(dirs.dataBaseDir, 'profile'));
+      assert.equal(env.homeDir, join(dirs.dataBaseDir, 'home'));
+      assert.notEqual(env.appDataDir, 'C:/original-profile/appdata');
+      assert.notEqual(env.localAppDataDir, 'C:/original-profile/localappdata');
+      assert.notEqual(env.userProfileDir, 'C:/original-profile/user');
+      assert.notEqual(env.homeDir, 'C:/original-profile/home');
+      assert.equal(env.hasUserHome, true);
       assert.equal(env.hasZcodeHome, false);
       assert.equal(env.hasSecret, false);
       assert.equal(env.appServerArg, 'app-server');
     });
   } finally {
-    if (oldSecret === undefined) delete process.env.ZERO_PEER_TEST_SECRET;
-    else process.env.ZERO_PEER_TEST_SECRET = oldSecret;
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 
@@ -440,6 +475,8 @@ test('existing-desktop mode forwards only profile location and proxy variables w
       assert.equal(env.hasDesktopProfile, true);
       assert.equal(env.hasProxy, true);
       assert.equal(env.hasZcodeHome, false);
+      assert.equal(env.builtinProviderConfig, undefined);
+      assert.equal(env.personalProviderConfig, undefined);
     } finally {
       await peer.close();
       await rm(root, { recursive: true, force: true });
@@ -449,6 +486,71 @@ test('existing-desktop mode forwards only profile location and proxy variables w
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+  }
+});
+
+test('bundled provider config discovery passes profile-scoped paths only when the sibling file exists', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'zero-zcode-peer-provider-config-'));
+  const resources = join(root, 'resources');
+  const entryDir = join(resources, 'glm');
+  const configDir = join(resources, 'config', 'provider');
+  const worktree = join(root, 'task-worktree');
+  const zeroDataRoot = join(root, 'zero-owned-data');
+  const dataBaseDir = join(zeroDataRoot, 'zcode');
+  const entry = join(entryDir, 'zcode.cjs');
+  const builtin = join(configDir, 'zcode-builtin.json');
+  await mkdir(entryDir, { recursive: true });
+  await mkdir(configDir, { recursive: true });
+  await mkdir(worktree);
+  await writeFile(entry, CONFIG_ENV_SERVER_SOURCE, 'utf8');
+  // The fixture is deliberately a placeholder; the adapter must only pass its path.
+  await writeFile(builtin, '{}', 'utf8');
+
+  const peer = await ZCodeAppServerPeer.launch({
+    entry,
+    taskWorktree: worktree,
+    profileMode: 'isolated',
+    zeroDataRoot,
+    dataBaseDir,
+  });
+  try {
+    const paths = await debugRequest(peer, 'test/provider-config-env') as { builtin?: string; personal?: string };
+    assert.equal(paths.builtin, builtin);
+    assert.equal(paths.personal, join(dataBaseDir, '.zcode', 'v2', 'provider_config.json'));
+  } finally {
+    try { await peer.close(); }
+    finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test('existing-desktop provider config path uses configured data root when bundled config exists', async () => {
+  const previous = process.env.ZCODE_DATA_BASE_DIR;
+  const root = await mkdtemp(join(tmpdir(), 'zero-zcode-peer-provider-desktop-'));
+  const resources = join(root, 'resources');
+  const entryDir = join(resources, 'glm');
+  const configDir = join(resources, 'config', 'provider');
+  const worktree = join(root, 'task-worktree');
+  const entry = join(entryDir, 'zcode.cjs');
+  const builtin = join(configDir, 'zcode-builtin.json');
+  const configuredDataDir = join(root, 'desktop-data');
+  await mkdir(entryDir, { recursive: true });
+  await mkdir(configDir, { recursive: true });
+  await mkdir(worktree);
+  await writeFile(entry, CONFIG_ENV_SERVER_SOURCE, 'utf8');
+  await writeFile(builtin, '{}', 'utf8');
+  process.env.ZCODE_DATA_BASE_DIR = configuredDataDir;
+
+  let peer: ZCodeAppServerPeer | undefined;
+  try {
+    peer = await ZCodeAppServerPeer.launch({ entry, taskWorktree: worktree, profileMode: 'existing-desktop' });
+    const paths = await debugRequest(peer, 'test/provider-config-env') as { builtin?: string; personal?: string };
+    assert.equal(paths.builtin, builtin);
+    assert.equal(paths.personal, join(configuredDataDir, '.zcode', 'v2', 'provider_config.json'));
+  } finally {
+    if (peer) await peer.close();
+    await rm(root, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.ZCODE_DATA_BASE_DIR;
+    else process.env.ZCODE_DATA_BASE_DIR = previous;
   }
 });
 
