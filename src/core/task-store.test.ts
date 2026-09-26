@@ -220,6 +220,33 @@ function pauseReviewReworkQuota(f: ReturnType<typeof reviewFixture>, observed: u
   return { pkg, verdict, continuation: begun.continuation, stage, attempt, retryAt, task, inspection };
 }
 
+function failedReworkCheckRun(f: ReturnType<typeof reviewFixture>, continuationId: string, omitLastResult = false) {
+  const stage = f.store.createStage(f.task.id, { role: "revise", processStartId: "failed-rework-check-stage",
+    harness: "zcode", model: "model-x" });
+  f.store.startStage(stage.id, f.owner, "failed-rework-check-stage");
+  f.store.checkpointReviewRework(f.task.id, continuationId, { owner: f.owner, generationId: f.generationId },
+    { phase: "writer_started", stageId: stage.id, checkpoint: { attempt: "complete-writer" } });
+  const attempt = f.store.createAttempt(f.task.id, "revise", { owner: f.owner, stageId: stage.id, harness: "zcode", model: "model-x" });
+  f.store.finishAttempt(attempt.id, { status: "succeeded" }, { owner: f.owner, processStartId: "failed-rework-check-stage" });
+  f.store.checkpointReviewRework(f.task.id, continuationId, { owner: f.owner, generationId: f.generationId },
+    { phase: "writer_finished", stageId: stage.id, checkpoint: { attemptId: attempt.id } });
+  const checkDefinitionHash = createHash("sha256").update(JSON.stringify(f.task.checks ?? []), "utf8").digest("hex");
+  const run = f.store.startCheckRun({ taskId: f.task.id, owner: f.owner, generationId: f.generationId,
+    executionAttemptId: attempt.id, executionStageId: stage.id, routeAttemptId: f.routeAttempt.id, route: f.route,
+    branchRef: `refs/heads/zero/${f.task.id}`, snapshot: f.snapshot, checkDefinitionHash,
+    expectedCheckIds: (f.task.checks ?? []).map(check => check.id) });
+  const failedId = (f.task.checks ?? [])[0]?.id;
+  for (const [index, check] of (f.task.checks ?? []).entries()) {
+    if (omitLastResult && index === (f.task.checks ?? []).length - 1) continue;
+    f.store.recordCheckResult(run.id, { owner: f.owner, generationId: f.generationId },
+      { id: check.id, argv: check.argv, status: check.id === failedId ? "failed" : "passed",
+        exitCode: check.id === failedId ? 1 : 0, durationMs: 5 });
+  }
+  f.store.finishCheckRun(run.id, { owner: f.owner, generationId: f.generationId }, "failed", "validation checks failed");
+  f.store.finishStage(stage.id, f.owner, "failed-rework-check-stage", "failed");
+  return { stage, attempt, run };
+}
+
 test("beginReviewRework consumes a changes-requested verdict and increments the revision only once", () => {
   const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, ":memory:", undefined, 1);
   try {
@@ -432,6 +459,8 @@ test("rework quota waits are excluded from generic claims and resume only once w
     assert.equal(paused.task.status, "waiting");
     assert.equal(paused.task.resumeCheckpoint?.kind, "rework_quota");
     assert.equal(paused.task.leaseOwner, undefined);
+    assert.throws(() => f.store.beginReviewRework(f.task.id, { packageId: paused.pkg.id, verdictId: paused.verdict.id,
+      owner: f.owner, generationId: g0 }), /live running claim/);
     const dueAt = new Date(paused.retryAt);
     assert.equal(f.store.claimNext("generic-rework-quota", 60_000, dueAt), undefined);
     assert.equal(f.store.claimReviewReworkQuotaResume(f.task.id, "early-rework", {
@@ -583,6 +612,145 @@ test("rework checks_started may checkpoint a still-running writer stage", () => 
     const checksFinished = f.store.checkpointReviewRework(f.task.id, begun.continuation.id,
       { owner: f.owner, generationId: f.generationId }, { phase: "checks_finished", stageId: stage.id, checkpoint: { passed: true } });
     assert.equal(checksFinished.phase, "checks_finished");
+  } finally { f.store.close(); }
+});
+
+test("failed rework check run survives a pre-step crash, consumes once in G1, and recovers at the new revision in G2", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-rework-check-retry-generations-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "b".repeat(64);
+  const g0 = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
+  const g1 = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+  const g2 = "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" }, 3);
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const begun = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: f.owner, generationId: g0 });
+    assert.equal(begun.kind, "started");
+    if (begun.kind !== "started") return;
+    const { run } = failedReworkCheckRun(f, begun.continuation.id);
+    assert.equal(f.store.reviewReworkRevisionSteps(f.task.id, begun.continuation.id).length, 0);
+
+    // Simulate a crash after the failed run is durable but before its retry revision is consumed.
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const recovery = f.store.claimReviewReworkContinuation(f.task.id, "retry-g1",
+      reviewReworkRecoveryInput(f, observed, new Date()));
+    assert.ok(recovery);
+    const firstConsume = f.store.beginReviewReworkCheckRetry(f.task.id, begun.continuation.id,
+      { checkRunId: run.id, owner: "retry-g1", generationId: g1 });
+    assert.equal(firstConsume.kind, "started");
+    if (firstConsume.kind !== "started") return;
+    assert.equal(firstConsume.step.revisionBefore, 1);
+    assert.equal(firstConsume.step.revisionAfter, 2);
+    assert.equal(firstConsume.alreadyApplied, false);
+    assert.equal(firstConsume.task.revisionCount, 2);
+    const duplicate = f.store.beginReviewReworkCheckRetry(f.task.id, begun.continuation.id,
+      { checkRunId: run.id, owner: "retry-g1", generationId: g1 });
+    assert.equal(duplicate.kind, "started");
+    if (duplicate.kind === "started") assert.equal(duplicate.alreadyApplied, true);
+    assert.equal(f.store.reviewReworkRevisionSteps(f.task.id, begun.continuation.id).length, 1);
+
+    // Crash after the atomic step; G2 must claim against revision 2 and the duplicate API call must not increment again.
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g2, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const recoveredAgain = f.store.claimReviewReworkContinuation(f.task.id, "retry-g2",
+      reviewReworkRecoveryInput(f, observed, new Date()));
+    assert.equal(recoveredAgain?.priorClaimGenerationId, g1);
+    assert.equal(recoveredAgain?.claimGenerationId, g2);
+    const replay = f.store.beginReviewReworkCheckRetry(f.task.id, begun.continuation.id,
+      { checkRunId: run.id, owner: "retry-g2", generationId: g2 });
+    assert.equal(replay.kind, "started");
+    if (replay.kind === "started") assert.equal(replay.alreadyApplied, true);
+    assert.equal(f.store.get(f.task.id)?.revisionCount, 2);
+    assert.equal(f.store.reviewReworkRevisionSteps(f.task.id, begun.continuation.id).length, 1);
+
+    const quotaStage = f.store.createStage(f.task.id, { role: "revise", processStartId: "g2-quota-stage", harness: "zcode", model: "model-x" });
+    f.store.startStage(quotaStage.id, "retry-g2", "g2-quota-stage");
+    const quotaAttempt = f.store.createAttempt(f.task.id, "revise", { owner: "retry-g2", stageId: quotaStage.id,
+      harness: "zcode", model: "model-x" });
+    f.store.finishAttempt(quotaAttempt.id, { status: "interrupted", error: "quota" },
+      { owner: "retry-g2", processStartId: "g2-quota-stage" });
+    f.store.finishStage(quotaStage.id, "retry-g2", "g2-quota-stage", "interrupted");
+    const pauseAt = new Date();
+    const quotaInspection = reviewReworkRecoveryInput(f, observed, pauseAt);
+    const quotaRetryAt = new Date(pauseAt.getTime() + 60_000).toISOString();
+    f.store.pauseReviewReworkForQuota(f.task.id, "retry-g2", { continuationId: begun.continuation.id,
+      attemptId: quotaAttempt.id, retryAt: quotaRetryAt, reason: "quota", identity: quotaInspection.identity,
+      gitState: quotaInspection.gitState, now: pauseAt });
+    assert.equal(f.store.quotaCheckpoint(f.task.id)?.revision, 2);
+    const resumedQuota = f.store.claimReviewReworkQuotaResume(f.task.id, "retry-g2", {
+      ...reviewReworkRecoveryInput(f, observed, new Date(quotaRetryAt)), leaseMs: 60_000,
+    });
+    assert.equal(resumedQuota?.revision, 2);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed check revision API rejects stale runs and fails closed at the revision limit", () => {
+  const stale = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, ":memory:", undefined, 3);
+  try {
+    const pkg = completeReviewPackage(stale);
+    const verdict = finishChangesRequested(stale, pkg.id);
+    const begun = stale.store.beginReviewRework(stale.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: stale.owner, generationId: stale.generationId });
+    assert.equal(begun.kind, "started");
+    if (begun.kind !== "started") return;
+    const { run } = failedReworkCheckRun(stale, begun.continuation.id);
+    const nextStage = stale.store.createStage(stale.task.id, { role: "revise", processStartId: "newer-run-stage", harness: "zcode", model: "model-x" });
+    stale.store.startStage(nextStage.id, stale.owner, "newer-run-stage");
+    const nextAttempt = stale.store.createAttempt(stale.task.id, "revise", { owner: stale.owner, stageId: nextStage.id, harness: "zcode", model: "model-x" });
+    stale.store.finishAttempt(nextAttempt.id, { status: "succeeded" }, { owner: stale.owner, processStartId: "newer-run-stage" });
+    const newerRun = stale.store.startCheckRun({ taskId: stale.task.id, owner: stale.owner, generationId: stale.generationId,
+      executionAttemptId: nextAttempt.id, executionStageId: nextStage.id, routeAttemptId: stale.routeAttempt.id, route: stale.route,
+      branchRef: `refs/heads/zero/${stale.task.id}`, snapshot: stale.snapshot,
+      checkDefinitionHash: createHash("sha256").update(JSON.stringify(stale.task.checks ?? []), "utf8").digest("hex"),
+      expectedCheckIds: (stale.task.checks ?? []).map(check => check.id) });
+    assert.notEqual(newerRun.id, run.id);
+    assert.throws(() => stale.store.beginReviewReworkCheckRetry(stale.task.id, begun.continuation.id,
+      { checkRunId: run.id, owner: stale.owner, generationId: stale.generationId }), /latest failed check run/);
+  } finally { stale.store.close(); }
+
+  const limited = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, ":memory:", undefined, 1);
+  try {
+    const pkg = completeReviewPackage(limited);
+    const verdict = finishChangesRequested(limited, pkg.id);
+    const begun = limited.store.beginReviewRework(limited.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: limited.owner, generationId: limited.generationId });
+    assert.equal(begun.kind, "started");
+    if (begun.kind !== "started") return;
+    const { run } = failedReworkCheckRun(limited, begun.continuation.id);
+    const outcome = limited.store.beginReviewReworkCheckRetry(limited.task.id, begun.continuation.id,
+      { checkRunId: run.id, owner: limited.owner, generationId: limited.generationId });
+    assert.equal(outcome.kind, "revision_limit");
+    assert.equal(outcome.task.status, "failed");
+    assert.equal(outcome.task.revisionCount, 1);
+    assert.match(outcome.reason, /after 1 content revisions/);
+    assert.equal(limited.store.reviewReworkRevisionSteps(limited.task.id, begun.continuation.id).length, 0);
+  } finally { limited.store.close(); }
+});
+
+test("failed check revision requires the current complete check set and definition hash", () => {
+  const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }, { id: "lint", argv: ["node", "lint.js"] }],
+    60_000, ":memory:", undefined, 3);
+  try {
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const begun = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: f.owner, generationId: f.generationId });
+    assert.equal(begun.kind, "started");
+    if (begun.kind !== "started") return;
+    const { run } = failedReworkCheckRun(f, begun.continuation.id, true);
+    assert.throws(() => f.store.beginReviewReworkCheckRetry(f.task.id, begun.continuation.id,
+      { checkRunId: run.id, owner: f.owner, generationId: f.generationId }), /complete check set/);
   } finally { f.store.close(); }
 });
 

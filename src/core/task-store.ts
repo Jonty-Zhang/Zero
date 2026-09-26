@@ -302,6 +302,37 @@ export interface ReviewReworkProgressRecord {
   createdAt: string;
 }
 
+export interface ReviewReworkRevisionStepRecord {
+  id: string;
+  taskId: string;
+  continuationId: string;
+  failedCheckRunId: string;
+  revisionBefore: number;
+  revisionAfter: number;
+  checkRunGenerationId: string;
+  owner: string;
+  generationId: string;
+  executionStageId: string;
+  executionAttemptId: string;
+  checkDefinitionHash: string;
+  expectedCheckIds: string[];
+  failedCheckIds: string[];
+  resultsHash: string;
+  snapshotHash: string;
+  createdAt: string;
+}
+
+export interface BeginReviewReworkCheckRetryInput {
+  checkRunId: string;
+  owner: string;
+  generationId: string;
+  now?: Date;
+}
+
+export type BeginReviewReworkCheckRetryResult =
+  | { kind: "started"; step: ReviewReworkRevisionStepRecord; task: TaskRecord; alreadyApplied: boolean }
+  | { kind: "revision_limit"; reason: string; task: TaskRecord };
+
 export interface ReviewReworkGitInspection {
   checkedAt: string;
   branchRef: string;
@@ -640,6 +671,16 @@ export class TaskStore {
       CREATE INDEX IF NOT EXISTS rework_progress_continuation_sequence ON rework_progress(continuation_id,sequence);
       CREATE TRIGGER IF NOT EXISTS rework_progress_no_update BEFORE UPDATE ON rework_progress BEGIN SELECT RAISE(ABORT,'rework progress is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS rework_progress_no_delete BEFORE DELETE ON rework_progress BEGIN SELECT RAISE(ABORT,'rework progress is immutable'); END;
+      CREATE TABLE IF NOT EXISTS rework_revision_steps (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), continuation_id TEXT NOT NULL REFERENCES rework_continuations(id),
+        failed_check_run_id TEXT NOT NULL REFERENCES check_runs(id), revision_before INTEGER NOT NULL, revision_after INTEGER NOT NULL,
+        check_run_generation_id TEXT NOT NULL REFERENCES startup_generations(id), generation_id TEXT NOT NULL REFERENCES startup_generations(id),
+        owner TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(continuation_id,failed_check_run_id)
+      );
+      CREATE INDEX IF NOT EXISTS rework_revision_steps_continuation ON rework_revision_steps(continuation_id,revision_after);
+      CREATE TRIGGER IF NOT EXISTS rework_revision_steps_no_update BEFORE UPDATE ON rework_revision_steps BEGIN SELECT RAISE(ABORT,'rework revision steps are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS rework_revision_steps_no_delete BEFORE DELETE ON rework_revision_steps BEGIN SELECT RAISE(ABORT,'rework revision steps are immutable'); END;
       CREATE TABLE IF NOT EXISTS rework_continuation_claims (
         id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), continuation_id TEXT NOT NULL REFERENCES rework_continuations(id),
         prior_claim_generation_id TEXT NOT NULL REFERENCES startup_generations(id), claim_generation_id TEXT NOT NULL REFERENCES startup_generations(id),
@@ -1983,7 +2024,7 @@ export class TaskStore {
 
       const continuation = this.getReviewReworkContinuation(taskId, input.continuationId);
       if (!continuation || continuation.id !== this.getReviewReworkContinuation(taskId)?.id ||
-          continuation.revisionAfter !== task.revision_count) throw new Error("Rework quota pause must bind the current continuation and revision");
+          this.#reviewReworkRevisionHighWater(continuation) !== task.revision_count) throw new Error("Rework quota pause must bind the current continuation and revision");
       const anchor = this.#latestReworkAnchor(taskId, continuation.packageId, continuation.verdictId);
       if (!anchor || anchor.result.verdict !== "changes_requested") throw new Error("Rework quota pause requires the latest changes-requested verdict");
       const claims = this.#db.prepare("SELECT * FROM rework_continuation_claims WHERE continuation_id=? ORDER BY rowid")
@@ -2051,7 +2092,7 @@ export class TaskStore {
       const stageSequence = stage ? Number(stage.sequence) : Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0) AS n FROM stages WHERE task_id=?")
         .get(taskId) as { n: number }).n);
       const checkpoint = { kind: "rework_quota", continuationId: continuation.id, packageId: continuation.packageId,
-        verdictId: continuation.verdictId, revision: continuation.revisionAfter, claimGenerationId: this.#startupGeneration.id,
+        verdictId: continuation.verdictId, revision: task.revision_count, claimGenerationId: this.#startupGeneration.id,
         owner, attemptId: attempt.id, stageId: stage?.id ? String(stage.id) : null, stageSequence,
         pauseIdentity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint },
         pauseGitState: input.gitState, retryAt: retryAt.toISOString() };
@@ -2119,7 +2160,7 @@ export class TaskStore {
       const continuation = this.getReviewReworkContinuation(taskId, checkpoint.continuationId);
       if (!continuation || continuation.id !== this.getReviewReworkContinuation(taskId)?.id ||
           continuation.packageId !== checkpoint.packageId || continuation.verdictId !== checkpoint.verdictId ||
-          continuation.revisionAfter !== checkpoint.revision || task.revision_count !== continuation.revisionAfter) return;
+          this.#reviewReworkRevisionHighWater(continuation) !== checkpoint.revision || task.revision_count !== checkpoint.revision) return;
       const anchor = this.#latestReworkAnchor(taskId, continuation.packageId, continuation.verdictId);
       if (!anchor || anchor.result.verdict !== "changes_requested") return;
       const claims = this.#db.prepare("SELECT * FROM rework_continuation_claims WHERE continuation_id=? ORDER BY rowid")
@@ -2179,7 +2220,7 @@ export class TaskStore {
       const checkpointId = recoveredGeneration ? randomUUID() : undefined;
       const claim: ReviewReworkQuotaResumeClaimRecord = { ...(checkpointId ? { id: checkpointId } : {}), taskId,
         continuationId: continuation.id, packageId: continuation.packageId, verdictId: continuation.verdictId,
-        revision: continuation.revisionAfter, priorClaimGenerationId: priorGenerationId,
+        revision: task.revision_count, priorClaimGenerationId: priorGenerationId,
         claimGenerationId: this.#startupGeneration.id, owner, leaseExpiresAt: expires,
         ...(previousClaim ? { priorClaimId: String(previousClaim.id) } : {}), ...(guardianLineage ? { guardianLineage } : {}),
         identity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint },
@@ -2201,7 +2242,7 @@ export class TaskStore {
       this.#event(taskId, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2,
         generationId: this.#startupGeneration.id, recovery: recoveredGeneration ? "review_rework_quota" : "review_rework_quota_resume" }, at);
       this.#event(taskId, "task.review_rework_quota_resumed", { continuationId: continuation.id,
-        packageId: continuation.packageId, verdictId: continuation.verdictId, revision: continuation.revisionAfter,
+        packageId: continuation.packageId, verdictId: continuation.verdictId, revision: task.revision_count,
         priorGenerationId, generationId: this.#startupGeneration.id, owner, recoveredGeneration, claimId: checkpointId }, at);
       result = claim;
     });
@@ -2677,6 +2718,11 @@ export class TaskStore {
       if (!task) throw new Error(`Unknown task ${taskId}`);
       if (existing) {
         const continuation = JSON.parse(String(existing.payload)) as ReviewReworkContinuationRecord;
+        const existingLeaseExpires = task.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
+        if (!["running", "revision"].includes(task.status) || task.lease_owner !== input.owner ||
+            task.claim_generation_id !== input.generationId || !Number.isFinite(existingLeaseExpires) || existingLeaseExpires <= now.getTime()) {
+          throw new Error("Existing review rework continuation does not have this live running claim");
+        }
         if (continuation.taskId !== taskId || continuation.packageId !== input.packageId || continuation.verdictId !== input.verdictId ||
             continuation.beginGenerationId !== input.generationId || continuation.owner !== input.owner ||
             task.revision_count < continuation.revisionAfter) throw new Error("Existing review rework continuation does not match its immutable verdict binding");
@@ -2734,6 +2780,33 @@ export class TaskStore {
       ? this.#db.prepare("SELECT payload FROM rework_continuations WHERE task_id=? AND id=?").get(taskId, continuationId) as { payload: string } | undefined
       : this.#db.prepare("SELECT payload FROM rework_continuations WHERE task_id=? ORDER BY rowid DESC LIMIT 1").get(taskId) as { payload: string } | undefined;
     return row ? JSON.parse(row.payload) as ReviewReworkContinuationRecord : undefined;
+  }
+
+  #reviewReworkRevisionHighWater(continuation: ReviewReworkContinuationRecord): number | undefined {
+    const rows = this.#db.prepare("SELECT * FROM rework_revision_steps WHERE task_id=? AND continuation_id=? ORDER BY rowid")
+      .all(continuation.taskId, continuation.id) as Array<Record<string, unknown>>;
+    let revision = continuation.revisionAfter;
+    const checkRunIds = new Set<string>();
+    for (const row of rows) {
+      let payload: ReviewReworkRevisionStepRecord;
+      try { payload = JSON.parse(String(row.payload)) as ReviewReworkRevisionStepRecord; }
+      catch { return undefined; }
+      if (row.task_id !== continuation.taskId || row.continuation_id !== continuation.id ||
+          row.revision_before !== revision || Number(row.revision_after) !== revision + 1 ||
+          payload.taskId !== continuation.taskId || payload.continuationId !== continuation.id ||
+          payload.failedCheckRunId !== row.failed_check_run_id || payload.revisionBefore !== revision ||
+          payload.revisionAfter !== revision + 1 || payload.checkRunGenerationId !== row.check_run_generation_id ||
+          payload.generationId !== row.generation_id || payload.owner !== row.owner ||
+          payload.createdAt !== row.created_at || checkRunIds.has(String(row.failed_check_run_id))) return undefined;
+      checkRunIds.add(String(row.failed_check_run_id));
+      revision++;
+    }
+    return revision;
+  }
+
+  reviewReworkRevisionSteps(taskId: string, continuationId: string): ReviewReworkRevisionStepRecord[] {
+    return (this.#db.prepare("SELECT payload FROM rework_revision_steps WHERE task_id=? AND continuation_id=? ORDER BY rowid")
+      .all(taskId, continuationId) as Array<{ payload: string }>).map(row => JSON.parse(row.payload) as ReviewReworkRevisionStepRecord);
   }
 
   /** Append a stage/progress checkpoint while the continuation owner holds its live task lease. */
@@ -2802,6 +2875,157 @@ export class TaskStore {
         taskId: String(row.task_id), sequence: Number(row.sequence), generationId: String(row.generation_id), owner: String(row.owner),
         phase: row.phase as ReviewReworkProgressRecord["phase"], ...(row.stage_id ? { stageId: String(row.stage_id) } : {}),
         checkpoint: JSON.parse(String(row.checkpoint)) as Record<string, unknown>, createdAt: String(row.created_at) }));
+  }
+
+  /** Atomically consumes one exact failed rework check run as a single revision increment. */
+  beginReviewReworkCheckRetry(taskId: string, continuationId: string,
+    input: BeginReviewReworkCheckRetryInput): BeginReviewReworkCheckRetryResult {
+    if (!input?.owner?.trim() || !input.generationId || !input.checkRunId) {
+      throw new Error("Rework check retry requires a check run, owner, and generation binding");
+    }
+    const now = input.now ?? new Date();
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new Error("Rework check retry requires a valid timestamp");
+    const at = now.toISOString();
+    let result!: BeginReviewReworkCheckRetryResult;
+    this.#transaction(() => {
+      const continuation = this.getReviewReworkContinuation(taskId, continuationId);
+      const task = this.#db.prepare(`SELECT status,revision_count,lease_owner,lease_expires_at,claim_generation_id,active_attempt_id,payload
+        FROM tasks WHERE id=?`).get(taskId) as { status: TaskStatus; revision_count: number; lease_owner: string | null;
+          lease_expires_at: string | null; claim_generation_id: string | null; active_attempt_id: string | null; payload: string } | undefined;
+      const expiresAt = task?.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
+      if (!continuation || continuation.id !== this.getReviewReworkContinuation(taskId)?.id || !task ||
+          task.status !== "running" || task.lease_owner !== input.owner || task.claim_generation_id !== input.generationId ||
+          !Number.isFinite(expiresAt) || expiresAt <= now.getTime() || task.active_attempt_id !== null) {
+        throw new Error("Rework check retry requires the live running continuation lease and no active attempt");
+      }
+      const anchor = this.#latestReworkAnchor(taskId, continuation.packageId, continuation.verdictId);
+      if (!anchor || anchor.result.verdict !== "changes_requested" || anchor.verdictGenerationId !== continuation.sourceGenerationId ||
+          anchor.reviewOwner !== continuation.owner || this.#db.prepare("SELECT 1 FROM commit_operations WHERE task_id=? UNION ALL SELECT 1 FROM report_operations WHERE task_id=? LIMIT 1")
+            .get(taskId, taskId)) throw new Error("Rework check retry is outside the current changes-requested review boundary");
+      const claims = this.#db.prepare("SELECT * FROM rework_continuation_claims WHERE continuation_id=? ORDER BY rowid")
+        .all(continuation.id) as Array<Record<string, unknown>>;
+      if (claims.length) {
+        if (!this.#verifiedReworkClaimChain(continuation, input.generationId, input.owner)) {
+          throw new Error("Rework check retry is not at the verified continuation claim-chain tail");
+        }
+      } else if (continuation.beginGenerationId !== input.generationId ||
+          !this.#taskClaimOwnersForGeneration(taskId, input.generationId).has(continuation.owner) ||
+          this.#latestTaskClaimOwnerForGeneration(taskId, input.generationId) !== input.owner) {
+        throw new Error("Rework check retry is not owned by the current continuation generation");
+      }
+      const allowedRunGenerations = new Set([continuation.beginGenerationId, ...claims.map(row => String(row.claim_generation_id))]);
+
+      let submission: TaskSubmission;
+      try { submission = JSON.parse(task.payload) as TaskSubmission; }
+      catch { throw new Error("Rework check retry task submission is malformed"); }
+      const requiredChecks = submission.checks ?? [];
+      const currentCheckDefinitionHash = createHash("sha256").update(JSON.stringify(requiredChecks), "utf8").digest("hex");
+      const run = this.#db.prepare("SELECT * FROM check_runs WHERE id=? AND task_id=?")
+        .get(input.checkRunId, taskId) as Record<string, unknown> | undefined;
+      const latestRun = this.#db.prepare("SELECT id FROM check_runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
+        .get(taskId) as { id: string } | undefined;
+      if (!run || latestRun?.id !== input.checkRunId || run.status !== "failed" || !run.terminal_reason ||
+          run.generation_id !== input.generationId && !allowedRunGenerations.has(String(run.generation_id)) ||
+          !this.#taskClaimOwnersForGeneration(taskId, String(run.generation_id)).has(String(run.owner))) {
+        throw new Error("Rework check retry must consume the latest failed check run from this continuation claim chain");
+      }
+      let expectedCheckIds: string[];
+      let storedSnapshot: CheckRunSnapshot;
+      try {
+        expectedCheckIds = JSON.parse(String(run.expected_check_ids)) as string[];
+        storedSnapshot = JSON.parse(String(run.snapshot)) as CheckRunSnapshot;
+      } catch { throw new Error("Failed rework check run has malformed immutable definitions or snapshot"); }
+      const checkRows = this.#db.prepare("SELECT check_id,result FROM check_run_results WHERE run_id=? ORDER BY id")
+        .all(input.checkRunId) as Array<{ check_id: string; result: string }>;
+      let checkResults: CheckResult[];
+      try { checkResults = checkRows.map(row => JSON.parse(row.result) as CheckResult); }
+      catch { throw new Error("Failed rework check run has malformed result evidence"); }
+      if (!Array.isArray(expectedCheckIds) || expectedCheckIds.length !== requiredChecks.length ||
+          !sameStringSet(expectedCheckIds, requiredChecks.map(check => check.id)) ||
+          run.check_definition_hash !== currentCheckDefinitionHash ||
+          checkRows.length !== expectedCheckIds.length || !sameStringSet(checkRows.map(row => row.check_id), expectedCheckIds) ||
+          checkResults.some((check, index) => check.id !== checkRows[index]?.check_id ||
+            !["passed", "failed", "timed_out", "spawn_error"].includes(check.status) ||
+            (check.status === "passed" && check.exitCode !== 0)) || !checkResults.some(check => check.status !== "passed") ||
+          !storedSnapshot || !SHA256_PATTERN.test(storedSnapshot.diffHash) ||
+          createHash("sha256").update(storedSnapshot.diff, "utf8").digest("hex") !== storedSnapshot.diffHash) {
+        throw new Error("Failed rework check run must have the current complete check set, matching definition hash, and a real failure");
+      }
+      const stage = this.#db.prepare("SELECT * FROM stages WHERE id=? AND task_id=?")
+        .get(String(run.execution_stage_id), taskId) as Record<string, unknown> | undefined;
+      const attempt = this.#db.prepare("SELECT * FROM attempts WHERE id=? AND task_id=?")
+        .get(String(run.execution_attempt_id), taskId) as Record<string, unknown> | undefined;
+      const latestAttempt = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? ORDER BY sequence DESC LIMIT 1")
+        .get(taskId) as { id: string } | undefined;
+      if (!stage || !attempt || latestAttempt?.id !== attempt.id || attempt.stage_id !== stage.id ||
+          attempt.status !== "succeeded" || !["implement", "revise"].includes(String(stage.role)) ||
+          stage.generation_id !== run.generation_id || stage.status !== "failed" || stage.finished_at == null ||
+          run.execution_stage_id !== stage.id || run.execution_attempt_id !== attempt.id) {
+        throw new Error("Failed check run is not bound to the latest completed writer attempt and failed rework stage");
+      }
+
+      const highWater = this.#reviewReworkRevisionHighWater(continuation);
+      if (highWater === undefined || task.revision_count !== highWater) throw new Error("Rework revision chain or task revision count is inconsistent");
+      const existingRow = this.#db.prepare("SELECT payload FROM rework_revision_steps WHERE continuation_id=? AND failed_check_run_id=?")
+        .get(continuation.id, input.checkRunId) as { payload: string } | undefined;
+      if (existingRow) {
+        const step = JSON.parse(existingRow.payload) as ReviewReworkRevisionStepRecord;
+        if (step.revisionAfter !== highWater || task.revision_count !== step.revisionAfter) {
+          throw new Error("Existing failed-check revision step is no longer the current revision high-water");
+        }
+        result = { kind: "started", step, task: this.get(taskId)!, alreadyApplied: true };
+        return;
+      }
+      if (task.revision_count < continuation.revisionAfter) throw new Error("Task revision count precedes its review rework continuation");
+      const revisionLimit = submission.maxRevisions ?? 0;
+      if (!Number.isSafeInteger(revisionLimit) || revisionLimit < 0) throw new Error("Task maxRevisions must be a non-negative integer");
+      if (task.revision_count >= revisionLimit) {
+        const failedIds = checkResults.filter(check => check.status !== "passed").map(check => check.id);
+        const reason = `Validation failed after ${task.revision_count} content revisions: ${failedIds.join(", ")}`;
+        const changed = this.#db.prepare(`UPDATE tasks SET status='failed',updated_at=?,failure_reason=?,lease_owner=NULL,
+          lease_expires_at=NULL,heartbeat_at=NULL,active_attempt_id=NULL WHERE id=? AND status='running' AND lease_owner=?
+          AND claim_generation_id=? AND revision_count=?`).run(at, reason, taskId, input.owner, input.generationId, task.revision_count);
+        if (Number(changed.changes) !== 1) throw new Error("Task changed before review rework revision limit could be recorded");
+        this.#db.prepare("DELETE FROM quota_pauses WHERE task_id=?").run(taskId);
+        this.#disableExecutionRecoveryCheckpoint(taskId, at, "terminal:failed");
+        this.#event(taskId, "task.transition", { from: "running", to: "failed", reason, failedCheckRunId: input.checkRunId }, at);
+        this.#event(taskId, "task.review_rework_revision_limit", { continuationId, checkRunId: input.checkRunId,
+          revision: task.revision_count, failedCheckIds: failedIds, reason }, at);
+        result = { kind: "revision_limit", reason, task: this.get(taskId)! };
+        return;
+      }
+
+      const failedCheckIds = checkResults.filter(check => check.status !== "passed").map(check => check.id);
+      const step: ReviewReworkRevisionStepRecord = { id: randomUUID(), taskId, continuationId,
+        failedCheckRunId: input.checkRunId, revisionBefore: task.revision_count, revisionAfter: task.revision_count + 1,
+        checkRunGenerationId: String(run.generation_id), owner: input.owner, generationId: input.generationId,
+        executionStageId: String(stage.id), executionAttemptId: String(attempt.id),
+        checkDefinitionHash: String(run.check_definition_hash), expectedCheckIds,
+        failedCheckIds, resultsHash: createHash("sha256").update(JSON.stringify(checkResults), "utf8").digest("hex"),
+        snapshotHash: createHash("sha256").update(JSON.stringify(storedSnapshot), "utf8").digest("hex"), createdAt: at };
+      const payload = JSON.stringify(step);
+      if (Buffer.byteLength(payload, "utf8") > 65_536) throw new Error("Rework revision step exceeds 64 KiB");
+      const inserted = this.#db.prepare(`INSERT INTO rework_revision_steps(id,task_id,continuation_id,failed_check_run_id,
+        revision_before,revision_after,check_run_generation_id,generation_id,owner,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(step.id, taskId, continuationId, input.checkRunId, step.revisionBefore, step.revisionAfter,
+          step.checkRunGenerationId, input.generationId, input.owner, payload, at);
+      if (Number(inserted.changes) !== 1) throw new Error("Failed check run was already consumed by a rework revision step");
+      const transitionRevision = this.#db.prepare(`UPDATE tasks SET status='revision',revision_count=revision_count+1,updated_at=?,failure_reason=NULL
+        WHERE id=? AND status='running' AND lease_owner=? AND claim_generation_id=? AND revision_count=?`)
+        .run(at, taskId, input.owner, input.generationId, task.revision_count);
+      if (Number(transitionRevision.changes) !== 1) throw new Error("Task changed before failed-check revision was consumed");
+      const returnToRunning = this.#db.prepare(`UPDATE tasks SET status='running',updated_at=?
+        WHERE id=? AND status='revision' AND lease_owner=? AND claim_generation_id=? AND revision_count=?`)
+        .run(at, taskId, input.owner, input.generationId, step.revisionAfter);
+      if (Number(returnToRunning.changes) !== 1) throw new Error("Task could not return to running after failed-check revision");
+      this.#event(taskId, "task.transition", { from: "running", to: "revision", reason: "validation checks failed",
+        continuationId, checkRunId: input.checkRunId, revision: step.revisionAfter }, at);
+      this.#event(taskId, "task.transition", { from: "revision", to: "running", reason: "starting validation revision",
+        continuationId, checkRunId: input.checkRunId, revision: step.revisionAfter }, at);
+      this.#event(taskId, "task.review_rework_check_retry_begun", step, at);
+      result = { kind: "started", step, task: this.get(taskId)!, alreadyApplied: false };
+    });
+    return result;
   }
 
   /** Freshly inspects and reclaims the pending continuation after a guardian proves the previous worker drained. */
@@ -2964,7 +3188,8 @@ export class TaskStore {
         this.#db.prepare("UPDATE tasks SET revision_count=revision_count+1 WHERE id=? AND status='recovery_required' AND claim_generation_id=?")
           .run(taskId, priorGenerationId);
         createdDuringRecovery = true;
-      } else if (!["running", "revision"].includes(previousStatus) || task.revision_count !== continuation.revisionAfter) {
+      } else if (!["running", "revision"].includes(previousStatus) ||
+          this.#reviewReworkRevisionHighWater(continuation) !== task.revision_count) {
         return;
       }
 
