@@ -1406,7 +1406,7 @@ test("Codex allocation and review quota pauses resume at their exact stages", as
   const repo = join(root, "repo");
   const db = join(root, "tasks.sqlite");
   await mkdir(repo);
-  let store = new TaskStore(db);
+  let store = new TaskStore(db, guardianGeneration("1".repeat(32)));
   try {
     await exec("git", ["init", "-b", "main"], { cwd: repo });
     await exec("git", ["config", "user.name", "Test"], { cwd: repo });
@@ -1438,15 +1438,33 @@ test("Codex allocation and review quota pauses resume at their exact stages", as
       const current = store.get(task.id)!;
       const now = current.retryAt ? new Date(Date.parse(current.retryAt) + 1000) : new Date();
       const owner = `quota-stage-${cycle}`;
-      assert.equal(store.claimNext(owner, 60_000, now)?.id, task.id);
-      const result = await worker().runClaimed(task.id, owner);
+      let result: TaskRecord | undefined;
+      if (current.resumeCheckpoint?.kind === "review_quota") {
+        const quotaDb = new DatabaseSync(db);
+        quotaDb.prepare("UPDATE quota_pauses SET retry_at=? WHERE task_id=?")
+          .run(new Date(Date.now() - 1_000).toISOString(), task.id);
+        quotaDb.close();
+        result = await worker().runNext(owner);
+      } else {
+        assert.equal(store.claimNext(owner, 60_000, now)?.id, task.id);
+        result = await worker().runClaimed(task.id, owner);
+      }
+      assert.ok(result);
       if (cycle < 2) {
         assert.equal(result.status, "waiting");
-        assert.equal(result.resumeStage, cycle === 0 ? "route" : "review");
+        if (cycle === 0) assert.equal(result.resumeStage, "route");
+        else {
+          assert.equal(result.resumeCheckpoint?.kind, "review_quota");
+          assert.equal(result.resumeCheckpoint?.packageId, store.reviewPackages(task.id)[0]?.id);
+          assert.equal(store.reviewPackages(task.id).length, 1);
+          assert.equal(store.checkRuns(task.id).length, 1);
+          assert.deepEqual(store.attempts(task.id).filter(attempt => attempt.role === "review").map(attempt => attempt.status),
+            ["interrupted"]);
+        }
         assert.equal(result.revisionCount, 0);
         store.close();
-        store = new TaskStore(db);
-      } else assert.equal(result.status, "done");
+        store = new TaskStore(db, guardianGeneration(String(cycle + 2).repeat(32)));
+      } else assert.equal(result?.status, "done");
     }
     assert.equal(routeCalls, 2);
     assert.equal(runCalls, 1);
