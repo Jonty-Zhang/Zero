@@ -569,6 +569,18 @@ export class GitWorktreeManager {
     return candidate.commit;
   }
 
+  /** Verify an already persisted candidate object before recovery claims work. */
+  async verifyReviewedCommitCandidateObject(
+    info: WorktreeInfo,
+    candidate: ReviewedCommitCandidate,
+    reviewed: WorktreeReviewSnapshot,
+  ): Promise<void> {
+    await this.#validateInfo(info);
+    assertReviewSnapshot(reviewed);
+    assertCandidate(candidate, info, reviewed);
+    await this.#verifyCandidate(info, candidate, reviewed);
+  }
+
   /**
    * Verify after a process restart that a previously persisted candidate was
    * already applied. This deliberately does not compare the pre-CAS snapshot:

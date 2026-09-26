@@ -488,6 +488,148 @@ test("worker leaves a raced reviewed branch failed with its candidate intent and
   }
 });
 
+test("review recovery resumes commit intent, applied candidate, and completed report crash boundaries", async () => {
+  for (const boundary of ["commit-intent", "branch-applied", "report-complete"] as const) {
+    const root = await mkdtemp(join(process.cwd(), `.zero-worker-review-recovery-${boundary}-`));
+    const repo = join(root, "repo");
+    const db = join(root, "tasks.sqlite");
+    const worktreeRoot = join(root, "worktrees");
+    const artifacts = join(root, "artifacts");
+    await initRepo(repo);
+    let store = new TaskStore(db, guardianGeneration("a".repeat(32)));
+    let releaseBoundary!: () => void;
+    let reachedBoundary!: () => void;
+    const boundaryReached = new Promise<void>(resolve => { reachedBoundary = resolve; });
+    const blocked = new Promise<void>(resolve => { releaseBoundary = resolve; });
+    try {
+      const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create result.txt", maxRevisions: 0,
+        allowedPaths: ["result.txt"], checks: [{ id: "pass", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+      const firstOwner = `review-recovery-${boundary}-old`;
+      assert.equal(store.claimNext(firstOwner, 120_000)?.id, task.id);
+      class CrashingWorktrees extends GitWorktreeManager {
+        private appliedVerifications = 0;
+        override async createReviewedCommitCandidate(info: WorktreeInfo, preHead: string, reviewed: WorktreeReviewSnapshot,
+          metadata: ReviewedCommitMetadata): Promise<ReviewedCommitCandidate> {
+          const candidate = await super.createReviewedCommitCandidate(info, preHead, reviewed, metadata);
+          if (boundary === "commit-intent") { reachedBoundary(); await blocked; }
+          return candidate;
+        }
+        override async applyReviewedCommitCandidate(info: WorktreeInfo, candidate: ReviewedCommitCandidate,
+          reviewed: WorktreeReviewSnapshot): Promise<string> {
+          if (boundary === "branch-applied") {
+            const result = await super.applyReviewedCommitCandidate(info, candidate, reviewed);
+            reachedBoundary(); await blocked;
+            return result;
+          }
+          return super.applyReviewedCommitCandidate(info, candidate, reviewed);
+        }
+        override async verifyAppliedReviewedCommitCandidate(info: WorktreeInfo, candidate: ReviewedCommitCandidate,
+          reviewed: WorktreeReviewSnapshot): Promise<void> {
+          await super.verifyAppliedReviewedCommitCandidate(info, candidate, reviewed);
+          this.appliedVerifications++;
+          if (boundary === "report-complete" && this.appliedVerifications === 2) { reachedBoundary(); await blocked; }
+        }
+      }
+      const reviewer: TaskReviewer = { async review() { return { harness: "codex", model: "review", exitCode: 0,
+        result: { verdict: "pass", summary: "approved", findings: [] } }; } };
+      const options = { store, worktrees: new CrashingWorktrees(worktreeRoot), testRunner: new TestRunner(),
+        router: { async route(current: TaskRecord) { return routeFor(current); } }, reviewer,
+        adapters: new Map([["fake", new FakeAdapter()]]), artifactRoot: artifacts, leaseMs: 120_000, heartbeatIntervalMs: 40_000 };
+      const oldRun = new TaskWorker(options).runClaimed(task.id, firstOwner);
+      await boundaryReached;
+      assert.equal(store.get(task.id)?.status, "reviewing");
+      const beforeRecoveryOperation = store.commitOperations(task.id)[0];
+      assert.ok(beforeRecoveryOperation);
+      assert.equal(beforeRecoveryOperation.status, boundary === "commit-intent" ? "intent"
+        : boundary === "branch-applied" ? "candidate" : "applied");
+      if (boundary === "report-complete") assert.equal(store.reportOperations(task.id)[0]?.status, "complete");
+      assert.deepEqual(store.recoverExpired(new Date(Date.now() + 240_000)), [task.id]);
+      store.close();
+
+      store = new TaskStore(db, guardianGeneration("b".repeat(32)));
+      const recoveryWorker = new TaskWorker({ ...options, store, worktrees: new GitWorktreeManager(worktreeRoot) });
+      const done = await recoveryWorker.runNext(`review-recovery-${boundary}-new`);
+      assert.equal(done?.id, task.id);
+      assert.equal(done?.status, "done");
+      assert.equal(store.commitOperations(task.id).length, 1, "recovery never creates a second commit intent");
+      assert.equal(store.commitOperations(task.id)[0]?.status, "applied");
+      assert.equal(store.reportOperations(task.id).length, 1);
+      assert.equal(store.reportOperations(task.id)[0]?.status, "complete");
+      assert.equal(store.events(task.id).filter(event => event.type === "task.transition"
+        && (event.payload as { to?: string } | undefined)?.to === "done").length, 1);
+      releaseBoundary();
+      await oldRun.catch(() => undefined);
+    } finally {
+      releaseBoundary();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("review recovery keeps a moved branch quarantined without routing, writing, or committing", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-review-recovery-moved-branch-"));
+  const repo = join(root, "repo");
+  const db = join(root, "tasks.sqlite");
+  const worktreeRoot = join(root, "worktrees");
+  await initRepo(repo);
+  let store = new TaskStore(db, guardianGeneration("c".repeat(32)));
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create result.txt", maxRevisions: 0,
+      checks: [{ id: "pass", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+    const oldOwner = "review-recovery-moved-old";
+    store.claimNext(oldOwner, 120_000);
+    const worktrees = new GitWorktreeManager(worktreeRoot);
+    const plan = await worktrees.prepareCreatePlan(task.id, repo, "main");
+    store.recordWorktreeCreationIntent(task.id, oldOwner, plan);
+    const created = await worktrees.executePlan(plan);
+    store.completeWorktreeCreation(task.id, oldOwner, created, created.fingerprint);
+    const stage = store.createStage(task.id, { role: "implement", harness: "fake", model: "model", processStartId: "review-crash-stage" });
+    store.startStage(stage.id, oldOwner, "review-crash-stage");
+    const attempt = store.createAttempt(task.id, "implement", { owner: oldOwner, stageId: stage.id, harness: "fake", model: "model" });
+    await writeFile(join(plan.path, "result.txt"), "approved\n");
+    await worktrees.prepareReview(created.info);
+    store.finishAttempt(attempt.id, { status: "succeeded" }, { owner: oldOwner, processStartId: "review-crash-stage" });
+    const route = routeFor(task);
+    const routeAttempt = store.createAttempt(task.id, "route", { owner: oldOwner, harness: "codex" });
+    store.saveRoute(route);
+    store.finishAttempt(routeAttempt.id, { status: "succeeded", metadata: { decision: route } });
+    const snapshot = await worktrees.captureReviewSnapshot(created.info);
+    const branch = await worktrees.readTaskBranchHead(created.info);
+    const checkRun = store.startCheckRun({ taskId: task.id, owner: oldOwner, generationId: store.get(task.id)!.claimGenerationId!,
+      executionAttemptId: attempt.id, executionStageId: stage.id, routeAttemptId: routeAttempt.id, route, branchRef: branch.ref,
+      snapshot: { baseCommit: created.info.baseCommit, preHead: branch.head, ...snapshot },
+      expectedCheckIds: ["pass"], checkDefinitionHash: (await import("node:crypto")).createHash("sha256").update(JSON.stringify(task.checks)).digest("hex") });
+    store.recordCheckResult(checkRun.id, { owner: oldOwner, generationId: store.get(task.id)!.claimGenerationId! },
+      { id: "pass", argv: [], status: "passed", exitCode: 0, durationMs: 1 });
+    store.finishStage(stage.id, oldOwner, "review-crash-stage", "succeeded", await worktrees.fingerprint(created.info));
+    store.completeCheckRun(checkRun.id, { owner: oldOwner, generationId: store.get(task.id)!.claimGenerationId! },
+      { baseCommit: created.info.baseCommit, preHead: branch.head, ...snapshot });
+    const reviewAttempt = store.createAttempt(task.id, "review", { owner: oldOwner, harness: "codex",
+      metadata: { packageId: store.reviewPackages(task.id)[0]!.id, generationId: store.get(task.id)!.claimGenerationId! } });
+    store.finishPackageReview({ packageId: store.reviewPackages(task.id)[0]!.id, attemptId: reviewAttempt.id, owner: oldOwner,
+      generationId: store.get(task.id)!.claimGenerationId!, recheckedSnapshot: { baseCommit: created.info.baseCommit, preHead: branch.head, ...snapshot },
+      result: { verdict: "pass", summary: "pass", findings: [] }, attemptResult: { exitCode: 0, model: "review" } });
+    assert.deepEqual(store.recoverExpired(new Date(Date.now() + 240_000)), [task.id]);
+    store.close();
+    store = new TaskStore(db, guardianGeneration("d".repeat(32)));
+    const competing = await exec("git", ["commit-tree", snapshot.treeId, "-p", branch.head, "-m", "unexpected moved branch"], { cwd: plan.path });
+    await exec("git", ["update-ref", branch.ref, competing.stdout.trim()], { cwd: plan.path });
+    let routeCalls = 0;
+    let writerCalls = 0;
+    const result = await new TaskWorker({ store, worktrees: new GitWorktreeManager(worktreeRoot), testRunner: new TestRunner(),
+      router: { async route(current) { routeCalls++; return routeFor(current); } }, reviewer: { async review() { throw new Error("must not review"); } },
+      adapters: new Map([["fake", { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
+        async run() { writerCalls++; return { status: "completed", exitCode: 0, durationMs: 1 }; } }]]), artifactRoot: join(root, "artifacts") }).runNext("review-recovery-moved-new");
+    assert.equal(result, undefined);
+    assert.equal(store.get(task.id)?.status, "recovery_required");
+    assert.equal(routeCalls, 0);
+    assert.equal(writerCalls, 0);
+    assert.equal(store.commitOperations(task.id).length, 0);
+    assert.equal(store.reviewRecoveryClaims(task.id).length, 0);
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test("worker binds passing checks to the reviewed Git tree and rejects check mutations", async () => {
   for (const scenario of [
     { name: "unchanged", argv: [process.execPath, "-e", "process.exit(0)"], expected: "done" as const },

@@ -149,14 +149,15 @@ test('run uses the exact provider/model in one existing-desktop task-worktree se
 });
 
 test('a structured temporal usage limit becomes a quota result after confirmed peer close', async () => {
-  const peer = fakePeer({ turnFailure: { message: "You've hit your usage limit. Try again at 2026-09-26T05:00:00Z" } });
+  const retryAt = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
+  const peer = fakePeer({ turnFailure: { message: `You've hit your usage limit. Try again at ${retryAt}` } });
   const state = adapterHarness({ peer });
   const result = await state.adapter.run(request());
 
   assert.equal(result.status, 'failed');
-  assert.deepEqual(result.quota, { source: 'provider_message', retryAt: '2026-09-26T05:00:00.000Z' });
+  assert.deepEqual(result.quota, { source: 'provider_message', retryAt });
   assert.match(result.error ?? '', /usage limit reached/);
-  assert.ok(!result.error?.includes('2026-09-26'));
+  assert.ok(!result.error?.includes(retryAt));
   assert.equal(peer.isClosed(), true);
 });
 

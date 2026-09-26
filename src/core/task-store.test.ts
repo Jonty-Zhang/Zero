@@ -29,8 +29,9 @@ test("file-backed task store reopens with WAL and FULL synchronous mode", async 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-function reviewFixture(checks = [{ id: "unit", argv: ["node", "test.js"] }], leaseMs = 60_000, path = ":memory:") {
-  const store = new TaskStore(path);
+function reviewFixture(checks = [{ id: "unit", argv: ["node", "test.js"] }], leaseMs = 60_000, path = ":memory:",
+  startup?: import("./task-store.js").StartupGenerationAttestation) {
+  const store = new TaskStore(path, startup);
   const task = store.submit({ repoPath: ".", baseRef: "main", prompt: "review package", checks }, "review_package_store_test");
   const owner = "review-worker";
   const claimed = store.claimNext(owner, leaseMs)!;
@@ -99,7 +100,9 @@ test("durable check run creates a review package and reviewing transition atomic
 
 function completeReviewPackage(f: ReturnType<typeof reviewFixture>) {
   const run = f.store.startCheckRun(f.input);
-  f.store.recordCheckResult(run.id, { owner: f.owner, generationId: f.generationId }, f.result("unit"));
+  for (const checkId of f.input.expectedCheckIds) {
+    f.store.recordCheckResult(run.id, { owner: f.owner, generationId: f.generationId }, f.result(checkId));
+  }
   f.store.finishStage(f.stage.id, f.owner, "process-1", "succeeded", "fingerprint");
   return f.store.completeCheckRun(run.id, { owner: f.owner, generationId: f.generationId }, f.snapshot).reviewPackage;
 }
@@ -150,6 +153,29 @@ function completeReportOperation(f: ReturnType<typeof reviewFixture>, applied: R
     { reportBytes: input.reportBytes, diffBytes: input.diffBytes });
 }
 
+function registerReviewRecoveryWorktree(f: ReturnType<typeof reviewFixture>) {
+  const plan = { taskId: f.task.id, repoPath: "C:/repo", commonGitDir: "C:/repo/.git", worktreeRoot: "C:/worktrees",
+    path: `C:/worktrees/${f.task.id}`, branch: `zero/${f.task.id}`, baseCommit: f.snapshot.baseCommit };
+  f.store.recordWorktreeCreationIntent(f.task.id, f.owner, plan);
+  const observed = { info: { taskId: f.task.id, repoPath: plan.repoPath, path: plan.path, branch: plan.branch, baseCommit: plan.baseCommit },
+    commonGitDir: plan.commonGitDir, head: plan.baseCommit, fingerprint: "b".repeat(64) };
+  f.store.completeWorktreeCreation(f.task.id, f.owner, observed, "b".repeat(64));
+  return { plan, observed };
+}
+
+function reviewRecoveryInput(f: ReturnType<typeof reviewFixture>, observed: unknown, kind: "pre_commit" | "applied_candidate",
+  at = new Date(), applied?: ReturnType<typeof completeAppliedCommit>) {
+  const state = kind === "pre_commit"
+    ? { kind, checkedAt: at.toISOString(), branchRef: `refs/heads/zero/${f.task.id}`, head: f.snapshot.preHead,
+        treeId: f.snapshot.treeId, diffHash: f.snapshot.diffHash, snapshot: f.snapshot }
+    : { kind, checkedAt: at.toISOString(), packageId: applied!.pkg.id, commitOperationId: applied!.operation.id,
+        branchRef: applied!.operation.branchRef, head: applied!.candidateSha, refHead: applied!.candidateSha,
+        treeId: applied!.operation.treeId, diffHash: applied!.operation.diffHash, candidateSha: applied!.candidateSha,
+        candidateObjectVerified: true as const, indexMatchesReviewedTree: true as const, worktreeClean: true as const };
+  const observedValue = observed as { info: Record<string, unknown>; commonGitDir: string };
+  return { now: at, identity: { checkedAt: at.toISOString(), observed: { ...observedValue, head: state.head, fingerprint: "c".repeat(64) }, fingerprint: "c".repeat(64) }, gitState: state };
+}
+
 test("dedicated DONE transaction requires the complete evidence chain and fresh Git verification", () => {
   const f = reviewFixture();
   try {
@@ -175,6 +201,284 @@ test("dedicated DONE transaction requires the complete evidence chain and fresh 
     assert.equal(f.store.events(f.task.id).filter(event => event.type === "task.transition" &&
       (event.payload as { to?: string } | undefined)?.to === "done").length, 1);
   } finally { f.store.close(); }
+});
+
+test("G0 pass verdict can create G1 commit intent only through the explicit recovery API and reach DONE", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-recovered-verdict-done-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "4".repeat(64);
+  const g0 = "21212121212121212121212121212121";
+  const g1 = "31313131313131313131313131313131";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const reviewed = completePassingReview(f);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const claimAt = new Date();
+    f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "pre_commit", claimAt));
+    const preCommitInspection = { checkedAt: claimAt.toISOString(), branchRef: reviewed.pkg.branchRef,
+      head: reviewed.pkg.snapshot.preHead, snapshot: reviewed.pkg.snapshot };
+    const input = { ...reviewed.input, operationId: "recovered-commit-g1", owner: "recovery-g1", generationId: g1,
+      preCommitInspection };
+    assert.throws(() => f.store.createCommitOperation({ ...reviewed.input, operationId: "normal-api-must-stay-strict",
+      owner: "recovery-g1", generationId: g1 }), /successful atomic Codex package verdict/);
+    const operation = f.store.createCommitOperationFromRecoveredVerdict(input);
+    assert.equal(operation.verdictId, reviewed.verdict.id);
+    assert.equal(operation.generationId, g1);
+    assert.equal(operation.owner, "recovery-g1");
+    assert.equal(operation.status, "intent");
+    const candidateSha = "d".repeat(40);
+    f.store.recordCommitOperationCandidate(operation.id, { owner: "recovery-g1", generationId: g1 }, candidateSha);
+    const appliedOperation = f.store.markCommitOperationApplied(operation.id, { owner: "recovery-g1", generationId: g1 }, {
+      branchRef: operation.branchRef, refHead: candidateSha, worktreeHead: candidateSha, treeId: operation.treeId,
+      diffHash: operation.diffHash, candidateObjectVerified: true, indexMatchesReviewedTree: true, worktreeClean: true,
+    });
+    const applied = { ...reviewed, operation: appliedOperation, candidateSha };
+    const reportInputValue = { ...reportInput(f, applied, "recovered-report-g1"), owner: "recovery-g1", generationId: g1 };
+    const report = f.store.createReportOperation(reportInputValue);
+    f.store.completeReportOperation(report.id, { owner: "recovery-g1", generationId: g1 }, {
+      reportBytes: reportInputValue.reportBytes, diffBytes: reportInputValue.diffBytes,
+    });
+    const evidence = { branchRef: operation.branchRef, refHead: candidateSha, worktreeHead: candidateSha,
+      treeId: operation.treeId, diffHash: operation.diffHash, candidateObjectVerified: true as const,
+      indexMatchesReviewedTree: true as const, worktreeClean: true as const };
+    assert.equal(f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: report.id,
+      owner: "recovery-g1", generationId: g1, gitEvidence: evidence }).status, "done");
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery accepts multiple proven task owners within the source generation after same-generation reclaim", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-same-generation-reclaim-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "6".repeat(64);
+  const g0 = "81818181818181818181818181818181";
+  const g1 = "91919191919191919191919191919191";
+  const quotaOwner = "quota-resume-owner";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    completePassingReview(f);
+    const editor = new DatabaseSync(path);
+    try {
+      editor.prepare("UPDATE tasks SET lease_owner=?,lease_expires_at=? WHERE id=?")
+        .run(quotaOwner, new Date(Date.now() - 1_000).toISOString(), f.task.id);
+      editor.prepare("INSERT INTO events(task_id,type,at,payload) VALUES(?,?,?,?)").run(f.task.id, "task.claimed",
+        new Date().toISOString(), JSON.stringify({ owner: quotaOwner, generationId: g0, recovery: "quota_resume" }));
+    } finally { editor.close(); }
+    f.store.recoverExpired(new Date());
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const at = new Date();
+    const claim = f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "pre_commit", at));
+    assert.equal(claim?.priorClaimGenerationId, g0);
+    assert.equal(claim?.claimGenerationId, g1);
+    assert.equal(f.store.get(f.task.id)?.leaseOwner, "recovery-g1");
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery validates package epochs across revision before a later generation claim", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-recovery-package-epochs-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "8".repeat(64);
+  const g0 = "a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8";
+  const g1 = "b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8";
+  const g2 = "c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8";
+  const g1Owner = "recovery-g1";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const p1 = completeReviewPackage(f);
+    const p1Review = startBoundReviewAttempt(f, p1.id);
+    f.store.finishPackageReview({ packageId: p1.id, attemptId: p1Review.id, owner: f.owner, generationId: g0,
+      recheckedSnapshot: p1.snapshot, result: { verdict: "pass", summary: "P1 reviewed.", findings: [] }, attemptResult: { exitCode: 0 } });
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const recoveredAt = new Date();
+    const firstClaim = f.store.claimReviewRecovery(f.task.id, g1Owner, reviewRecoveryInput(f, observed, "pre_commit", recoveredAt));
+    assert.ok(firstClaim);
+
+    // G1 performs a review of P1, requests a revision, and seals P2 in G1.
+    const p1G1Review = f.store.createAttempt(f.task.id, "review", { owner: g1Owner, harness: "codex",
+      metadata: { packageId: p1.id, generationId: g1 } });
+    f.store.finishPackageReview({ packageId: p1.id, attemptId: p1G1Review.id, owner: g1Owner, generationId: g1,
+      recheckedSnapshot: p1.snapshot, result: { verdict: "changes_requested", summary: "Revise P1.",
+        findings: [{ severity: "low", evidence: "Missing edge case.", requestedChange: "Add coverage." }] }, attemptResult: { exitCode: 0 } });
+    f.store.transition(f.task.id, "reviewing", "revision", { owner: g1Owner, incrementRevision: true, reason: "review requested changes" });
+    f.store.transition(f.task.id, "revision", "running", { owner: g1Owner, reason: "starting revision" });
+    const reviseStage = f.store.createStage(f.task.id, { role: "revise", processStartId: "process-g1-revise", harness: "zcode", model: "model-x" });
+    f.store.startStage(reviseStage.id, g1Owner, "process-g1-revise");
+    const reviseAttempt = f.store.createAttempt(f.task.id, "revise", { owner: g1Owner, stageId: reviseStage.id, harness: "zcode", model: "model-x" });
+    f.store.finishAttempt(reviseAttempt.id, { status: "succeeded" }, { owner: g1Owner, processStartId: "process-g1-revise" });
+    const p2Input = { ...f.input, owner: g1Owner, generationId: g1, executionAttemptId: reviseAttempt.id,
+      executionStageId: reviseStage.id, snapshot: p1.snapshot };
+    const run = f.store.startCheckRun(p2Input);
+    f.store.recordCheckResult(run.id, { owner: g1Owner, generationId: g1 }, f.result("unit"));
+    f.store.finishStage(reviseStage.id, g1Owner, "process-g1-revise", "succeeded", "p2-fingerprint");
+    const p2 = f.store.completeCheckRun(run.id, { owner: g1Owner, generationId: g1 }, p1.snapshot).reviewPackage;
+    assert.notEqual(p2.id, p1.id);
+    const p2Review = f.store.createAttempt(f.task.id, "review", { owner: g1Owner, harness: "codex",
+      metadata: { packageId: p2.id, generationId: g1 } });
+    const p2Verdict = f.store.finishPackageReview({ packageId: p2.id, attemptId: p2Review.id, owner: g1Owner, generationId: g1,
+      recheckedSnapshot: p2.snapshot, result: { verdict: "pass", summary: "P2 passes.", findings: [] }, attemptResult: { exitCode: 0 } });
+
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g2, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const secondClaimAt = new Date();
+    const secondClaim = f.store.claimReviewRecovery(f.task.id, "recovery-g2", reviewRecoveryInput(f, observed, "pre_commit", secondClaimAt));
+    assert.equal(secondClaim?.priorCheckpointId, firstClaim?.id);
+    assert.equal(secondClaim?.priorClaimGenerationId, g1);
+    assert.equal(secondClaim?.claimGenerationId, g2);
+    assert.equal((f.store.reviewRecoveryClaims(f.task.id)[0]?.packageId), p1.id);
+    assert.equal((f.store.reviewRecoveryClaims(f.task.id)[1]?.packageId), p2.id);
+
+    const recoveredCommitInput = { operationId: "epoch-commit-g2", taskId: f.task.id, packageId: p2.id, verdictId: p2Verdict.id,
+      owner: "recovery-g2", generationId: g2, branchRef: p2.branchRef, preHead: p2.snapshot.preHead,
+      treeId: p2.snapshot.treeId, diffHash: p2.snapshot.diffHash, message: "Commit revised P2",
+      timestamp: new Date().toISOString(), preCommitInspection: { checkedAt: new Date().toISOString(), branchRef: p2.branchRef,
+        head: p2.snapshot.preHead, snapshot: p2.snapshot } };
+    const commit = f.store.createCommitOperationFromRecoveredVerdict(recoveredCommitInput);
+    const candidateSha = "d".repeat(40);
+    f.store.recordCommitOperationCandidate(commit.id, { owner: "recovery-g2", generationId: g2 }, candidateSha);
+    const appliedOperation = f.store.markCommitOperationApplied(commit.id, { owner: "recovery-g2", generationId: g2 }, {
+      branchRef: commit.branchRef, refHead: candidateSha, worktreeHead: candidateSha, treeId: commit.treeId,
+      diffHash: commit.diffHash, candidateObjectVerified: true, indexMatchesReviewedTree: true, worktreeClean: true,
+    });
+    const applied = { pkg: p2, attempt: p2Review, verdict: p2Verdict, input: recoveredCommitInput,
+      operation: appliedOperation, candidateSha };
+    const reportInputValue = { ...reportInput(f, applied, "epoch-report-g2"), owner: "recovery-g2", generationId: g2 };
+    const report = f.store.createReportOperation(reportInputValue);
+    f.store.completeReportOperation(report.id, { owner: "recovery-g2", generationId: g2 }, {
+      reportBytes: reportInputValue.reportBytes, diffBytes: reportInputValue.diffBytes,
+    });
+    const gitEvidence = { branchRef: commit.branchRef, refHead: candidateSha, worktreeHead: candidateSha, treeId: commit.treeId,
+      diffHash: commit.diffHash, candidateObjectVerified: true as const, indexMatchesReviewedTree: true as const, worktreeClean: true as const };
+    assert.equal(f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: report.id, owner: "recovery-g2",
+      generationId: g2, gitEvidence }).status, "done");
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("G0 completed report survives G1/G2 claims and DONE rejects foreign report generations or a broken chain", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-recovered-complete-report-done-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "5".repeat(64);
+  const g0 = "41414141414141414141414141414141";
+  const g1 = "51515151515151515151515151515151";
+  const g2 = "61616161616161616161616161616161";
+  const foreignGeneration = "71717171717171717171717171717171";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const applied = completeAppliedCommit(f);
+    const report = completeReportOperation(f, applied);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    let at = new Date();
+    const first = f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "applied_candidate", at, applied));
+    assert.equal(f.store.getReportOperation(report.id)?.claimGenerationId, g0);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g2, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    at = new Date();
+    const second = f.store.claimReviewRecovery(f.task.id, "recovery-g2", reviewRecoveryInput(f, observed, "applied_candidate", at, applied));
+    assert.equal(second?.priorCheckpointId, first?.id);
+    assert.equal(f.store.getReportOperation(report.id)?.claimGenerationId, g0);
+    assert.equal(f.store.getCommitOperation(applied.operation.id)?.claimGenerationId, g2);
+    const evidence = { branchRef: applied.operation.branchRef, refHead: applied.candidateSha, worktreeHead: applied.candidateSha,
+      treeId: applied.operation.treeId, diffHash: applied.operation.diffHash, candidateObjectVerified: true as const,
+      indexMatchesReviewedTree: true as const, worktreeClean: true as const };
+
+    const foreign = new TaskStore(path, { id: foreignGeneration, predecessorDrained: false, evidenceKind: "unguarded" });
+    foreign.close();
+    const editor = new DatabaseSync(path);
+    try {
+      editor.exec("DROP TRIGGER report_operations_guard_update");
+      editor.prepare("UPDATE report_operations SET claim_generation_id=? WHERE id=?").run(foreignGeneration, report.id);
+    } finally { editor.close(); }
+    assert.throws(() => f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: report.id,
+      owner: "recovery-g2", generationId: g2, gitEvidence: evidence }), /verified continuous task claim chain/);
+
+    const repair = new DatabaseSync(path);
+    try { repair.prepare("UPDATE report_operations SET claim_generation_id=? WHERE id=?").run(g0, report.id); }
+    finally { repair.close(); }
+
+    const reportOwnerTamper = new DatabaseSync(path);
+    try { reportOwnerTamper.prepare("UPDATE report_operations SET owner=? WHERE id=?").run("foreign-report-creator", report.id); }
+    finally { reportOwnerTamper.close(); }
+    assert.throws(() => f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: report.id,
+      owner: "recovery-g2", generationId: g2, gitEvidence: evidence }), /generation owners must match/);
+    const reportOwnerRestore = new DatabaseSync(path);
+    try { reportOwnerRestore.prepare("UPDATE report_operations SET owner=? WHERE id=?").run(f.owner, report.id); }
+    finally { reportOwnerRestore.close(); }
+
+    const reportClaimOwnerTamper = new DatabaseSync(path);
+    try { reportClaimOwnerTamper.prepare("UPDATE report_operations SET claim_owner=? WHERE id=?").run("foreign-report-claimer", report.id); }
+    finally { reportClaimOwnerTamper.close(); }
+    assert.throws(() => f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: report.id,
+      owner: "recovery-g2", generationId: g2, gitEvidence: evidence }), /generation owners must match/);
+    const reportClaimOwnerRestore = new DatabaseSync(path);
+    try { reportClaimOwnerRestore.prepare("UPDATE report_operations SET claim_owner=? WHERE id=?").run(f.owner, report.id); }
+    finally { reportClaimOwnerRestore.close(); }
+
+    const commitOwnerTamper = new DatabaseSync(path);
+    try {
+      commitOwnerTamper.exec("DROP TRIGGER commit_operations_guard_update");
+      commitOwnerTamper.prepare("UPDATE commit_operations SET owner=? WHERE id=?").run("foreign-commit-creator", applied.operation.id);
+    } finally { commitOwnerTamper.close(); }
+    assert.throws(() => f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: report.id,
+      owner: "recovery-g2", generationId: g2, gitEvidence: evidence }), /generation owners must match/);
+    const commitOwnerRestore = new DatabaseSync(path);
+    try { commitOwnerRestore.prepare("UPDATE commit_operations SET owner=? WHERE id=?").run(f.owner, applied.operation.id); }
+    finally { commitOwnerRestore.close(); }
+
+    const reviewOwnerTamper = new DatabaseSync(path);
+    let reviewEvent: { id: number; payload: string } | undefined;
+    try {
+      reviewEvent = reviewOwnerTamper.prepare("SELECT id,payload FROM events WHERE task_id=? AND type='review.finished' ORDER BY id DESC LIMIT 1")
+        .get(f.task.id) as { id: number; payload: string } | undefined;
+      const payload = JSON.parse(reviewEvent!.payload) as Record<string, unknown>;
+      reviewOwnerTamper.prepare("UPDATE events SET payload=? WHERE id=?").run(JSON.stringify({ ...payload, owner: "foreign-reviewer" }), reviewEvent!.id);
+    } finally { reviewOwnerTamper.close(); }
+    assert.throws(() => f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: report.id,
+      owner: "recovery-g2", generationId: g2, gitEvidence: evidence }), /generation owners must match/);
+    const reviewOwnerRestore = new DatabaseSync(path);
+    try { reviewOwnerRestore.prepare("UPDATE events SET payload=? WHERE id=?").run(reviewEvent!.payload, reviewEvent!.id); }
+    finally { reviewOwnerRestore.close(); }
+
+    const tamper = new DatabaseSync(path);
+    try {
+      tamper.exec("DROP TRIGGER review_recovery_claims_no_update");
+      tamper.prepare("UPDATE review_recovery_claims SET prior_checkpoint_id=id WHERE id=?").run(first!.id);
+    } finally { tamper.close(); }
+    assert.throws(() => f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: report.id,
+      owner: "recovery-g2", generationId: g2, gitEvidence: evidence }), /verified continuous task claim chain/);
+    const restore = new DatabaseSync(path);
+    try { restore.prepare("UPDATE review_recovery_claims SET prior_checkpoint_id=NULL WHERE id=?").run(first!.id); }
+    finally { restore.close(); }
+
+    assert.equal(f.store.completeReviewedTask({ taskId: f.task.id, reportOperationId: report.id,
+      owner: "recovery-g2", generationId: g2, gitEvidence: evidence }).status, "done");
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("DONE rejects missing or incomplete report operations and a stale lease", async () => {
@@ -1207,6 +1511,328 @@ test("execution recovery quarantines legacy, multi-stage, review, quota, and ide
     }
   } finally {
     store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery claims a continuous guardian chain and permits a pass created in the prior recovered generation", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-recovery-chain-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "a".repeat(64);
+  const g0 = "10101010101010101010101010101010";
+  const g1 = "20202020202020202020202020202020";
+  const g2 = "30303030303030303030303030303030";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const firstAt = new Date();
+    const first = f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "pre_commit", firstAt));
+    assert.equal(first?.priorClaimGenerationId, g0);
+    assert.equal(first?.claimGenerationId, g1);
+    assert.equal(first?.priorCheckpointId, undefined);
+    assert.equal(f.store.claimReviewRecovery(f.task.id, "duplicate", reviewRecoveryInput(f, observed, "pre_commit", firstAt)), undefined);
+
+    const attempt = f.store.createAttempt(f.task.id, "review", { owner: "recovery-g1", harness: "codex",
+      metadata: { packageId: pkg.id, generationId: g1 } });
+    f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: "recovery-g1", generationId: g1,
+      recheckedSnapshot: pkg.snapshot, result: { verdict: "pass", summary: "No findings after recovery.", findings: [] },
+      attemptResult: { exitCode: 0 } });
+    f.store.close();
+
+    f.store = new TaskStore(path, { id: g2, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    const secondAt = new Date();
+    const second = f.store.claimReviewRecovery(f.task.id, "recovery-g2", reviewRecoveryInput(f, observed, "pre_commit", secondAt));
+    assert.equal(second?.priorClaimGenerationId, g1);
+    assert.equal(second?.claimGenerationId, g2);
+    assert.equal(second?.priorCheckpointId, first?.id);
+    assert.equal(second?.sourceGenerationId, g0);
+    assert.deepEqual(f.store.reviewRecoveryClaims(f.task.id).map(claim => [claim.priorClaimGenerationId, claim.claimGenerationId]), [[g0, g1], [g1, g2]]);
+    assert.equal(f.store.get(f.task.id)?.status, "reviewing");
+    assert.equal(f.store.get(f.task.id)?.claimGenerationId, g2);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery transfers a prepared commit but keeps completed report ownership as audit history", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-recovery-report-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "b".repeat(64);
+  const g0 = "41414141414141414141414141414141";
+  const g1 = "51515151515151515151515151515151";
+  const g2 = "61616161616161616161616161616161";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const applied = completeAppliedCommit(f);
+    const completedReport = completeReportOperation(f, applied);
+    const originalReportOwner = completedReport.claimOwner;
+    const originalReportGeneration = completedReport.claimGenerationId;
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    let at = new Date();
+    const first = f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "applied_candidate", at, applied));
+    assert.equal(first?.commitOperation?.claimOwner, f.owner);
+    assert.equal(first?.reportOperation?.status, "complete");
+    assert.equal(f.store.getCommitOperation(applied.operation.id)?.claimOwner, "recovery-g1");
+    assert.equal(f.store.getReportOperation(completedReport.id)?.claimOwner, originalReportOwner);
+    assert.equal(f.store.getReportOperation(completedReport.id)?.claimGenerationId, originalReportGeneration);
+    f.store.close();
+
+    f.store = new TaskStore(path, { id: g2, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    at = new Date();
+    const second = f.store.claimReviewRecovery(f.task.id, "recovery-g2", reviewRecoveryInput(f, observed, "applied_candidate", at, applied));
+    assert.equal(second?.priorCheckpointId, first?.id);
+    assert.equal(f.store.getCommitOperation(applied.operation.id)?.claimOwner, "recovery-g2");
+    assert.equal(f.store.getCommitOperation(applied.operation.id)?.claimGenerationId, g2);
+    assert.equal(f.store.getReportOperation(completedReport.id)?.claimOwner, originalReportOwner);
+    assert.equal(f.store.reviewRecoveryClaims(f.task.id).length, 2);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery quarantines failed verdicts and broken first-claim source lineage", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-recovery-deny-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "c".repeat(64);
+  const g0 = "71717171717171717171717171717171";
+  const g1 = "81818181818181818181818181818181";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }, { id: "lint", argv: ["node", "lint.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const attempt = startBoundReviewAttempt(f, pkg.id);
+    f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: g0,
+      recheckedSnapshot: pkg.snapshot, result: { verdict: "changes_requested", summary: "Needs revision.",
+        findings: [{ severity: "low", evidence: "A test is missing.", requestedChange: "Add the test." }] }, attemptResult: { exitCode: 0 } });
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const at = new Date();
+    const claim = f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "pre_commit", at));
+    assert.equal(claim, undefined);
+    assert.equal(f.store.get(f.task.id)?.status, "recovery_required");
+    assert.match(f.store.get(f.task.id)?.recoveryReason ?? "", /Latest review verdict is not passing/);
+    assert.equal(f.store.reviewRecoveryClaims(f.task.id).length, 0);
+    assert.equal(f.store.events(f.task.id).some(event => event.type === "task.review_recovery_quarantined"), true);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery rejects fresh Git state that differs from the sealed snapshot", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-recovery-git-mismatch-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "d".repeat(64);
+  const g0 = "91919191919191919191919191919191";
+  const g1 = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    completeReviewPackage(f);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const at = new Date();
+    const input = reviewRecoveryInput(f, observed, "pre_commit", at);
+    assert.throws(() => f.store.claimReviewRecovery(f.task.id, "recovery-g1", { ...input,
+      gitState: { ...input.gitState, diffHash: "0".repeat(64) } }), /does not match the complete immutable review package snapshot/);
+    assert.equal(f.store.get(f.task.id)?.status, "recovery_required");
+    assert.equal(f.store.reviewRecoveryClaims(f.task.id).length, 0);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery transfers a prepared report operation with the prior live claim", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-recovery-prepared-report-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "e".repeat(64);
+  const g0 = "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
+  const g1 = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const applied = completeAppliedCommit(f);
+    const reportInputValue = reportInput(f, applied);
+    const prepared = f.store.createReportOperation(reportInputValue);
+    assert.equal(prepared.status, "prepared");
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const at = new Date();
+    const claim = f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "applied_candidate", at, applied));
+    assert.equal(claim?.reportOperation?.status, "prepared");
+    assert.equal(claim?.reportOperation?.claimOwner, f.owner);
+    assert.equal(claim?.reportOperation?.claimGenerationId, g0);
+    assert.equal(f.store.getReportOperation(prepared.id)?.claimOwner, "recovery-g1");
+    assert.equal(f.store.getReportOperation(prepared.id)?.claimGenerationId, g1);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery quarantines a first claim when the sealed package source generation is missing", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-recovery-lineage-gap-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "f".repeat(64);
+  const g0 = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
+  const g1 = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const editor = new DatabaseSync(path);
+    try { editor.prepare("UPDATE check_runs SET generation_id=? WHERE id=?").run(g1, pkg.checkRunId); }
+    finally { editor.close(); }
+    const at = new Date();
+    assert.equal(f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "pre_commit", at)), undefined);
+    assert.match(f.store.get(f.task.id)?.recoveryReason ?? "", /First review recovery claim does not match/);
+    assert.equal(f.store.reviewRecoveryClaims(f.task.id).length, 0);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery rejects a tampered historical guardian/checkpoint link", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-recovery-chain-tamper-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "1".repeat(64);
+  const g0 = "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2";
+  const g1 = "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2";
+  const g2 = "03030303030303030303030303030303";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    completeReviewPackage(f);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const firstAt = new Date();
+    const first = f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "pre_commit", firstAt));
+    assert.ok(first);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+
+    f.store = new TaskStore(path, { id: g2, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const editor = new DatabaseSync(path);
+    try {
+      editor.exec("DROP TRIGGER review_recovery_claims_no_update");
+      editor.prepare("UPDATE review_recovery_claims SET prior_checkpoint_id=id WHERE id=?").run(first!.id);
+    } finally { editor.close(); }
+    const at = new Date();
+    assert.equal(f.store.claimReviewRecovery(f.task.id, "recovery-g2", reviewRecoveryInput(f, observed, "pre_commit", at)), undefined);
+    assert.match(f.store.get(f.task.id)?.recoveryReason ?? "", /claim chain is incomplete|broken checkpoint link/);
+    assert.equal(f.store.reviewRecoveryClaims(f.task.id).length, 1);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery quarantines a completed report whose original claim is outside the task chain", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-recovery-foreign-report-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "2".repeat(64);
+  const g0 = "14141414141414141414141414141414";
+  const g1 = "15151515151515151515151515151515";
+  const foreignGeneration = "16161616161616161616161616161616";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const applied = completeAppliedCommit(f);
+    const completed = completeReportOperation(f, applied);
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const foreign = new TaskStore(path, { id: foreignGeneration, predecessorDrained: false, evidenceKind: "unguarded" });
+    foreign.close();
+    const editor = new DatabaseSync(path);
+    try {
+      editor.exec("DROP TRIGGER report_operations_guard_update");
+      editor.prepare("UPDATE report_operations SET claim_generation_id=? WHERE id=?").run(foreignGeneration, completed.id);
+    } finally { editor.close(); }
+    const at = new Date();
+    assert.equal(f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "applied_candidate", at, applied)), undefined);
+    assert.match(f.store.get(f.task.id)?.recoveryReason ?? "", /exact commit, verdict, and prior claim/);
+    assert.equal(f.store.reviewRecoveryClaims(f.task.id).length, 0);
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review recovery quarantines a commit operation bound to a superseded package", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-review-recovery-stale-commit-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "3".repeat(64);
+  const g0 = "17171717171717171717171717171717";
+  const g1 = "18181818181818181818181818181818";
+  let f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path,
+    { id: g0, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const reviewAttempt = startBoundReviewAttempt(f, pkg.id);
+    const verdict = f.store.finishPackageReview({ packageId: pkg.id, attemptId: reviewAttempt.id, owner: f.owner, generationId: g0,
+      recheckedSnapshot: pkg.snapshot, result: { verdict: "pass", summary: "Reviewed latest package.", findings: [] },
+      attemptResult: { exitCode: 0 } });
+    const editor = new DatabaseSync(path);
+    try {
+      const oldCheckRunId = `old-check-${f.task.id}`;
+      const oldPackageId = `old-package-${f.task.id}`;
+      editor.prepare(`INSERT INTO check_runs(id,task_id,generation_id,owner,execution_attempt_id,execution_stage_id,route_attempt_id,
+        route,branch_ref,snapshot,check_definition_hash,expected_check_ids,status,created_at)
+        SELECT ?,task_id,generation_id,owner,execution_attempt_id,execution_stage_id,route_attempt_id,route,branch_ref,snapshot,
+          check_definition_hash,expected_check_ids,status,created_at FROM check_runs WHERE id=?`).run(oldCheckRunId, pkg.checkRunId);
+      editor.prepare(`INSERT INTO review_packages(rowid,id,task_id,check_run_id,execution_attempt_id,execution_stage_id,route_attempt_id,
+        route,branch_ref,snapshot,check_definition_hash,expected_check_ids,created_at)
+        SELECT 0,?,task_id,?,execution_attempt_id,execution_stage_id,route_attempt_id,route,branch_ref,snapshot,
+          check_definition_hash,expected_check_ids,'2000-01-01T00:00:00.000Z' FROM review_packages WHERE id=?`)
+        .run(oldPackageId, oldCheckRunId, pkg.id);
+      editor.prepare(`INSERT INTO commit_operations(id,task_id,package_id,verdict_id,generation_id,owner,claim_owner,claim_generation_id,
+        branch_ref,pre_head,tree_id,diff_hash,message,timestamp,author_name,author_email,committer_name,committer_email,encoding,status,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(`old-commit-${f.task.id}`, f.task.id, oldPackageId, verdict.id, g0,
+          f.owner, f.owner, g0, `refs/heads/zero/${f.task.id}`, pkg.snapshot.preHead, pkg.snapshot.treeId, pkg.snapshot.diffHash,
+          "old commit", "2026-01-01T00:00:00.000Z", "Zero", "zero@localhost", "Zero", "zero@localhost", "UTF-8", "intent", "2000-01-01T00:00:00.000Z");
+    } finally { editor.close(); }
+    f.store.recoverExpired(new Date(Date.now() + 120_000));
+    f.store.close();
+    f.store = new TaskStore(path, { id: g1, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+    const at = new Date();
+    assert.equal(f.store.claimReviewRecovery(f.task.id, "recovery-g1", reviewRecoveryInput(f, observed, "pre_commit", at)), undefined);
+    assert.match(f.store.get(f.task.id)?.recoveryReason ?? "", /commit operation outside the latest package boundary/);
+    assert.equal(f.store.get(f.task.id)?.status, "recovery_required");
+    assert.equal(f.store.reviewRecoveryClaims(f.task.id).length, 0);
+  } finally {
+    f.store.close();
     await rm(root, { recursive: true, force: true });
   }
 });

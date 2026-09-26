@@ -31,6 +31,8 @@
 
 已完成的 report operation 保留完成时的 claim 作为审计记录；恢复后专用 DONE 事务可在 guardian 证明该代清空、固定字节与读回 marker 自洽、当前任务 lease 有效时接受它。尚处于 prepared 的 report operation 必须在同一恢复认领事务内把 claim 转交新代，才能继续写文件并完成 marker。任务新 lease、commit operation claim 与 prepared report claim 的转交要作为同一个 SQLite 事务完成，任一步失败则全部回滚。
 
+重复崩溃不能要求当前 guardian 永远直接证明最初的审核 generation：它只能证明**紧邻前一位任务 claim 持有者**已清空。每次 reviewing 恢复认领都追加不可变检查点，记录上一 claim generation、新 claim generation、所接续的上一检查点与原始审核来源；下一次恢复须验证这条连续链，并再次取得对紧邻前代的 guardian 证明。缺少中间检查点、代际跳跃或链上证据冲突时隔离。已有 commit operation 的优先级高于重审；不得封一个新 package 来绕过已经应用的候选提交。候选 SHA 已保存但对象缺失时继续隔离，不从丢失的对象事实推断安全恢复。
+
 `update-ref` 遇到残留 `.lock` 不等同于 CAS 冲突。恢复代码不得仅凭租约到期自动删除锁文件；先证明前代 guardian Job 已清空，再明确判定锁的归属和状态。v1 无法证明时隔离，保留现场供人工检查。
 
 此协议不运行 Git commit hooks，也不会继承常规 `git commit` 的签名流程。Zero 的配置检查和 Codex 审核是本流程的放行门禁；项目若依赖 hook，必须把相应命令显式列入任务检查。是否支持可选签名另行设计，不能在恢复中无声改变 candidate。

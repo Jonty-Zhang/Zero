@@ -155,6 +155,10 @@ export interface CreateCommitOperationInput {
   timestamp: string;
 }
 
+export interface CreateRecoveredCommitOperationInput extends CreateCommitOperationInput {
+  preCommitInspection: { checkedAt: string; branchRef: string; head: string; snapshot: CheckRunSnapshot };
+}
+
 /**
  * Caller attestation produced only after Git object/ref/worktree verification has completed.
  * TaskStore validates that the fields match the stored intent; it cannot independently prove Git state.
@@ -222,6 +226,37 @@ export interface CompleteReviewedTaskInput {
   generationId: string;
   /** Freshly obtained after report completion by independently verifying Git immediately before this call. */
   gitEvidence: VerifiedAppliedCommitEvidence;
+}
+
+export type ReviewRecoveryGitState =
+  | { kind: "pre_commit"; checkedAt: string; branchRef: string; head: string; treeId: string; diffHash: string; snapshot: CheckRunSnapshot }
+  | { kind: "applied_candidate"; checkedAt: string; packageId: string; commitOperationId: string; branchRef: string;
+      head: string; refHead: string; treeId: string; diffHash: string; candidateSha: string;
+      candidateObjectVerified: true; indexMatchesReviewedTree: true; worktreeClean: true };
+
+export interface ClaimReviewRecoveryInput {
+  leaseMs?: number;
+  now?: Date;
+  identity: { checkedAt: string; observed: unknown; fingerprint: string };
+  gitState: ReviewRecoveryGitState;
+}
+
+export interface ReviewRecoveryClaimRecord {
+  id: string;
+  taskId: string;
+  priorClaimGenerationId: string;
+  claimGenerationId: string;
+  owner: string;
+  leaseExpiresAt: string;
+  priorCheckpointId?: string;
+  packageId: string;
+  sourceGenerationId: string;
+  identity: { checkedAt: string; observed: unknown; fingerprint: string };
+  gitState: ReviewRecoveryGitState;
+  /** Operation ownership at claim time, including completed reports retained as audit evidence. */
+  commitOperation?: Record<string, unknown>;
+  reportOperation?: Record<string, unknown>;
+  claimedAt: string;
 }
 
 const ZERO_COMMIT_IDENTITY = {
@@ -461,6 +496,18 @@ export class TaskStore {
           CHECK(status IN ('claimed','quarantined','inspection_required','disabled','superseded')),
         payload TEXT NOT NULL, updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS review_recovery_claims (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+        prior_claim_generation_id TEXT NOT NULL REFERENCES startup_generations(id),
+        claim_generation_id TEXT NOT NULL REFERENCES startup_generations(id), owner TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL, prior_checkpoint_id TEXT REFERENCES review_recovery_claims(id),
+        package_id TEXT NOT NULL REFERENCES review_packages(id), source_generation_id TEXT NOT NULL REFERENCES startup_generations(id),
+        identity TEXT NOT NULL, git_state TEXT NOT NULL, payload TEXT NOT NULL, claimed_at TEXT NOT NULL,
+        UNIQUE(task_id,claim_generation_id)
+      );
+      CREATE INDEX IF NOT EXISTS review_recovery_claims_task_chain ON review_recovery_claims(task_id,claimed_at,id);
+      CREATE TRIGGER IF NOT EXISTS review_recovery_claims_no_update BEFORE UPDATE ON review_recovery_claims BEGIN SELECT RAISE(ABORT,'review recovery claims are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS review_recovery_claims_no_delete BEFORE DELETE ON review_recovery_claims BEGIN SELECT RAISE(ABORT,'review recovery claims are immutable'); END;
     `);
     // Additive, idempotent migration: old attempts remain valid with a NULL stage_id.
     // Existing databases are not rebuilt or rewritten.
@@ -548,6 +595,134 @@ export class TaskStore {
       row.predecessor_generation_id === generationId && row.previous_id === generationId &&
       row.previous_evidence_kind === "guardian_startup_verified" &&
       row.previous_lock_id === row.current_lock_id);
+  }
+
+  #startupGenerationProvesPredecessorDrained(generationId: string, predecessorGenerationId: string): boolean {
+    const row = this.#db.prepare(`SELECT child.predecessor_drained,child.evidence_kind,child.lock_id,
+        child.predecessor_generation_id,parent.id AS parent_id,parent.evidence_kind AS parent_evidence_kind,parent.lock_id AS parent_lock_id
+      FROM startup_generations AS child LEFT JOIN startup_generations AS parent
+        ON parent.id=child.predecessor_generation_id WHERE child.id=?`).get(generationId) as {
+          predecessor_drained: number; evidence_kind: string; lock_id: string | null; predecessor_generation_id: string | null;
+          parent_id: string | null; parent_evidence_kind: string | null; parent_lock_id: string | null;
+        } | undefined;
+    return Boolean(row && row.predecessor_drained === 1 && row.evidence_kind === "guardian_startup_verified" &&
+      row.lock_id && row.predecessor_generation_id === predecessorGenerationId && row.parent_id === predecessorGenerationId &&
+      row.parent_evidence_kind === "guardian_startup_verified" && row.parent_lock_id === row.lock_id);
+  }
+
+  #taskClaimOwnersForGeneration(taskId: string, generationId: string): Set<string> {
+    const rows = this.#db.prepare("SELECT payload FROM events WHERE task_id=? AND type='task.claimed' ORDER BY id")
+      .all(taskId) as Array<{ payload: string | null }>;
+    const owners = new Set<string>();
+    for (const row of rows) {
+      try {
+        const payload = decode<Record<string, unknown>>(row.payload);
+        if (payload?.generationId === generationId && typeof payload.owner === "string" && payload.owner.trim()) owners.add(payload.owner);
+      } catch { return new Set(); }
+    }
+    return owners;
+  }
+
+  #latestTaskClaimOwnerForGeneration(taskId: string, generationId: string): string | undefined {
+    const rows = this.#db.prepare("SELECT payload FROM events WHERE task_id=? AND type='task.claimed' ORDER BY id")
+      .all(taskId) as Array<{ payload: string | null }>;
+    let owner: string | undefined;
+    for (const row of rows) {
+      try {
+        const payload = decode<Record<string, unknown>>(row.payload);
+        if (payload?.generationId === generationId && typeof payload.owner === "string" && payload.owner.trim()) owner = payload.owner;
+      } catch { return undefined; }
+    }
+    return owner;
+  }
+
+  #reviewRecoveryClaimEventMatches(taskId: string, claim: Record<string, unknown>): boolean {
+    const rows = this.#db.prepare("SELECT payload FROM events WHERE task_id=? AND type='task.review_recovery_claimed' ORDER BY id")
+      .all(taskId) as Array<{ payload: string | null }>;
+    for (const row of rows) {
+      try {
+        const payload = decode<Record<string, unknown>>(row.payload);
+        if (payload && payload.id === claim.id && payload.priorClaimGenerationId === claim.prior_claim_generation_id &&
+            payload.claimGenerationId === claim.claim_generation_id && payload.owner === claim.owner) return true;
+      } catch { return false; }
+    }
+    return false;
+  }
+
+  #reviewVerdictOwner(taskId: string, attemptId: string, packageId: string, generationId: string): string | undefined {
+    const rows = this.#db.prepare("SELECT payload FROM events WHERE task_id=? AND type='review.finished' ORDER BY id")
+      .all(taskId) as Array<{ payload: string | null }>;
+    const owners = new Set<string>();
+    for (const row of rows) {
+      try {
+        const payload = decode<Record<string, unknown>>(row.payload);
+        if (payload?.attemptId === attemptId && payload.packageId === packageId && payload.generationId === generationId &&
+            typeof payload.owner === "string" && payload.owner.trim()) owners.add(payload.owner);
+      } catch { return undefined; }
+    }
+    return owners.size === 1 ? [...owners][0] : undefined;
+  }
+
+  #verifiedReviewRecoveryGenerationChain(taskId: string, packageId: string, sourceGenerationId: string,
+    expectedTailGenerationId: string, expectedTailOwner: string): Map<string, Set<string>> | undefined {
+    const claims = this.#db.prepare("SELECT * FROM review_recovery_claims WHERE task_id=? ORDER BY rowid")
+      .all(taskId) as Array<Record<string, unknown>>;
+    if (claims.length === 0) return undefined;
+    const activePackage = this.#db.prepare(`SELECT p.id,p.rowid AS package_rowid,c.generation_id AS source_generation_id
+      FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id
+      WHERE p.id=? AND p.task_id=?`).get(packageId, taskId) as { id: string; package_rowid: number; source_generation_id: string } | undefined;
+    if (!activePackage || activePackage.source_generation_id !== sourceGenerationId) return undefined;
+
+    // Package epochs can advance after a recovery claim (for example, a reviewer
+    // requests changes and the same generation creates a new revision package).
+    // Anchor the immutable chain at its first row, then validate each row against
+    // its own sealed package/check run. The active package may start later in that
+    // chain, so old-generation evidence cannot authorize the newer package.
+    const first = claims[0]!;
+    const sourceGeneration = String(first.source_generation_id ?? "");
+    if (!sourceGeneration || first.prior_claim_generation_id !== sourceGeneration) return undefined;
+    const sourceOwners = this.#taskClaimOwnersForGeneration(taskId, sourceGeneration);
+    if (sourceOwners.size === 0) return undefined;
+    const generationOwners = new Map<string, Set<string>>([[sourceGeneration, sourceOwners]]);
+    let expectedGeneration = sourceGeneration;
+    let expectedCheckpointId: string | undefined;
+    let previousPackageId: string | undefined;
+    let previousPackageRowid = 0;
+    let previousPackageSource: string | undefined;
+    for (const claim of claims) {
+      const claimPackage = this.#db.prepare(`SELECT p.id,p.rowid AS package_rowid,c.generation_id AS source_generation_id,c.status AS check_status
+        FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id
+        WHERE p.id=? AND p.task_id=?`).get(String(claim.package_id), taskId) as
+        { id: string; package_rowid: number; source_generation_id: string; check_status: string } | undefined;
+      const claimSourceGeneration = String(claim.source_generation_id ?? "");
+      const packageEpochIsForward = previousPackageId === undefined || claim.package_id === previousPackageId
+        ? claimPackage?.source_generation_id === previousPackageSource || previousPackageId === undefined
+        : claimSourceGeneration === expectedGeneration && Number(claimPackage?.package_rowid) > previousPackageRowid;
+      if (claim.prior_claim_generation_id !== expectedGeneration ||
+          (claim.prior_checkpoint_id ?? undefined) !== expectedCheckpointId ||
+          !claimPackage || claim.source_generation_id !== claimPackage.source_generation_id ||
+          !generationOwners.has(claimSourceGeneration) || !packageEpochIsForward ||
+          claimPackage.check_status !== "completed" ||
+          !this.#startupGenerationProvesPredecessorDrained(String(claim.claim_generation_id), expectedGeneration)) return undefined;
+      const claimOwner = String(claim.owner ?? "");
+      const claimGenerationId = String(claim.claim_generation_id);
+      const claimGenerationOwners = this.#taskClaimOwnersForGeneration(taskId, claimGenerationId);
+      if (!claimOwner || generationOwners.has(claimGenerationId) || !claimGenerationOwners.has(claimOwner) ||
+          !this.#reviewRecoveryClaimEventMatches(taskId, claim)) return undefined;
+      expectedGeneration = String(claim.claim_generation_id);
+      expectedCheckpointId = String(claim.id);
+      generationOwners.set(expectedGeneration, claimGenerationOwners);
+      previousPackageId = String(claim.package_id);
+      previousPackageRowid = Number(claimPackage.package_rowid);
+      previousPackageSource = claimSourceGeneration;
+    }
+    const latest = claims.at(-1)!;
+    if (expectedGeneration !== expectedTailGenerationId || latest.claim_generation_id !== expectedTailGenerationId ||
+        this.#latestTaskClaimOwnerForGeneration(taskId, expectedTailGenerationId) !== expectedTailOwner) return undefined;
+    const activeSourceIndex = [...generationOwners.keys()].indexOf(sourceGenerationId);
+    if (activeSourceIndex < 0 || Number(activePackage.package_rowid) < previousPackageRowid ||
+        (activePackage.id !== previousPackageId && sourceGenerationId !== expectedTailGenerationId)) return undefined;
+    return new Map([...generationOwners.entries()].slice(activeSourceIndex));
   }
 
   close(): void { this.#db.close(); }
@@ -861,6 +1036,255 @@ export class TaskStore {
       claimed = true;
     });
     return claimed ? this.get(taskId) : undefined;
+  }
+
+  /**
+   * Claims an expired reviewing task only after this startup directly proves the immediately
+   * previous generation drained and the caller supplies fresh worktree/Git inspection.
+   * SQLite binds this evidence to the exact package and any durable commit/report operation;
+   * the caller remains responsible for performing the actual filesystem and Git inspection.
+   */
+  claimReviewRecovery(taskId: string, owner: string, input: ClaimReviewRecoveryInput): ReviewRecoveryClaimRecord | undefined {
+    if (!owner?.trim() || !input?.identity || !input.gitState || !/^[a-f0-9]{64}$/i.test(input.identity.fingerprint ?? "")) {
+      throw new Error("Review recovery requires an owner, fresh worktree identity, and valid fingerprint");
+    }
+    const now = input.now ?? new Date();
+    const leaseMs = input.leaseMs ?? 60_000;
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || !Number.isFinite(leaseMs) || leaseMs <= 0) {
+      throw new Error("Review recovery requires valid now and positive leaseMs values");
+    }
+    this.#assertFreshRecoveryCheck(input.identity.checkedAt, now);
+    this.#assertFreshRecoveryCheck(input.gitState.checkedAt, now);
+    const identityJson = JSON.stringify(input.identity.observed);
+    const gitStateJson = JSON.stringify(input.gitState);
+    if (!identityJson || identityJson === "null" || Buffer.byteLength(identityJson) > 65_536 ||
+        !gitStateJson || Buffer.byteLength(gitStateJson) > 65_536) {
+      throw new Error("Fresh review recovery inspection must be non-empty and at most 64 KiB");
+    }
+    const at = now.toISOString();
+    const expires = new Date(now.getTime() + leaseMs).toISOString();
+    let claimed: ReviewRecoveryClaimRecord | undefined;
+    this.#transaction(() => {
+      const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,recovery_evidence,recovery_reason,payload
+        FROM tasks WHERE id=?`).get(taskId) as {
+          status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null;
+          recovery_evidence: string | null; recovery_reason: string | null; payload: string;
+        } | undefined;
+      if (!task || task.status !== "recovery_required" || task.lease_owner !== null || task.lease_expires_at !== null ||
+          !task.claim_generation_id || !task.recovery_evidence) return;
+      let recoveryEvidence: Record<string, unknown>;
+      try { recoveryEvidence = JSON.parse(task.recovery_evidence) as Record<string, unknown>; }
+      catch { return; }
+      const priorGenerationId = task.claim_generation_id;
+      if (recoveryEvidence.kind !== "lease_expiry" || recoveryEvidence.claimProtocolVersion !== 2 ||
+          recoveryEvidence.previousStatus !== "reviewing" || recoveryEvidence.claimGenerationId !== priorGenerationId ||
+          !this.currentStartupProvesGenerationDrained(priorGenerationId)) return;
+
+      const reject = (reason: string, evidence: Record<string, unknown> = {}): void => {
+        this.#db.prepare("UPDATE tasks SET recovery_reason=?,updated_at=? WHERE id=? AND status='recovery_required' AND claim_generation_id=?")
+          .run(reason, at, taskId, priorGenerationId);
+        this.#event(taskId, "task.review_recovery_quarantined", { reason, priorGenerationId, generationId: this.#startupGeneration.id, ...evidence }, at);
+      };
+
+      const worktree = this.#db.prepare("SELECT * FROM worktree_creations WHERE task_id=?").get(taskId) as {
+        task_id: string; status: string; plan: string; observed: string | null; fingerprint: string | null;
+      } | undefined;
+      let plan: Record<string, unknown>;
+      let savedObserved: { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown; fingerprint?: unknown };
+      try {
+        if (!worktree || worktree.status !== "created" || !worktree.observed || !worktree.fingerprint ||
+            !/^[a-f0-9]{64}$/i.test(worktree.fingerprint)) throw new Error("missing durable worktree registration");
+        plan = JSON.parse(worktree.plan) as Record<string, unknown>;
+        savedObserved = JSON.parse(worktree.observed) as { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown; fingerprint?: unknown };
+      } catch { reject("Review recovery requires a valid completed worktree registration"); return; }
+      const freshObserved = input.identity.observed as { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown; fingerprint?: unknown };
+      const freshInfo = freshObserved?.info;
+      const savedInfo = savedObserved.info;
+      if (!plan || !savedInfo || !freshInfo ||
+          !["taskId", "repoPath", "path", "branch", "baseCommit"].every(key => plan[key] === savedInfo[key] && savedInfo[key] === freshInfo[key]) ||
+          plan.taskId !== taskId || plan.commonGitDir !== savedObserved.commonGitDir || savedObserved.commonGitDir !== freshObserved.commonGitDir ||
+          savedObserved.head !== plan.baseCommit || freshObserved.head !== input.gitState.head ||
+          freshObserved.fingerprint !== input.identity.fingerprint) {
+        throw new Error("Fresh review recovery identity does not match registered worktree or Git HEAD");
+      }
+
+      const pkgRow = this.#db.prepare(`SELECT p.*,c.generation_id AS source_generation_id,c.status AS check_status,
+          c.snapshot AS run_snapshot,c.check_definition_hash AS run_check_definition_hash,
+          c.expected_check_ids AS run_expected_check_ids
+        FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id
+        WHERE p.task_id=? ORDER BY p.rowid DESC LIMIT 1`).get(taskId) as Record<string, unknown> | undefined;
+      if (!pkgRow) { reject("Review recovery requires a sealed review package"); return; }
+      let packageSnapshot: CheckRunSnapshot;
+      let runSnapshot: CheckRunSnapshot;
+      let expectedCheckIds: string[];
+      let submission: TaskSubmission;
+      try {
+        packageSnapshot = JSON.parse(String(pkgRow.snapshot)) as CheckRunSnapshot;
+        runSnapshot = JSON.parse(String(pkgRow.run_snapshot)) as CheckRunSnapshot;
+        expectedCheckIds = JSON.parse(String(pkgRow.expected_check_ids)) as string[];
+        submission = JSON.parse(task.payload) as TaskSubmission;
+      } catch { reject("Review recovery package/check evidence is malformed", { packageId: pkgRow.id }); return; }
+      const checks = submission.checks ?? [];
+      const checkDefinitionHash = createHash("sha256").update(JSON.stringify(checks), "utf8").digest("hex");
+      const checkRows = this.#db.prepare("SELECT check_id,result FROM check_run_results WHERE run_id=? ORDER BY id")
+        .all(String(pkgRow.check_run_id)) as Array<{ check_id: string; result: string }>;
+      let results: CheckResult[];
+      try { results = checkRows.map(row => JSON.parse(row.result) as CheckResult); }
+      catch { reject("Review recovery check results are malformed", { packageId: pkgRow.id }); return; }
+      if (pkgRow.check_status !== "completed" || pkgRow.check_definition_hash !== pkgRow.run_check_definition_hash ||
+          pkgRow.expected_check_ids !== pkgRow.run_expected_check_ids || pkgRow.check_definition_hash !== checkDefinitionHash ||
+          !Array.isArray(expectedCheckIds) || !sameStringSet(expectedCheckIds, checks.map(check => check.id)) ||
+          !sameStringSet(checkRows.map(row => row.check_id), expectedCheckIds) || checkRows.length !== expectedCheckIds.length ||
+          results.some((result, index) => result.id !== checkRows[index]?.check_id || result.status !== "passed" || result.exitCode !== 0) ||
+          !sameReviewRecoverySnapshot(packageSnapshot, runSnapshot) || String(pkgRow.branch_ref) !== `refs/heads/zero/${taskId}`) {
+        reject("Review recovery requires the latest sealed package and complete all-passing current checks", { packageId: pkgRow.id }); return;
+      }
+
+      const priorClaims = this.#db.prepare("SELECT * FROM review_recovery_claims WHERE task_id=? ORDER BY rowid")
+        .all(taskId) as Array<Record<string, unknown>>;
+      const latestClaim = priorClaims.at(-1);
+      let priorCheckpointId: string | undefined;
+      let allowedReviewOwners = new Map<string, Set<string>>();
+      if (latestClaim) {
+        const validated = this.#verifiedReviewRecoveryGenerationChain(taskId, String(pkgRow.id), String(pkgRow.source_generation_id),
+          priorGenerationId, String(recoveryEvidence.leaseOwner ?? ""));
+        if (!validated) {
+          reject("Review recovery claim chain is incomplete, changed, or does not match the immediate prior task lease", {
+            previousCheckpointId: latestClaim.id, expiredLeaseOwner: recoveryEvidence.leaseOwner }); return;
+        }
+        allowedReviewOwners = validated;
+        priorCheckpointId = String(latestClaim.id);
+      } else if (pkgRow.source_generation_id !== priorGenerationId ||
+          this.#latestTaskClaimOwnerForGeneration(taskId, priorGenerationId) !== recoveryEvidence.leaseOwner) {
+        reject("First review recovery claim does not match the package source generation", { packageId: pkgRow.id,
+          packageSourceGenerationId: pkgRow.source_generation_id }); return;
+      } else {
+        const sourceOwners = this.#taskClaimOwnersForGeneration(taskId, priorGenerationId);
+        if (sourceOwners.size === 0) { reject("First review recovery claim has no task claim owner provenance", { priorGenerationId }); return; }
+        allowedReviewOwners.set(priorGenerationId, sourceOwners);
+      }
+
+      const latestVerdict = this.#db.prepare(`SELECT v.*,a.status AS attempt_status,a.role AS attempt_role,a.harness AS attempt_harness,a.metadata AS attempt_metadata
+        FROM review_verdicts v JOIN attempts a ON a.id=v.attempt_id WHERE v.task_id=? ORDER BY v.rowid DESC LIMIT 1`).get(taskId) as Record<string, unknown> | undefined;
+      let verdictId: string | undefined;
+      if (latestVerdict) {
+        let verdictResult: ReviewResult;
+        let metadata: Record<string, unknown>;
+        try {
+          verdictResult = JSON.parse(String(latestVerdict.result)) as ReviewResult;
+          metadata = latestVerdict.attempt_metadata ? JSON.parse(String(latestVerdict.attempt_metadata)) as Record<string, unknown> : {};
+        } catch { reject("Latest review verdict evidence is malformed", { verdictId: latestVerdict.id }); return; }
+        if (latestVerdict.package_id !== pkgRow.id || latestVerdict.attempt_status !== "succeeded" ||
+            latestVerdict.attempt_role !== "review" || latestVerdict.attempt_harness !== "codex" ||
+            metadata.packageId !== pkgRow.id || metadata.generationId !== latestVerdict.generation_id ||
+            !allowedReviewOwners.has(String(latestVerdict.generation_id)) ||
+            !allowedReviewOwners.get(String(latestVerdict.generation_id))?.has(this.#reviewVerdictOwner(taskId, String(latestVerdict.attempt_id),
+              String(pkgRow.id), String(latestVerdict.generation_id)) ?? "") ||
+            !sameReviewRecoverySnapshot(packageSnapshot, JSON.parse(String(latestVerdict.snapshot)) as CheckRunSnapshot)) {
+          reject("Latest review verdict is not bound to this package and continuous claim chain", { verdictId: latestVerdict.id }); return;
+        }
+        if (!isValidReviewResult(verdictResult) || verdictResult.verdict !== "pass") {
+          reject("Latest review verdict is not passing; task remains quarantined", { verdictId: latestVerdict.id,
+            verdict: verdictResult?.verdict }); return;
+        }
+        verdictId = String(latestVerdict.id);
+      }
+
+      const taskCommitRows = this.#db.prepare("SELECT * FROM commit_operations WHERE task_id=? ORDER BY rowid")
+        .all(taskId) as Array<Record<string, unknown>>;
+      if (taskCommitRows.length > 1 || (taskCommitRows.length === 1 && taskCommitRows[0]?.package_id !== pkgRow.id)) {
+        reject("Review recovery found a commit operation outside the latest package boundary", {
+          packageId: pkgRow.id, operationIds: taskCommitRows.map(operation => operation.id),
+          operationPackageIds: taskCommitRows.map(operation => operation.package_id),
+        }); return;
+      }
+      const commitRow = taskCommitRows[0];
+      if (commitRow && (!verdictId || commitRow.verdict_id !== verdictId ||
+          !allowedReviewOwners.get(String(commitRow.generation_id))?.has(String(commitRow.owner)) ||
+          commitRow.claim_owner !== recoveryEvidence.leaseOwner || commitRow.claim_generation_id !== priorGenerationId)) {
+        reject("Persisted commit operation does not bind the latest pass and immediate prior claim", {
+          operationId: commitRow.id, verdictId, operationVerdictId: commitRow.verdict_id }); return;
+      }
+      const reportRow = this.#db.prepare("SELECT * FROM report_operations WHERE task_id=?").get(taskId) as Record<string, unknown> | undefined;
+      if (reportRow && (!commitRow || reportRow.commit_operation_id !== commitRow.id || reportRow.package_id !== pkgRow.id ||
+          reportRow.verdict_id !== verdictId || !allowedReviewOwners.get(String(reportRow.generation_id))?.has(String(reportRow.owner)) ||
+          !allowedReviewOwners.get(String(reportRow.claim_generation_id))?.has(String(reportRow.claim_owner)) || (reportRow.status === "prepared" &&
+            (reportRow.claim_owner !== recoveryEvidence.leaseOwner || reportRow.claim_generation_id !== priorGenerationId)))) {
+        reject("Persisted report operation does not match the exact commit, verdict, and prior claim", {
+          operationId: reportRow.id, status: reportRow.status }); return;
+      }
+
+      const state = input.gitState;
+      if (state.kind === "pre_commit") {
+        if (state.branchRef !== String(pkgRow.branch_ref) || state.head.toLowerCase() !== packageSnapshot.preHead.toLowerCase() ||
+            !sameReviewRecoverySnapshot(state.snapshot, packageSnapshot) || state.treeId.toLowerCase() !== packageSnapshot.treeId.toLowerCase() ||
+            state.diffHash.toLowerCase() !== packageSnapshot.diffHash.toLowerCase() || commitRow?.status === "applied" || reportRow?.status === "complete") {
+          throw new Error("Fresh pre-commit Git state does not match the complete immutable review package snapshot");
+        }
+      } else if (state.kind === "applied_candidate") {
+        if (!commitRow || !verdictId || commitRow.id !== state.commitOperationId || commitRow.package_id !== pkgRow.id ||
+            commitRow.verdict_id !== verdictId || !["candidate", "applied"].includes(String(commitRow.status)) ||
+            typeof commitRow.candidate_sha !== "string" || !/^[a-f0-9]{40,64}$/i.test(String(commitRow.candidate_sha)) ||
+            state.packageId !== pkgRow.id || state.branchRef !== String(pkgRow.branch_ref) ||
+            state.candidateSha.toLowerCase() !== String(commitRow.candidate_sha).toLowerCase() ||
+            state.head.toLowerCase() !== String(commitRow.candidate_sha).toLowerCase() ||
+            state.refHead.toLowerCase() !== String(commitRow.candidate_sha).toLowerCase() ||
+            state.treeId.toLowerCase() !== String(commitRow.tree_id).toLowerCase() || state.treeId.toLowerCase() !== packageSnapshot.treeId.toLowerCase() ||
+            state.diffHash.toLowerCase() !== String(commitRow.diff_hash).toLowerCase() || state.diffHash.toLowerCase() !== packageSnapshot.diffHash.toLowerCase() ||
+            state.candidateObjectVerified !== true || state.indexMatchesReviewedTree !== true || state.worktreeClean !== true) {
+          throw new Error("Fresh applied-candidate Git verification does not match the persisted candidate SHA and reviewed package");
+        }
+      } else {
+        throw new Error("Unknown review recovery Git state classification");
+      }
+
+      const checkpointId = randomUUID();
+      const checkpoint: ReviewRecoveryClaimRecord = {
+        id: checkpointId, taskId, priorClaimGenerationId: priorGenerationId, claimGenerationId: this.#startupGeneration.id,
+        owner, leaseExpiresAt: expires, ...(priorCheckpointId ? { priorCheckpointId } : {}), packageId: String(pkgRow.id),
+        sourceGenerationId: String(pkgRow.source_generation_id),
+        identity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint },
+        gitState: input.gitState,
+        ...(commitRow ? { commitOperation: { id: commitRow.id, status: commitRow.status, verdictId: commitRow.verdict_id,
+          claimOwner: commitRow.claim_owner, claimGenerationId: commitRow.claim_generation_id, candidateSha: commitRow.candidate_sha ?? undefined } } : {}),
+        ...(reportRow ? { reportOperation: { id: reportRow.id, status: reportRow.status, claimOwner: reportRow.claim_owner,
+          claimGenerationId: reportRow.claim_generation_id, completedAt: reportRow.completed_at ?? undefined } } : {}),
+        claimedAt: at,
+      };
+      const checkpointJson = JSON.stringify(checkpoint);
+      if (Buffer.byteLength(checkpointJson) > 65_536) throw new Error("Review recovery checkpoint exceeds 64 KiB");
+      const changed = this.#db.prepare(`UPDATE tasks SET status='reviewing',updated_at=?,lease_owner=?,lease_expires_at=?,heartbeat_at=?,
+          active_attempt_id=NULL,lease_protocol_version=2,claim_generation_id=?,recovery_reason=NULL,recovery_evidence=NULL
+        WHERE id=? AND status='recovery_required' AND lease_owner IS NULL AND lease_expires_at IS NULL AND claim_generation_id=?`)
+        .run(at, owner, expires, at, this.#startupGeneration.id, taskId, priorGenerationId);
+      if (Number(changed.changes) !== 1) return;
+      if (commitRow) {
+        const transferred = this.#db.prepare(`UPDATE commit_operations SET claim_owner=?,claim_generation_id=?
+          WHERE id=? AND claim_owner=? AND claim_generation_id=? AND status IN ('intent','candidate','applied')`)
+          .run(owner, this.#startupGeneration.id, String(commitRow.id), String(recoveryEvidence.leaseOwner), priorGenerationId);
+        if (Number(transferred.changes) !== 1) throw new Error("Commit operation claim ownership changed before review recovery transfer");
+      }
+      if (reportRow?.status === "prepared") {
+        const transferred = this.#db.prepare(`UPDATE report_operations SET claim_owner=?,claim_generation_id=?
+          WHERE id=? AND status='prepared' AND claim_owner=? AND claim_generation_id=?`)
+          .run(owner, this.#startupGeneration.id, String(reportRow.id), String(recoveryEvidence.leaseOwner), priorGenerationId);
+        if (Number(transferred.changes) !== 1) throw new Error("Prepared report operation claim ownership changed before review recovery transfer");
+      }
+      this.#db.prepare(`INSERT INTO review_recovery_claims(id,task_id,prior_claim_generation_id,claim_generation_id,owner,lease_expires_at,
+          prior_checkpoint_id,package_id,source_generation_id,identity,git_state,payload,claimed_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(checkpointId, taskId, priorGenerationId, this.#startupGeneration.id, owner, expires,
+        priorCheckpointId ?? null, String(pkgRow.id), String(pkgRow.source_generation_id), identityJson, gitStateJson, checkpointJson, at);
+      this.#event(taskId, "task.review_recovery_claimed", checkpoint, at);
+      this.#event(taskId, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2,
+        generationId: this.#startupGeneration.id, recovery: "review" }, at);
+      claimed = checkpoint;
+    });
+    return claimed;
+  }
+
+  reviewRecoveryClaims(taskId: string): ReviewRecoveryClaimRecord[] {
+    return (this.#db.prepare("SELECT payload FROM review_recovery_claims WHERE task_id=? ORDER BY rowid").all(taskId) as Array<{ payload: string }>)
+      .map(row => JSON.parse(row.payload) as ReviewRecoveryClaimRecord);
   }
 
   /** After a claimed identity fails a second check, return to quarantine with the checkpoint intact. */
@@ -1427,7 +1851,7 @@ export class TaskStore {
       this.#db.prepare(`INSERT INTO review_verdicts(id,task_id,package_id,attempt_id,generation_id,snapshot,result,created_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(verdictId, String(pkg.task_id), input.packageId, input.attemptId, input.generationId,
         JSON.stringify(snapshot), JSON.stringify(input.result), createdAt);
-      this.#event(String(pkg.task_id), "review.finished", { attemptId: input.attemptId, packageId: input.packageId,
+      this.#event(String(pkg.task_id), "review.finished", { attemptId: input.attemptId, packageId: input.packageId, owner: input.owner,
         generationId: input.generationId, result: input.result }, createdAt);
       this.#event(String(pkg.task_id), "attempt.finished", { attempt: completedAttempt }, createdAt);
     });
@@ -1531,6 +1955,111 @@ export class TaskStore {
         input.message, input.timestamp, ZERO_COMMIT_IDENTITY.authorName, ZERO_COMMIT_IDENTITY.authorEmail,
         ZERO_COMMIT_IDENTITY.committerName, ZERO_COMMIT_IDENTITY.committerEmail, ZERO_COMMIT_IDENTITY.encoding, createdAt);
       this.#event(taskId, "commit_operation.created", { operationId, packageId: input.packageId, verdictId: input.verdictId,
+        branchRef: input.branchRef, preHead: input.preHead.toLowerCase(), treeId: input.treeId.toLowerCase(), diffHash: input.diffHash }, createdAt);
+    });
+    return this.getCommitOperation(operationId)!;
+  }
+
+  /** Explicitly resumes commit intent from a pass verdict made in this task's verified recovery chain. */
+  createCommitOperationFromRecoveredVerdict(input: CreateRecoveredCommitOperationInput): CommitOperationRecord {
+    const operationId = input?.operationId;
+    if (!input || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(operationId ?? "")) throw new Error("Invalid commit operation ID");
+    if (!input.owner?.trim() || !input.generationId?.trim()) throw new Error("Recovered commit operation requires a live owner and generation");
+    if (!/^refs\/heads\/zero\/[A-Za-z0-9][A-Za-z0-9._:_-]{0,127}$/.test(input.branchRef ?? "")) throw new Error("Invalid task commit branch ref");
+    if (!/^[a-fA-F0-9]{40,64}$/.test(input.preHead ?? "") || !/^[a-fA-F0-9]{40,64}$/.test(input.treeId ?? "")) {
+      throw new Error("Recovered commit operation requires valid Git pre-HEAD and reviewed tree object IDs");
+    }
+    if (!SHA256_PATTERN.test(input.diffHash ?? "")) throw new Error("Recovered commit operation requires a SHA-256 reviewed diff hash");
+    if (typeof input.message !== "string" || !input.message.trim() || input.message.includes("\0") ||
+        Buffer.byteLength(input.message, "utf8") > 65_536 || Buffer.from(input.message, "utf8").toString("utf8") !== input.message) {
+      throw new Error("Recovered commit operation message must be valid UTF-8 text of at most 64 KiB");
+    }
+    if (typeof input.timestamp !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(input.timestamp) ||
+        !Number.isFinite(Date.parse(input.timestamp)) || new Date(input.timestamp).toISOString() !== input.timestamp) {
+      throw new Error("Recovered commit operation timestamp must be a canonical UTC ISO timestamp");
+    }
+    const inspection = input.preCommitInspection;
+    if (!inspection || !inspection.branchRef || !inspection.head || !inspection.snapshot) throw new Error("Recovered commit requires a fresh full pre-commit inspection");
+    this.#assertFreshRecoveryCheck(inspection.checkedAt, new Date());
+    const createdAt = new Date().toISOString();
+    this.#transaction(() => {
+      const pkg = this.#db.prepare(`SELECT p.*,c.status AS check_status,c.generation_id AS source_generation_id,
+          c.expected_check_ids AS run_expected_check_ids,c.check_definition_hash AS run_check_definition_hash,c.snapshot AS run_snapshot
+        FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id WHERE p.id=?`)
+        .get(input.packageId) as Record<string, unknown> | undefined;
+      if (!pkg || pkg.check_status !== "completed") throw new Error("Recovered commit requires a completed package check run");
+      const taskId = String(pkg.task_id);
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id,payload FROM tasks WHERE id=?")
+        .get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null; payload: string } | undefined;
+      this.#assertCommitOperationLease(task, input.owner, input.generationId);
+      if (task?.claim_generation_id !== input.generationId || input.branchRef !== `refs/heads/zero/${taskId}` || pkg.branch_ref !== input.branchRef ||
+          inspection.branchRef !== pkg.branch_ref || inspection.head.toLowerCase() !== input.preHead.toLowerCase()) {
+        throw new Error("Recovered commit inspection must match the live task claim, package branch, and pre-commit HEAD");
+      }
+      const packageSnapshot = JSON.parse(String(pkg.snapshot)) as CheckRunSnapshot;
+      if (!sameReviewRecoverySnapshot(inspection.snapshot, packageSnapshot) ||
+          input.preHead.toLowerCase() !== packageSnapshot.preHead.toLowerCase() ||
+          input.treeId.toLowerCase() !== packageSnapshot.treeId.toLowerCase() || input.diffHash !== packageSnapshot.diffHash ||
+          !packageSnapshot.diff.trim()) {
+        throw new Error("Recovered commit full pre-commit inspection does not match the immutable package snapshot");
+      }
+      const latestPackage = this.#db.prepare("SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
+        .get(taskId) as { id: string } | undefined;
+      if (latestPackage?.id !== input.packageId) throw new Error("Recovered commit package is not the latest package for this task");
+      const existingCommitOperations = this.#db.prepare("SELECT id,package_id FROM commit_operations WHERE task_id=? ORDER BY rowid")
+        .all(taskId) as Array<{ id: string; package_id: string }>;
+      if (existingCommitOperations.length !== 0) {
+        throw new Error("Recovered commit cannot be created when any task commit operation already exists");
+      }
+      const chain = this.#verifiedReviewRecoveryGenerationChain(taskId, String(pkg.id), String(pkg.source_generation_id),
+        input.generationId, input.owner);
+      if (!chain || !chain.has(input.generationId)) throw new Error("Recovered commit requires the current live claim to be the tail of a verified review recovery chain");
+
+      const packageCheckIds = JSON.parse(String(pkg.expected_check_ids)) as string[];
+      const runCheckIds = JSON.parse(String(pkg.run_expected_check_ids)) as string[];
+      const packageDefinitionHash = String(pkg.check_definition_hash);
+      if (!sameStringSet(packageCheckIds, runCheckIds) || packageDefinitionHash !== pkg.run_check_definition_hash ||
+          !sameReviewRecoverySnapshot(JSON.parse(String(pkg.snapshot)) as CheckRunSnapshot, JSON.parse(String(pkg.run_snapshot)) as CheckRunSnapshot)) {
+        throw new Error("Recovered commit package check definitions do not match their completed check run");
+      }
+      const submittedChecks = (JSON.parse(task!.payload) as TaskSubmission).checks ?? [];
+      const submittedDefinitionHash = createHash("sha256").update(JSON.stringify(submittedChecks), "utf8").digest("hex");
+      if (submittedDefinitionHash !== packageDefinitionHash || !sameStringSet(submittedChecks.map(check => check.id), packageCheckIds)) {
+        throw new Error("Recovered commit check definitions do not match the submitted task checks");
+      }
+      const latestVerdict = this.#db.prepare(`SELECT v.*,a.status AS attempt_status,a.role AS attempt_role,a.harness AS attempt_harness,
+          a.metadata AS attempt_metadata FROM review_verdicts v JOIN attempts a ON a.id=v.attempt_id WHERE v.task_id=? ORDER BY v.rowid DESC LIMIT 1`)
+        .get(taskId) as Record<string, unknown> | undefined;
+      if (!latestVerdict || latestVerdict.package_id !== input.packageId || latestVerdict.id !== input.verdictId ||
+          latestVerdict.attempt_status !== "succeeded" || latestVerdict.attempt_role !== "review" || latestVerdict.attempt_harness !== "codex" ||
+          !chain.get(String(latestVerdict.generation_id))?.has(this.#reviewVerdictOwner(taskId, String(latestVerdict.attempt_id),
+            input.packageId, String(latestVerdict.generation_id)) ?? "")) {
+        throw new Error("Recovered commit requires the latest successful Codex pass verdict from this verified task claim chain");
+      }
+      const verdictResult = JSON.parse(String(latestVerdict.result)) as ReviewResult;
+      const verdictSnapshot = JSON.parse(String(latestVerdict.snapshot)) as CheckRunSnapshot;
+      if (!isValidReviewResult(verdictResult) || verdictResult.verdict !== "pass" || !sameReviewRecoverySnapshot(packageSnapshot, verdictSnapshot)) {
+        throw new Error("Recovered commit requires an exact immutable passing verdict for the full package snapshot");
+      }
+      const attemptMetadata = latestVerdict.attempt_metadata ? JSON.parse(String(latestVerdict.attempt_metadata)) as Record<string, unknown> : {};
+      if (attemptMetadata.packageId !== input.packageId || attemptMetadata.generationId !== latestVerdict.generation_id) {
+        throw new Error("Recovered review attempt does not bind the package and its original generation");
+      }
+      const checkRows = this.#db.prepare("SELECT check_id,result FROM check_run_results WHERE run_id=? ORDER BY id")
+        .all(String(pkg.check_run_id)) as Array<{ check_id: string; result: string }>;
+      const checks = checkRows.map(row => JSON.parse(row.result) as CheckResult);
+      if (checkRows.length !== packageCheckIds.length || !sameStringSet(checkRows.map(row => row.check_id), packageCheckIds) ||
+          checks.some((result, index) => result.id !== checkRows[index]?.check_id || result.status !== "passed" || result.exitCode !== 0)) {
+        throw new Error("Recovered commit requires the complete passing current check result set");
+      }
+      this.#db.prepare(`INSERT INTO commit_operations(id,task_id,package_id,verdict_id,generation_id,owner,claim_owner,claim_generation_id,branch_ref,pre_head,tree_id,diff_hash,
+        message,timestamp,author_name,author_email,committer_name,committer_email,encoding,status,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'intent',?)`).run(operationId, taskId, input.packageId, input.verdictId,
+        input.generationId, input.owner, input.owner, input.generationId, input.branchRef, input.preHead.toLowerCase(), input.treeId.toLowerCase(), input.diffHash,
+        input.message, input.timestamp, ZERO_COMMIT_IDENTITY.authorName, ZERO_COMMIT_IDENTITY.authorEmail,
+        ZERO_COMMIT_IDENTITY.committerName, ZERO_COMMIT_IDENTITY.committerEmail, ZERO_COMMIT_IDENTITY.encoding, createdAt);
+      this.#event(taskId, "commit_operation.created_from_recovered_verdict", { operationId, packageId: input.packageId,
+        verdictId: input.verdictId, verdictGenerationId: latestVerdict.generation_id, claimGenerationId: input.generationId,
         branchRef: input.branchRef, preHead: input.preHead.toLowerCase(), treeId: input.treeId.toLowerCase(), diffHash: input.diffHash }, createdAt);
     });
     return this.getCommitOperation(operationId)!;
@@ -1761,7 +2290,9 @@ export class TaskStore {
       if (!report || report.status !== "complete" || !report.readback_evidence) {
         throw new Error("DONE requires a complete report operation with verified file readback");
       }
-      this.#assertReportOperationGuard(report, { owner: input.owner, generationId: input.generationId });
+      if (report.claim_generation_id === input.generationId) {
+        this.#assertReportOperationGuard(report, { owner: input.owner, generationId: input.generationId });
+      }
       const reportBytes = Buffer.from(report.report_bytes as Uint8Array);
       const diffBytes = Buffer.from(report.diff_bytes as Uint8Array);
       if (reportBytes.byteLength !== Number(report.report_size) || sha256Bytes(reportBytes) !== String(report.report_sha256) ||
@@ -1806,7 +2337,7 @@ export class TaskStore {
         JOIN attempts a ON a.id=v.attempt_id WHERE v.task_id=? ORDER BY v.rowid DESC LIMIT 1`).get(input.taskId) as Record<string, unknown> | undefined;
       if (!latestPackage || latestPackage.id !== report.package_id || latestPackage.id !== commit.package_id || !latestVerdict ||
           latestVerdict.id !== report.verdict_id || latestVerdict.id !== commit.verdict_id || latestVerdict.package_id !== latestPackage.id ||
-          latestVerdict.generation_id !== commit.generation_id || latestVerdict.attempt_status !== "succeeded" ||
+          latestVerdict.attempt_status !== "succeeded" ||
           latestVerdict.attempt_role !== "review" || latestVerdict.attempt_harness !== "codex") {
         throw new Error("DONE requires the latest immutable passing verdict from its successful Codex review attempt");
       }
@@ -1830,6 +2361,32 @@ export class TaskStore {
           packageRun.expected_check_ids !== latestPackage.expected_check_ids ||
           !sameSnapshot(JSON.parse(String(packageRun.snapshot)) as CheckRunSnapshot, packageSnapshot)) {
         throw new Error("DONE requires the complete check run bound to the latest review package");
+      }
+      const recoveryClaimCount = Number((this.#db.prepare("SELECT COUNT(*) AS count FROM review_recovery_claims WHERE task_id=?")
+        .get(input.taskId) as { count: number }).count);
+      if (recoveryClaimCount > 0) {
+        const chain = this.#verifiedReviewRecoveryGenerationChain(input.taskId, latestPackage.id, String(packageRun.generation_id),
+          input.generationId, input.owner);
+        if (!chain || !chain.get(String(latestVerdict.generation_id))?.has(this.#reviewVerdictOwner(input.taskId,
+            String(latestVerdict.attempt_id), latestPackage.id, String(latestVerdict.generation_id)) ?? "") ||
+            !chain.get(String(commit.generation_id))?.has(String(commit.owner)) ||
+            !chain.get(String(commit.claim_generation_id))?.has(String(commit.claim_owner)) ||
+            !chain.get(String(report.generation_id))?.has(String(report.owner)) ||
+            !chain.get(String(report.claim_generation_id))?.has(String(report.claim_owner))) {
+          throw new Error("DONE operation, verdict, and report generation owners must match the verified continuous task claim chain");
+        }
+        if (report.claim_generation_id === input.generationId) {
+          this.#assertReportOperationGuard(report, { owner: input.owner, generationId: input.generationId });
+        }
+      } else {
+        if (latestVerdict.generation_id !== commit.generation_id || commit.generation_id !== input.generationId ||
+            report.generation_id !== input.generationId || report.claim_generation_id !== input.generationId ||
+            commit.owner !== input.owner || report.owner !== input.owner || report.claim_owner !== input.owner ||
+            !this.#taskClaimOwnersForGeneration(input.taskId, input.generationId).has(input.owner) ||
+            this.#reviewVerdictOwner(input.taskId, String(latestVerdict.attempt_id), latestPackage.id, input.generationId) !== input.owner) {
+          throw new Error("DONE without a recovery chain requires verdict, commit, report, and live claim from one generation and owner");
+        }
+        this.#assertReportOperationGuard(report, { owner: input.owner, generationId: input.generationId });
       }
       const expectedIds = JSON.parse(latestPackage.expected_check_ids) as string[];
       const checkRows = this.#db.prepare("SELECT check_id,result FROM check_run_results WHERE run_id=? ORDER BY id")
@@ -2233,3 +2790,8 @@ function copyUtf8Bytes(value: Uint8Array, label: string, maxBytes: number): Buff
 function sha256Bytes(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
 
 function sameHexHash(left: string, right: string): boolean { return left.toLowerCase() === right.toLowerCase(); }
+
+function sameReviewRecoverySnapshot(left: CheckRunSnapshot, right: CheckRunSnapshot): boolean {
+  return Boolean(left && right && left.baseCommit === right.baseCommit && left.preHead === right.preHead &&
+    left.treeId === right.treeId && left.fingerprint === right.fingerprint && left.diffHash === right.diffHash && left.diff === right.diff);
+}

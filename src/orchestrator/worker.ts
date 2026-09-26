@@ -19,6 +19,7 @@ import { GitWorktreeManager, type WorktreeCreationEvidence, type WorktreeCreatio
 import { TaskStore } from "../core/task-store.js";
 import type { CheckRunSnapshot, ReviewPackageRecord } from "../core/task-store.js";
 import { materializeReportProjection } from "../core/report-projection.js";
+import { inspectReviewRecovery } from "./review-recovery-inspector.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
 import { HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
@@ -180,6 +181,31 @@ export class TaskWorker {
           } catch { /* concurrent recovery or changed evidence remains quarantined */ }
         }
         // Transient filesystem or Git I/O leaves the recovery candidate intact.
+      }
+    }
+    // Review recovery is a separate commit/report state machine. It must never
+    // re-enter route, implementation, or validation after a review package was sealed.
+    for (const candidate of this.#options.store.list("recovery_required")) {
+      const evidence = candidate.recoveryEvidence;
+      if (evidence?.kind !== "lease_expiry" || evidence.claimProtocolVersion !== 2
+        || evidence.previousStatus !== "reviewing" || !candidate.claimGenerationId
+        || !this.#options.store.currentStartupProvesGenerationDrained(candidate.claimGenerationId)) continue;
+      try {
+        const creation = this.#options.store.getWorktreeCreation(candidate.id);
+        const reviewPackage = this.#options.store.reviewPackages(candidate.id).at(-1);
+        if (!creation || !reviewPackage) continue;
+        const commitOperation = this.#options.store.commitOperations(candidate.id).at(-1);
+        const inspection = await inspectReviewRecovery(this.#options.worktrees, creation, reviewPackage, commitOperation);
+        this.#assertAllowedPaths(candidate, await this.#options.worktrees.changedPaths(inspection.info));
+        const claimed = this.#options.store.claimReviewRecovery(candidate.id, owner, {
+          leaseMs: this.#options.leaseMs,
+          identity: inspection.identity,
+          gitState: inspection.gitState,
+        });
+        if (!claimed) continue;
+        return this.#resumeReviewRecovery(candidate.id, owner, claimed.id, inspection.info, reviewPackage);
+      } catch {
+        // Failed or ambiguous inspection stays quarantined for an operator or later retry.
       }
     }
     const task = this.#options.store.claimNext(owner, this.#options.leaseMs);
@@ -926,6 +952,209 @@ export class TaskWorker {
       try { await active.adapter.cancel?.(taskId, active.attempt.id); } catch { /* the worker still observes the abort flag */ }
     }
     return true;
+  }
+
+  /** Resume only the immutable review/commit/report boundaries after a proven-drained reviewing claim. */
+  async #resumeReviewRecovery(taskId: string, owner: string, recoveryClaimId: string, worktree: WorktreeInfo,
+    reviewPackage: ReviewPackageRecord): Promise<TaskRecord> {
+    const task = this.#requireTask(taskId);
+    const generationId = task.claimGenerationId;
+    if (task.status !== "reviewing" || task.leaseOwner !== owner || !generationId) return task;
+    if (this.#active.has(taskId)) return task;
+    const active = { controller: new AbortController(), cancelRequested: false };
+    this.#active.set(taskId, active);
+    let leaseLost = false;
+    let reviewAttempt: Attempt | undefined;
+    const interval = setInterval(() => {
+      try {
+        if (!this.#options.store.heartbeat(taskId, owner, this.#options.leaseMs)) {
+          leaseLost = true;
+          active.controller.abort(new Error("Task lease was lost"));
+        }
+      } catch {
+        leaseLost = true;
+        active.controller.abort(new Error("Task lease heartbeat failed"));
+      }
+    }, this.#options.heartbeatIntervalMs);
+    try {
+      this.#assertLease(taskId, owner, () => leaseLost);
+      const latestPackage = this.#options.store.reviewPackages(taskId).at(-1);
+      if (!latestPackage || latestPackage.id !== reviewPackage.id) throw new Error("Review recovery package is no longer the latest sealed package");
+      const checks = this.#options.store.checkRunResults(reviewPackage.checkRunId);
+      const savedVerdict = this.#options.store.packageReviewVerdicts(taskId).at(-1);
+      let verdictId = savedVerdict?.packageId === reviewPackage.id && savedVerdict.result.verdict === "pass"
+        ? savedVerdict.id : undefined;
+      if (!verdictId) {
+        this.#assertNotCancelled(active);
+        this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+        const before = await this.#options.worktrees.captureReviewSnapshot(worktree);
+        const branchBefore = await this.#options.worktrees.readTaskBranchHead(worktree);
+        if (!sameFullReviewSnapshot(reviewPackage.snapshot, before) || branchBefore.ref !== reviewPackage.branchRef
+          || branchBefore.head.toLowerCase() !== reviewPackage.snapshot.preHead.toLowerCase()) {
+          throw new Error("Fresh review recovery snapshot does not match the sealed package");
+        }
+        reviewAttempt = this.#options.store.createAttempt(taskId, "review", {
+          owner, harness: "codex", metadata: { packageId: reviewPackage.id, generationId, recoveryClaimId },
+        });
+        const activeWithAttempt = active as typeof active & { adapter?: HarnessAdapter; attempt?: Attempt };
+        activeWithAttempt.adapter = this.#options.adapters.get("codex");
+        activeWithAttempt.attempt = reviewAttempt;
+        const review = await this.#options.reviewer.review(task, worktree, reviewPackage.route, checks, before.diff, { attemptId: reviewAttempt.id });
+        this.#assertNotCancelled(active);
+        this.#assertLease(taskId, owner, () => leaseLost);
+        const after = await this.#options.worktrees.captureReviewSnapshot(worktree);
+        const branchAfter = await this.#options.worktrees.readTaskBranchHead(worktree);
+        if (!sameFullReviewSnapshot(before, after) || branchAfter.ref !== branchBefore.ref || branchAfter.head !== branchBefore.head) {
+          throw new Error("Worktree or task branch changed during recovered review");
+        }
+        if (review.harness !== "codex" || review.exitCode !== 0 || !isReviewResult(review.result)) {
+          throw new Error("Codex recovery reviewer failed or returned an invalid verdict");
+        }
+        const persistedVerdict = this.#options.store.finishPackageReview({
+          packageId: reviewPackage.id,
+          attemptId: reviewAttempt.id,
+          owner,
+          generationId,
+          recheckedSnapshot: { baseCommit: worktree.baseCommit, preHead: branchAfter.head, ...after },
+          result: review.result,
+          attemptResult: { exitCode: review.exitCode, stdoutPath: review.stdoutPath, stderrPath: review.stderrPath,
+            resultPath: review.eventsPath, model: review.model, reasoningEffort: review.reasoningEffort },
+        });
+        reviewAttempt = undefined;
+        (activeWithAttempt as { adapter?: HarnessAdapter; attempt?: Attempt }).adapter = undefined;
+        (activeWithAttempt as { adapter?: HarnessAdapter; attempt?: Attempt }).attempt = undefined;
+        if (review.result.verdict !== "pass") {
+          // The Store currently records this exact verdict, but only allows a later
+          // recovery claim to continue from a persisted pass verdict.
+          return this.#options.store.get(taskId) ?? task;
+        }
+        verdictId = persistedVerdict.id;
+      }
+
+      let operation = this.#options.store.commitOperations(taskId).at(-1);
+      let candidate: { branchRef: string; preHead: string; commit: string; treeId: string; diffHash: string; opId: string };
+      const snapshot: WorktreeReviewSnapshot = { fingerprint: reviewPackage.snapshot.fingerprint, diff: reviewPackage.snapshot.diff,
+        diffHash: reviewPackage.snapshot.diffHash, treeId: reviewPackage.snapshot.treeId };
+      if (!operation) {
+        this.#assertNotCancelled(active);
+        this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+        const preCommit = await this.#options.worktrees.captureReviewSnapshot(worktree);
+        const preBranch = await this.#options.worktrees.readTaskBranchHead(worktree);
+        if (!sameFullReviewSnapshot(reviewPackage.snapshot, preCommit) || preBranch.ref !== reviewPackage.branchRef
+          || preBranch.head.toLowerCase() !== reviewPackage.snapshot.preHead.toLowerCase()) {
+          throw new Error("Fresh pre-commit inspection no longer matches the reviewed package");
+        }
+        operation = this.#options.store.createCommitOperationFromRecoveredVerdict({
+          operationId: randomUUID(), packageId: reviewPackage.id, verdictId: verdictId!, owner, generationId,
+          branchRef: preBranch.ref, preHead: preBranch.head, treeId: preCommit.treeId, diffHash: preCommit.diffHash,
+          message: `Zero task ${taskId}`, timestamp: new Date().toISOString(),
+          preCommitInspection: { checkedAt: new Date().toISOString(), branchRef: preBranch.ref, head: preBranch.head,
+            snapshot: { baseCommit: worktree.baseCommit, preHead: preBranch.head, ...preCommit } },
+        });
+      }
+
+      candidate = { branchRef: operation.branchRef, preHead: operation.preHead, commit: operation.candidateSha ?? "",
+        treeId: operation.treeId, diffHash: operation.diffHash, opId: operation.id };
+      if (operation.status === "intent") {
+        this.#assertNotCancelled(active);
+        this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+        const generated = await this.#options.worktrees.createReviewedCommitCandidate(worktree, operation.preHead, snapshot,
+          { opId: operation.id, message: operation.message, timestamp: operation.timestamp });
+        if (generated.opId !== operation.id || generated.branchRef !== operation.branchRef || generated.preHead !== operation.preHead
+          || generated.treeId !== operation.treeId || generated.diffHash !== operation.diffHash) {
+          throw new Error("Recovered Git candidate does not match its persisted deterministic commit intent");
+        }
+        this.#options.store.recordCommitOperationCandidate(operation.id, { owner, generationId }, generated.commit);
+        operation = this.#options.store.getCommitOperation(operation.id)!;
+        candidate = generated;
+      }
+      await this.#options.worktrees.verifyReviewedCommitCandidateObject(worktree, candidate, snapshot);
+      let branch = await this.#options.worktrees.readTaskBranchHead(worktree);
+      if (branch.ref !== operation.branchRef) throw new Error("Task branch ref changed during recovered commit");
+      if (branch.head.toLowerCase() === operation.preHead.toLowerCase()) {
+        this.#assertNotCancelled(active);
+        this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+        const applied = await this.#options.worktrees.applyReviewedCommitCandidate(worktree, candidate, snapshot);
+        if (applied !== candidate.commit) throw new Error("Recovered commit candidate was not applied exactly");
+      } else if (branch.head.toLowerCase() !== candidate.commit.toLowerCase()) {
+        throw new Error("Task branch moved away from both pre-HEAD and the persisted reviewed candidate");
+      }
+      await this.#options.worktrees.verifyAppliedReviewedCommitCandidate(worktree, candidate, snapshot);
+      await this.#options.worktrees.verifyReviewedCommit(worktree, candidate.commit, snapshot);
+      branch = await this.#options.worktrees.readTaskBranchHead(worktree);
+      if (branch.ref !== operation.branchRef || branch.head.toLowerCase() !== candidate.commit.toLowerCase()) {
+        throw new Error("Applied branch does not match the persisted reviewed candidate");
+      }
+      if (operation.status !== "applied") {
+        operation = this.#options.store.markCommitOperationApplied(operation.id, { owner, generationId }, {
+          branchRef: branch.ref, refHead: branch.head, worktreeHead: candidate.commit, treeId: operation.treeId,
+          diffHash: operation.diffHash, candidateObjectVerified: true, indexMatchesReviewedTree: true, worktreeClean: true,
+        });
+      }
+
+      const reports = this.#options.store.reportOperations(taskId);
+      let reportOperation = reports.at(-1);
+      if (!reportOperation) {
+        this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+        const diff = reviewPackage.snapshot.diff;
+        if (!diff.trim()) throw new Error("Recovered reviewed package has an empty diff");
+        const reportOperationId = await this.#writeDoneReport(taskId, { task, baseCommit: worktree.baseCommit,
+          resultCommit: candidate.commit, diff, checks, authoritativeCheckAttemptId: reviewPackage.executionAttemptId,
+          commitOperationId: operation.id, owner, generationId });
+        reportOperation = this.#options.store.getReportOperation(reportOperationId);
+      } else {
+        if (reportOperation.artifactDirectory !== this.#artifactDirectory(taskId)
+          || reportOperation.reportPath !== resolve(reportOperation.artifactDirectory, "report.json")
+          || reportOperation.diffPath !== resolve(reportOperation.artifactDirectory, "result.diff")) {
+          throw new Error("Persisted report operation paths do not match the fixed task artifact directory");
+        }
+        await mkdir(reportOperation.artifactDirectory, { recursive: true });
+        await materializeReportProjection(reportOperation.artifactDirectory, "report.json", reportOperation.reportBytes, reportOperation.reportSha256);
+        await materializeReportProjection(reportOperation.artifactDirectory, "result.diff", reportOperation.diffBytes, reportOperation.diffSha256);
+        const reportReadback = await readFile(reportOperation.reportPath);
+        const diffReadback = await readFile(reportOperation.diffPath);
+        if (!reportReadback.equals(reportOperation.reportBytes) || !diffReadback.equals(reportOperation.diffBytes)) {
+          throw new Error("Persisted report projection readback differs from its exact stored bytes");
+        }
+        if (reportOperation.status === "prepared") {
+          reportOperation = this.#options.store.completeReportOperation(reportOperation.id, { owner, generationId }, {
+            reportBytes: reportReadback, diffBytes: diffReadback,
+          });
+        }
+      }
+      if (!reportOperation || reportOperation.status !== "complete") throw new Error("Recovered DONE report is not complete");
+
+      this.#assertNotCancelled(active);
+      this.#assertLease(taskId, owner, () => leaseLost);
+      this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+      await this.#options.worktrees.verifyReviewedCommitCandidateObject(worktree, candidate, snapshot);
+      await this.#options.worktrees.verifyAppliedReviewedCommitCandidate(worktree, candidate, snapshot);
+      await this.#options.worktrees.verifyReviewedCommit(worktree, candidate.commit, snapshot);
+      const finalBranch = await this.#options.worktrees.readTaskBranchHead(worktree);
+      if (finalBranch.ref !== operation.branchRef || finalBranch.head.toLowerCase() !== candidate.commit.toLowerCase()) {
+        throw new Error("Task branch changed after report verification and before DONE");
+      }
+      this.#options.store.completeReviewedTask({ taskId, reportOperationId: reportOperation.id, owner, generationId,
+        gitEvidence: { branchRef: finalBranch.ref, refHead: finalBranch.head, worktreeHead: candidate.commit,
+          treeId: operation.treeId, diffHash: operation.diffHash, candidateObjectVerified: true,
+          indexMatchesReviewedTree: true, worktreeClean: true } });
+      return this.#requireTask(taskId);
+    } catch (error) {
+      if (reviewAttempt) {
+        try {
+          this.#options.store.finishAttempt(reviewAttempt.id, {
+            status: error instanceof QuotaLimitError || leaseLost || active.cancelRequested ? "interrupted" : "failed",
+            error: errorText(error),
+          });
+        } catch { /* stale ownership leaves the durable attempt for lease recovery */ }
+      }
+      // Leave the leased task in reviewing. Once its heartbeat stops, recoverExpired
+      // returns it to quarantine and the guardian can retry the same immutable boundary.
+      return this.#options.store.get(taskId) ?? task;
+    } finally {
+      clearInterval(interval);
+      this.#active.delete(taskId);
+    }
   }
 
   #requireCurrentReviewPackage(input: {

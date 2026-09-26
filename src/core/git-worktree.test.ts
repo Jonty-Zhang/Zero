@@ -56,6 +56,22 @@ test("a fresh manager verifies an applied candidate after restart without its ol
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+test("recovery can verify an existing candidate object before CAS and fails closed when it is missing", async () => {
+  const fixture = await candidateFixture("candidate_object_recovery");
+  try {
+    const { manager, info, reviewed, branch, metadata } = fixture;
+    const candidate = await manager.createReviewedCommitCandidate(info, branch.head, reviewed, metadata);
+    await manager.verifyReviewedCommitCandidateObject(info, candidate, reviewed);
+    assert.deepEqual(await manager.readTaskBranchHead(info), branch);
+
+    await assert.rejects(
+      manager.verifyReviewedCommitCandidateObject(info, { ...candidate, commit: "0".repeat(40) }, reviewed),
+      /not a valid|missing or is not a commit|could not get object info/i,
+    );
+    assert.deepEqual(await manager.readTaskBranchHead(info), branch);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 test("restart verification rejects index pollution, wrong candidate metadata, and a moved branch", async () => {
   const fixture = await candidateFixture("candidate_restart_reject");
   try {
