@@ -43,12 +43,21 @@ export type ZCodeAppServerRpcErrorCategory =
   | 'other_protocol_error'
   | 'no_code';
 
+export type ZCodeAppServerTransportFailureCategory =
+  | 'child_exit'
+  | 'timeout'
+  | 'malformed_frame'
+  | 'stream_failure'
+  | 'write_failure'
+  | 'other';
+
 /** Deliberately contains no app-server, process, profile, or task supplied data. */
 export interface ZCodeAppServerDiagnosticEvent {
   readonly stage: ZCodeAppServerDiagnosticStage;
   readonly outcome: ZCodeAppServerDiagnosticOutcome;
   readonly code?: ZCodeAppServerDiagnosticCode;
   readonly rpcErrorCategory?: ZCodeAppServerRpcErrorCategory;
+  readonly transportFailureCategory?: ZCodeAppServerTransportFailureCategory;
   readonly elapsedMs: number;
 }
 
@@ -81,6 +90,12 @@ interface PendingRequest {
 class ZCodeAppServerRpcError extends Error {
   constructor(readonly rpcCode: number | undefined) {
     super('ZCode app-server RPC failed');
+  }
+}
+
+class ZCodeAppServerTransportError extends Error {
+  constructor(readonly category: ZCodeAppServerTransportFailureCategory, message = 'ZCode app-server transport failed') {
+    super(message);
   }
 }
 
@@ -219,7 +234,10 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
           preferences: { askUserQuestionAutoResolutionEnabled: false },
         });
       } catch (error) {
-        this.emitDiagnostic('preference_ack', 'failed', 'rpc_failed', elapsedMs(preferenceStartedAt), rpcErrorCategory(error));
+        this.emitDiagnostic(
+          'preference_ack', 'failed', 'rpc_failed', elapsedMs(preferenceStartedAt),
+          rpcErrorCategory(error), transportFailureCategory(error),
+        );
         throw error;
       }
       let preference: Record<string, unknown>;
@@ -293,7 +311,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
       const key = responseKey(id)!;
       const timer = setTimeout(() => {
         this.pending.delete(key);
-        const error = new Error(`ZCode app-server RPC timed out (${method})`);
+        const error = new ZCodeAppServerTransportError('timeout', 'ZCode app-server RPC timed out');
         rejectResponse(error);
         this.fail(error);
       }, this.requestTimeoutMs);
@@ -302,10 +320,12 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     try {
       await this.writeMessage({ id, method, params });
     } catch (error) {
-      const writeError = new Error('ZCode app-server request write failed');
+      const writeError = error instanceof ZCodeAppServerTransportError
+        ? error
+        : new ZCodeAppServerTransportError('write_failure');
       this.fail(writeError);
       await response.catch(() => undefined);
-      throw error instanceof Error ? error : new Error('ZCode app-server request write failed');
+      throw writeError;
     }
     return response;
   }
@@ -402,13 +422,13 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
     this.stdoutBuffer = Buffer.concat([this.stdoutBuffer, bytes]);
     if (this.stdoutBuffer.length > MAX_LINE_BYTES && this.stdoutBuffer.indexOf(0x0a) < 0) {
-      this.fail(new Error('ZCode app-server NDJSON line exceeded the safe size limit'));
+      this.fail(new ZCodeAppServerTransportError('malformed_frame', 'ZCode app-server NDJSON line exceeded the safe size limit'));
       return;
     }
     let newline = this.stdoutBuffer.indexOf(0x0a);
     while (newline >= 0) {
       if (newline > MAX_LINE_BYTES) {
-        this.fail(new Error('ZCode app-server NDJSON line exceeded the safe size limit'));
+        this.fail(new ZCodeAppServerTransportError('malformed_frame'));
         return;
       }
       const line = this.stdoutBuffer.subarray(0, newline).toString('utf8').trim();
@@ -424,11 +444,11 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
   };
 
   private readonly onInputError = (): void => {
-    if (!this.closing) this.fail(new Error('ZCode app-server stdin closed'));
+    if (!this.closing) this.fail(new ZCodeAppServerTransportError('stream_failure'));
   };
 
   private readonly onStreamError = (): void => {
-    this.fail(new Error('ZCode app-server stream failed'));
+    this.fail(new ZCodeAppServerTransportError('stream_failure'));
   };
 
   private readonly onChildError = (): void => {
@@ -439,7 +459,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     this.childClosed = true;
     this.emitDiagnostic('child_exit', 'exited', this.closing ? 'child_exit_during_close' : 'child_exit_unexpected', elapsedMs(this.launchedAt));
     if (!this.closing && !this.terminalError) {
-      this.fail(new Error(`ZCode app-server exited unexpectedly (${code ?? 'no exit code'})`));
+      this.fail(new ZCodeAppServerTransportError('child_exit'));
     }
   };
 
@@ -452,11 +472,11 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     try {
       message = JSON.parse(line) as unknown;
     } catch {
-      this.fail(new Error('ZCode app-server emitted malformed NDJSON'));
+      this.fail(new ZCodeAppServerTransportError('malformed_frame'));
       return;
     }
     if (!isRecord(message)) {
-      this.fail(new Error('ZCode app-server emitted an invalid protocol message'));
+      this.fail(new ZCodeAppServerTransportError('malformed_frame'));
       return;
     }
     if (Object.hasOwn(message, 'id') && (Object.hasOwn(message, 'result') || Object.hasOwn(message, 'error'))) {
@@ -473,18 +493,18 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
       // is logged; the interaction-bearing request methods are handled separately.
       return;
     }
-    this.fail(new Error('ZCode app-server emitted an unrecognized protocol message'));
+    this.fail(new ZCodeAppServerTransportError('malformed_frame'));
   }
 
   private handleResponse(message: Record<string, unknown>): void {
     const key = responseKey(message.id);
     if (!key) {
-      this.fail(new Error('ZCode app-server response used an invalid request id'));
+      this.fail(new ZCodeAppServerTransportError('malformed_frame'));
       return;
     }
     const pending = this.pending.get(key);
     if (!pending) {
-      this.fail(new Error('ZCode app-server response id did not match a pending request'));
+      this.fail(new ZCodeAppServerTransportError('malformed_frame', 'ZCode app-server response id did not match a pending request'));
       return;
     }
     this.pending.delete(key);
@@ -500,7 +520,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
 
   private handleReverseRequest(message: Record<string, unknown>): void {
     if (responseKey(message.id) === undefined) {
-      this.fail(new Error('ZCode app-server reverse request used an invalid id'));
+      this.fail(new ZCodeAppServerTransportError('malformed_frame'));
       return;
     }
     const method = typeof message.method === 'string' ? message.method : '';
@@ -682,8 +702,9 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     code: ZCodeAppServerDiagnosticCode | undefined,
     elapsed: number,
     rpcErrorCategory?: ZCodeAppServerRpcErrorCategory,
+    transportFailureCategory?: ZCodeAppServerTransportFailureCategory,
   ): void {
-    emitDiagnostic(this.diagnosticSink, stage, outcome, code, elapsed, rpcErrorCategory);
+    emitDiagnostic(this.diagnosticSink, stage, outcome, code, elapsed, rpcErrorCategory, transportFailureCategory);
   }
 
   private async waitForSpawn(): Promise<void> {
@@ -900,6 +921,7 @@ function emitDiagnostic(
   code: ZCodeAppServerDiagnosticCode | undefined,
   elapsed: number,
   rpcErrorCategory?: ZCodeAppServerRpcErrorCategory,
+  transportFailureCategory?: ZCodeAppServerTransportFailureCategory,
 ): void {
   if (typeof sink !== 'function') return;
   const event: ZCodeAppServerDiagnosticEvent = {
@@ -907,6 +929,7 @@ function emitDiagnostic(
     outcome,
     ...(code === undefined ? {} : { code }),
     ...(rpcErrorCategory === undefined ? {} : { rpcErrorCategory }),
+    ...(transportFailureCategory === undefined ? {} : { transportFailureCategory }),
     elapsedMs: Math.min(24 * 60 * 60 * 1_000, Math.max(0, Math.floor(elapsed))),
   };
   try { sink(event); } catch {
@@ -919,6 +942,10 @@ function rpcErrorCategory(error: unknown): ZCodeAppServerRpcErrorCategory {
   if (error.rpcCode === -32601) return 'method_not_found';
   if (error.rpcCode === -32602) return 'invalid_params';
   return 'other_protocol_error';
+}
+
+function transportFailureCategory(error: unknown): ZCodeAppServerTransportFailureCategory {
+  return error instanceof ZCodeAppServerTransportError ? error.category : 'other';
 }
 
 function waitForDrain(stream: NodeJS.WritableStream): Promise<void> {

@@ -2,7 +2,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { HarnessAdapter, HarnessCapabilities, RunRequest, RunResult } from '../domain/types.js';
 import { ZCodeAppServerPeer } from './zcode-app-server-peer.js';
-import type { ZCodeAppServerDiagnosticEvent, ZCodeAppServerPeerOptions } from './zcode-app-server-peer.js';
+import type { ZCodeAppServerDiagnosticEvent, ZCodeAppServerPeerOptions, ZCodeAppServerTransportFailureCategory } from './zcode-app-server-peer.js';
 import { runZCodeProtocolSession, ZCodeQuotaError } from './zcode-protocol-session.js';
 import type { ZCodeProtocolPeer } from './zcode-protocol-session.js';
 import type { ModelBinding, ModelConfig, ReasoningEffort } from './types.js';
@@ -36,6 +36,7 @@ export interface ZCodeDesktopDiagnostic {
   failureStage: 'not_checked' | 'none' | 'launch' | 'preference_ack' | 'session_create' | 'response_shape' | 'model_registry';
   preferenceAckFailure: 'not_checked' | 'none' | 'rpc_failed' | 'ack_invalid' | 'other';
   preferenceAckRpcFailure: 'not_checked' | 'not_applicable' | 'method_not_found' | 'invalid_params' | 'other_protocol_error' | 'no_code';
+  preferenceAckTransportFailure: 'not_checked' | 'not_applicable' | ZCodeAppServerTransportFailureCategory;
   modelRegistry: 'not_checked' | 'unavailable' | 'empty' | 'populated';
   modelCount: number | null;
 }
@@ -99,6 +100,7 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
       failureStage: 'not_checked',
       preferenceAckFailure: 'not_checked',
       preferenceAckRpcFailure: 'not_checked',
+      preferenceAckTransportFailure: 'not_checked',
       modelRegistry: 'not_checked',
       modelCount: null,
     };
@@ -108,6 +110,7 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
     result.failureStage = 'none';
     result.preferenceAckFailure = 'none';
     result.preferenceAckRpcFailure = 'not_applicable';
+    result.preferenceAckTransportFailure = 'not_applicable';
 
     let peer: ZCodeProtocolPeer;
     try {
@@ -314,6 +317,7 @@ function applyFailureStage(result: ZCodeDesktopDiagnostic, event: ZCodeAppServer
       : 'other';
     if (event.code === 'rpc_failed') {
       result.preferenceAckRpcFailure = event.rpcErrorCategory ?? 'no_code';
+      result.preferenceAckTransportFailure = event.transportFailureCategory ?? 'other';
     }
   }
   else if (event.stage === 'session_create_rpc') {

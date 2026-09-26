@@ -160,6 +160,7 @@ test('desktop diagnostic reports lifecycle categories and a model count without 
     failureStage: 'none',
     preferenceAckFailure: 'none',
     preferenceAckRpcFailure: 'not_applicable',
+    preferenceAckTransportFailure: 'not_applicable',
     modelRegistry: 'populated', modelCount: 2,
   });
   assert.deepEqual(calls, ['session/create']);
@@ -188,6 +189,7 @@ test('desktop diagnostic converts child launch errors with fake credentials to f
     failureStage: 'launch',
     preferenceAckFailure: 'none',
     preferenceAckRpcFailure: 'not_applicable',
+    preferenceAckTransportFailure: 'not_applicable',
     modelRegistry: 'not_checked', modelCount: null,
   });
   assert.equal(stdout.includes(secret), false);
@@ -202,14 +204,21 @@ test('desktop diagnostic maps safe peer events to categorical failure stages', a
     failureStage: 'preference_ack' | 'session_create' | 'response_shape';
     preferenceAckFailure: 'none' | 'rpc_failed' | 'ack_invalid';
     preferenceAckRpcFailure: 'not_applicable' | 'method_not_found' | 'invalid_params' | 'other_protocol_error' | 'no_code';
+    preferenceAckTransportFailure: 'not_applicable' | 'child_exit' | 'timeout' | 'malformed_frame' | 'stream_failure' | 'write_failure' | 'other';
   }> = [
-    { event: { stage: 'preference_ack', outcome: 'failed', code: 'ack_invalid', elapsedMs: 2 }, failureStage: 'preference_ack', preferenceAckFailure: 'ack_invalid', preferenceAckRpcFailure: 'not_applicable' },
-    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'method_not_found', elapsedMs: 3 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'method_not_found' },
-    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'invalid_params', elapsedMs: 4 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'invalid_params' },
-    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'other_protocol_error', elapsedMs: 5 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'other_protocol_error' },
-    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'no_code', elapsedMs: 6 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'no_code' },
-    { event: { stage: 'session_create_rpc', outcome: 'failed', code: 'rpc_failed', elapsedMs: 7 }, failureStage: 'session_create', preferenceAckFailure: 'none', preferenceAckRpcFailure: 'not_applicable' },
-    { event: { stage: 'session_create_rpc', outcome: 'failed', code: 'response_invalid', elapsedMs: 8 }, response: { session: {} }, failureStage: 'response_shape', preferenceAckFailure: 'none', preferenceAckRpcFailure: 'not_applicable' },
+    { event: { stage: 'preference_ack', outcome: 'failed', code: 'ack_invalid', elapsedMs: 2 }, failureStage: 'preference_ack', preferenceAckFailure: 'ack_invalid', preferenceAckRpcFailure: 'not_applicable', preferenceAckTransportFailure: 'not_applicable' },
+    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'method_not_found', elapsedMs: 3 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'method_not_found', preferenceAckTransportFailure: 'other' },
+    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'invalid_params', elapsedMs: 4 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'invalid_params', preferenceAckTransportFailure: 'other' },
+    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'other_protocol_error', elapsedMs: 5 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'other_protocol_error', preferenceAckTransportFailure: 'other' },
+    { event: { stage: 'preference_ack', outcome: 'failed', code: 'rpc_failed', rpcErrorCategory: 'no_code', elapsedMs: 6 }, failureStage: 'preference_ack', preferenceAckFailure: 'rpc_failed', preferenceAckRpcFailure: 'no_code', preferenceAckTransportFailure: 'other' },
+    ...(['child_exit', 'timeout', 'malformed_frame', 'stream_failure', 'write_failure', 'other'] as const).map((category, index) => ({
+      event: { stage: 'preference_ack' as const, outcome: 'failed' as const, code: 'rpc_failed' as const,
+        rpcErrorCategory: 'no_code' as const, transportFailureCategory: category, elapsedMs: 7 + index },
+      failureStage: 'preference_ack' as const, preferenceAckFailure: 'rpc_failed' as const,
+      preferenceAckRpcFailure: 'no_code' as const, preferenceAckTransportFailure: category,
+    })),
+    { event: { stage: 'session_create_rpc', outcome: 'failed', code: 'rpc_failed', elapsedMs: 20 }, failureStage: 'session_create', preferenceAckFailure: 'none', preferenceAckRpcFailure: 'not_applicable', preferenceAckTransportFailure: 'not_applicable' },
+    { event: { stage: 'session_create_rpc', outcome: 'failed', code: 'response_invalid', elapsedMs: 21 }, response: { session: {} }, failureStage: 'response_shape', preferenceAckFailure: 'none', preferenceAckRpcFailure: 'not_applicable', preferenceAckTransportFailure: 'not_applicable' },
   ];
 
   for (const current of cases) {
@@ -234,6 +243,7 @@ test('desktop diagnostic maps safe peer events to categorical failure stages', a
     assert.equal(diagnostic.failureStage, current.failureStage);
     assert.equal(diagnostic.preferenceAckFailure, current.preferenceAckFailure);
     assert.equal(diagnostic.preferenceAckRpcFailure, current.preferenceAckRpcFailure);
+    assert.equal(diagnostic.preferenceAckTransportFailure, current.preferenceAckTransportFailure);
     assert.equal(JSON.stringify(diagnostic).includes(secret), false);
   }
 });

@@ -334,6 +334,7 @@ test('diagnostics expose bounded safe lifecycle enums and omit RPC text and user
     assert.deepEqual(Object.keys(event).sort(), [
       ...(event.code === undefined ? [] : ['code']),
       ...(event.rpcErrorCategory === undefined ? [] : ['rpcErrorCategory']),
+      ...(event.transportFailureCategory === undefined ? [] : ['transportFailureCategory']),
       'elapsedMs', 'outcome', 'stage',
     ].sort());
     assert.equal(Number.isInteger(event.elapsedMs), true);
@@ -346,6 +347,7 @@ test('diagnostics expose bounded safe lifecycle enums and omit RPC text and user
     await assert.rejects(createSession(peer));
   }, event => failedEvents.push(event));
   assert.ok(failedEvents.some(event => event.stage === 'preference_ack' && event.outcome === 'failed' && event.code === 'rpc_failed'));
+  assert.equal(failedEvents.find(event => event.stage === 'preference_ack' && event.outcome === 'failed')?.transportFailureCategory, 'other');
   const malformedPreferenceEvents: ZCodeAppServerDiagnosticEvent[] = [];
   await withFakeServer(async peer => {
     await debugRequest(peer, 'test/set-mode', { mode: 'pref-malformed' });

@@ -49,7 +49,7 @@ async function main() {
     if (args.length) {
       process.stdout.write(`${JSON.stringify({
         version: 'not_run', childSpawn: 'not_run', sessionCreate: 'not_run',
-        failureStage: 'not_checked', preferenceAckFailure: 'not_checked', preferenceAckRpcFailure: 'not_checked',
+        failureStage: 'not_checked', preferenceAckFailure: 'not_checked', preferenceAckRpcFailure: 'not_checked', preferenceAckTransportFailure: 'not_checked',
         modelRegistry: 'not_checked', modelCount: null,
       }, null, 2)}\n`);
       return;
@@ -66,6 +66,7 @@ async function main() {
         failureStage: 'not_checked',
         preferenceAckFailure: 'not_checked',
         preferenceAckRpcFailure: 'not_checked',
+        preferenceAckTransportFailure: 'not_checked',
         modelRegistry: 'not_checked',
         modelCount: null,
       }, null, 2)}\n`);
