@@ -342,6 +342,34 @@ export interface ReviewReworkClaimRecord {
   identity: { checkedAt: string; observed: unknown; fingerprint: string };
   gitState: ReviewReworkGitInspection;
   claimedAt: string;
+  /** Exact verified startup chain when this claim bridges an idle quota wait across generations. */
+  guardianLineage?: string[];
+}
+
+export interface PauseReviewReworkForQuotaInput {
+  continuationId: string;
+  attemptId: string;
+  retryAt: string;
+  reason: string;
+  identity: ClaimReviewReworkContinuationInput["identity"];
+  gitState: ReviewReworkGitInspection;
+  now?: Date;
+}
+
+export interface ClaimReviewReworkQuotaResumeInput {
+  now?: Date;
+  leaseMs?: number;
+  identity: ClaimReviewReworkContinuationInput["identity"];
+  gitState: ReviewReworkGitInspection;
+}
+
+export interface ReviewReworkQuotaResumeClaimRecord extends Omit<ReviewReworkClaimRecord, "id"> {
+  /** Present only when a new immutable cross-generation chain row was appended. */
+  id?: string;
+  packageId: string;
+  verdictId: string;
+  revision: number;
+  recoveredGeneration: boolean;
 }
 
 const ZERO_COMMIT_IDENTITY = {
@@ -824,9 +852,15 @@ export class TaskStore {
     for (const claim of claims) {
       const claimGeneration = String(claim.claim_generation_id);
       const claimOwner = String(claim.owner ?? "");
+      let payload: ReviewReworkClaimRecord;
+      try { payload = JSON.parse(String(claim.payload)) as ReviewReworkClaimRecord; }
+      catch { return false; }
+      const guardianBridge = Array.isArray(payload.guardianLineage)
+        ? this.#guardianLineageIsValid(payload.guardianLineage, expectedGeneration, claimGeneration)
+        : this.#startupGenerationProvesPredecessorDrained(claimGeneration, expectedGeneration);
       if (claim.task_id !== continuation.taskId || claim.continuation_id !== continuation.id ||
           claim.prior_claim_generation_id !== expectedGeneration || (claim.prior_claim_id ?? undefined) !== previousClaimId ||
-          !this.#startupGenerationProvesPredecessorDrained(claimGeneration, expectedGeneration) || !claimOwner ||
+          !guardianBridge || !claimOwner ||
           !this.#taskClaimOwnersForGeneration(continuation.taskId, claimGeneration).has(claimOwner) ||
           !this.#reworkClaimEventMatches(continuation.taskId, claim)) return false;
       expectedGeneration = claimGeneration;
@@ -1055,7 +1089,8 @@ export class TaskStore {
         Array<{ id: string; status: TaskStatus; checkpoint: string | null }>;
       const row = candidates.find(candidate => {
         try {
-          if ((JSON.parse(candidate.checkpoint ?? "null") as Record<string, unknown> | null)?.kind === "review_quota") return false;
+          const kind = (JSON.parse(candidate.checkpoint ?? "null") as Record<string, unknown> | null)?.kind;
+          if (kind === "review_quota" || kind === "rework_quota") return false;
           return candidate.status === "pending" || candidate.status === "waiting";
         }
         catch { return false; }
@@ -1919,6 +1954,260 @@ export class TaskStore {
     return result;
   }
 
+  /** Persist a rework quota wait together with the exact post-process worktree inspection. */
+  pauseReviewReworkForQuota(taskId: string, owner: string, input: PauseReviewReworkForQuotaInput): TaskRecord {
+    const now = input.now ?? new Date();
+    const retryAt = new Date(input.retryAt);
+    if (!owner?.trim() || !input.continuationId || !input.attemptId || typeof input.reason !== "string" || !input.reason.trim() ||
+        !(now instanceof Date) || !Number.isFinite(now.getTime()) || !Number.isFinite(retryAt.getTime()) || retryAt.getTime() <= now.getTime() ||
+        !input.identity || !input.gitState || !/^[a-f0-9]{64}$/i.test(input.identity.fingerprint ?? "")) {
+      throw new Error("Rework quota pause requires a continuation, terminal attempt, fresh inspection, reason, and future retryAt");
+    }
+    this.#assertFreshRecoveryCheck(input.identity.checkedAt, now);
+    this.#assertFreshRecoveryCheck(input.gitState.checkedAt, now);
+    const identityJson = JSON.stringify(input.identity.observed);
+    const gitStateJson = JSON.stringify(input.gitState);
+    if (!identityJson || identityJson === "null" || Buffer.byteLength(identityJson, "utf8") > 65_536 ||
+        !gitStateJson || Buffer.byteLength(gitStateJson, "utf8") > 65_536 || !Array.isArray(input.gitState.changedPaths) ||
+        Buffer.byteLength(JSON.stringify(input.gitState.changedPaths), "utf8") > 65_536 || input.gitState.allowedPathsVerified !== true) {
+      throw new Error("Rework quota inspection must include verified allowed paths and stay within 64 KiB");
+    }
+    const at = now.toISOString();
+    this.#transaction(() => {
+      const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,active_attempt_id,revision_count
+        FROM tasks WHERE id=?`).get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null;
+          claim_generation_id: string | null; active_attempt_id: string | null; revision_count: number } | undefined;
+      if (!task || task.status !== "running" || task.lease_owner !== owner || !task.lease_expires_at ||
+          Date.parse(task.lease_expires_at) <= now.getTime() || task.claim_generation_id !== this.#startupGeneration.id ||
+          task.active_attempt_id !== null) throw new Error(`Task ${taskId} is not idle under a live running lease for ${owner}`);
+
+      const continuation = this.getReviewReworkContinuation(taskId, input.continuationId);
+      if (!continuation || continuation.id !== this.getReviewReworkContinuation(taskId)?.id ||
+          continuation.revisionAfter !== task.revision_count) throw new Error("Rework quota pause must bind the current continuation and revision");
+      const anchor = this.#latestReworkAnchor(taskId, continuation.packageId, continuation.verdictId);
+      if (!anchor || anchor.result.verdict !== "changes_requested") throw new Error("Rework quota pause requires the latest changes-requested verdict");
+      const claims = this.#db.prepare("SELECT * FROM rework_continuation_claims WHERE continuation_id=? ORDER BY rowid")
+        .all(continuation.id) as Array<Record<string, unknown>>;
+      if (claims.length > 0) {
+        if (!this.#verifiedReworkClaimChain(continuation, this.#startupGeneration.id, owner)) {
+          throw new Error("Rework quota pause is not at the verified continuation claim-chain tail");
+        }
+      } else if (continuation.beginGenerationId !== this.#startupGeneration.id ||
+          !this.#taskClaimOwnersForGeneration(taskId, this.#startupGeneration.id).has(continuation.owner) ||
+          this.#latestTaskClaimOwnerForGeneration(taskId, this.#startupGeneration.id) !== owner) {
+        throw new Error("Rework quota pause is not owned by the current continuation generation");
+      }
+
+      const attempt = this.#db.prepare(`SELECT id,status,role,harness,stage_id FROM attempts WHERE id=? AND task_id=?`)
+        .get(input.attemptId, taskId) as { id: string; status: string; role: string; harness: string | null; stage_id: string | null } | undefined;
+      const latestAttempt = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? ORDER BY sequence DESC LIMIT 1").get(taskId) as { id: string } | undefined;
+      const stage = attempt?.stage_id ? this.#db.prepare("SELECT * FROM stages WHERE id=? AND task_id=?")
+        .get(attempt.stage_id, taskId) as Record<string, unknown> | undefined : undefined;
+      const runningWriter = this.#db.prepare("SELECT 1 FROM stages WHERE task_id=? AND generation_id=? AND role IN ('implement','revise') AND status='running' LIMIT 1")
+        .get(taskId, this.#startupGeneration.id);
+      const routeQuota = attempt?.role === "route" && attempt.harness === "codex" &&
+        (!stage || stage.role === "route" && stage.generation_id === this.#startupGeneration.id &&
+          ["succeeded", "failed", "interrupted"].includes(String(stage.status)) && stage.finished_at != null);
+      const executionQuota = attempt && ["implement", "revise"].includes(attempt.role) && stage &&
+        stage.generation_id === this.#startupGeneration.id && Number(stage.sequence) > continuation.stageHighWater &&
+        stage.role === attempt.role && stage.harness === attempt.harness &&
+        ["succeeded", "failed", "interrupted"].includes(String(stage.status)) && stage.finished_at != null && stage.started_at != null;
+      if (!attempt || latestAttempt?.id !== attempt.id || !["failed", "interrupted"].includes(attempt.status) ||
+          (!routeQuota && !executionQuota) || runningWriter || (stage && (stage.started_at == null || stage.process_start_id == null))) {
+        throw new Error("Rework quota pause requires the latest terminal quota attempt and no active rework writer");
+      }
+
+      const worktree = this.#db.prepare("SELECT * FROM worktree_creations WHERE task_id=?").get(taskId) as {
+        status: string; plan: string; observed: string | null; fingerprint: string | null;
+      } | undefined;
+      let plan: Record<string, unknown>;
+      let savedObserved: { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown };
+      try {
+        if (!worktree || worktree.status !== "created" || !worktree.observed || !worktree.fingerprint ||
+            !/^[a-f0-9]{64}$/i.test(worktree.fingerprint)) throw new Error("missing registered worktree");
+        plan = JSON.parse(worktree.plan) as Record<string, unknown>;
+        savedObserved = JSON.parse(worktree.observed) as typeof savedObserved;
+      } catch { throw new Error("Rework quota pause requires a registered task worktree"); }
+      const freshObserved = input.identity.observed as { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown; fingerprint?: unknown };
+      if (!savedObserved.info || !freshObserved?.info ||
+          !["taskId", "repoPath", "path", "branch", "baseCommit"].every(key => plan[key] === savedObserved.info![key] &&
+            savedObserved.info![key] === freshObserved.info![key]) || plan.taskId !== taskId ||
+          plan.commonGitDir !== savedObserved.commonGitDir || savedObserved.commonGitDir !== freshObserved.commonGitDir ||
+          savedObserved.head !== plan.baseCommit || freshObserved.head !== input.gitState.head ||
+          freshObserved.fingerprint !== input.identity.fingerprint) {
+        throw new Error("Fresh rework quota identity does not match the registered worktree or Git HEAD");
+      }
+      const pkg = this.#db.prepare("SELECT branch_ref FROM review_packages WHERE id=? AND task_id=?")
+        .get(continuation.packageId, taskId) as { branch_ref: string } | undefined;
+      const snapshot = input.gitState.snapshot;
+      if (!pkg || input.gitState.branchRef !== pkg.branch_ref || input.gitState.head !== freshObserved.head ||
+          snapshot.preHead !== input.gitState.head || snapshot.baseCommit !== plan.baseCommit ||
+          !SHA256_PATTERN.test(snapshot.diffHash) || createHash("sha256").update(snapshot.diff, "utf8").digest("hex") !== snapshot.diffHash) {
+        throw new Error("Fresh rework quota Git inspection does not match its task branch and snapshot");
+      }
+
+      const previous = this.#db.prepare("SELECT retry_count FROM quota_pauses WHERE task_id=?").get(taskId) as { retry_count: number } | undefined;
+      const retryCount = (previous?.retry_count ?? 0) + 1;
+      const stageSequence = stage ? Number(stage.sequence) : Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0) AS n FROM stages WHERE task_id=?")
+        .get(taskId) as { n: number }).n);
+      const checkpoint = { kind: "rework_quota", continuationId: continuation.id, packageId: continuation.packageId,
+        verdictId: continuation.verdictId, revision: continuation.revisionAfter, claimGenerationId: this.#startupGeneration.id,
+        owner, attemptId: attempt.id, stageId: stage?.id ? String(stage.id) : null, stageSequence,
+        pauseIdentity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint },
+        pauseGitState: input.gitState, retryAt: retryAt.toISOString() };
+      const checkpointJson = JSON.stringify(checkpoint);
+      if (Buffer.byteLength(checkpointJson, "utf8") > 65_536) throw new Error("Rework quota checkpoint exceeds 64 KiB");
+      this.#db.prepare(`INSERT INTO quota_pauses(task_id,retry_at,retry_count,checkpoint,reason,source) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(task_id) DO UPDATE SET retry_at=excluded.retry_at,retry_count=excluded.retry_count,
+          checkpoint=excluded.checkpoint,reason=excluded.reason,source=excluded.source`)
+        .run(taskId, retryAt.toISOString(), retryCount, checkpointJson, input.reason, "provider_message");
+      const changed = this.#db.prepare(`UPDATE tasks SET status='waiting',updated_at=?,failure_reason=?,lease_owner=NULL,
+        lease_expires_at=NULL,heartbeat_at=NULL,active_attempt_id=NULL WHERE id=? AND status='running' AND lease_owner=?
+        AND claim_generation_id=? AND active_attempt_id IS NULL`).run(at, input.reason, taskId, owner, this.#startupGeneration.id);
+      if (Number(changed.changes) !== 1) throw new Error("Rework lease changed before quota pause");
+      this.#disableExecutionRecoveryCheckpoint(taskId, at, "quota_waiting");
+      this.#event(taskId, "task.quota_waiting", { retryAt: retryAt.toISOString(), retryCount, checkpoint,
+        source: "provider_message", reason: input.reason, reworkContinuationId: continuation.id }, at);
+    });
+    return this.get(taskId)!;
+  }
+
+  /** Resume a due rework quota checkpoint only after an exact fresh inspection; cross-generation resumes append to the claim chain. */
+  claimReviewReworkQuotaResume(taskId: string, owner: string, input: ClaimReviewReworkQuotaResumeInput): ReviewReworkQuotaResumeClaimRecord | undefined {
+    if (!owner?.trim() || !input?.identity || !input.gitState || !/^[a-f0-9]{64}$/i.test(input.identity.fingerprint ?? "")) {
+      throw new Error("Rework quota resume requires an owner and fresh registered worktree/Git evidence");
+    }
+    const now = input.now ?? new Date();
+    const leaseMs = input.leaseMs ?? 60_000;
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || !Number.isFinite(leaseMs) || leaseMs <= 0) {
+      throw new Error("Rework quota resume requires valid now and positive leaseMs values");
+    }
+    this.#assertFreshRecoveryCheck(input.identity.checkedAt, now);
+    this.#assertFreshRecoveryCheck(input.gitState.checkedAt, now);
+    if (input.gitState.allowedPathsVerified !== true) throw new Error("Rework quota resume requires fresh verified allowed paths");
+    const identityJson = JSON.stringify(input.identity.observed);
+    const gitStateJson = JSON.stringify(input.gitState);
+    if (!identityJson || identityJson === "null" || Buffer.byteLength(identityJson, "utf8") > 65_536 ||
+        !gitStateJson || Buffer.byteLength(gitStateJson, "utf8") > 65_536) {
+      throw new Error("Fresh rework quota inspection must be non-empty and at most 64 KiB");
+    }
+    const at = now.toISOString();
+    const expires = new Date(now.getTime() + leaseMs).toISOString();
+    let result: ReviewReworkQuotaResumeClaimRecord | undefined;
+    this.#transaction(() => {
+      const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,revision_count
+        FROM tasks WHERE id=?`).get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null;
+          claim_generation_id: string | null; revision_count: number } | undefined;
+      const quota = this.#db.prepare("SELECT retry_at,checkpoint FROM quota_pauses WHERE task_id=?").get(taskId) as
+        { retry_at: string; checkpoint: string } | undefined;
+      if (!task || task.status !== "waiting" || task.lease_owner !== null || task.lease_expires_at !== null || !quota ||
+          Date.parse(quota.retry_at) > now.getTime() || !task.claim_generation_id) return;
+      let checkpoint: Record<string, unknown>;
+      try { checkpoint = JSON.parse(quota.checkpoint) as Record<string, unknown>; }
+      catch { return; }
+      const priorGenerationId = task.claim_generation_id;
+      if (checkpoint.kind !== "rework_quota" || checkpoint.claimGenerationId !== priorGenerationId ||
+          typeof checkpoint.continuationId !== "string" || typeof checkpoint.packageId !== "string" ||
+          typeof checkpoint.verdictId !== "string" || typeof checkpoint.owner !== "string" ||
+          typeof checkpoint.attemptId !== "string" || (checkpoint.stageId !== null && typeof checkpoint.stageId !== "string") ||
+          typeof checkpoint.stageSequence !== "number" || typeof checkpoint.revision !== "number" ||
+          !checkpoint.pauseIdentity || typeof checkpoint.pauseIdentity !== "object" ||
+          !checkpoint.pauseGitState || typeof checkpoint.pauseGitState !== "object") return;
+      const recoveredGeneration = this.#startupGeneration.id !== priorGenerationId;
+      const guardianLineage = recoveredGeneration ? this.#verifiedGuardianLineage(priorGenerationId, this.#startupGeneration.id) : undefined;
+      if (recoveredGeneration && !guardianLineage) return;
+      const continuation = this.getReviewReworkContinuation(taskId, checkpoint.continuationId);
+      if (!continuation || continuation.id !== this.getReviewReworkContinuation(taskId)?.id ||
+          continuation.packageId !== checkpoint.packageId || continuation.verdictId !== checkpoint.verdictId ||
+          continuation.revisionAfter !== checkpoint.revision || task.revision_count !== continuation.revisionAfter) return;
+      const anchor = this.#latestReworkAnchor(taskId, continuation.packageId, continuation.verdictId);
+      if (!anchor || anchor.result.verdict !== "changes_requested") return;
+      const claims = this.#db.prepare("SELECT * FROM rework_continuation_claims WHERE continuation_id=? ORDER BY rowid")
+        .all(continuation.id) as Array<Record<string, unknown>>;
+      const previousClaim = claims.at(-1);
+      if (previousClaim) {
+        if (!this.#verifiedReworkClaimChain(continuation, priorGenerationId, String(checkpoint.owner))) return;
+      } else if (continuation.beginGenerationId !== priorGenerationId ||
+          !this.#taskClaimOwnersForGeneration(taskId, priorGenerationId).has(continuation.owner) ||
+          this.#latestTaskClaimOwnerForGeneration(taskId, priorGenerationId) !== checkpoint.owner) return;
+
+      const attempt = this.#db.prepare("SELECT id,status,role,harness,stage_id FROM attempts WHERE id=? AND task_id=?")
+        .get(checkpoint.attemptId, taskId) as { id: string; status: string; role: string; harness: string | null; stage_id: string | null } | undefined;
+      const latestAttempt = this.#db.prepare("SELECT id FROM attempts WHERE task_id=? ORDER BY sequence DESC LIMIT 1").get(taskId) as { id: string } | undefined;
+      const stage = attempt?.stage_id ? this.#db.prepare("SELECT * FROM stages WHERE id=? AND task_id=?")
+        .get(attempt.stage_id, taskId) as Record<string, unknown> | undefined : undefined;
+      const runningWriter = this.#db.prepare("SELECT 1 FROM stages WHERE task_id=? AND generation_id=? AND role IN ('implement','revise') AND status='running' LIMIT 1")
+        .get(taskId, priorGenerationId);
+      const routeQuota = attempt?.role === "route" && attempt.harness === "codex" &&
+        (checkpoint.stageId === null ? !stage && Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0) AS n FROM stages WHERE task_id=?")
+          .get(taskId) as { n: number }).n) === checkpoint.stageSequence :
+          Boolean(stage && attempt.stage_id === checkpoint.stageId && stage.role === "route" &&
+            stage.generation_id === priorGenerationId && stage.sequence === checkpoint.stageSequence &&
+            ["interrupted", "failed", "succeeded"].includes(String(stage.status)) && stage.finished_at != null));
+      const executionQuota = attempt && ["implement", "revise"].includes(attempt.role) && stage &&
+        attempt.stage_id === checkpoint.stageId && stage.role === attempt.role && stage.harness === attempt.harness &&
+        stage.generation_id === priorGenerationId && stage.sequence === checkpoint.stageSequence &&
+        ["interrupted", "failed", "succeeded"].includes(String(stage.status)) && stage.finished_at != null;
+      if (!attempt || latestAttempt?.id !== attempt.id || !["failed", "interrupted"].includes(attempt.status) ||
+          (!routeQuota && !executionQuota) || runningWriter) return;
+
+      const savedIdentity = checkpoint.pauseIdentity as ClaimReviewReworkContinuationInput["identity"];
+      const savedGit = checkpoint.pauseGitState as ReviewReworkGitInspection;
+      const freshObserved = input.identity.observed as { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown; fingerprint?: unknown };
+      let savedObserved: { info?: Record<string, unknown>; commonGitDir?: unknown; head?: unknown };
+      let plan: Record<string, unknown>;
+      let worktree: { status: string; plan: string; observed: string | null; fingerprint: string | null } | undefined;
+      try {
+        worktree = this.#db.prepare("SELECT status,plan,observed,fingerprint FROM worktree_creations WHERE task_id=?").get(taskId) as typeof worktree;
+        if (!worktree || worktree.status !== "created" || !worktree.observed || !worktree.fingerprint) throw new Error("missing worktree");
+        plan = JSON.parse(worktree.plan) as Record<string, unknown>;
+        savedObserved = JSON.parse(worktree.observed) as typeof savedObserved;
+      } catch { return; }
+      if (!savedObserved.info || !freshObserved?.info ||
+          !["taskId", "repoPath", "path", "branch", "baseCommit"].every(key => plan[key] === savedObserved.info![key] &&
+            savedObserved.info![key] === freshObserved.info![key]) || plan.taskId !== taskId ||
+          plan.commonGitDir !== savedObserved.commonGitDir || savedObserved.commonGitDir !== freshObserved.commonGitDir ||
+          input.identity.fingerprint !== savedIdentity.fingerprint || JSON.stringify(input.identity.observed) !== JSON.stringify(savedIdentity.observed) ||
+          freshObserved.head !== input.gitState.head || freshObserved.fingerprint !== input.identity.fingerprint ||
+          input.gitState.branchRef !== savedGit.branchRef ||
+          input.gitState.head !== savedGit.head || !sameReviewRecoverySnapshot(input.gitState.snapshot, savedGit.snapshot) ||
+          JSON.stringify(input.gitState.changedPaths) !== JSON.stringify(savedGit.changedPaths) ||
+          input.gitState.allowedPathsVerified !== true || savedGit.allowedPathsVerified !== true) {
+        throw new Error("Fresh rework quota inspection differs from the saved pause or registered worktree");
+      }
+
+      const checkpointId = recoveredGeneration ? randomUUID() : undefined;
+      const claim: ReviewReworkQuotaResumeClaimRecord = { ...(checkpointId ? { id: checkpointId } : {}), taskId,
+        continuationId: continuation.id, packageId: continuation.packageId, verdictId: continuation.verdictId,
+        revision: continuation.revisionAfter, priorClaimGenerationId: priorGenerationId,
+        claimGenerationId: this.#startupGeneration.id, owner, leaseExpiresAt: expires,
+        ...(previousClaim ? { priorClaimId: String(previousClaim.id) } : {}), ...(guardianLineage ? { guardianLineage } : {}),
+        identity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint },
+        gitState: input.gitState, claimedAt: at, recoveredGeneration };
+      const payload = JSON.stringify(claim);
+      if (Buffer.byteLength(payload, "utf8") > 65_536) throw new Error("Rework quota recovery claim exceeds 64 KiB");
+      const changed = this.#db.prepare(`UPDATE tasks SET status='running',updated_at=?,lease_owner=?,lease_expires_at=?,heartbeat_at=?,
+          active_attempt_id=NULL,lease_protocol_version=2,claim_generation_id=?,failure_reason=NULL
+        WHERE id=? AND status='waiting' AND lease_owner IS NULL AND lease_expires_at IS NULL AND claim_generation_id=?`)
+        .run(at, owner, expires, at, this.#startupGeneration.id, taskId, priorGenerationId);
+      if (Number(changed.changes) !== 1) return;
+      if (recoveredGeneration) {
+        this.#db.prepare(`INSERT INTO rework_continuation_claims(id,task_id,continuation_id,prior_claim_generation_id,claim_generation_id,
+            owner,lease_expires_at,prior_claim_id,identity,git_state,payload,claimed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(checkpointId!, taskId, continuation.id, priorGenerationId, this.#startupGeneration.id, owner, expires,
+            previousClaim ? String(previousClaim.id) : null, identityJson, gitStateJson, payload, at);
+        this.#event(taskId, "task.review_rework_claimed", claim, at);
+      }
+      this.#event(taskId, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2,
+        generationId: this.#startupGeneration.id, recovery: recoveredGeneration ? "review_rework_quota" : "review_rework_quota_resume" }, at);
+      this.#event(taskId, "task.review_rework_quota_resumed", { continuationId: continuation.id,
+        packageId: continuation.packageId, verdictId: continuation.verdictId, revision: continuation.revisionAfter,
+        priorGenerationId, generationId: this.#startupGeneration.id, owner, recoveredGeneration, claimId: checkpointId }, at);
+      result = claim;
+    });
+    return result;
+  }
+
   quotaCheckpoint(taskId: string): Record<string, unknown> | undefined {
     const row = this.#db.prepare("SELECT checkpoint FROM quota_pauses WHERE task_id=?").get(taskId) as { checkpoint: string } | undefined;
     return row ? JSON.parse(row.checkpoint) as Record<string, unknown> : undefined;
@@ -2460,8 +2749,9 @@ export class TaskStore {
     let record!: ReviewReworkProgressRecord;
     this.#transaction(() => {
       const continuation = this.getReviewReworkContinuation(taskId, continuationId);
-      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id FROM tasks WHERE id=?")
-        .get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null } | undefined;
+      const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id,active_attempt_id FROM tasks WHERE id=?")
+        .get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null;
+          claim_generation_id: string | null; active_attempt_id: string | null } | undefined;
       const expires = task?.lease_expires_at ? Date.parse(task.lease_expires_at) : Number.NaN;
       if (!continuation || continuation.id !== this.getReviewReworkContinuation(taskId)?.id || !task ||
           !["running", "revision"].includes(task.status) || task.lease_owner !== guard.owner || task.claim_generation_id !== guard.generationId ||
@@ -2469,13 +2759,21 @@ export class TaskStore {
       if (input.stageId) {
         const stage = this.getStage(input.stageId);
         if (!stage || stage.taskId !== taskId || stage.generationId !== guard.generationId) throw new Error("Review rework progress stage is outside this task claim");
+        const latestStageAttempt = input.phase === "writer_finished"
+          ? this.#db.prepare("SELECT id,status,role FROM attempts WHERE task_id=? AND stage_id=? ORDER BY sequence DESC LIMIT 1")
+            .get(taskId, input.stageId) as { id: string; status: string; role: string } | undefined
+          : undefined;
+        const writerFinishedDuringChecks = input.phase === "writer_finished" && stage.status === "running" &&
+          latestStageAttempt?.status === "succeeded" && latestStageAttempt.role === stage.role && task.active_attempt_id === null;
         const invalidStagePhase = input.phase === "route_started"
           ? stage.role !== "route" || stage.status !== "running"
           : input.phase === "writer_started"
             ? !["implement", "revise"].includes(stage.role) || stage.status !== "running"
-            : input.phase === "writer_finished"
-              ? !["implement", "revise"].includes(stage.role) || stage.status !== "succeeded"
-              : !["implement", "revise"].includes(stage.role) || stage.status !== "succeeded";
+          : input.phase === "writer_finished"
+              ? !["implement", "revise"].includes(stage.role) || (stage.status !== "succeeded" && !writerFinishedDuringChecks)
+              : input.phase === "checks_started"
+                ? !["implement", "revise"].includes(stage.role) || stage.status !== "running"
+                : !["implement", "revise"].includes(stage.role) || stage.status !== "succeeded";
         if (invalidStagePhase) {
           throw new Error("Review rework progress stage role or status does not match its phase");
         }
