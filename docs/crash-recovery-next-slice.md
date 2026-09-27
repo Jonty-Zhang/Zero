@@ -1,6 +1,6 @@
 # 普通崩溃自动续跑：下一切片
 
-状态：迭代 A 已实现；迭代 B 仍是设计，2026-09-26。本文区分已实现边界与后续方案。不代表 guardian 已在目标电脑安装或经真实重启验收。额度等待仍走独立 quota checkpoint 路径。
+状态：迭代 A 已实现；迭代 B 仍是设计，2026-09-26。本文区分已实现边界与后续方案。目标电脑已验证 guardian 安装与单阶段执行期间的受控进程中断恢复；其他崩溃边界及整机重启仍未验证。额度等待仍走独立 quota checkpoint 路径。
 
 ## 决策摘要
 
@@ -91,7 +91,7 @@ report intent 在 commit 成功后、文件写入前持久化：report schema、
 4. 本地 commit（含 HEAD 不再是预期 base）、身份/path/allowedPaths 不匹配、lineage 缺失、inspection evidence 不足或恢复后身份再次变化都会留在 `recovery_required`。正常 quota pause 使用原有独立 checkpoint，不会变成 crash replay；终态会禁用 crash recovery checkpoint。
 5. 没有逐阶段 phase-intent 表，也不逐一恢复 route、check、review、commit 或 report。整个 route/execution/check 不确定窗口按一个安全边界处理；review 和 commit/report 窗口继续隔离。恢复使用原 task/worktree，不恢复 Harness session，不保证外部副作用可撤销或去重。
 
-自动化测试覆盖迭代 A 的主要恢复 gate、worktree 身份变化、重试 lineage、重新 route/execution/check/review 和隔离边界。该改动的 CI 结果需在提交后确认。目标电脑上的 guardian/launcher 重新启动及真实 Harness 故障注入仍未完成，不能据此宣称实机恢复已验收。迭代 B 的 review/commit/report 故障注入尚待实现。
+自动化测试覆盖迭代 A 的主要恢复 gate、worktree 身份变化、重试 lineage、重新 route/execution/check/review 和隔离边界。2026-09-28 的目标电脑故障注入验证了迭代 A 的一个单阶段执行窗口：精确终止测试 guardian 后，启动器自动重启，后继代证明前代 Job 清空；同一任务旧实现尝试中断，新路由和实现尝试成功，重新通过检查与 Codex 审核并生成提交和报告。它不能证明其他崩溃窗口；迭代 B 的 review/commit/report 故障注入尚待验证。
 
 ### 迭代 B：待实现 snapshot-bound review 和 commit/report 收尾
 

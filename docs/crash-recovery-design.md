@@ -8,7 +8,7 @@ Zero 的额度等待有明确的完成边界：适配器返回已分类的额度
 
 只有 guardian 在持有同用户、同 lock ID 的命名互斥锁后，完成旧命名 Job 查询且确认 ActiveProcesses 为零（或确认 Job 不存在）时，才会设置 `PREDECESSOR_DRAINED=1`。它随后在本会话的命名映射中记录启动代际、guardian 和直属子进程的 PID 与创建时间；直属子进程先加入新 Job，再开始运行。Node 通过随包 guardian.exe 的 `--verify-startup` 核对自身正是该代直属子进程，且仍属于新 Job。lock ID 不匹配、映射或进程证据缺失、超时或 helper 不可用时，启动证据记为 `guardian_startup_unverified`，`predecessor_drained` 不置真。
 
-直属子进程核验是恢复判断的基础证据，不是对同一账户恶意篡改或仿造命名对象的密码学证明：同账户程序仍可影响本地安装和 SQLite。新证据类型为 `guardian_startup_verified`；历史 `guardian_env_assertion` 和旧 `member_verified` 列保持可读，但不能建立可恢复的前代关联。没有 guardian 环境、字段不完整或 lock ID 不匹配时，Node 持久化 `unguarded`、`invalid_attestation` 或 `rejected_lock_id`。当前已实现的有限恢复要求本代证明精确关联到紧邻前代，并由 guardian 在启动前确认前代 Job 已清空；租约过期、PID 或代际字段都不能单独授权接管已有 worktree。该机制尚未在目标机器安装或完成开机及强制中断实机验收。实现与限制见[原生 guardian 说明](../native/windows-guardian/README.md)。
+直属子进程核验是恢复判断的基础证据，不是对同一账户恶意篡改或仿造命名对象的密码学证明：同账户程序仍可影响本地安装和 SQLite。新证据类型为 `guardian_startup_verified`；历史 `guardian_env_assertion` 和旧 `member_verified` 列保持可读，但不能建立可恢复的前代关联。没有 guardian 环境、字段不完整或 lock ID 不匹配时，Node 持久化 `unguarded`、`invalid_attestation` 或 `rejected_lock_id`。当前已实现的有限恢复要求本代证明精确关联到紧邻前代，并由 guardian 在启动前确认前代 Job 已清空；租约过期、PID 或代际字段都不能单独授权接管已有 worktree。目标机器已安装该机制，并在 2026-09-28 对单阶段执行期间的 guardian 强制中断完成一次实机恢复验收；整机重启与其他崩溃窗口尚未验证。实现与限制见[原生 guardian 说明](../native/windows-guardian/README.md)。
 
 ## 必须保持的约束
 
@@ -47,4 +47,4 @@ Zero 的额度等待有明确的完成边界：适配器返回已分类的额度
 - 用假适配器在上述各个边界注入崩溃，重开 TaskStore，确认不出现第二写入者或错误的 `done`。
 - 覆盖服务在租约到期**之前**重启、随后租约到期的场景，确认运行中的周期检查会处理。
 - 用可控 guardian 证据分别测试“旧进程树仍在”“已确认停止”“证据丢失”。
-- 迭代 A 已包含自动化测试；仍需在目标机器验证手动启动、guardian 故障恢复、网络/订阅恢复和实际模型任务。Zero 不会在 Windows 开机时自动启动；用户重新启动 launcher 后才会进入恢复扫描。未完成实机验收前，不能声称目标设备已实现全流程崩溃恢复。
+- 迭代 A 已包含自动化测试；目标机器的手动启动、单阶段执行期间 guardian 故障恢复和实际 Codex 任务已验证。网络/订阅额度恢复、整机重启及其他崩溃窗口仍需验证。Zero 不会在 Windows 开机时自动启动；用户手动启动 launcher 后才会进入恢复扫描。该单点实机验收不能证明所有崩溃位置都可自动恢复。
