@@ -10,7 +10,7 @@
 
 ## 结论
 
-Zero v1 做成**一个独立安装的应用**：后台服务负责无人值守执行，同一服务提供本地 Web 界面，CLI 提供脚本入口。核心使用 Node.js 24 + TypeScript、SQLite、Git worktree、Codex/DSH/ZCode Harness Adapter，以及可选 Codex 或 API 主分配器；界面采用 React 并作为静态资源随服务打包。**不直接 fork 参考仓库。** 其中 Hydra 是最接近需求的流程参考，CAO 提供清晰的多 CLI Provider/会话抽象，Agent Orchestrator 提供已落地的同任务切换实例；这些项目可继续作为运行时与交接设计参考，但不担任 Zero 的任务状态源。
+Zero v1 做成**一个独立安装的应用**：用户在常开 Windows 电脑上手动启动前台 launcher，由 guardian 监督本地服务；同一服务提供 Web 界面，CLI 提供脚本入口。核心使用 Node.js 24 + TypeScript、SQLite、Git worktree、Codex/DSH/ZCode Harness Adapter，以及可选 Codex 或 API 主分配器；界面采用 React 并作为静态资源随服务打包。**不直接 fork 参考仓库。** 其中 Hydra 是最接近需求的流程参考，CAO 提供清晰的多 CLI Provider/会话抽象，Agent Orchestrator 提供已落地的同任务切换实例；这些项目可继续作为运行时与交接设计参考，但不担任 Zero 的任务状态源。
 
 这个判断针对当前 Windows 节点和 Zero 的交付标准：每项任务必须经过可追溯的路由、独立工作区、机器测试、Codex 独立审核、有限返工和持久归档。Zero 自己维护状态机，避免把某个 Agent 的自然语言“已完成”当成 DONE。按当前决定，**主分配器可选 Codex 订阅或 API；Reviewer 固定使用 Codex**。用户可在 Zero 中手动指定执行 Harness、模型和思考强度，未指定的字段由当前主分配器在可用候选中选择。
 
@@ -137,13 +137,13 @@ bindings:
 
 ## 实施顺序与验收门槛
 
-1. **环境与仓库**：建立 Zero 的 Git 仓库与公开 GitHub 仓库，Zero 原创代码采用 Apache-2.0；建立忽略规则、密钥扫描、CI。逐个验证 Codex、DSH、ZCode 在目标机器上的 CLI 版本、认证、模型绑定和无头任务。2026-09-24 已发布公开仓库、配置隐私检查和 CI；Codex 已通过一次真实的分配→执行→检查→审核→归档任务。DSH 已隔离安装并完成无模型请求的 CLI 版本、headless 帮助及配置检查；它仍缺少认证和模型调用证据。ZCode 已从官方源码隔离构建 v0.16.9 并通过版本/帮助探测，模型锁定和认证调用仍待验证。Windows 开机启动和退出登录后的真实运行也尚未验收。
+1. **环境与仓库**：建立 Zero 的 Git 仓库与公开 GitHub 仓库，Zero 原创代码采用 Apache-2.0；建立忽略规则、密钥扫描、CI。逐个验证 Codex、DSH、ZCode 在目标机器上的 CLI 版本、认证、模型绑定和无头任务。2026-09-24 已发布公开仓库、配置隐私检查和 CI；Codex 已通过一次真实的分配→执行→检查→审核→归档任务。DSH 已隔离安装并完成无模型请求的 CLI 版本、headless 帮助及配置检查；它仍缺少认证和模型调用证据。ZCode 已从官方源码隔离构建 v0.16.9 并通过版本/帮助探测；2026-09-27，现有桌面 CLI 的无模型诊断和 `list-zcode-desktop-models` 命令在空会话中返回了 4 组提供方/模型标识，但没有建立绑定或执行模型调用，不能据此启用路由。Windows 未签名安装包已在目标电脑安装并手动启动；真实 Codex 订阅绑定检查通过进程级系统代理成功，但由已安装程序完成完整任务尚未验证：嵌套 Codex CLI 的额度限制和审批状态处理仍有歧义。Windows 开机或登录自启不属于当前要求。
 2. **状态核心**：SQLite schema、task/event/attempt、原子领取、lease/恢复、HTTP API 与 CLI submit/status/cancel；用假 Adapter 证明掉电重启后不丢任务、不重复 DONE。
 3. **工作区与测试**：worktree 创建/保留/清理、范围检查、测试执行器、进程超时与日志归档；证明并行任务互不影响。
 4. **三个 Harness Adapter**：先实现 Codex，再接 DSH 和 ZCode；每个 binding 通过真实冒烟测试才进入 Router 候选。原始事件与标准结果均存档。
 5. **主分配器与 Reviewer**：实现候选过滤、Codex 结构化分配、可选 API 协调器、用户模型覆盖、route 快照、Codex 独立只读 review、结构化 verdict。验证 reviewer 不会写工作区。
 6. **返工闭环**：测试或审核失败后生成 revision brief；达到 `max_revisions` 准确 FAILED；通过后重跑门禁再 DONE。
-7. **应用界面与无人值守部署**：同一服务托管 React 界面，提供提交、状态看板、任务详情、日志与报告下载；做成单一安装体验。后台进程开机自启，使用专用低权限执行环境、健康检查、磁盘/配额上限、凭据注入与故障恢复；完成一次完整真实仓库任务的端到端演练，公开发布文档和版本。
+7. **应用界面与手动常驻部署**：同一服务托管 React 界面，提供提交、状态看板、任务详情、日志与报告下载；提供单一安装体验和用户手动启动的前台 launcher，由 guardian 监督服务并在异常退出后退避重启。Zero 在常开 Windows 电脑上由用户按需启动；不注册开机触发器或 Task Scheduler 任务，也不请求账户密码。目标电脑上的安装、手动启动和真实 Codex 订阅绑定检查已验证；完成从已安装程序启动的真实仓库任务、独立审核并归档到 `done` 仍是验收项，当前受嵌套 Codex CLI 的额度限制/审批状态处理歧义阻碍。目标机故障恢复仍待验证；发布状态见[Windows 应用打包](windows-app-packaging.md)和[实时验证记录](live-validation.md)。
 
 每个阶段由主负责人定义验收标准和审查结果；具体实现及部分验证交给 `gpt-6-luna high` 子 agent。主负责人保留架构、底座选择、集成审查和发布判断。
 

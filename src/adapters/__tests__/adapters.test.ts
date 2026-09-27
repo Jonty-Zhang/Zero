@@ -35,6 +35,7 @@ test('Codex builds argv with an explicit model, workspace sandbox and reasoning 
   assert.equal(invocation.executable, 'codex');
   assert.deepEqual(invocation.args, [
     'exec', '--json', '--model', 'gpt-5-codex', '--sandbox', 'workspace-write', '--cd', 'C:/repo with space',
+    '-c', 'approval_policy=never',
     '-c', 'model_reasoning_effort=high', '--output-schema', 'C:/artifacts/result schema.json', '-',
   ]);
   assert.equal(invocation.stdin, 'Fix the thing; keep spaces intact.');
@@ -47,6 +48,20 @@ test('Codex forces review to be read-only', async () => {
   assert.ok(!invocation.args.includes('workspace-write'));
   assert.ok(invocation.args.includes('--ignore-user-config'));
   assert.ok(invocation.args.includes('--ephemeral'));
+});
+
+test('Codex disables interactive approval for every role and preserves role-specific config behavior', async () => {
+  const adapter = new CodexAdapter();
+  for (const role of ['implement', 'revise', 'review', 'allocate'] as const) {
+    const invocation = await adapter.prepare(context({ role }), codexBinding);
+    const approvalOverride = invocation.args.indexOf('approval_policy=never');
+    assert.ok(approvalOverride > 0, `${role} should set approval_policy=never`);
+    assert.equal(invocation.args[approvalOverride - 1], '-c');
+    const readOnly = role === 'review' || role === 'allocate';
+    assert.ok(invocation.args.includes(readOnly ? 'read-only' : 'workspace-write'));
+    assert.equal(invocation.args.includes('--ignore-user-config'), readOnly);
+    assert.equal(invocation.args.includes('--ephemeral'), readOnly);
+  }
 });
 
 test('Codex rejects an unverified reasoning level for the selected model binding', async () => {

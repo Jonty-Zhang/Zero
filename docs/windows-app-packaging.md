@@ -1,6 +1,6 @@
 # Zero Windows app package
 
-Status: the per-user NSIS installer passed build, packaged manual-launch, and install/uninstall smoke tests in [Windows CI](https://github.com/Jonty-Zhang/Zero/actions/runs/36290900633). The unsigned release stage also passed an isolated launch-and-stop test on the target PC. Target-machine installation and validation of a real Harness task remain outstanding.
+Status: the per-user NSIS installer passed build, packaged manual-launch, and install/uninstall smoke tests in [Windows CI](https://github.com/Jonty-Zhang/Zero/actions/runs/36290900633). The unsigned package was installed and manually launched on the target PC, and a real Codex subscription binding check succeeded using a process-scoped system proxy. A complete task run from the installed package through execution, separate review, archive, and `done` remains unverified because nested Codex CLI usage-limit and approval states are not yet classified reliably by Zero.
 
 ## Installer behavior
 
@@ -33,4 +33,4 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\package-
   -ProductVersion '0.1.0'
 ```
 
-The [CI run](https://github.com/Jonty-Zhang/Zero/actions/runs/36290900633) passed NSIS compilation, packaged manual launch with verified guardian lineage and launcher-exit cleanup, and install/uninstall smoke tests. These checks do not prove that Harness authentication, proxy access, or real task execution is configured on a target PC.
+The [CI run](https://github.com/Jonty-Zhang/Zero/actions/runs/36290900633) passed NSIS compilation, packaged manual launch with verified guardian lineage and launcher-exit cleanup, and install/uninstall smoke tests. Separate target-PC validation has since confirmed package installation, manual launch, and a real Codex subscription binding check through a process-scoped system proxy. Full installed task execution through review and `done` remains unverified because nested Codex CLI usage-limit and approval states are not yet classified reliably. Windows boot triggers, sign-in startup entries, and Task Scheduler registration are not used.

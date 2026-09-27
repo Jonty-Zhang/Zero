@@ -34,7 +34,7 @@ export class CodexAdapter extends BaseHarnessAdapter {
     if (binding.harness !== 'codex' || binding.selector !== 'cli_argument' || !binding.verified) {
       throw new Error('Codex requires a verified cli_argument model binding');
     }
-    const args = ['exec', '--json', '--model', binding.model.modelId, '--sandbox', context.role === 'review' || context.role === 'allocate' ? 'read-only' : 'workspace-write', '--cd', context.cwd];
+    const args = ['exec', '--json', '--model', binding.model.modelId, '--sandbox', context.role === 'review' || context.role === 'allocate' ? 'read-only' : 'workspace-write', '--cd', context.cwd, '-c', 'approval_policy=never'];
     if (context.role === 'review' || context.role === 'allocate') args.push('--ignore-user-config', '--ephemeral');
     if (context.reasoningEffort) {
       const supported = binding.reasoningEfforts ?? ['minimal', 'low', 'medium', 'high', 'xhigh'];
