@@ -18,13 +18,13 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "$env:LOCALAPPDATA
 Invoke-RestMethod 'http://127.0.0.1:4179/api/health'
 ```
 
-应返回 `status: ok`。日志按日期保存在 `%LOCALAPPDATA%\Zero\logs`。
+应返回 `status: ok`。服务标准输出和错误日志按每次启动的时间分别保存在 `%LOCALAPPDATA%\Zero\logs`。
 
 ## Harness 与服务环境
 
 请使用已安装并登录所需 Harness CLI 的 Windows 账户启动 Zero。启动器把该用户进程的环境传给 Zero 服务。API 分配器使用 `keyEnv` 时，指定的环境变量必须在启动 Zero 时可用。凭据应保存在相应 CLI 的安全登录状态或用户环境中；不要放入命令参数、脚本、Zero 配置文件或日志。
 
-启动器支持与 `run-zero.ps1` 相同的可选覆盖参数；不需要覆盖时使用上面的默认命令。可用的参数包括 `-CodexExe`、`-DshEntry`、`-ZcodeEntry`、`-ProxyUrl` 和 `-Port`，用于指定 CLI 可执行文件或 JavaScript 入口、代理地址或服务端口。路径必须是绝对路径。`-ProxyUrl` 仅接受不含凭据、路径、查询或片段的 HTTP(S)/SOCKS5 authority URL；代理认证应在用户环境中单独配置。CLI 路径覆盖只对本次启动的 Zero 子进程生效。
+启动器支持可选覆盖参数；不需要覆盖时使用上面的默认命令。可用的参数包括 `-CodexExe`、`-DshEntry`、`-ZcodeEntry`、`-ProxyUrl` 和 `-Port`，用于指定 CLI 可执行文件或 JavaScript 入口、代理地址或服务端口。路径必须是绝对路径。`-ProxyUrl` 仅接受不含凭据、路径、查询或片段的 HTTP(S)/SOCKS5 authority URL；代理认证应在用户环境中单独配置。CLI 路径覆盖只对本次启动的 Zero 子进程生效。
 
 例如，需要明确指定 Codex CLI 路径时：
 
@@ -36,7 +36,7 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "$env:LOCALAPPDATA
 
 ## Guardian 与恢复
 
-原生 Windows guardian 监督 Zero 服务进程树，并为同一用户和数据目录保持单实例。启动器会在服务以非零状态退出后自动重试，退避时间从 5 秒逐步增加，最长 5 分钟；服务以状态码 0 正常退出后，启动器停止重试。若关闭启动器或中断它，重新从开始菜单或 PowerShell 启动即可。机器重启后仍需手动启动。
+原生 Windows guardian 直接启动 Node 服务，监督其进程树，并为同一用户和数据目录保持单实例。启动器会在服务以非零状态退出后自动重试，退避时间从 5 秒逐步增加，最长 5 分钟；服务以状态码 0 正常退出后，启动器停止重试。guardian 同时监视启动器进程：启动器退出时会结束服务进程树。若关闭启动器或中断它，重新从开始菜单或 PowerShell 启动即可。机器重启后仍需手动启动。
 
 新 guardian 会等待旧进程 Job 中的进程全部退出，再启动新的 Zero。Zero 随后根据持久化证据执行任务恢复检查。证据不完整或不匹配的任务可能进入 `recovery_required` 等待检查；重新启动不保证每个中断任务都能自动续跑。详见[guardian 说明](../native/windows-guardian/README.md)和[崩溃恢复设计](crash-recovery-design.md)。
 

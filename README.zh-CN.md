@@ -24,7 +24,7 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 
 ## 尚属设计或待验证的目标
 
-- ZCode 桌面实时接入仍未验证。本机 app-server 探测尚未返回可用模型目录，也没有建立基于 nonce 的绑定；因此不能据此声称桌面 GLM 或 DeepSeek 模型已加入路由。适配器不会声称已确认实际响应模型身份，也不会迁移桌面会话上下文。详见[接入设计](docs/zcode-existing-desktop-enrollment.md)。
+- ZCode 桌面实时接入仍未验证。现有桌面 profile 的无模型 app-server 诊断已创建空会话并返回 4 项可用模型，但尚未建立基于 nonce 的绑定，也没有真实模型调用；因此不能据此声称桌面 GLM 或 DeepSeek 模型已加入路由。适配器不会声称已确认实际响应模型身份，也不会迁移桌面会话上下文。详见[接入设计](docs/zcode-existing-desktop-enrollment.md)。
 - DSH 和隔离式 ZCode CLI 不会仅因适配器存在就加入路由。必须先在 Zero 隔离的数据目录中创建并验证绑定；可用性和证据等级取决于本机 CLI 版本及验证结果。详见[服务端配置](src/server/README.md)。
 - 当前审核使用新的 Codex 会话，但不保证审核模型一定不同于执行模型：当执行 Harness 也是 Codex 时，模型层面的独立性取决于审核绑定配置。
 

@@ -16,9 +16,10 @@ test('manual launcher keeps the guardian lock path and has no task registration 
   assert.match(source, /Get-CanonicalDataDir/);
   assert.match(source, /Get-GuardianLockId/);
   assert.match(source, /--lock-id/);
-  assert.match(source, /run-zero\.ps1/);
-  assert.match(source, /-NoNewWindow -Wait/);
-  assert.match(source, /if \(\$process\.ExitCode -eq 0\) \{ exit 0 \}/);
+  assert.match(source, /\$scriptDirectory = Split-Path -Parent \$MyInvocation\.MyCommand\.Path/);
+  assert.match(source, /'--parent-pid', \[string\]\$PID, '--', \$resolvedNodePath, \$entryPoint, 'serve'/);
+  assert.match(source, /-NoNewWindow -PassThru/);
+  assert.match(source, /if \(\$exitCode -eq 0\) \{ exit 0 \}/);
   assert.match(source, /Start-Sleep -Seconds \$retryDelaySeconds/);
   assert.match(source, /\$retryDelaySeconds = \[Math\]::Min\(\$retryDelaySeconds \* 2, 300\)/);
   assert.match(source, /\$retryDelaySeconds = 5/);

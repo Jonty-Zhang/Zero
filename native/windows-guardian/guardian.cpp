@@ -89,6 +89,12 @@ class StartupMapping {
   StartupRecord* record_ = nullptr;
 };
 
+class ParentProcess {
+ public:
+  ~ParentProcess() { if (handle != nullptr) CloseHandle(handle); }
+  HANDLE handle = nullptr;
+};
+
 bool IsGeneration(const wchar_t* value) {
   if (value == nullptr) return false;
   for (size_t i = 0; i < 32; ++i) {
@@ -333,10 +339,26 @@ int wmain(int argc, wchar_t** argv) {
   if (argc >= 2 && wcscmp(argv[1], L"--verify-member") == 0) {
     return VerifyMember(argc, argv);
   }
-  if (argc < 5 || wcscmp(argv[1], L"--lock-id") != 0 ||
-      !IsSafeLockId(argv[2]) || wcscmp(argv[3], L"--") != 0 ||
-      argv[4][0] == L'\0') {
+  if (argc < 5 || wcscmp(argv[1], L"--lock-id") != 0 || !IsSafeLockId(argv[2])) {
     return static_cast<int>(kInvalidArgs);
+  }
+  int child_start = 4;
+  DWORD parent_pid = 0;
+  if (wcscmp(argv[3], L"--parent-pid") == 0) {
+    if (argc < 7 || !ParseProcessId(argv[4], &parent_pid) ||
+        wcscmp(argv[5], L"--") != 0 || argv[6][0] == L'\0' ||
+        parent_pid == GetCurrentProcessId()) return static_cast<int>(kInvalidArgs);
+    child_start = 6;
+  } else if (wcscmp(argv[3], L"--") != 0 || argv[4][0] == L'\0') {
+    return static_cast<int>(kInvalidArgs);
+  }
+
+  ParentProcess parent;
+  if (parent_pid != 0) {
+    parent.handle = OpenProcess(SYNCHRONIZE, FALSE, parent_pid);
+    if (parent.handle == nullptr || WaitForSingleObject(parent.handle, 0) != WAIT_TIMEOUT) {
+      return static_cast<int>(kFailure);
+    }
   }
 
   const std::wstring sid = CurrentUserSidString();
@@ -423,7 +445,7 @@ int wmain(int argc, wchar_t** argv) {
     return static_cast<int>(kFailure);
   }
 
-  std::wstring command_line = BuildCommandLine(argc, argv, 4);
+  std::wstring command_line = BuildCommandLine(argc, argv, child_start);
   if (command_line.size() >= 32767) {
     CloseHandle(job);
     ReleaseMutex(mutex);
@@ -436,7 +458,7 @@ int wmain(int argc, wchar_t** argv) {
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};
-  if (!CreateProcessW(argv[4], mutable_command.data(), nullptr, nullptr, FALSE,
+  if (!CreateProcessW(argv[child_start], mutable_command.data(), nullptr, nullptr, FALSE,
                       CREATE_SUSPENDED, nullptr, nullptr, &startup, &process)) {
     CloseHandle(job);
     ReleaseMutex(mutex);
@@ -483,7 +505,33 @@ int wmain(int argc, wchar_t** argv) {
     return static_cast<int>(kFailure);
   }
 
-  WaitForSingleObject(process.hProcess, INFINITE);
+  HANDLE waits[2] = {process.hProcess, parent.handle};
+  const DWORD wait_result = parent.handle != nullptr
+      ? WaitForMultipleObjects(2, waits, FALSE, INFINITE)
+      : WaitForSingleObject(process.hProcess, INFINITE);
+  if (parent.handle != nullptr && wait_result == WAIT_OBJECT_0 + 1) {
+    // A manually launched Zero must not outlive its foreground launcher.
+    TerminateJobObject(job, 0);
+    WaitForSingleObject(process.hProcess, INFINITE);
+    WaitForJobToBecomeEmpty(job);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    CloseHandle(job);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    return 0;
+  }
+  if (wait_result != WAIT_OBJECT_0) {
+    TerminateJobObject(job, kFailure);
+    WaitForSingleObject(process.hProcess, INFINITE);
+    WaitForJobToBecomeEmpty(job);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    CloseHandle(job);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    return static_cast<int>(kFailure);
+  }
   DWORD child_exit_code = kFailure;
   GetExitCodeProcess(process.hProcess, &child_exit_code);
 

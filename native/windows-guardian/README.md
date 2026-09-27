@@ -16,6 +16,13 @@ startup lineage, then attaches that generation to task claims and started
 stages. If those values are absent, incomplete, mismatched, or unverifiable,
 Zero records the startup as unguarded, rejected, or member-unverified.
 
+The Windows manual launcher sets the service environment before invoking the
+guardian and makes the packaged Node process its direct child. It passes
+`--parent-pid <launcher-pid>` so the guardian can also wait on the launcher's
+process handle. If the launcher exits first, the guardian terminates its Job
+and waits for the service tree to drain. The parent process is not part of the
+startup proof; this option only ties service lifetime to the visible launcher.
+
 These inherited variables are assertions, not authentication. A process
 running as the same Windows account can set them itself; they do not prove to
 SQLite that guardian.exe was the sender. They exist to correlate normal
