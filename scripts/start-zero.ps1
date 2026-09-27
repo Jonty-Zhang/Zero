@@ -6,7 +6,7 @@ param(
     [string]$DataDir = (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Zero'),
     [string]$LogDir,
     [string]$CodexExe,
-    [ValidateSet('elevated', 'unelevated')][string]$CodexWindowsSandbox,
+    [ValidateSet('elevated', 'unelevated')][string]$CodexWindowsSandbox = 'unelevated',
     [string]$DshEntry,
     [string]$ZcodeEntry,
     [string]$ProxyUrl,
@@ -62,6 +62,12 @@ $nodeVersion = & $resolvedNodePath --version
 if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v?(\d+)\.') { throw 'Could not verify the Node.js version.' }
 if ([int]$Matches[1] -lt 24) { throw "Zero requires Node.js 24 or later; found $nodeVersion." }
 
+if (-not $CodexExe -and -not $env:ZERO_CODEX_EXE) {
+    # The npm Codex package bundles the native executable at this standard
+    # per-user path. Use it only for this process; leave Codex settings alone.
+    $installedCodexExe = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)) 'npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
+    if (Test-Path -LiteralPath $installedCodexExe -PathType Leaf) { $CodexExe = $installedCodexExe }
+}
 if ($CodexExe) {
     if (-not [System.IO.Path]::IsPathRooted($CodexExe)) { throw 'CodexExe must be an absolute path.' }
     $resolvedCodexExe = [System.IO.Path]::GetFullPath($CodexExe)

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { link, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ZCodeAppServerPeer } from '../zcode-app-server-peer.js';
@@ -14,6 +14,9 @@ let mode = 'normal';
 let keepAlive;
 const seenMethods = [];
 let runtimePreferenceResponse;
+let reverseResponse;
+let reverseError;
+let holdPendingResolution = false;
 const write = value => process.stdout.write(JSON.stringify(value) + '\n');
 const respond = (id, result) => write({ id, result });
 const snapshotWire = (subscriptionId, pendingInteractions, options = {}) => ({
@@ -65,10 +68,17 @@ const deltaWire = (subscriptionId, pendingInteractions, fromSeq = 0, toSeq = 1) 
 rl.on('line', raw => {
   const request = JSON.parse(raw);
   if (Object.hasOwn(request, 'error')) {
+    if (request.id === 'reverse-permission') reverseError = request.error;
     return;
   }
   if (Object.hasOwn(request, 'result') && !Object.hasOwn(request, 'method')) {
-    runtimePreferenceResponse = request.result;
+    if (request.id === 'runtime-pref-request') runtimePreferenceResponse = request.result;
+    if (request.id === 'reverse-permission') {
+      reverseResponse = request.result;
+      if (request.result?.decision === 'allow' && !holdPendingResolution) {
+        setTimeout(() => write({ method: 'v4/conversation/frame', params: deltaWire('sub-one', [], 1, 2) }), 5);
+      }
+    }
     return;
   }
   const { id, method, params = {} } = request;
@@ -162,6 +172,34 @@ rl.on('line', raw => {
     respond(id, { ok: true });
     return;
   }
+  if (method === 'test/reverse-permission') {
+    write({ id: 'reverse-permission', method: 'interaction/requestPermission', params });
+    respond(id, { ok: true });
+    return;
+  }
+  if (method === 'test/reverse-pending-write' || method === 'test/reverse-pending-write-stalled') {
+    holdPendingResolution = method.endsWith('stalled');
+    const interaction = {
+      interactionId: params.requestId, kind: 'permission', anchorRowId: null, createdAt: 2,
+      payload: { kind: 'permission', toolCallId: params.toolCallId, toolName: params.toolName,
+        summary: 'Write file', detail: {}, options: [] },
+    };
+    write({ method: 'v4/conversation/frame', params: deltaWire('sub-one', [interaction]) });
+    write({ id: 'reverse-permission', method: 'interaction/requestPermission', params });
+    respond(id, { ok: true });
+    return;
+  }
+  if (method === 'test/reverse-user-input') {
+    write({ id: 'reverse-user-input', method: 'interaction/requestUserInput', params: {
+      sessionId: 'session-one', requestId: 'user-input-one',
+    } });
+    respond(id, { ok: true });
+    return;
+  }
+  if (method === 'test/reverse-response') {
+    setTimeout(() => respond(id, { response: reverseResponse, error: reverseError }), 25);
+    return;
+  }
   if (method === 'test/reverse-runtime-invalid') {
     write({ id: 'reverse-runtime-invalid', method: 'session/requestRuntimePreferences', params: {
       sessionId: 'session-one', scope: 'unexpected-scope',
@@ -226,7 +264,11 @@ rl.on('line', raw => {
 });
 `;
 
-async function withFakeServer<T>(run: (peer: ZCodeAppServerPeer, dirs: { root: string; worktree: string; dataBaseDir: string }) => Promise<T>, onDiagnostic?: (event: ZCodeAppServerDiagnosticEvent) => void): Promise<T> {
+async function withFakeServer<T>(
+  run: (peer: ZCodeAppServerPeer, dirs: { root: string; worktree: string; dataBaseDir: string }) => Promise<T>,
+  onDiagnostic?: (event: ZCodeAppServerDiagnosticEvent) => void,
+  profileMode: 'isolated' | 'existing-desktop' = 'isolated',
+): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), 'zero-zcode-peer-'));
   const worktree = join(root, 'task-worktree');
   const dataBaseDir = join(root, 'isolated-zcode-data');
@@ -236,9 +278,8 @@ async function withFakeServer<T>(run: (peer: ZCodeAppServerPeer, dirs: { root: s
   const peer = await ZCodeAppServerPeer.launch({
     entry,
     taskWorktree: worktree,
-    profileMode: 'isolated',
-    zeroDataRoot: root,
-    dataBaseDir,
+    profileMode,
+    ...(profileMode === 'isolated' ? { zeroDataRoot: root, dataBaseDir } : {}),
     requestTimeoutMs: 1_000,
     initialFrameTimeoutMs: 150,
     onDiagnostic,
@@ -252,11 +293,22 @@ async function withFakeServer<T>(run: (peer: ZCodeAppServerPeer, dirs: { root: s
 }
 
 async function createSession(peer: ZCodeAppServerPeer): Promise<void> {
+  const taskWorktree = (peer as unknown as { taskWorktree: string }).taskWorktree;
   const result = await peer.request('session/create', {
-    workspace: { workspacePath: 'C:/zero/task-worktree', workspaceIdentity: 'C:/zero/task-worktree', workspaceKey: 'task-one' },
+    workspace: { workspacePath: taskWorktree, workspaceIdentity: taskWorktree, workspaceKey: 'task-one' },
     persistence: 'deferred',
   }) as { session?: { sessionId?: string } };
   assert.equal(result.session?.sessionId, 'session-one');
+}
+
+function permissionRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    requestId: 'permission-one', sessionId: 'session-one', turnId: 'turn-one',
+    toolCallId: 'tool-one', toolName: 'Write', reason: 'Write requested file', riskLevel: 'low',
+    input: { file_path: 'C:/unused/file.txt', content: 'hello' },
+    options: [{ optionId: 'allow_once', kind: 'allow_once', name: 'Allow once', response: { decision: 'allow', reason: 'Approved once' } }],
+    ...overrides,
+  };
 }
 
 // Bypass the production method allowlist only for fake-process control and inspection.
@@ -408,8 +460,9 @@ test('diagnostics expose bounded safe lifecycle enums and omit RPC text and user
   const invalidSessionEvents: ZCodeAppServerDiagnosticEvent[] = [];
   await withFakeServer(async peer => {
     await debugRequest(peer, 'test/set-mode', { mode: 'session-bad' });
+    const taskWorktree = (peer as unknown as { taskWorktree: string }).taskWorktree;
     const result = await peer.request('session/create', {
-      workspace: { workspacePath: 'C:/zero/task-worktree', workspaceIdentity: 'C:/zero/task-worktree', workspaceKey: 'task-one' },
+      workspace: { workspacePath: taskWorktree, workspaceIdentity: taskWorktree, workspaceKey: 'task-one' },
       persistence: 'deferred',
     });
     assert.deepEqual(result, { session: {} });
@@ -623,7 +676,157 @@ test('reverse permission request is answered with error and surfaced as a blocke
     await createSession(peer);
     assert.deepEqual(await peer.readPendingInteractions('session-one'), []);
     await debugRequest(peer, 'test/reverse', {});
-    await assert.rejects(peer.readPendingInteractions('session-one'), /interaction request is not supported/);
+    await assert.rejects(peer.readPendingInteractions('session-one'), /permission request was malformed/);
+  });
+});
+
+test('existing-desktop peer grants only one-shot low or medium Edit and Write inside the task worktree', async () => {
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    assert.deepEqual(await peer.readPendingInteractions('session-one'), []);
+    for (const toolName of ['Edit', 'Write']) {
+      await debugRequest(peer, 'test/reverse-permission', permissionRequest({
+        requestId: `permission-${toolName}`,
+        toolName,
+        input: toolName === 'Write'
+          ? { file_path: join(dirs.worktree, 'write.txt'), content: 'safe' }
+          : { file_path: join(dirs.worktree, 'edit.txt'), old_string: 'old', new_string: 'new' },
+      }));
+      const result = await debugRequest(peer, 'test/reverse-response') as { response?: Record<string, unknown> };
+      assert.deepEqual(result.response, { decision: 'allow', reason: 'Approved once' });
+      assert.equal(Object.hasOwn(result.response!, 'permissionUpdates'), false);
+    }
+  }, undefined, 'existing-desktop');
+});
+
+test('one-shot permission waits for the matching v4 interaction to clear before session events', async () => {
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    const request = permissionRequest({ input: { file_path: join(dirs.worktree, 'race.txt'), content: 'safe' } });
+    await debugRequest(peer, 'test/reverse-pending-write', request);
+    assert.deepEqual(await peer.readPendingInteractions('session-one'), []);
+    assert.equal(await peer.consumeApprovedPermissionEvent?.('session-one', { type: 'permission.requested' }, {
+      requestId: request.requestId, toolCallId: request.toolCallId, toolName: request.toolName,
+    }), true);
+    assert.equal(await peer.consumeApprovedPermissionEvent?.('session-one', { type: 'permission.requested' }, {
+      requestId: 'unapproved-request', toolCallId: request.toolCallId, toolName: request.toolName,
+    }), false);
+  }, undefined, 'existing-desktop');
+});
+
+test('one-shot permission v4 resolution timeout fails closed', async () => {
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    const request = permissionRequest({ input: { file_path: join(dirs.worktree, 'stalled.txt'), content: 'safe' } });
+    await debugRequest(peer, 'test/reverse-pending-write-stalled', request);
+    await assert.rejects(peer.readPendingInteractions('session-one'), /did not clear from v4 interaction state before timeout/);
+  }, undefined, 'existing-desktop');
+});
+
+test('one-shot permission policy denies Bash, unsafe risk, foreign session, and paths outside the task', async () => {
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    const cases = [
+      permissionRequest({ toolName: 'Bash', input: { command: 'npm test' } }),
+      permissionRequest({ riskLevel: 'high' }),
+      permissionRequest({ riskLevel: 'critical' }),
+      permissionRequest({ sessionId: 'session-other' }),
+      permissionRequest({ input: { file_path: join(dirs.root, 'outside.txt') } }),
+      permissionRequest({ input: { file_path: join(dirs.worktree, 'inside.txt'), content: 'safe', path: join(dirs.root, 'outside.txt') } }),
+      permissionRequest({ origin: { kind: 'subagent' } }),
+    ];
+    for (const [index, request] of cases.entries()) {
+      await debugRequest(peer, 'test/reverse-permission', { ...request, requestId: `denied-${index}` });
+      const result = await debugRequest(peer, 'test/reverse-response') as { response?: Record<string, unknown> };
+      assert.equal(result.response?.decision, 'deny');
+      assert.equal(Object.hasOwn(result.response ?? {}, 'permissionUpdates'), false);
+    }
+  }, undefined, 'existing-desktop');
+});
+
+test('one-shot permission policy rejects .git metadata and symlink or reparse traversal', async () => {
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    const outside = join(dirs.root, 'outside');
+    await mkdir(outside);
+    const link = join(dirs.worktree, 'escape');
+    await symlink(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
+    const targets = [join(dirs.worktree, '.git', 'config'), join(link, 'new.txt')];
+    for (const [index, target] of targets.entries()) {
+      await debugRequest(peer, 'test/reverse-permission', permissionRequest({
+        requestId: `protected-${index}`, input: { file_path: target },
+      }));
+      const result = await debugRequest(peer, 'test/reverse-response') as { response?: Record<string, unknown> };
+      assert.equal(result.response?.decision, 'deny');
+    }
+  }, undefined, 'existing-desktop');
+});
+
+test('one-shot permission policy rejects hard links to files outside the task worktree', async () => {
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    const outsideFile = join(dirs.root, 'outside.txt');
+    const inTreeHardLink = join(dirs.worktree, 'linked.txt');
+    await writeFile(outsideFile, 'outside data');
+    await link(outsideFile, inTreeHardLink);
+    await debugRequest(peer, 'test/reverse-permission', permissionRequest({
+      input: { file_path: inTreeHardLink, content: 'replace content' },
+    }));
+    const result = await debugRequest(peer, 'test/reverse-response') as { response?: Record<string, unknown> };
+    assert.equal(result.response?.decision, 'deny');
+  }, undefined, 'existing-desktop');
+});
+
+test('one-shot permission policy rejects Windows path aliases and alternate data streams', async () => {
+  if (process.platform !== 'win32') return;
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    const targets = [
+      join(dirs.worktree, '.git.', 'config'),
+      join(dirs.worktree, '.zero ', 'state'),
+      join(dirs.worktree, 'notes.txt:stream'),
+      join(dirs.worktree, 'ordinary.', 'file.txt'),
+    ];
+    for (const [index, target] of targets.entries()) {
+      await debugRequest(peer, 'test/reverse-permission', permissionRequest({
+        requestId: `windows-alias-${index}`, input: { file_path: target, content: 'blocked' },
+      }));
+      const result = await debugRequest(peer, 'test/reverse-response') as { response?: Record<string, unknown> };
+      assert.equal(result.response?.decision, 'deny');
+    }
+  }, undefined, 'existing-desktop');
+});
+
+test('malformed permission params fail closed and existing-desktop changes no permission policy', async () => {
+  await withFakeServer(async (peer) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    await debugRequest(peer, 'test/reverse-permission', {
+      ...permissionRequest({ input: { file_path: (peer as unknown as { taskWorktree: string }).taskWorktree + '/safe.txt' } }),
+      unexpected: true,
+    });
+    const result = await debugRequest(peer, 'test/reverse-response') as { response?: unknown; error?: Record<string, unknown> };
+    assert.equal(result.response, undefined);
+    assert.equal(result.error?.code, -32001);
+    await assert.rejects(peer.readPendingInteractions('session-one'), /permission request was malformed/);
+  }, undefined, 'existing-desktop');
+});
+
+test('isolated profile does not auto-approve a task-local write', async () => {
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    await debugRequest(peer, 'test/reverse-permission', permissionRequest({
+      input: { file_path: join(dirs.worktree, 'safe.txt') },
+    }));
+    const result = await debugRequest(peer, 'test/reverse-response') as { response?: Record<string, unknown> };
+    assert.equal(result.response?.decision, 'deny');
   });
 });
 

@@ -32,7 +32,7 @@ Invoke-RestMethod 'http://127.0.0.1:4179/api/health'
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "$env:LOCALAPPDATA\Programs\Zero\scripts\start-zero.ps1" -CodexExe '<absolute path to codex.exe>'
 ```
 
-需要时可通过 `-CodexWindowsSandbox elevated` 或 `-CodexWindowsSandbox unelevated` 为 Zero 发起的 Codex 调用指定原生 Windows 沙盒模式；省略时 Zero 不覆盖 Codex 的沙盒设置，也不会写入 Codex 配置。OpenAI 官方建议使用 `elevated`；仅在管理员批准的设置不可用或失败时将 `unelevated` 作为回退。它仍保留 ACL 文件系统边界，但网络隔离较弱。[Windows sandbox 指南](https://learn.chatgpt.com/docs/windows/windows-sandbox)
+安装版启动器会先寻找本机标准 npm 安装目录中的原生 Codex CLI，以及本机 ZCode 安装包附带的 CLI；仅为本次 Zero 进程设置路径，不修改两者的登录或配置。找不到时仍可显式传入 `-CodexExe` 或 `-ZcodeEntry`。本机验收发现默认/`elevated` Codex 命令运行器无法读取审核快照，因此安装版启动器默认为本次进程使用 `-CodexWindowsSandbox unelevated`；可显式传入 `-CodexWindowsSandbox elevated` 覆盖。Zero 不写入 Codex 配置。OpenAI 官方将 `elevated` 列为首选，`unelevated` 作为设置失败时的回退；后者保留 ACL 文件系统边界，但网络隔离较弱。[Windows sandbox 指南](https://learn.chatgpt.com/docs/windows/windows-sandbox)
 
 应使用实际需要的选项。绑定验证应使用启动 Zero 时相同的 Windows 用户、数据目录、CLI 登录和环境。详见[服务端配置与绑定验证](../src/server/README.md)。
 

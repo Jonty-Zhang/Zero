@@ -11,6 +11,11 @@ import { classifyQuota, type QuotaSignal } from '../core/quota.js';
 export interface ZCodeProtocolPeer {
   request(method: string, params: Record<string, unknown>): Promise<unknown>;
   readPendingInteractions(sessionId: string): Promise<unknown>;
+  consumeApprovedPermissionEvent?(
+    sessionId: string,
+    event: Record<string, unknown>,
+    payload: Record<string, unknown>,
+  ): Promise<boolean> | boolean;
   close(): Promise<void>;
 }
 
@@ -243,7 +248,9 @@ export async function runZCodeProtocolSession(
           : undefined;
 
         if (isInteractionEvent(event, payload)) {
-          throw new Error(interactionBlockReason(event, payload));
+          const handled = payload && await peer.consumeApprovedPermissionEvent?.(sessionId, event, payload);
+          if (!handled) throw new Error(interactionBlockReason(event, payload));
+          continue;
         }
         if (
           event.type === 'turn.started' &&

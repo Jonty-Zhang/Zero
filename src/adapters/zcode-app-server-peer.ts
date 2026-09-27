@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, realpath, stat } from 'node:fs/promises';
+import { access, lstat, mkdir, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -12,6 +12,8 @@ const MAX_REVERSE_BLOCKERS = 16;
 const MAX_PRE_ACK_FRAMES = 8;
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const DEFAULT_INITIAL_FRAME_TIMEOUT_MS = 10_000;
+const APPROVED_INTERACTION_RESOLUTION_TIMEOUT_MS = 2_000;
+const APPROVED_INTERACTION_RESOLUTION_POLL_MS = 20;
 const V4_WIRE_PROTOCOL_VERSION = 3;
 
 export type ZCodeAppServerDiagnosticStage =
@@ -121,6 +123,13 @@ interface Deferred<T> {
   reject(error: Error): void;
 }
 
+type OneShotPermissionState = 'evaluating' | 'approved' | 'denied';
+interface OneShotPermissionRecord {
+  toolCallId: string;
+  toolName: string;
+  state: OneShotPermissionState;
+}
+
 /**
  * Zero-owned app-server process using the official 0.16.9 line protocol.
  *
@@ -134,6 +143,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly subscriptions = new Map<string, SubscriptionState>();
   private readonly interactionGatedSessions = new Set<string>();
+  private readonly permissionInteractions = new Map<string, Map<string, OneShotPermissionRecord>>();
   private readonly globalBlockers: string[] = [];
   private nextRequestId = 1;
   private stdoutBuffer = Buffer.alloc(0);
@@ -147,9 +157,13 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
   private readonly abortSignal?: AbortSignal;
   private readonly diagnosticSink?: ZCodeAppServerDiagnosticSink;
   private readonly launchedAt = Date.now();
+  private readonly profileMode: ZCodeAppServerPeerOptions['profileMode'];
+  private readonly taskWorktree: string;
 
-  private constructor(options: ZCodeAppServerPeerOptions, child: ChildProcessWithoutNullStreams) {
+  private constructor(options: ZCodeAppServerPeerOptions, child: ChildProcessWithoutNullStreams, taskWorktree: string) {
     this.child = child;
+    this.profileMode = options.profileMode;
+    this.taskWorktree = taskWorktree;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
     this.initialFrameTimeoutMs = options.initialFrameTimeoutMs ?? DEFAULT_INITIAL_FRAME_TIMEOUT_MS;
     this.abortSignal = options.signal;
@@ -176,13 +190,14 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
       const bundledProviderConfig = await findBundledProviderConfig(options.entry);
       const taskStat = await stat(options.taskWorktree);
       if (!taskStat.isDirectory()) throw new Error('ZCode taskWorktree must be an existing directory');
+      const canonicalTaskWorktree = await realpath(options.taskWorktree);
       if (options.profileMode === 'isolated') {
         await mkdir(options.zeroDataRoot!, { recursive: true });
         await mkdir(options.dataBaseDir!, { recursive: true });
         const [realRoot, realDataDir, realWorktree] = await Promise.all([
           realpath(options.zeroDataRoot!),
           realpath(options.dataBaseDir!),
-          realpath(options.taskWorktree),
+          Promise.resolve(canonicalTaskWorktree),
         ]);
         if (!isPathInside(realRoot, realDataDir)) {
           throw new Error('ZCode dataBaseDir resolves outside the Zero-owned data root');
@@ -206,7 +221,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
         stdio: 'pipe',
         detached: process.platform !== 'win32',
       });
-      peer = new ZCodeAppServerPeer(options, child);
+      peer = new ZCodeAppServerPeer(options, child, canonicalTaskWorktree);
       await peer.waitForSpawn();
       peer.emitDiagnostic('launch', 'acknowledged', undefined, elapsedMs(startedAt));
       return peer;
@@ -231,6 +246,12 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
       const workspaceIdentity = nonEmptyString(workspace.workspaceIdentity);
       if (!workspacePath || !workspaceKey || !workspaceIdentity || Object.hasOwn(workspace, 'remoteSessionId')) {
         throw new Error('ZCode session/create requires a local workspace identity for interaction safety gating');
+      }
+      const canonicalWorkspace = await canonicalizeExistingDirectory(workspacePath);
+      const canonicalIdentity = await canonicalizeExistingDirectory(workspaceIdentity);
+      if (!canonicalWorkspace || !sameCanonicalPath(canonicalWorkspace, this.taskWorktree) ||
+        !canonicalIdentity || !sameCanonicalPath(canonicalIdentity, this.taskWorktree)) {
+        throw new Error('ZCode session/create refused a workspace outside this exact task worktree');
       }
       const expectedWorkspace = { workspacePath, workspaceIdentity, workspaceKey };
       const preferenceStartedAt = Date.now();
@@ -369,7 +390,38 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     if (!Array.isArray(state.pendingInteractions)) {
       throw new Error('ZCode v4 conversation snapshot has no pendingInteractions state');
     }
-    return [...state.pendingInteractions];
+    return await this.waitForApprovedInteractionsToResolve(state);
+  }
+
+  async consumeApprovedPermissionEvent(
+    sessionId: string,
+    event: Record<string, unknown>,
+    payload: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (event.type !== 'permission.requested') return false;
+    const requestId = nonEmptyString(payload.requestId);
+    const toolCallId = nonEmptyString(payload.toolCallId);
+    const toolName = nonEmptyString(payload.toolName);
+    const state = this.subscriptions.get(sessionId);
+    const record = requestId ? this.permissionInteractions.get(sessionId)?.get(requestId) : undefined;
+    if (!state || !record || record.toolCallId !== toolCallId || record.toolName !== toolName) return false;
+    const deadline = Date.now() + APPROVED_INTERACTION_RESOLUTION_TIMEOUT_MS;
+    while (true) {
+      if (state.error) throw state.error;
+      const current = this.permissionInteractions.get(sessionId)?.get(requestId!);
+      if (!current || current.toolCallId !== toolCallId || current.toolName !== toolName || current.state === 'denied') return false;
+      const stillPending = (state.pendingInteractions ?? []).some(item => matchesApprovedInteraction(item, new Map([[requestId!, current]])));
+      if (current.state === 'approved' && !stillPending) {
+        this.permissionInteractions.get(sessionId)?.delete(requestId!);
+        return true;
+      }
+      if (Date.now() >= deadline) {
+        const error = new Error('ZCode approved permission event did not resolve in v4 interaction state before timeout');
+        this.setSubscriptionError(state, error);
+        throw error;
+      }
+      await new Promise(resolveWait => setTimeout(resolveWait, APPROVED_INTERACTION_RESOLUTION_POLL_MS));
+    }
   }
 
   async close(): Promise<void> {
@@ -562,6 +614,11 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
       return;
     }
     const sessionId = nonEmptyString(params?.sessionId);
+    if (method === 'interaction/requestPermission') {
+      this.trackInFlightPermission(params);
+      void this.answerPermissionRequest(message.id, params);
+      return;
+    }
     const reason = knownInteraction
       ? 'interaction request is not supported by the Zero peer'
       : 'reverse request is not supported by the Zero peer';
@@ -576,6 +633,99 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
       id: message.id,
       error: { code: -32001, message: 'Zero-owned app-server peer refuses reverse requests' },
     }).catch(() => this.fail(new Error('ZCode app-server reverse request response failed')));
+  }
+
+  private async answerPermissionRequest(id: unknown, params: Record<string, unknown> | undefined): Promise<void> {
+    const validated = validatePermissionRequest(params);
+    if (!validated) {
+      this.blockMalformedInteraction(params);
+      await this.writeMessage({
+        id,
+        error: { code: -32001, message: 'Zero-owned app-server peer refuses malformed permission requests' },
+      }).catch(() => this.fail(new Error('ZCode permission response failed')));
+      return;
+    }
+    const { sessionId, toolCallId, toolName, input } = validated;
+    const allowed = this.isEligibleOneShotPermission(validated);
+    let response: Record<string, unknown>;
+    if (!allowed) {
+      response = permissionDenied('This permission request is outside the task-local one-shot policy');
+    } else {
+      const target = typeof input.file_path === 'string' ? input.file_path : undefined;
+      const canonicalTarget = target ? await canonicalizeTaskTarget(this.taskWorktree, target) : undefined;
+      response = canonicalTarget
+        ? { decision: 'allow', reason: 'Approved once' }
+        : permissionDenied('This file target is outside the task worktree');
+    }
+    if (!isPermissionResponse(response)) {
+      this.blockMalformedInteraction(params);
+      await this.writeMessage({
+        id,
+        error: { code: -32001, message: 'Zero-owned app-server peer refuses malformed permission responses' },
+      }).catch(() => this.fail(new Error('ZCode permission response failed')));
+      return;
+    }
+    this.setPermissionRequestState(sessionId, validated.requestId, response.decision === 'allow' ? 'approved' : 'denied');
+    await this.writeMessage({ id, result: response })
+      .catch(() => this.fail(new Error('ZCode permission response failed')));
+  }
+
+  private async waitForApprovedInteractionsToResolve(state: SubscriptionState): Promise<unknown[]> {
+    const sessionApprovals = this.permissionInteractions.get(state.sessionId);
+    if (!sessionApprovals?.size) return [...state.pendingInteractions!];
+    const deadline = Date.now() + APPROVED_INTERACTION_RESOLUTION_TIMEOUT_MS;
+    while (true) {
+      if (state.error) throw state.error;
+      const pending = state.pendingInteractions ?? [];
+      const unknownPending = pending.filter(item => {
+        if (!isRecord(item) || typeof item.interactionId !== 'string') return true;
+        const expected = sessionApprovals.get(item.interactionId);
+        return !expected || expected.state === 'denied' || !matchesApprovedInteraction(item, new Map([[item.interactionId, expected]]));
+      });
+      if (unknownPending.length > 0) return [...pending];
+      if (pending.length === 0) return [];
+      const awaitingDecision = pending.some(item => sessionApprovals.get(asRecord(item).interactionId as string)?.state === 'evaluating');
+      const awaitingResolution = pending.some(item => sessionApprovals.get(asRecord(item).interactionId as string)?.state === 'approved');
+      if (!awaitingDecision && !awaitingResolution) return [...pending];
+      if (Date.now() >= deadline) {
+        const error = new Error('ZCode approved permission did not clear from v4 interaction state before timeout');
+        this.setSubscriptionError(state, error);
+        throw error;
+      }
+      await new Promise(resolveWait => setTimeout(resolveWait, APPROVED_INTERACTION_RESOLUTION_POLL_MS));
+    }
+  }
+
+  private trackInFlightPermission(params: Record<string, unknown> | undefined): void {
+    const validated = validatePermissionRequest(params);
+    if (!validated || !this.isEligibleOneShotPermission(validated)) return;
+    const requests = this.permissionInteractions.get(validated.sessionId) ?? new Map();
+    requests.set(validated.requestId, { toolCallId: validated.toolCallId, toolName: validated.toolName, state: 'evaluating' });
+    this.permissionInteractions.set(validated.sessionId, requests);
+  }
+
+  private setPermissionRequestState(sessionId: string, requestId: string, state: OneShotPermissionState): void {
+    const record = this.permissionInteractions.get(sessionId)?.get(requestId);
+    if (record) record.state = state;
+  }
+
+  private isEligibleOneShotPermission(request: ValidPermissionRequest): boolean {
+    return this.profileMode === 'existing-desktop' &&
+      this.interactionGatedSessions.has(request.sessionId) &&
+      this.subscriptions.has(request.sessionId) &&
+      !request.hasOrigin &&
+      (request.toolName === 'Edit' || request.toolName === 'Write') &&
+      isSafeFileToolInput(request.toolName, request.input) &&
+      (request.riskLevel === 'low' || request.riskLevel === 'medium');
+  }
+
+  private blockMalformedInteraction(params: Record<string, unknown> | undefined): void {
+    const sessionId = nonEmptyString(params?.sessionId);
+    if (sessionId && this.subscriptions.has(sessionId)) {
+      this.setSubscriptionError(this.subscriptions.get(sessionId)!, new Error('ZCode permission request was malformed'));
+    } else if (this.globalBlockers.length < MAX_REVERSE_BLOCKERS) {
+      this.globalBlockers.push('permission request was malformed');
+    }
   }
 
   private handleConversationFrame(value: unknown, bytes: number): void {
@@ -924,8 +1074,174 @@ function isolatedProfileDirectories(dataBaseDir: string): Record<'APPDATA' | 'LO
 }
 
 function isPathInside(parent: string, child: string): boolean {
-  const rel = relative(parent, child);
+  const parentPath = process.platform === 'win32' ? parent.toLowerCase() : parent;
+  const childPath = process.platform === 'win32' ? child.toLowerCase() : child;
+  const rel = relative(parentPath, childPath);
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+interface ValidPermissionRequest {
+  requestId: string;
+  sessionId: string;
+  toolCallId: string;
+  toolName: string;
+  riskLevel: 'low' | 'medium' | 'high' | 'critical';
+  input: Record<string, unknown>;
+  hasOrigin: boolean;
+}
+
+function validatePermissionRequest(value: unknown): ValidPermissionRequest | undefined {
+  if (!isRecord(value)) return undefined;
+  const requestId = nonEmptyString(value.requestId);
+  const sessionId = nonEmptyString(value.sessionId);
+  const toolCallId = nonEmptyString(value.toolCallId);
+  const toolName = nonEmptyString(value.toolName);
+  const allowedKeys = new Set([
+    'requestId', 'sessionId', 'turnId', 'toolCallId', 'toolName', 'reason', 'riskLevel', 'input', 'origin', 'options',
+  ]);
+  if (Object.keys(value).some(key => !allowedKeys.has(key)) ||
+    !requestId || !sessionId || !toolCallId || !toolName ||
+    (value.turnId !== undefined && !nonEmptyString(value.turnId)) ||
+    typeof value.reason !== 'string' ||
+    !['low', 'medium', 'high', 'critical'].includes(String(value.riskLevel)) ||
+    !isRecord(value.input) || !Array.isArray(value.options) || value.options.length === 0 ||
+    (value.origin !== undefined && !isRecord(value.origin))) return undefined;
+  for (const option of value.options) {
+    if (!isRecord(option) || Object.keys(option).some(key => !['optionId', 'kind', 'name', 'description', 'response'].includes(key)) ||
+      !nonEmptyString(option.optionId) || !nonEmptyString(option.kind) || !nonEmptyString(option.name) ||
+      (option.description !== undefined && typeof option.description !== 'string') ||
+      !isPermissionResponse(option.response)) return undefined;
+  }
+  return {
+    requestId,
+    sessionId,
+    toolCallId,
+    toolName,
+    riskLevel: value.riskLevel as ValidPermissionRequest['riskLevel'],
+    input: value.input,
+    hasOrigin: value.origin !== undefined,
+  };
+}
+
+function isPermissionResponse(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  if (Object.keys(value).some(key => !['decision', 'reason', 'modifiedInput', 'permissionUpdates'].includes(key)) ||
+    !['allow', 'deny', 'escalate', 'modify'].includes(String(value.decision)) ||
+    (value.reason !== undefined && typeof value.reason !== 'string') ||
+    (value.permissionUpdates !== undefined && !Array.isArray(value.permissionUpdates))) return false;
+  if (Array.isArray(value.permissionUpdates) && value.permissionUpdates.some(update => {
+    if (!isRecord(update) || Object.keys(update).some(key => !['type', 'behavior', 'rules'].includes(key)) ||
+      update.type !== 'addRules' || !['allow', 'deny', 'ask'].includes(String(update.behavior)) ||
+      !Array.isArray(update.rules) || update.rules.length === 0) return true;
+    return update.rules.some(rule => !isRecord(rule) ||
+      Object.keys(rule).some(key => !['toolName', 'ruleContent'].includes(key)) ||
+      !nonEmptyString(rule.toolName) ||
+      (rule.ruleContent !== undefined && typeof rule.ruleContent !== 'string'));
+  })) return false;
+  return true;
+}
+
+function matchesApprovedInteraction(
+  value: unknown,
+  approved: Map<string, { toolCallId: string; toolName: string }>,
+): boolean {
+  if (!isRecord(value) || typeof value.interactionId !== 'string' || value.kind !== 'permission' || !isRecord(value.payload)) return false;
+  const expected = approved.get(value.interactionId);
+  return Boolean(expected && value.payload.kind === 'permission' &&
+    value.payload.toolCallId === expected.toolCallId && value.payload.toolName === expected.toolName);
+}
+
+function permissionDenied(reason: string): Record<string, unknown> {
+  return { decision: 'deny', reason };
+}
+
+function isSafeFileToolInput(toolName: string, input: Record<string, unknown>): boolean {
+  if (toolName === 'Write') {
+    return Object.keys(input).length === 2 &&
+      Object.hasOwn(input, 'file_path') && Object.hasOwn(input, 'content') &&
+      typeof input.file_path === 'string' && typeof input.content === 'string';
+  }
+  if (toolName === 'Edit') {
+    const keys = new Set(['file_path', 'old_string', 'new_string', 'replace_all']);
+    if (Object.keys(input).some(key => !keys.has(key)) ||
+      !Object.hasOwn(input, 'file_path') || !Object.hasOwn(input, 'old_string') || !Object.hasOwn(input, 'new_string') ||
+      typeof input.file_path !== 'string' || typeof input.old_string !== 'string' || typeof input.new_string !== 'string') return false;
+    const replaceAll = input.replace_all;
+    if (replaceAll === undefined || typeof replaceAll === 'boolean') return true;
+    return typeof replaceAll === 'string' &&
+      ['true', '1', 'yes', 'y', 'on', 'false', '0', 'no', 'n', 'off'].includes(replaceAll.trim().toLowerCase());
+  }
+  return false;
+}
+
+async function canonicalizeExistingDirectory(value: string): Promise<string | undefined> {
+  try {
+    const canonical = await realpath(value);
+    return (await stat(canonical)).isDirectory() ? canonical : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function canonicalizeTaskTarget(root: string, target: string): Promise<string | undefined> {
+  if (!isAbsolute(target)) return undefined;
+  if (process.platform === 'win32' && hasUnsafeWindowsTargetSyntax(target)) return undefined;
+  const lexicalTarget = resolve(target);
+  if (!isPathInside(root, lexicalTarget) || isProtectedTaskMetadataPath(root, lexicalTarget)) return undefined;
+  let existing = lexicalTarget;
+  let existingStat;
+  const unresolvedSuffix: string[] = [];
+  while (true) {
+    try {
+      existingStat = await lstat(existing);
+      break;
+    } catch (error) {
+      if (!isRecord(error) || error.code !== 'ENOENT') return undefined;
+      const parent = dirname(existing);
+      if (parent === existing || !isPathInside(root, parent) && !sameCanonicalPath(parent, root)) return undefined;
+      unresolvedSuffix.unshift(existing.slice(parent.length).replace(/^[\\/]+/, ''));
+      existing = parent;
+    }
+  }
+  if (existingStat.isSymbolicLink()) return undefined;
+  if (existingStat.isFile() && existingStat.nlink > 1) return undefined;
+  const canonicalExisting = await realpath(existing).catch(() => undefined);
+  if (!canonicalExisting || !sameCanonicalPath(canonicalExisting, existing)) return undefined;
+  if (!sameCanonicalPath(existing, root) && !isPathInside(root, existing)) return undefined;
+  const canonicalTarget = unresolvedSuffix.length > 0
+    ? resolve(canonicalExisting, ...unresolvedSuffix)
+    : canonicalExisting;
+  if (!isPathInside(root, canonicalTarget) || isProtectedTaskMetadataPath(root, canonicalTarget)) return undefined;
+  if (!sameCanonicalPath(existing, lexicalTarget) && !existingStat.isDirectory()) return undefined;
+  if (sameCanonicalPath(existing, lexicalTarget) && existingStat.isDirectory()) return undefined;
+  // If target does not yet exist, the nearest existing ancestor was checked for
+  // symlink/reparse traversal and the unresolved suffix remains inside the root.
+  return lexicalTarget;
+}
+
+function hasUnsafeWindowsTargetSyntax(target: string): boolean {
+  if (target.startsWith('\\\\?\\') || target.startsWith('\\\\.\\') || target.startsWith('\\??\\')) return true;
+  const drivePath = /^[A-Za-z]:[\\/]/.test(target);
+  const pathWithoutDrive = drivePath ? target.slice(2) : target;
+  if (pathWithoutDrive.includes(':')) return true;
+  return target.split(/[\\/]/).some(component => /[ .]$/.test(component));
+}
+
+function sameCanonicalPath(left: string, right: string): boolean {
+  const normalize = (value: string) => {
+    const resolved = resolve(value);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  return normalize(left) === normalize(right);
+}
+
+function isProtectedTaskMetadataPath(root: string, target: string): boolean {
+  const rel = relative(root, target);
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return true;
+  return rel.split(sep).some(component => {
+    const name = component.toLowerCase();
+    return name === '.git' || name === '.zero' || name.startsWith('.zero-') || name.startsWith('.zero_');
+  });
 }
 
 function responseKey(value: unknown): string | undefined {
