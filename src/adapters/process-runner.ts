@@ -2,6 +2,7 @@ import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ChildProcess } from 'node:child_process';
 import type { ProcessOutcome, ProcessRunnerOptions, RunStatus } from './types.js';
+import { CodexLifecycleTrace } from './codex-lifecycle-trace.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_LOG_LIMIT = 2 * 1024 * 1024;
@@ -17,6 +18,7 @@ export async function runProcess(options: ProcessRunnerOptions): Promise<Process
   const maxBytes = options.maxLogBytes ?? DEFAULT_LOG_LIMIT;
   const spawnProcess = options.spawnProcess ?? ((executable, args, spawnOptions) =>
     spawn(executable, args, { ...spawnOptions, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: 'pipe' }));
+  const lifecycleTrace = options.lifecycleTracePath ? await CodexLifecycleTrace.open(options.lifecycleTracePath) : undefined;
   let child: ChildProcess;
   try {
     child = spawnProcess(options.executable, options.args, {
@@ -26,6 +28,7 @@ export async function runProcess(options: ProcessRunnerOptions): Promise<Process
       stdio: 'pipe',
     });
   } catch (error) {
+    await lifecycleTrace?.close();
     return failedSpawn(error);
   }
 
@@ -42,7 +45,10 @@ export async function runProcess(options: ProcessRunnerOptions): Promise<Process
     if (room > 0) target.push(bytes.subarray(0, room));
     return used + bytes.length;
   };
-  child.stdout?.on('data', (chunk: Buffer | string) => { stdoutBytes = capture(stdout, chunk, stdoutBytes); });
+  child.stdout?.on('data', (chunk: Buffer | string) => {
+    stdoutBytes = capture(stdout, chunk, stdoutBytes);
+    lifecycleTrace?.consume(chunk);
+  });
   child.stderr?.on('data', (chunk: Buffer | string) => { stderrBytes = capture(stderr, chunk, stderrBytes); });
   child.stdin?.on('error', () => { /* Early child exit may close stdin; the exit status remains authoritative. */ });
   if (options.stdin !== undefined) child.stdin?.end(options.stdin, 'utf8');
@@ -73,6 +79,7 @@ export async function runProcess(options: ProcessRunnerOptions): Promise<Process
   settled = true;
   clearTimeout(timer);
   options.signal?.removeEventListener('abort', onAbort);
+  await lifecycleTrace?.close();
 
   const redactedOut = redact(Buffer.concat(stdout).toString('utf8'), options.secrets ?? []);
   const redactedErr = redact(Buffer.concat(stderr).toString('utf8'), options.secrets ?? []);

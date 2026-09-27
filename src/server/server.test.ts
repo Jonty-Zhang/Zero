@@ -73,6 +73,34 @@ test('Codex adapter uses ZERO_CODEX_EXE in its execution invocation', async () =
   }
 });
 
+test('Codex adapter rejects an invalid ZERO_CODEX_WINDOWS_SANDBOX before execution', () => {
+  const previous = process.env.ZERO_CODEX_WINDOWS_SANDBOX;
+  process.env.ZERO_CODEX_WINDOWS_SANDBOX = 'danger-full-access';
+  try {
+    assert.throws(() => createCodexAdapter([{ harness: 'codex', model, selector: 'cli_argument', verified: true }]),
+      /ZERO_CODEX_WINDOWS_SANDBOX must be elevated or unelevated/);
+  } finally {
+    if (previous === undefined) delete process.env.ZERO_CODEX_WINDOWS_SANDBOX;
+    else process.env.ZERO_CODEX_WINDOWS_SANDBOX = previous;
+  }
+});
+
+test('Codex adapter maps ZERO_CODEX_WINDOWS_SANDBOX to a per-invocation config override', async () => {
+  const previous = process.env.ZERO_CODEX_WINDOWS_SANDBOX;
+  process.env.ZERO_CODEX_WINDOWS_SANDBOX = 'unelevated';
+  try {
+    const adapter = createCodexAdapter([{ harness: 'codex', model, selector: 'cli_argument', verified: true }]);
+    const invocation = await adapter.prepare({ taskId: 'task', attemptId: 'attempt', role: 'implement', cwd: process.cwd(), prompt: 'hello' },
+      { harness: 'codex', model, selector: 'cli_argument', verified: true });
+    const index = invocation.args.indexOf('windows.sandbox=unelevated');
+    assert.ok(index > 0);
+    assert.equal(invocation.args[index - 1], '-c');
+  } finally {
+    if (previous === undefined) delete process.env.ZERO_CODEX_WINDOWS_SANDBOX;
+    else process.env.ZERO_CODEX_WINDOWS_SANDBOX = previous;
+  }
+});
+
 function testConfig(hasLiveVerification: boolean): LocalZeroConfig {
   return {
     models: [model],

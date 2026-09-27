@@ -138,6 +138,8 @@ export interface ProcessRunnerOptions {
   stdin?: string;
   timeoutMs: number;
   maxLogBytes?: number;
+  /** Optional metadata-only JSONL trace path for Codex stdout events. */
+  lifecycleTracePath?: string;
   secrets?: string[];
   signal?: AbortSignal;
   /** Injectable for deterministic tests. Production runner owns cancellation and process-tree termination. */

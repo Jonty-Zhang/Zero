@@ -8,6 +8,7 @@ import { classifyQuota } from '../core/quota.js';
 export interface AdapterConfig {
   executable?: string;
   bindings?: ModelBinding[];
+  codexWindowsSandbox?: 'elevated' | 'unelevated';
   envAllowlist?: string[];
   secretRefs?: Record<string, string>;
   resolveSecret?: (ref: string) => string | undefined;
@@ -76,6 +77,9 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
       const controller = new AbortController();
       const activeKey = `${request.taskId}:${request.attemptId}`;
       this.active.set(activeKey, controller);
+      const lifecycleTracePath = this.id === 'codex' && request.artifactDir
+        ? join(request.artifactDir, `${safeName(request.taskId)}-${safeName(request.attemptId)}.lifecycle.jsonl`)
+        : undefined;
       let outcome;
       try {
         outcome = await runProcess({
@@ -86,6 +90,7 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
           env: child.env,
           timeoutMs,
           maxLogBytes: this.config.maxLogBytes,
+          lifecycleTracePath,
           secrets: child.secrets,
           signal: controller.signal,
         });

@@ -10,9 +10,11 @@ const workspace = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const script = join(workspace, 'scripts', 'stage-windows-release.mjs');
 const verifier = join(workspace, 'scripts', 'verify-windows-release.mjs');
 const launcher = join(workspace, 'scripts', 'start-zero.ps1');
+const directLauncher = join(workspace, 'scripts', 'run-zero.ps1');
 
 test('manual launcher keeps the guardian lock path and has no task registration or saved config', () => {
   const source = readFileSync(launcher, 'utf8');
+  const directSource = readFileSync(directLauncher, 'utf8');
   assert.match(source, /Get-CanonicalDataDir/);
   assert.match(source, /Get-GuardianLockId/);
   assert.match(source, /--lock-id/);
@@ -23,6 +25,12 @@ test('manual launcher keeps the guardian lock path and has no task registration 
   assert.match(source, /Start-Sleep -Seconds \$retryDelaySeconds/);
   assert.match(source, /\$retryDelaySeconds = \[Math\]::Min\(\$retryDelaySeconds \* 2, 300\)/);
   assert.match(source, /\$retryDelaySeconds = 5/);
+  assert.match(source, /Add-CodexNativeToolsToProcessPath \$resolvedCodexExe/);
+  assert.match(directSource, /Add-CodexNativeToolsToProcessPath \$resolvedCodexExe/);
+  assert.match(source, /ValidateSet\('elevated', 'unelevated'\)\]\[string\]\$CodexWindowsSandbox/);
+  assert.match(directSource, /ValidateSet\('elevated', 'unelevated'\)\]\[string\]\$CodexWindowsSandbox/);
+  assert.match(source, /Set-CodexWindowsSandbox \$CodexWindowsSandbox/);
+  assert.match(directSource, /Set-CodexWindowsSandbox \$CodexWindowsSandbox/);
   assert.doesNotMatch(source, /ScheduledTask|Register-ScheduledTask|Get-Credential|CodexExe\s*=\s*['"]/i);
 });
 
@@ -59,6 +67,7 @@ test('Windows release staging copies only explicit runtime inputs and hashes eve
     assert.ok(names.includes('runtime/node.exe'));
     assert.ok(names.includes('guardian/guardian.exe'));
     assert.ok(names.includes('scripts/start-zero.ps1'));
+    assert.ok(names.includes('scripts/codex-native-path.ps1'));
     assert.ok(names.includes('scripts/uninstall-windows-task.ps1'));
     assert.equal(names.includes('scripts/install-windows-task.ps1'), false);
     assert.ok(names.includes('dist/cli.js'));

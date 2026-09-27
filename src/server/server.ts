@@ -70,7 +70,16 @@ function zeroDataRoot(): string {
 /** Use the explicitly configured Codex CLI path for both runtime and binding verification. */
 export function createCodexAdapter(bindings: ModelBinding[], config: Omit<AdapterConfig, 'bindings' | 'executable'> = {}): CodexAdapter {
   const executable = process.env.ZERO_CODEX_EXE?.trim();
-  return new CodexAdapter({ ...config, bindings, ...(executable ? { executable } : {}) });
+  const windowsSandbox = process.env.ZERO_CODEX_WINDOWS_SANDBOX;
+  if (windowsSandbox !== undefined && windowsSandbox !== 'elevated' && windowsSandbox !== 'unelevated') {
+    throw new Error('ZERO_CODEX_WINDOWS_SANDBOX must be elevated or unelevated');
+  }
+  return new CodexAdapter({
+    ...config,
+    bindings,
+    ...(executable ? { executable } : {}),
+    ...(windowsSandbox !== undefined ? { codexWindowsSandbox: windowsSandbox } : {}),
+  });
 }
 
 export function createZeroServer(options: ZeroServerOptions): Server {

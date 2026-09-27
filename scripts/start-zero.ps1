@@ -6,6 +6,7 @@ param(
     [string]$DataDir = (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Zero'),
     [string]$LogDir,
     [string]$CodexExe,
+    [ValidateSet('elevated', 'unelevated')][string]$CodexWindowsSandbox,
     [string]$DshEntry,
     [string]$ZcodeEntry,
     [string]$ProxyUrl,
@@ -14,6 +15,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDirectory 'codex-native-path.ps1')
+Set-CodexWindowsSandbox $CodexWindowsSandbox
 if (-not $InstallDir) { $InstallDir = Split-Path -Parent $scriptDirectory }
 if (-not $NodePath) { $NodePath = Join-Path $InstallDir 'runtime\node.exe' }
 if (-not $GuardianPath) { $GuardianPath = Join-Path $InstallDir 'guardian\guardian.exe' }
@@ -64,6 +67,7 @@ if ($CodexExe) {
     $resolvedCodexExe = [System.IO.Path]::GetFullPath($CodexExe)
     if (-not (Test-Path -LiteralPath $resolvedCodexExe -PathType Leaf)) { throw "Codex executable not found: $resolvedCodexExe" }
     $env:ZERO_CODEX_EXE = $resolvedCodexExe
+    Add-CodexNativeToolsToProcessPath $resolvedCodexExe
 }
 if ($DshEntry) {
     if (-not [System.IO.Path]::IsPathRooted($DshEntry)) { throw 'DshEntry must be an absolute JavaScript CLI entry path.' }

@@ -64,6 +64,18 @@ test('Codex disables interactive approval for every role and preserves role-spec
   }
 });
 
+test('Codex applies an explicit Windows sandbox override to every role when configured', async () => {
+  for (const mode of ['elevated', 'unelevated'] as const) {
+    const adapter = new CodexAdapter({ codexWindowsSandbox: mode });
+    for (const role of ['implement', 'revise', 'review', 'allocate'] as const) {
+      const invocation = await adapter.prepare(context({ role }), codexBinding);
+      const overrideIndex = invocation.args.indexOf(`windows.sandbox=${mode}`);
+      assert.ok(overrideIndex > 0, `${role} should set windows.sandbox=${mode}`);
+      assert.equal(invocation.args[overrideIndex - 1], '-c');
+    }
+  }
+});
+
 test('Codex rejects an unverified reasoning level for the selected model binding', async () => {
   const binding = { ...codexBinding, reasoningEfforts: ['low'] as const } as ModelBinding;
   await assert.rejects(new CodexAdapter().prepare(context({ reasoningEffort: 'high' }), binding), /does not support reasoning effort/);
@@ -329,6 +341,9 @@ test('run stores bounded, redacted logs and normalized events in artifactDir', a
     assert.ok(result.stdoutPath && result.stderrPath && result.eventsPath);
     assert.match(await readFile(result.stdoutPath!, 'utf8'), /written output/);
     assert.match(await readFile(result.eventsPath!, 'utf8'), /item.completed/);
+    const trace = await readFile(join(artifactDir, 'task-logs-attempt-1.lifecycle.jsonl'), 'utf8');
+    assert.match(trace, /"eventType":"item.completed"/);
+    assert.doesNotMatch(trace, /written output/);
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
   }

@@ -6,7 +6,12 @@ import type { Invocation, ModelBinding, ParsedOutput, RunContext } from './types
 export class CodexAdapter extends BaseHarnessAdapter {
   readonly id = 'codex' as const;
 
-  constructor(config: AdapterConfig = {}) { super(config); }
+  constructor(config: AdapterConfig = {}) {
+    if (config.codexWindowsSandbox !== undefined && !['elevated', 'unelevated'].includes(config.codexWindowsSandbox)) {
+      throw new Error('Codex Windows sandbox must be elevated or unelevated');
+    }
+    super(config);
+  }
 
   async probe(): Promise<HarnessCapabilities> {
     const result = await probeExecutable(this, ['exec', '--help'], ['--json', '--model', '--sandbox', '--cd', '--output-schema', '-c', '--ignore-user-config', '--ephemeral']);
@@ -35,6 +40,7 @@ export class CodexAdapter extends BaseHarnessAdapter {
       throw new Error('Codex requires a verified cli_argument model binding');
     }
     const args = ['exec', '--json', '--model', binding.model.modelId, '--sandbox', context.role === 'review' || context.role === 'allocate' ? 'read-only' : 'workspace-write', '--cd', context.cwd, '-c', 'approval_policy=never'];
+    if (this.config.codexWindowsSandbox) args.push('-c', `windows.sandbox=${this.config.codexWindowsSandbox}`);
     if (context.role === 'review' || context.role === 'allocate') args.push('--ignore-user-config', '--ephemeral');
     if (context.reasoningEffort) {
       const supported = binding.reasoningEfforts ?? ['minimal', 'low', 'medium', 'high', 'xhigh'];

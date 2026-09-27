@@ -24,13 +24,15 @@ Invoke-RestMethod 'http://127.0.0.1:4179/api/health'
 
 请使用已安装并登录所需 Harness CLI 的 Windows 账户启动 Zero。启动器把该用户进程的环境传给 Zero 服务。API 分配器使用 `keyEnv` 时，指定的环境变量必须在启动 Zero 时可用。凭据应保存在相应 CLI 的安全登录状态或用户环境中；不要放入命令参数、脚本、Zero 配置文件或日志。
 
-启动器支持可选覆盖参数；不需要覆盖时使用上面的默认命令。可用的参数包括 `-CodexExe`、`-DshEntry`、`-ZcodeEntry`、`-ProxyUrl` 和 `-Port`，用于指定 CLI 可执行文件或 JavaScript 入口、代理地址或服务端口。路径必须是绝对路径。`-ProxyUrl` 仅接受不含凭据、路径、查询或片段的 HTTP(S)/SOCKS5 authority URL；代理认证应在用户环境中单独配置。CLI 路径覆盖只对本次启动的 Zero 子进程生效。
+启动器支持可选覆盖参数；不需要覆盖时使用上面的默认命令。可用的参数包括 `-CodexExe`、`-CodexWindowsSandbox`、`-DshEntry`、`-ZcodeEntry`、`-ProxyUrl` 和 `-Port`，用于指定 CLI 可执行文件、Codex 原生 Windows 沙盒模式、JavaScript 入口、代理地址或服务端口。路径必须是绝对路径。`-ProxyUrl` 仅接受不含凭据、路径、查询或片段的 HTTP(S)/SOCKS5 authority URL；代理认证应在用户环境中单独配置。CLI 路径和沙盒模式覆盖仅对本次启动的 Zero 进程生效。
 
 例如，需要明确指定 Codex CLI 路径时：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "$env:LOCALAPPDATA\Programs\Zero\scripts\start-zero.ps1" -CodexExe '<absolute path to codex.exe>'
 ```
+
+需要时可通过 `-CodexWindowsSandbox elevated` 或 `-CodexWindowsSandbox unelevated` 为 Zero 发起的 Codex 调用指定原生 Windows 沙盒模式；省略时 Zero 不覆盖 Codex 的沙盒设置，也不会写入 Codex 配置。OpenAI 官方建议使用 `elevated`；仅在管理员批准的设置不可用或失败时将 `unelevated` 作为回退。它仍保留 ACL 文件系统边界，但网络隔离较弱。[Windows sandbox 指南](https://learn.chatgpt.com/docs/windows/windows-sandbox)
 
 应使用实际需要的选项。绑定验证应使用启动 Zero 时相同的 Windows 用户、数据目录、CLI 登录和环境。详见[服务端配置与绑定验证](../src/server/README.md)。
 
