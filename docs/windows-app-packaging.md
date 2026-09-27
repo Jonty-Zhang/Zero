@@ -1,6 +1,6 @@
 # Zero Windows app package
 
-Status: the first per-user NSIS installer was built in [Windows CI](https://github.com/Jonty-Zhang/Zero/actions/runs/36148528629) and passed install/uninstall smoke tests. The release is unsigned. Target-machine installation and validation of a real Harness task remain outstanding.
+Status: the per-user NSIS installer passed build, packaged manual-launch, and install/uninstall smoke tests in [Windows CI](https://github.com/Jonty-Zhang/Zero/actions/runs/36290900633). The unsigned release stage also passed an isolated launch-and-stop test on the target PC. Target-machine installation and validation of a real Harness task remain outstanding.
 
 ## Installer behavior
 
@@ -33,4 +33,4 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\package-
   -ProductVersion '0.1.0'
 ```
 
-The [CI run](https://github.com/Jonty-Zhang/Zero/actions/runs/36148528629) passed NSIS compilation and install/uninstall smoke tests. These checks do not prove that Harness authentication, proxy access, or real task execution is configured on a target PC.
+The [CI run](https://github.com/Jonty-Zhang/Zero/actions/runs/36290900633) passed NSIS compilation, packaged manual launch with verified guardian lineage and launcher-exit cleanup, and install/uninstall smoke tests. These checks do not prove that Harness authentication, proxy access, or real task execution is configured on a target PC.
