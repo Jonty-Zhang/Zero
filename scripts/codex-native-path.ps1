@@ -12,11 +12,13 @@ function Add-CodexNativeToolsToProcessPath([string]$CodexExecutable) {
 }
 
 function Set-CodexWindowsSandbox([AllowNull()][object]$Mode) {
+    if ($null -eq $Mode -or ($Mode -is [string] -and $Mode.Length -eq 0)) {
+        Remove-Item Env:ZERO_CODEX_WINDOWS_SANDBOX -ErrorAction SilentlyContinue
+        return
+    }
     if ($null -ne $Mode -and ($Mode -isnot [string] -or $Mode -notin @('elevated', 'unelevated'))) {
         throw 'CodexWindowsSandbox must be elevated or unelevated.'
     }
     Remove-Item Env:ZERO_CODEX_WINDOWS_SANDBOX -ErrorAction SilentlyContinue
-    if ($null -ne $Mode) {
-        [Environment]::SetEnvironmentVariable('ZERO_CODEX_WINDOWS_SANDBOX', ([string]$Mode).ToLowerInvariant(), 'Process')
-    }
+    [Environment]::SetEnvironmentVariable('ZERO_CODEX_WINDOWS_SANDBOX', ([string]$Mode).ToLowerInvariant(), 'Process')
 }

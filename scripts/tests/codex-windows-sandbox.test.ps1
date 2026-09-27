@@ -18,6 +18,10 @@ try {
     Set-CodexWindowsSandbox $null
     if (Test-Path Env:ZERO_CODEX_WINDOWS_SANDBOX) { throw 'Omitting the option did not leave the process sandbox mode unset.' }
 
+    $env:ZERO_CODEX_WINDOWS_SANDBOX = 'elevated'
+    Set-CodexWindowsSandbox ''
+    if (Test-Path Env:ZERO_CODEX_WINDOWS_SANDBOX) { throw 'An empty default option did not clear the process sandbox mode.' }
+
     Set-CodexWindowsSandbox 'unelevated'
     if ($env:ZERO_CODEX_WINDOWS_SANDBOX -ne 'unelevated') { throw 'Sandbox mode was not set for this process.' }
     try {
