@@ -68,6 +68,40 @@ test('app-server verification replaces the ZCode binding and preserves other Zer
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
+test('desktop tuple registration changes only Zero models and does not verify or bind it', async () => {
+  const f = await fixture();
+  const selected = { id: 'deepseek-desktop', provider: 'account:deepseek', modelId: 'deepseek-v3' };
+  try {
+    const result = await f.store.registerZCodeDesktopModel(selected);
+    const config = await f.store.read();
+    assert.equal(result, 'registered');
+    assert.deepEqual(config.models, [...f.initial.models, selected]);
+    assert.deepEqual(config.bindings, f.initial.bindings);
+    assert.deepEqual(config.verifications, f.initial.verifications);
+    assert.deepEqual(config.allocator, f.initial.allocator);
+    assert.deepEqual(config.reviewer, f.initial.reviewer);
+    assert.deepEqual(config.secretRefs, f.initial.secretRefs);
+
+    assert.equal(await f.store.registerZCodeDesktopModel(selected), 'already_registered');
+    assert.deepEqual(await f.store.read(), config);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('desktop tuple registration rejects collisions without changing config bytes', async () => {
+  const cases = [
+    { model: { id: 'glm-main', provider: 'other', modelId: 'different' }, error: /already registered with a different tuple/ },
+    { model: { id: 'another-id', provider: 'zai', modelId: 'glm-5' }, error: /already registered under another local model ID/ },
+    { model: { id: 'bad\n-id', provider: 'zai', modelId: 'glm-5' }, error: /safe local ID/ },
+  ];
+  for (const item of cases) {
+    const f = await fixture();
+    try {
+      await assert.rejects(f.store.registerZCodeDesktopModel(item.model), item.error);
+      assert.equal(await readFile(f.path, 'utf8'), f.initialBytes);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  }
+});
+
 test('app-server verification failures preserve the config file byte-for-byte', async () => {
   const cases: Array<{ name: string; run: (store: ConfigStore) => Promise<void>; error: RegExp }> = [
     { name: 'provider mismatch', run: store => store.markZCodeAppServerVerified(model.id, model, { ...evidence, providerId: 'other' }, nonceProof), error: /exact provider\/model tuple/ },

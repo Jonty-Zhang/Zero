@@ -41,7 +41,20 @@ export interface ZCodeDesktopDiagnostic {
   modelCount: number | null;
 }
 
+export interface ZCodeDesktopModelTuple {
+  providerId: string;
+  modelId: string;
+}
+
+export class ZCodeDesktopCatalogPeerExitError extends Error {
+  constructor() {
+    super('ZCode app-server exit could not be confirmed; model catalog was withheld.');
+    this.name = 'ZCodeDesktopCatalogPeerExitError';
+  }
+}
+
 const MAX_PROBE_OUTPUT = 64 * 1024;
+const MAX_DESKTOP_CATALOG_MODELS = 512;
 const SUPPORTED_ROLES = new Set(['implement', 'revise']);
 const SAFE_MODEL_ID = /^[^\u0000-\u001f\u007f]{1,256}$/;
 
@@ -162,6 +175,61 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
     } finally {
       await peer.close().catch(() => undefined);
     }
+  }
+
+  /** Reads only exact provider/model IDs from an empty deferred session catalog. */
+  async listExistingDesktopModels(cwd: string): Promise<ZCodeDesktopModelTuple[]> {
+    const probe = await this.probeCli();
+    if (!probe.available) throw new Error('ZCode version/help probe failed; model catalog was not read.');
+
+    let peer: ZCodeProtocolPeer;
+    try {
+      peer = await this.launchPeer({ entry: this.entry!, taskWorktree: cwd, profileMode: 'existing-desktop' });
+    } catch {
+      throw new Error('ZCode app-server could not be launched; model catalog was not read.');
+    }
+
+    let tuples: ZCodeDesktopModelTuple[] | undefined;
+    let requestFailed = false;
+    try {
+      const created = await peer.request('session/create', {
+        workspace: {
+          workspacePath: cwd,
+          workspaceIdentity: cwd,
+          workspaceKey: safeWorkspaceKey('zcode-model-catalog'),
+        },
+        persistence: 'deferred',
+      });
+      const createdRecord = isRecord(created) ? created : undefined;
+      const createdSession = createdRecord && isRecord(createdRecord.session) ? createdRecord.session : undefined;
+      if (typeof createdSession?.sessionId !== 'string' || !validIdentity(createdSession.sessionId)) throw new Error('session create failed');
+      const settings = createdRecord && isRecord(createdRecord.settings) ? createdRecord.settings : undefined;
+      const modelSettings = settings && isRecord(settings.model) ? settings.model : undefined;
+      const available = modelSettings?.available;
+      if (!Array.isArray(available)) throw new Error('catalog unavailable');
+      if (available.length > MAX_DESKTOP_CATALOG_MODELS) throw new Error('catalog too large');
+      const seen = new Set<string>();
+      tuples = available.map((item): ZCodeDesktopModelTuple => {
+        if (!isRecord(item) || !isRecord(item.ref)) throw new Error('catalog item malformed');
+        const providerId = item.ref.providerId;
+        const modelId = item.ref.modelId;
+        if (typeof providerId !== 'string' || typeof modelId !== 'string' || !validIdentity(providerId) || !validIdentity(modelId)) {
+          throw new Error('catalog tuple malformed');
+        }
+        const key = JSON.stringify([providerId, modelId]);
+        if (seen.has(key)) throw new Error('catalog tuple duplicated');
+        seen.add(key);
+        return { providerId, modelId };
+      });
+    } catch {
+      requestFailed = true;
+    }
+
+    let closeFailed = false;
+    try { await peer.close(); } catch { closeFailed = true; }
+    if (closeFailed) throw new ZCodeDesktopCatalogPeerExitError();
+    if (requestFailed) throw new Error('ZCode app-server model catalog could not be read.');
+    return tuples!;
   }
 
   async run(request: RunRequest): Promise<RunResult> {

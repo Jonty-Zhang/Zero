@@ -171,6 +171,84 @@ test('desktop diagnostic reports lifecycle categories and a model count without 
   assert.equal(stderr.includes(secret), false);
 });
 
+test('desktop model listing emits only exact catalog tuples and never starts a model turn', async () => {
+  const cli = probeCommand();
+  const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+  let closed = false;
+  const adapter = new ZCodeAppServerAdapter({
+    zcodeEntry: 'C:/tools/zcode/cli.mjs',
+    runProbeCommand: cli.run,
+    launchPeer: async () => ({
+      async request(method, params) {
+        calls.push({ method, params });
+        return {
+          session: { sessionId: 'private-session-id' },
+          settings: { model: { available: [
+            { name: 'display name', ref: { providerId: 'account:glm', modelId: 'GLM-5.3-Flash' }, apiKey: 'private-key' },
+            { ref: { providerId: 'account:deepseek', modelId: 'deepseek-v3' }, disabled: false },
+          ] } },
+        };
+      },
+      async readPendingInteractions() { throw new Error('catalog listing must not inspect interactions'); },
+      async close() { closed = true; },
+    }),
+  });
+
+  const models = await adapter.listExistingDesktopModels('C:/zero/worktree');
+
+  assert.deepEqual(models, [
+    { providerId: 'account:glm', modelId: 'GLM-5.3-Flash' },
+    { providerId: 'account:deepseek', modelId: 'deepseek-v3' },
+  ]);
+  assert.deepEqual(calls.map(call => call.method), ['session/create']);
+  assert.equal(calls[0]?.params?.persistence, 'deferred');
+  assert.equal(closed, true);
+  const output = JSON.stringify(models);
+  for (const secret of ['private-session-id', 'private-key', 'display name']) assert.equal(output.includes(secret), false);
+});
+
+test('desktop model listing withholds the catalog if app-server exit is uncertain', async () => {
+  const cli = probeCommand();
+  const secret = 'private-provider-error-token';
+  const adapter = new ZCodeAppServerAdapter({
+    zcodeEntry: 'C:/tools/zcode/cli.mjs',
+    runProbeCommand: cli.run,
+    launchPeer: async () => ({
+      async request() { return { session: { sessionId: 'session-ok' }, settings: { model: { available: [{ ref: { providerId: 'secret-provider', modelId: 'private-model' } }] } } }; },
+      async readPendingInteractions() { return []; },
+      async close() { throw new Error(secret); },
+    }),
+  });
+
+  await assert.rejects(adapter.listExistingDesktopModels('C:/zero/worktree'), error => {
+    assert.equal((error as Error).message.includes(secret), false);
+    return /exit could not be confirmed/.test((error as Error).message);
+  });
+});
+
+test('desktop model listing fails closed for malformed, duplicate, or oversized catalogs', async () => {
+  const catalogs = [
+    [{ ref: { providerId: 'provider-a', modelId: 'model-a' } }, { ref: { providerId: 'provider-b' } }],
+    [{ ref: { providerId: 'provider-a', modelId: 'model-a' } }, { ref: { providerId: 'provider-a', modelId: 'model-a' } }],
+    Array.from({ length: 513 }, (_, index) => ({ ref: { providerId: 'provider', modelId: `model-${index}` } })),
+  ];
+  for (const available of catalogs) {
+    const cli = probeCommand();
+    let closed = false;
+    const adapter = new ZCodeAppServerAdapter({
+      zcodeEntry: 'C:/tools/zcode/cli.mjs',
+      runProbeCommand: cli.run,
+      launchPeer: async () => ({
+        async request() { return { session: { sessionId: 'session-ok' }, settings: { model: { available } } }; },
+        async readPendingInteractions() { return []; },
+        async close() { closed = true; },
+      }),
+    });
+    await assert.rejects(adapter.listExistingDesktopModels('C:/zero/worktree'), /catalog could not be read/);
+    assert.equal(closed, true);
+  }
+});
+
 test('desktop diagnostic converts child launch errors with fake credentials to fixed categories', async () => {
   const secret = 'fake-provider-key-never-print-this';
   const cli = probeCommand();

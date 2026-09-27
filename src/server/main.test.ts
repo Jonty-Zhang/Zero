@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { startupGenerationAttestation } from './main.js';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { runZCodeDesktopModelCatalog, startupGenerationAttestation } from './main.js';
+import { access, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { RunRequest, RunResult } from '../domain/types.js';
@@ -12,9 +12,39 @@ import type { ZCodeAdapter } from '../adapters/zcode.js';
 import type { ZCodeProtocolPeer } from '../adapters/zcode-protocol-session.js';
 import type { ZCodeAppServerAdapterConfig } from '../adapters/zcode-app-server-adapter.js';
 import type { ZCodeAppServerPeerOptions } from '../adapters/zcode-app-server-peer.js';
-import { ZCodeAppServerAdapter } from '../adapters/zcode-app-server-adapter.js';
+import { ZCodeAppServerAdapter, ZCodeDesktopCatalogPeerExitError } from '../adapters/zcode-app-server-adapter.js';
 import { ConfigStore } from './config-store.js';
 import { runDshBindingVerification, runZCodeBindingVerification, runZCodeDesktopBindingVerification } from './main.js';
+
+test('desktop catalog uses and removes a temporary Zero-owned workspace after peer shutdown', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'zero-zcode-catalog-'));
+  let workspace = '';
+  try {
+    const tuples = await runZCodeDesktopModelCatalog({
+      dataRoot: root,
+      createAdapter: config => {
+        assert.deepEqual(config.bindings, []);
+        return { async listExistingDesktopModels(cwd) { workspace = cwd; return [{ providerId: 'account:zai', modelId: 'glm-5' }]; } };
+      },
+    });
+    assert.deepEqual(tuples, [{ providerId: 'account:zai', modelId: 'glm-5' }]);
+    assert.ok(workspace.startsWith(root));
+    await assert.rejects(access(workspace));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('desktop catalog retains its workspace when peer shutdown cannot be confirmed', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'zero-zcode-catalog-exit-'));
+  try {
+    await assert.rejects(runZCodeDesktopModelCatalog({
+      dataRoot: root,
+      createAdapter: () => ({ async listExistingDesktopModels() { throw new ZCodeDesktopCatalogPeerExitError(); } }),
+    }), /exit could not be confirmed/);
+    const entries = await readdir(root);
+    assert.equal(entries.length, 1);
+    assert.match(entries[0]!, /^zcode-desktop-catalog-/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('guardian startup lineage requires native startup proof for the exact current generation', () => {
   const id = '0123456789abcdef0123456789abcdef';

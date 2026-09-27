@@ -24,7 +24,7 @@ Zero is an application made of one Node.js service, a local React web UI, and a 
 
 ## What is still a design or validation target
 
-- Live ZCode desktop enrollment remains unverified. The existing-desktop profile's model-free app-server diagnostic created an empty session and returned four available models, but no nonce-backed binding or real model call has been established; no GLM or DeepSeek desktop model is enabled for routing on that basis. The adapter does not claim actual served-model identity or transfer of the desktop conversation context. See [the enrollment design](docs/zcode-existing-desktop-enrollment.md).
+- Live ZCode desktop enrollment remains unverified. The existing-desktop profile's model-free app-server diagnostic and explicit catalog command returned four exact provider/model tuples from empty sessions, but no nonce-backed binding or real model call has been established; no GLM or DeepSeek desktop model is enabled for routing on that basis. The adapter does not claim actual served-model identity or transfer of the desktop conversation context. See [the enrollment design](docs/zcode-existing-desktop-enrollment.md).
 - DSH and isolated ZCode CLI bindings are not enabled for routing merely because their adapters exist. Their bindings must be created and verified in Zero's isolated data area; availability and evidence level depend on the local CLI version and successful checks. See [server setup](src/server/README.md).
 - Current review is a new Codex session. It is not a different-model guarantee: when the execution Harness is also Codex, model-level independence depends on the configured reviewer binding.
 

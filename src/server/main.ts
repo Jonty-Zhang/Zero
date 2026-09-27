@@ -1,13 +1,13 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { lstatSync } from 'node:fs';
-import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ModelBinding, ModelConfig, ReasoningEffort } from '../adapters/types.js';
-import { ZCodeAppServerAdapter } from '../adapters/zcode-app-server-adapter.js';
+import { ZCodeAppServerAdapter, ZCodeDesktopCatalogPeerExitError } from '../adapters/zcode-app-server-adapter.js';
 import type { ZCodeAppServerAdapterConfig } from '../adapters/zcode-app-server-adapter.js';
 import { ZCodeAppServerPeer } from '../adapters/zcode-app-server-peer.js';
 import type { ZCodeAppServerPeerOptions } from '../adapters/zcode-app-server-peer.js';
@@ -690,6 +690,44 @@ export function createSequenceGoalReviewScheduler(options: {
 }
 
 export async function getConfiguredDataRoot() { await mkdir(dataRoot, { recursive: true }); return dataRoot; }
+
+export interface ZCodeDesktopModelCatalogOptions {
+  dataRoot?: string;
+  zcodeEntry?: string;
+  createAdapter?: (config: ZCodeAppServerAdapterConfig) => Pick<ZCodeAppServerAdapter, 'listExistingDesktopModels'>;
+}
+
+/** Lists the current desktop model catalog from a disposable Zero-owned workspace. */
+export async function runZCodeDesktopModelCatalog(options: ZCodeDesktopModelCatalogOptions = {}) {
+  const zeroDataRoot = resolve(options.dataRoot ?? dataRoot);
+  await mkdir(zeroDataRoot, { recursive: true });
+  const canonicalDataRoot = await realpath(zeroDataRoot);
+  const workspace = await mkdtemp(join(canonicalDataRoot, 'zcode-desktop-catalog-'));
+  const canonicalWorkspace = await realpath(workspace);
+  if (!isPathWithin(canonicalDataRoot, canonicalWorkspace)) {
+    await rm(workspace, { recursive: true, force: true }).catch(() => undefined);
+    throw new Error('Unable to create a temporary ZCode catalog workspace under Zero dataRoot.');
+  }
+  const entry = options.zcodeEntry ?? process.env.ZERO_ZCODE_ENTRY;
+  const adapterConfig: ZCodeAppServerAdapterConfig = {
+    ...(entry ? { zcodeEntry: entry } : {}),
+    bindings: [],
+    probeDataDir: resolve(zeroDataRoot, 'zcode-app-server-probe'),
+  };
+  let preserveWorkspace = false;
+  try {
+    const adapter = options.createAdapter?.(adapterConfig) ?? new ZCodeAppServerAdapter(adapterConfig);
+    return await adapter.listExistingDesktopModels(canonicalWorkspace);
+  } catch (error) {
+    if (error instanceof ZCodeDesktopCatalogPeerExitError) preserveWorkspace = true;
+    throw error;
+  } finally {
+    if (!preserveWorkspace) {
+      try { await rm(canonicalWorkspace, { recursive: true, force: true }); }
+      catch { throw new Error('Temporary ZCode catalog workspace cleanup could not be confirmed.'); }
+    }
+  }
+}
 
 const MAX_SEQUENCE_GOAL_EVIDENCE_BYTES = 512 * 1024;
 const MAX_SEQUENCE_GOAL_DIFF_BYTES = 192 * 1024;

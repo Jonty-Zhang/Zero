@@ -70,6 +70,28 @@ export class ConfigStore {
     await this.persist(next);
   }
 
+  /** Adds a user-selected ZCode desktop tuple to Zero's model registry only. */
+  async registerZCodeDesktopModel(model: ModelConfig): Promise<'registered' | 'already_registered'> {
+    if (!isValidLocalModel(model)) throw new Error('ZCode desktop model requires a safe local ID and exact provider/model IDs');
+    const config = await this.read();
+    const sameId = config.models.filter(item => item.id === model.id);
+    if (sameId.length) {
+      if (sameId.length === 1 && sameId[0]!.provider === model.provider && sameId[0]!.modelId === model.modelId) {
+        return 'already_registered';
+      }
+      throw new Error(`Local model ID ${model.id} is already registered with a different tuple`);
+    }
+    if (config.models.some(item => item.provider === model.provider && item.modelId === model.modelId)) {
+      throw new Error('This exact provider/model tuple is already registered under another local model ID');
+    }
+
+    // This command only adds a model selector. It does not create or change a
+    // binding, verification record, allocator choice, or reviewer choice.
+    config.models = [...config.models, { ...model }];
+    await this.persist(config);
+    return 'registered';
+  }
+
   async markVerified(harness: 'codex', modelId: string, evidence: Omit<LocalZeroConfig['verifications'][string], 'reasoningEfforts'> & { reasoningEfforts?: ReasoningEffort[] }): Promise<void> {
     const config = await this.read();
     const model = config.models.find(item => item.id === modelId || item.modelId === modelId);
@@ -233,4 +255,10 @@ function isPinnedCliVersion(version: string): boolean {
 
 function isValidTimestamp(value: string): boolean {
   return Number.isFinite(Date.parse(value));
+}
+
+function isValidLocalModel(model: ModelConfig): boolean {
+  const safe = (value: string) => typeof value === 'string' && value.length > 0 && value === value.trim() &&
+    value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value);
+  return Boolean(model && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(model.id) && safe(model.provider) && safe(model.modelId));
 }
