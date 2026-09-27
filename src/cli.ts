@@ -20,7 +20,7 @@ async function main() {
   }
   if (command === 'verify-binding') {
     const harness = args.shift(); const model = args.shift();
-    if (!model) throw new Error('Usage: zero verify-binding codex <model-id> [--effort high] | dsh <model-id> --profile <safe-profile> | zcode <model-id> --config-dir <absolute-path> --mode <build|yolo> | zcode-desktop <local-model-id>');
+    if (!model) throw new Error('Usage: zero verify-binding codex <model-id> [--effort high] | dsh <model-id> --profile <safe-profile> | zcode <model-id> --config-dir <absolute-path> --mode <build|yolo> | zcode-desktop <local-model-id> --effort <level>');
     if (harness === 'codex') {
       const effort = option(args, '--effort') ?? 'high';
       if (args.length) throw new Error('Usage: zero verify-binding codex <model-id> [--effort high]');
@@ -41,11 +41,12 @@ async function main() {
       return;
     }
     if (harness === 'zcode-desktop') {
-      if (args.length) throw new Error('Usage: zero verify-binding zcode-desktop <local-model-id>');
-      await runZCodeDesktopBindingVerification(model);
+      const effort = requiredOption(args, '--effort');
+      if (args.length) throw new Error('Usage: zero verify-binding zcode-desktop <local-model-id> --effort <level>');
+      await runZCodeDesktopBindingVerification(model, effort as Parameters<typeof runZCodeDesktopBindingVerification>[1]);
       return;
     }
-    throw new Error('Usage: zero verify-binding codex <model-id> [--effort high] | dsh <model-id> --profile <safe-profile> | zcode <model-id> --config-dir <absolute-path> --mode <build|yolo> | zcode-desktop <local-model-id>');
+    throw new Error('Usage: zero verify-binding codex <model-id> [--effort high] | dsh <model-id> --profile <safe-profile> | zcode <model-id> --config-dir <absolute-path> --mode <build|yolo> | zcode-desktop <local-model-id> --effort <level>');
   }
   if (command === 'diagnose-zcode-desktop') {
     if (args.length) {
@@ -94,7 +95,7 @@ async function main() {
     assertNoArguments(args);
     const dataRoot = await getConfiguredDataRoot();
     const result = await new ConfigStore(resolve(dataRoot, 'config.json')).registerZCodeDesktopModel({ id, provider, modelId });
-    process.stdout.write(`${result === 'registered' ? 'Registered' : 'Already registered'} ${id} in Zero's local model registry. This command does not change bindings or verification records; run zero verify-binding zcode-desktop ${id} to create a verified binding before routing can use it.\n`);
+    process.stdout.write(`${result === 'registered' ? 'Registered' : 'Already registered'} ${id} in Zero's local model registry. This command does not change bindings or verification records; run zero verify-binding zcode-desktop ${id} --effort <level> to create a verified binding before routing can use it.\n`);
     return;
   }
   if (command === 'submit') {
@@ -191,10 +192,10 @@ async function request(path: string, init?: RequestInit) {
   return text ? JSON.parse(text) as unknown : undefined;
 }
 function printHelp() {
-  process.stdout.write(`Zero task node\n\nCommands:\n  zero serve [--host 127.0.0.1] [--port 4179]\n  zero verify-binding codex <model-id> [--effort high]\n  zero verify-binding dsh <model-id> --profile <safe-profile>\n  zero verify-binding zcode <model-id> --config-dir <absolute-path> --mode <build|yolo>\n  zero verify-binding zcode-desktop <local-model-id>\n  zero diagnose-zcode-desktop
+  process.stdout.write(`Zero task node\n\nCommands:\n  zero serve [--host 127.0.0.1] [--port 4179]\n  zero verify-binding codex <model-id> [--effort high]\n  zero verify-binding dsh <model-id> --profile <safe-profile>\n  zero verify-binding zcode <model-id> --config-dir <absolute-path> --mode <build|yolo>\n  zero verify-binding zcode-desktop <local-model-id> --effort <level>\n  zero diagnose-zcode-desktop
   zero list-zcode-desktop-models
   zero enroll-zcode-desktop-model <local-id> --provider-id <provider-id> --model-id <model-id>
-  zero submit --repo <path> --prompt <text> [--base <ref>] [--acceptance <text>] [--check <command>] [--max-revisions 2] [--harness <id>] [--model <id>] [--effort <level>] [--stages-file <JSON-file>]\n  zero submit-sequence --file <JSON-file>\n  zero sequences\n  zero sequence <sequence-id>\n  zero status [task-id]\n  zero cancel <task-id>\n\nVerify runs a minimal model-binding check. Codex effort levels are registered only after passing that exact effort. DSH and ZCode bindings are pinned to the installed CLI version. ZCode isolated bindings require an explicit build or yolo mode; zcode-desktop verifies the selected local provider/model tuple through an existing-desktop app-server session.\ndiagnose-zcode-desktop reports only categorical app-server stages and a model count; it creates a deferred session but sends no model input. list-zcode-desktop-models prints only exact providerId/modelId tuples from the deferred session catalog. Enroll a selected tuple into Zero's local registry, then run verify-binding zcode-desktop; enrollment alone does not enable routing.
+  zero submit --repo <path> --prompt <text> [--base <ref>] [--acceptance <text>] [--check <command>] [--max-revisions 2] [--harness <id>] [--model <id>] [--effort <level>] [--stages-file <JSON-file>]\n  zero submit-sequence --file <JSON-file>\n  zero sequences\n  zero sequence <sequence-id>\n  zero status [task-id]\n  zero cancel <task-id>\n\nVerify runs a minimal model-binding check. Codex effort levels are registered only after passing that exact effort. DSH and ZCode bindings are pinned to the installed CLI version. ZCode isolated bindings require an explicit build or yolo mode; zcode-desktop verifies the selected local provider/model tuple through an existing-desktop app-server session.\ndiagnose-zcode-desktop reports only categorical app-server stages and a model count; it creates a deferred session but sends no model input. list-zcode-desktop-models prints exact providerId/modelId tuples and supported reasoning levels from the deferred session catalog. Enroll a selected tuple into Zero's local registry, then run verify-binding zcode-desktop; enrollment alone does not enable routing.
 Harness, model and effort are independent optional task overrides. A stages file is a JSON array of ordered stage objects using harnessId, modelId, and reasoningEffort; each field is optional.\nSet ZERO_URL to use a non-default local server URL.\n`);
 }
 

@@ -11,12 +11,14 @@ const evidence: ZCodeAppServerVerificationEvidence = {
   cliVersion: 'zcode 1.4.2',
   providerId: 'zai',
   modelId: 'glm-5',
+  reasoningEffort: 'high',
 };
 const nonceProof: ZCodeAppServerNonceProof = {
   nonce: 'ZERO_ZCODE_APP_SERVER_BINDING_VERIFIED_3c78a744-8bd2-4f9b-8b14-5ce8d95bd880',
   echoedNonce: 'ZERO_ZCODE_APP_SERVER_BINDING_VERIFIED_3c78a744-8bd2-4f9b-8b14-5ce8d95bd880',
   sessionEndedSuccessfully: true,
   peerExited: true,
+  reasoningEffort: 'high',
 };
 
 async function fixture() {
@@ -50,9 +52,9 @@ test('app-server verification replaces the ZCode binding and preserves other Zer
       verificationSource: 'smoke_test',
       verifiedCliVersion: evidence.cliVersion,
       verificationEvidence: {
-        kind: 'selector_only', verifiedAt: evidence.verifiedAt, providerId: 'zai', modelId: 'glm-5', cliVersion: evidence.cliVersion,
+        kind: 'selector_only', verifiedAt: evidence.verifiedAt, providerId: 'zai', modelId: 'glm-5', cliVersion: evidence.cliVersion, reasoningEffort: 'high',
       },
-      reasoningEfforts: [],
+      reasoningEfforts: ['high'],
     });
     assert.equal(config.bindings.filter(binding => binding.harness === 'zcode' && binding.model.id === model.id).length, 1);
     assert.deepEqual(config.bindings.find(binding => binding.harness === 'codex'), f.initial.bindings[1]);
@@ -63,7 +65,8 @@ test('app-server verification replaces the ZCode binding and preserves other Zer
     assert.deepEqual(config.verifications['codex:codex-main'], f.initial.verifications['codex:codex-main']);
     assert.deepEqual(config.verifications['zcode:glm-main'], {
       verifiedAt: evidence.verifiedAt, cliVersion: evidence.cliVersion, requestedModel: 'glm-5',
-      exitCode: 0, level: 'selector_only', reasoningEfforts: [],
+      exitCode: 0, level: 'selector_only', reasoningEfforts: ['high'],
+      effortEvidence: { high: { verifiedAt: evidence.verifiedAt, cliVersion: evidence.cliVersion, exitCode: 0 } },
     });
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });

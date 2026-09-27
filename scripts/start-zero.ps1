@@ -78,6 +78,12 @@ if ($DshEntry) {
     if (-not (Test-Path -LiteralPath $resolvedDshEntry -PathType Leaf)) { throw 'Configured DSH JavaScript CLI entry was not found.' }
     $env:ZERO_DSH_ENTRY = $resolvedDshEntry
 }
+if (-not $ZcodeEntry -and -not $env:ZERO_ZCODE_ENTRY) {
+    # Discover only the installed desktop app's bundled CLI. This sets a
+    # process environment value; it never changes the desktop profile.
+    $installedZcodeEntry = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Programs\ZCode\resources\glm\zcode.cjs'
+    if (Test-Path -LiteralPath $installedZcodeEntry -PathType Leaf) { $ZcodeEntry = $installedZcodeEntry }
+}
 if ($ZcodeEntry) {
     if (-not [System.IO.Path]::IsPathRooted($ZcodeEntry)) { throw 'ZcodeEntry must be an absolute JavaScript CLI entry path.' }
     $resolvedZcodeEntry = [System.IO.Path]::GetFullPath($ZcodeEntry)

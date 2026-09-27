@@ -192,7 +192,7 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
 
   protected normalizeEffort(value?: string): ReasoningEffort | undefined {
     if (!value) return undefined;
-    const valid: ReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+    const valid: ReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
     if (!valid.includes(value as ReasoningEffort)) throw new Error(`Unsupported reasoning effort: ${value}`);
     return value as ReasoningEffort;
   }

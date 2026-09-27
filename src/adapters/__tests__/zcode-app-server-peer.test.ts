@@ -141,6 +141,13 @@ rl.on('line', raw => {
     setTimeout(() => write({ method: 'v4/conversation/frame', params: deltaWire('sub-one', params.pendingInteractions) }), 1);
     return;
   }
+  if (method === 'test/empty-delta') {
+    respond(id, { ok: true });
+    const frame = deltaWire('sub-one', [], 0, 1);
+    frame.frame.payload.deltas = [];
+    setTimeout(() => write({ method: 'v4/conversation/frame', params: frame }), 1);
+    return;
+  }
   if (method === 'test/gap') {
     respond(id, { ok: true });
     setTimeout(() => write({ method: 'v4/conversation/frame', params: deltaWire('sub-one', [], 7, 8) }), 1);
@@ -567,6 +574,16 @@ test('v4 conversation subscription requires and tracks initial snapshot plus pen
       { interactionId: 'interaction-delta', kind: 'userInput', anchorRowId: null,
         createdAt: 2, payload: { kind: 'userInput', prompt: 'Choose', freeText: false } },
     ]);
+  });
+});
+
+test('filtered empty delta advances the conversation watermark without an interaction', async () => {
+  await withFakeServer(async peer => {
+    await createSession(peer);
+    assert.deepEqual(await peer.readPendingInteractions('session-one'), []);
+    await debugRequest(peer, 'test/empty-delta', {});
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.deepEqual(await peer.readPendingInteractions('session-one'), []);
   });
 });
 

@@ -4,7 +4,7 @@ import type { HarnessAdapter as DomainHarnessAdapter, HarnessCapabilities as Dom
 export type HarnessId = 'codex' | 'dsh' | 'zcode';
 export type RunRole = 'implement' | 'revise' | 'review' | 'allocate';
 export type RunStatus = 'completed' | 'failed' | 'timed_out' | 'cancelled';
-export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /** Model configuration names an actual model independently of any CLI. */
 export interface ModelConfig {
@@ -45,6 +45,7 @@ export type ModelBinding =
         providerId: string;
         modelId: string;
         cliVersion: string;
+        reasoningEffort: ReasoningEffort;
       };
       /** Only reasoning levels independently checked against the exact model catalog entry. */
       reasoningEfforts?: ReasoningEffort[];

@@ -24,10 +24,10 @@ test('desktop catalog uses and removes a temporary Zero-owned workspace after pe
       dataRoot: root,
       createAdapter: config => {
         assert.deepEqual(config.bindings, []);
-        return { async listExistingDesktopModels(cwd) { workspace = cwd; return [{ providerId: 'account:zai', modelId: 'glm-5' }]; } };
+        return { async listExistingDesktopModels(cwd) { workspace = cwd; return [{ providerId: 'account:zai', modelId: 'glm-5', reasoningLevels: ['high' as const] }]; } };
       },
     });
-    assert.deepEqual(tuples, [{ providerId: 'account:zai', modelId: 'glm-5' }]);
+    assert.deepEqual(tuples, [{ providerId: 'account:zai', modelId: 'glm-5', reasoningLevels: ['high'] }]);
     assert.ok(workspace.startsWith(root));
     await assert.rejects(access(workspace));
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -315,7 +315,7 @@ function fakeDesktopPeer(responseOverride?: string, closeError?: Error) {
     async request(method, params) {
       if (method === 'session/create') return {
         session: { sessionId: 'fake-desktop-session' },
-        settings: { model: { available: [{ ref: { providerId: zcodeModel.provider, modelId: zcodeModel.modelId } }] } },
+        settings: { model: { available: [{ ref: { providerId: zcodeModel.provider, modelId: zcodeModel.modelId }, reasoning: { levels: [{ value: 'high' }] } }] } },
       };
       if (method === 'v4/command') {
         const payload = params.payload as Record<string, unknown>;
@@ -372,7 +372,7 @@ test('ZCode existing-desktop enrollment proves exact nonce, closes peer and repl
   const f = await zcodeFixture();
   const options = desktopEnrollmentOptions(f);
   try {
-    await runZCodeDesktopBindingVerification(zcodeModel.id, options);
+    await runZCodeDesktopBindingVerification(zcodeModel.id, 'high', options);
     assert.equal(options.peer.closeCount, 1);
     assert.deepEqual(options.probeArgs, ['--version', '--help', '--version', '--help']);
     const config = await f.config.read();
@@ -382,7 +382,8 @@ test('ZCode existing-desktop enrollment proves exact nonce, closes peer and repl
       verificationEvidence: {
         kind: 'selector_only', providerId: zcodeModel.provider, modelId: zcodeModel.modelId,
         cliVersion: 'zcode-desktop-test-2', verifiedAt: config.verifications['zcode:glm-main']?.verifiedAt,
-      }, reasoningEfforts: [],
+        reasoningEffort: 'high',
+      }, reasoningEfforts: ['high'],
     });
     assert.equal(config.verifications['zcode:glm-main']?.level, 'selector_only');
   } finally { await rm(f.root, { recursive: true, force: true }); }
@@ -392,7 +393,7 @@ test('ZCode existing-desktop enrollment rejects a bad nonce without changing con
   const f = await zcodeFixture();
   const options = desktopEnrollmentOptions(f, { peer: fakeDesktopPeer('wrong nonce') });
   try {
-    await assert.rejects(runZCodeDesktopBindingVerification(zcodeModel.id, options), /nonce verification failed/);
+    await assert.rejects(runZCodeDesktopBindingVerification(zcodeModel.id, 'high', options), /nonce verification failed/);
     assert.equal(options.peer.closeCount, 1);
     assert.equal(await readFile(f.config.path, 'utf8'), f.initialBytes);
   } finally { await rm(f.root, { recursive: true, force: true }); }
@@ -402,7 +403,7 @@ test('ZCode existing-desktop enrollment rejects failed peer close and preserves 
   const f = await zcodeFixture();
   const options = desktopEnrollmentOptions(f, { peer: fakeDesktopPeer(undefined, new Error('exit was not confirmed')) });
   try {
-    await assert.rejects(runZCodeDesktopBindingVerification(zcodeModel.id, options));
+    await assert.rejects(runZCodeDesktopBindingVerification(zcodeModel.id, 'high', options));
     assert.equal(options.peer.closeCount, 1);
     assert.equal(await readFile(f.config.path, 'utf8'), f.initialBytes);
   } finally { await rm(f.root, { recursive: true, force: true }); }
@@ -413,7 +414,7 @@ test('ZCode existing-desktop enrollment rejects a post-session CLI version chang
   let probeCount = 0;
   const options = desktopEnrollmentOptions(f, { version: () => (++probeCount === 1 ? 'zcode-desktop-test-2' : 'zcode-desktop-test-3') });
   try {
-    await assert.rejects(runZCodeDesktopBindingVerification(zcodeModel.id, options), /probe changed/);
+    await assert.rejects(runZCodeDesktopBindingVerification(zcodeModel.id, 'high', options), /probe changed/);
     assert.equal(probeCount, 2);
     assert.equal(options.peer.closeCount, 1);
     assert.equal(await readFile(f.config.path, 'utf8'), f.initialBytes);

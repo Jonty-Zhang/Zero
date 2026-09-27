@@ -47,7 +47,7 @@ export interface ZeroServerOptions {
   maxBodyBytes?: number;
 }
 
-const REASONING = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+const REASONING = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 const MAX_SEQUENCE_STEPS = 20;
 const KNOWN_HARNESSES: HarnessName[] = ['codex', 'dsh', 'zcode'];
 const SECURITY_HEADERS = { 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'" };

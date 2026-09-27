@@ -11,20 +11,20 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 - 基于 SQLite 的任务队列和本地 HTTP API，任务状态包括 `pending`、`running`、`reviewing`、`revision`、`waiting`、`recovery_required`、`done` 和 `failed`。
 - 主分配器可切换为 Codex 订阅或兼容 OpenAI API 的 HTTPS 模型，负责选择路由和执行 Harness；分配器本身不会实现任务。用户可以手动固定 Harness、模型和思考强度中的任意字段；所选分配器只会从 Zero 已验证的绑定中补全未指定字段。结果仍由独立的只读 Codex 会话审核。
 - API 分配器在 Web 界面中配置：`baseUrl` 必须是 HTTPS 地址，`model` 是分配器模型，`keyEnv` 是 Zero 服务进程可读取的环境变量名称。Zero 只保存变量名，不保存 API 密钥；密钥由 Zero 服务进程环境提供。Codex Reviewer 保持不变。
-- Codex、DeepSeek Harness（DSH）和 ZCode 适配器。存在适配器不代表 Harness/模型组合已可用于路由：Zero 要求先验证绑定。DSH 和隔离式 ZCode CLI 绑定使用 Zero 自有配置档。现有桌面 ZCode `app-server` 适配器及 `verify-binding zcode-desktop` 流程已通过 mock 测试；实时接入尚未成功，因此该路由尚未验证，也不会用于任务路由。验证边界见[服务端配置](src/server/README.md)。
+- Codex、DeepSeek Harness（DSH）和 ZCode 适配器。存在适配器不代表 Harness/模型组合已可用于路由：Zero 要求先验证绑定。DSH 和隔离式 ZCode CLI 绑定使用 Zero 自有配置档。现有桌面 ZCode `app-server` 适配器已用本机配置的三种 API 模型和显式思考等级通过 nonce 验证；绑定保存在忽略的 Zero 数据目录中，尚未装入安装版运行数据。验证边界见[服务端配置](src/server/README.md)。
 - 每个任务使用独立 Git worktree，运行配置的验证命令，限制返工次数，并归档包含执行、测试、审核和 Git 证据的报告。成功任务的分支保留在源代码仓库中；Zero 不会自动合并或推送分支。
 - 有序 `executionStages` 已通过核心、HTTP API 和 CLI 的 `--stages-file` 选项实现，会在同一个任务 worktree 中串行执行。每个阶段会记录关联尝试、工作树指纹，以及由 Zero 实测事实构成的版本化交接单；报告收录这些阶段记录。
 - 可持久保存并按序执行多个任务步骤，可通过 Web 界面或 API 提交，并用 CLI 查询。每一步都是普通任务，可分别手动指定 Harness、模型和思考强度；留空字段由当前分配器从已验证绑定中选择。同一仓库中的步骤会在前一步达到 `done`、并具有权威应用提交和完整报告后，从该步骤的已验证结果提交开始。
 - 序列状态会区分步骤执行和整体目标验收。所有步骤任务完成后，如果提供了整体目标或目标级验收标准，Zero 会运行独立的汇总 Codex 验收。HTTP API 和界面会展示最近一次验收的状态、判定（`PASS`、`changes_requested` 或 `blocked`）、摘要、发现和额度重试时间。`steps_completed` 表示尚无可用的汇总判定；`completed` 表示未提供目标级信息，或汇总验收返回 `PASS`。收到 `changes_requested` 后，Zero 最多可自动追加并执行 `maxGoalRevisions` 个目标级返工任务（默认 `2`，允许 `0`–`5`）；`goalRevisionCount` 显示已使用次数。达到上限但仍未得到 `PASS` 时，序列保持阻塞，并在 API 和界面显示原因。2026-09-27 的已安装版验收中，两项有序任务均到达 `done`，各自的一项检查及 Codex 审核均通过。步骤 2 的 `effective_base_commit` 与步骤 1 报告中的 `resultCommit` 完全一致，且步骤 2 有独立的 `resultCommit`。最终文件为精确 LF 行尾，汇总 Codex 审核返回 `PASS`，序列变为 `completed`，`goalRevisionCount=0`；退出启动器后服务停止。此前两轮分别因 CRLF 和无法从最终事实观察的内部读取标准而被阻塞；最终轮使用可观察结果作为标准。详见[真实任务验证记录](docs/live-validation.md)。
 - 对已验证的模型使用额度限制提供 `waiting` 状态、持久检查点和跨服务重启的定时重试。自动化测试覆盖分配、执行、审核和审核要求返工期间的额度续跑；尚未观察到真实提供方的额度限制事件。普通崩溃时，Zero 先隔离过期租约。原生 guardian 证明上一代进程 Job 已清空后，合格任务可在已登记的同一 worktree 中恢复：首次执行、已封存审核包的审核与提交/报告，以及审核要求的返工。恢复的执行和返工会重新路由、建立新的尝试、重跑检查和审核。恢复必须匹配任务代际、Git 身份、允许修改路径、审核包及结论、返工次数等证据；证据缺失或不符时任务保留在 `recovery_required` 等待检查。
-- 恢复实现已包含自动化测试。目标电脑上的安装和手动启动已验证，真实 Codex 订阅绑定检查也已成功。目标电脑上的隔离式故障注入已验证单阶段执行崩溃这一受限路径：启动器重启 guardian，同一任务创建新的路由与实现尝试，重新通过检查和 Codex 审核，并保存结果提交与报告后到达 `done`。真实提供方额度耗尽及恢复、其他崩溃边界和 DSH/ZCode 实时执行仍未验证。忽略的构建/缓存文件不包含在 Zero 基于 Git 的 worktree 指纹中；它们可能留在 worktree 并影响恢复后的命令，因此应使用可重复的检查，不要依赖隐藏的本地缓存状态。详见[崩溃恢复设计](docs/crash-recovery-design.md)和[恢复实现边界](docs/crash-recovery-next-slice.md)。
+- 恢复实现已包含自动化测试。目标电脑上的安装和手动启动已验证，真实 Codex 订阅绑定检查也已成功。目标电脑上的隔离式故障注入已验证单阶段执行崩溃这一受限路径：启动器重启 guardian，同一任务创建新的路由与实现尝试，重新通过检查和 Codex 审核，并保存结果提交与报告后到达 `done`。真实提供方额度耗尽及恢复、其他崩溃边界、安装版 ZCode 任务执行和 DSH 实时执行仍未验证。忽略的构建/缓存文件不包含在 Zero 基于 Git 的 worktree 指纹中；它们可能留在 worktree 并影响恢复后的命令，因此应使用可重复的检查，不要依赖隐藏的本地缓存状态。详见[崩溃恢复设计](docs/crash-recovery-design.md)和[恢复实现边界](docs/crash-recovery-next-slice.md)。
 - 创建 worktree 前会持久记录目标仓库、分支、路径和基点；`git worktree add` 成功后再记录实测身份与指纹。创建结果不确定时保留这些证据并等待检查。
 - 原生 Windows 进程 guardian 已在 CI 中通过构建、进程包含和发布目录手动启动测试。用户手动启动受监督服务；非零退出时启动器会退避重试，启动器退出时 guardian 会结束服务进程树。目标电脑上的安装和手动启动已验证；开机或登录自启不属于部署方式。详见 [Windows 部署](docs/windows-deployment.md)。
 - Windows 发布目录脚本可打包已构建的服务、界面、CLI、显式指定的 Node 运行时与 guardian，并生成文件哈希清单。独立校验器在 CI 中核对所有文件并启动包内 CLI。未签名 NSIS 安装包已在 CI 中通过构建、安装/卸载和手动启动检查。2026-09-27，提交 `4b26a85` 的 CI 全部通过；其 42 文件安装包已在目标电脑安装，清单哈希全部匹配，且未注册计划任务。隔离 Git 测试仓库中的任务依次经过 `running` → `reviewing` → `done`；路由、实现、审核三次尝试均成功，一项检查通过，独立审核通过，并生成结果提交和报告，差异仅包含 `acceptance.txt`。详见 [Windows 单应用安装包](docs/windows-app-packaging.md)和[真实任务验证记录](docs/live-validation.md)。
 
 ## 尚属设计或待验证的目标
 
-- ZCode 桌面实时接入仍未验证。现有桌面 profile 的无模型 app-server 诊断与显式目录命令已通过空会话返回 4 组精确的提供方/模型标识，但尚未建立基于 nonce 的绑定，也没有真实模型调用；因此不能据此声称桌面 GLM 或 DeepSeek 模型已加入路由。适配器不会声称已确认实际响应模型身份，也不会迁移桌面会话上下文。详见[接入设计](docs/zcode-existing-desktop-enrollment.md)。
+- ZCode 桌面接入已有三组基于 nonce 的 `selector_only` 本机验证证据，分别对应用户配置的 GLM Flash、DeepSeek Flash 和 DeepSeek Pro API 模型。空会话目录会列出精确提供方/模型标识及可选思考等级；安装版还需更新构建、装入运行绑定并完成任务级验收。Start Plan 未出现在本次目录中，仍未验证。适配器不会声称已确认实际响应模型身份、计费来源，也不会迁移桌面会话上下文。详见[接入设计](docs/zcode-existing-desktop-enrollment.md)。
 - DSH 和隔离式 ZCode CLI 不会仅因适配器存在就加入路由。必须先在 Zero 隔离的数据目录中创建并验证绑定；可用性和证据等级取决于本机 CLI 版本及验证结果。详见[服务端配置](src/server/README.md)。
 - 当前审核使用新的 Codex 会话，但不保证审核模型一定不同于执行模型：当执行 Harness 也是 Codex 时，模型层面的独立性取决于审核绑定配置。
 

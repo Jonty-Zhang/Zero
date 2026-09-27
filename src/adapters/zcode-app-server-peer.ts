@@ -656,7 +656,9 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     if (state.sequence === undefined || frame.fromSeq !== state.sequence) {
       throw new Error('ZCode v4 conversation delta arrived before snapshot or with a sequence gap');
     }
-    if (Number(frame.toSeq) <= Number(frame.fromSeq) || payload.deltas.length === 0) {
+    // A provider may filter all conversation deltas for this subscriber while
+    // still advancing the authoritative sequence watermark.
+    if (Number(frame.toSeq) <= Number(frame.fromSeq)) {
       throw new Error('ZCode v4 conversation delta frame has an invalid sequence range');
     }
     for (const deltaValue of payload.deltas) {

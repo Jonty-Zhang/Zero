@@ -20,7 +20,9 @@ const binding = (overrides: Record<string, unknown> = {}): ModelBinding => ({
     providerId: 'account:zai-start-plan',
     modelId: 'GLM-5.3-Flash',
     cliVersion: '0.16.9',
+    reasoningEffort: 'high',
   },
+  reasoningEfforts: ['high'],
   ...overrides,
 } as ModelBinding);
 
@@ -32,6 +34,7 @@ const request = (overrides: Partial<RunRequest> = {}): RunRequest => ({
   prompt: 'Change the requested file.',
   harness: 'zcode',
   model: 'glm-flash',
+  reasoningEffort: 'high',
   ...overrides,
 });
 
@@ -58,7 +61,7 @@ function fakePeer(options: { blockAfterStart?: boolean; turnFailure?: unknown; c
       calls.push({ method, params });
       if (method === 'session/create') return {
         session: { sessionId: 's-app-server-test' },
-        settings: { model: { available: [{ ref: { providerId: 'account:zai-start-plan', modelId: 'GLM-5.3-Flash' } }] } },
+        settings: { model: { available: [{ ref: { providerId: 'account:zai-start-plan', modelId: 'GLM-5.3-Flash' }, reasoning: { levels: [{ value: 'high' }] } }] } },
       };
       if (method === 'v4/command') {
         if (params.type === 'stop') return { status: 'accepted', commandId: params.commandId };
@@ -184,8 +187,8 @@ test('desktop model listing emits only exact catalog tuples and never starts a m
         return {
           session: { sessionId: 'private-session-id' },
           settings: { model: { available: [
-            { name: 'display name', ref: { providerId: 'account:glm', modelId: 'GLM-5.3-Flash' }, apiKey: 'private-key' },
-            { ref: { providerId: 'account:deepseek', modelId: 'deepseek-v3' }, disabled: false },
+            { name: 'display name', ref: { providerId: 'account:glm', modelId: 'GLM-5.3-Flash' }, reasoning: { levels: [{ value: 'low' }, { value: 'high' }, { value: 'max' }] }, apiKey: 'private-key' },
+            { ref: { providerId: 'account:deepseek', modelId: 'deepseek-v3' }, reasoning: { levels: [{ value: 'disabled' }, { value: 'high' }] }, disabled: false },
           ] } },
         };
       },
@@ -197,8 +200,8 @@ test('desktop model listing emits only exact catalog tuples and never starts a m
   const models = await adapter.listExistingDesktopModels('C:/zero/worktree');
 
   assert.deepEqual(models, [
-    { providerId: 'account:glm', modelId: 'GLM-5.3-Flash' },
-    { providerId: 'account:deepseek', modelId: 'deepseek-v3' },
+    { providerId: 'account:glm', modelId: 'GLM-5.3-Flash', reasoningLevels: ['low', 'high', 'max'] },
+    { providerId: 'account:deepseek', modelId: 'deepseek-v3', reasoningLevels: ['high'] },
   ]);
   assert.deepEqual(calls.map(call => call.method), ['session/create']);
   assert.equal(calls[0]?.params?.persistence, 'deferred');
@@ -231,6 +234,7 @@ test('desktop model listing fails closed for malformed, duplicate, or oversized 
     [{ ref: { providerId: 'provider-a', modelId: 'model-a' } }, { ref: { providerId: 'provider-b' } }],
     [{ ref: { providerId: 'provider-a', modelId: 'model-a' } }, { ref: { providerId: 'provider-a', modelId: 'model-a' } }],
     Array.from({ length: 513 }, (_, index) => ({ ref: { providerId: 'provider', modelId: `model-${index}` } })),
+    [{ ref: { providerId: 'provider', modelId: 'model' }, reasoning: { levels: [{ value: 'unknown' }] } }],
   ];
   for (const available of catalogs) {
     const cli = probeCommand();
@@ -342,7 +346,7 @@ test('run uses the exact provider/model in one existing-desktop task-worktree se
   assert.equal(create.params.persistence, 'deferred');
   const send = state.peer.calls[1]!;
   assert.deepEqual((send.params.payload as Record<string, unknown>).modelSelection, {
-    providerId: 'account:zai-start-plan', modelId: 'GLM-5.3-Flash',
+    providerId: 'account:zai-start-plan', modelId: 'GLM-5.3-Flash', options: { reasoningLevel: 'high' },
   });
   assert.equal(state.peer.isClosed(), true);
 });
@@ -381,7 +385,7 @@ test('quota-like peer close failures and transient turn errors remain ordinary f
 });
 
 test('run fails closed before launch for inconsistent binding evidence, unsafe identity, or version mismatch', async () => {
-  const badEvidence = binding({ verificationEvidence: { kind: 'selector_only', verifiedAt: 'bad', providerId: 'other', modelId: 'GLM-5.3-Flash', cliVersion: '0.16.9' } });
+  const badEvidence = binding({ verificationEvidence: { kind: 'selector_only', verifiedAt: 'bad', providerId: 'other', modelId: 'GLM-5.3-Flash', cliVersion: '0.16.9', reasoningEffort: 'high' } });
   const badIdentity = binding({ model: { id: 'glm-flash', provider: 'account:zai-start-plan\nsecret', modelId: 'GLM-5.3-Flash' } });
   for (const configured of [badEvidence, badIdentity]) {
     const state = adapterHarness({ bindings: [configured] });
@@ -403,10 +407,16 @@ test('run rejects duplicate binding identities and unverified reasoning requests
   assert.equal(duplicate.launchOptions(), undefined);
 
   const noReasoning = adapterHarness();
-  const result = await noReasoning.adapter.run(request({ reasoningEffort: 'high' }));
+  const result = await noReasoning.adapter.run(request({ reasoningEffort: 'low' }));
   assert.equal(result.status, 'failed');
   assert.match(result.error ?? '', /reasoning effort/);
   assert.equal(noReasoning.launchOptions(), undefined);
+
+  const omittedEffort = adapterHarness();
+  const omitted = await omittedEffort.adapter.run(request({ reasoningEffort: undefined }));
+  assert.equal(omitted.status, 'failed');
+  assert.match(omitted.error ?? '', /reasoning effort/);
+  assert.equal(omittedEffort.launchOptions(), undefined);
 });
 
 test('cancel sends only the observed foreground stop and closes the app-server peer', async () => {

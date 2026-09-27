@@ -44,6 +44,7 @@ export interface ZCodeDesktopDiagnostic {
 export interface ZCodeDesktopModelTuple {
   providerId: string;
   modelId: string;
+  reasoningLevels: ReasoningEffort[];
 }
 
 export class ZCodeDesktopCatalogPeerExitError extends Error {
@@ -219,7 +220,7 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
         const key = JSON.stringify([providerId, modelId]);
         if (seen.has(key)) throw new Error('catalog tuple duplicated');
         seen.add(key);
-        return { providerId, modelId };
+        return { providerId, modelId, reasoningLevels: readReasoningLevels(item) };
       });
     } catch {
       requestFailed = true;
@@ -243,8 +244,8 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
     if (matches.length !== 1) return result('failed', 'No unique existing-desktop ZCode binding matches the requested model', started, { requestedModel: request.model });
     const binding = matches[0] as ExistingDesktopBinding;
     if (!isBindingEvidenceValid(binding)) return result('failed', 'ZCode existing-desktop binding is unverified or has inconsistent selector evidence', started, { requestedModel: binding.model.modelId });
-    if (request.reasoningEffort !== undefined && (!request.reasoningEffort || !binding.reasoningEfforts?.includes(request.reasoningEffort as ReasoningEffort))) {
-      return result('failed', 'Requested ZCode reasoning effort is not explicitly verified for this model', started, { requestedModel: binding.model.modelId });
+    if (request.reasoningEffort === undefined || !binding.reasoningEfforts?.includes(request.reasoningEffort as ReasoningEffort)) {
+      return result('failed', 'ZCode existing-desktop runs require an explicitly verified reasoning effort', started, { requestedModel: binding.model.modelId });
     }
 
     const probe = await this.probeCli();
@@ -271,7 +272,7 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
         model: {
           providerId: binding.model.provider,
           modelId: binding.model.modelId,
-          ...(request.reasoningEffort ? { reasoningLevel: request.reasoningEffort } : {}),
+          reasoningLevel: request.reasoningEffort as ReasoningEffort,
         },
         prompt: request.prompt,
         timeoutMs,
@@ -364,7 +365,27 @@ function isBindingEvidenceValid(binding: ExistingDesktopBinding): boolean {
     Number.isFinite(Date.parse(evidence.verifiedAt)) &&
     evidence.providerId === binding.model.provider && evidence.modelId === binding.model.modelId &&
     evidence.cliVersion === binding.verifiedCliVersion &&
-    (binding.reasoningEfforts ?? []).every(value => ['minimal', 'low', 'medium', 'high', 'xhigh'].includes(value));
+    binding.reasoningEfforts?.length === 1 &&
+    binding.reasoningEfforts[0] === evidence.reasoningEffort &&
+    isReasoningEffort(evidence.reasoningEffort);
+}
+
+const REASONING_EFFORTS: ReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return typeof value === 'string' && REASONING_EFFORTS.includes(value as ReasoningEffort);
+}
+
+function readReasoningLevels(model: Record<string, unknown>): ReasoningEffort[] {
+  if (model.reasoning === undefined) return [];
+  if (!isRecord(model.reasoning) || !Array.isArray(model.reasoning.levels)) throw new Error('catalog reasoning levels malformed');
+  const levels = model.reasoning.levels.map((level): ReasoningEffort | undefined => {
+    if (!isRecord(level)) throw new Error('catalog reasoning level malformed');
+    if (level.value === 'disabled') return undefined;
+    if (!isReasoningEffort(level.value)) throw new Error('catalog reasoning level unsupported or malformed');
+    return level.value;
+  }).filter((level): level is ReasoningEffort => level !== undefined);
+  return [...new Set(levels)];
 }
 
 function validIdentity(value: string): boolean {

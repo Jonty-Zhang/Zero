@@ -18,6 +18,7 @@ export interface ZCodeAppServerVerificationEvidence {
   cliVersion: string;
   providerId: string;
   modelId: string;
+  reasoningEffort: ReasoningEffort;
 }
 
 export interface ZCodeAppServerNonceProof {
@@ -27,6 +28,7 @@ export interface ZCodeAppServerNonceProof {
   sessionEndedSuccessfully: boolean;
   /** The app-server peer confirmed that it exited after the verification request. */
   peerExited: boolean;
+  reasoningEffort: ReasoningEffort;
 }
 
 const EMPTY: LocalZeroConfig = {
@@ -157,6 +159,9 @@ export class ConfigStore {
       || evidence.providerId !== expectedModel.provider || evidence.modelId !== expectedModel.modelId) {
       throw new Error('ZCode app-server verification evidence must match the exact provider/model tuple');
     }
+    if (!isReasoningEffort(evidence.reasoningEffort) || proof.reasoningEffort !== evidence.reasoningEffort) {
+      throw new Error('ZCode app-server verification must prove one supported reasoning effort');
+    }
     if (!proof.nonce.trim() || !proof.echoedNonce.trim() || proof.nonce !== proof.echoedNonce) {
       throw new Error('ZCode app-server nonce verification did not match');
     }
@@ -186,8 +191,9 @@ export class ConfigStore {
         providerId: evidence.providerId,
         modelId: evidence.modelId,
         cliVersion: evidence.cliVersion,
+        reasoningEffort: evidence.reasoningEffort,
       },
-      reasoningEfforts: [],
+      reasoningEfforts: [evidence.reasoningEffort],
     };
     config.bindings = [...config.bindings.filter(item => !(item.harness === 'zcode' && item.model.id === model.id)), binding];
     config.verifications[key] = {
@@ -196,7 +202,10 @@ export class ConfigStore {
       requestedModel: model.modelId,
       exitCode: 0,
       level: 'selector_only',
-      reasoningEfforts: [],
+      reasoningEfforts: [evidence.reasoningEffort],
+      effortEvidence: {
+        [evidence.reasoningEffort]: { verifiedAt: evidence.verifiedAt, cliVersion: evidence.cliVersion, exitCode: 0 },
+      },
     };
     await this.persist(config);
   }
@@ -248,6 +257,10 @@ function isAbsoluteConfigDir(path: string): boolean {
 }
 
 function isSupportedZCodeMode(mode: string): boolean { return mode === 'build' || mode === 'yolo'; }
+
+function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return typeof value === 'string' && ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value);
+}
 
 function isPinnedCliVersion(version: string): boolean {
   return version.trim().length > 0 && version === version.trim() && !/^unknown$/i.test(version) && !/[\r\n\0]/.test(version);

@@ -13,8 +13,8 @@ const desktopBinding: ModelBinding = {
   harness: 'zcode', selector: 'app_server_existing_desktop', verified: true,
   verificationSource: 'smoke_test', verifiedCliVersion: '0.16.9',
   model: { id: 'desktop', provider: 'account:start-plan', modelId: 'shared-name' },
-  verificationEvidence: { kind: 'selector_only', verifiedAt: '2026-09-25T00:00:00Z', providerId: 'account:start-plan', modelId: 'shared-name', cliVersion: '0.16.9' },
-  reasoningEfforts: [],
+  verificationEvidence: { kind: 'selector_only', verifiedAt: '2026-09-25T00:00:00Z', providerId: 'account:start-plan', modelId: 'shared-name', cliVersion: '0.16.9', reasoningEffort: 'high' },
+  reasoningEfforts: ['high'],
 };
 
 function fakeAdapter(models: string[], available = true): HarnessAdapter & { runs: RunRequest[]; cancelled: string[] } {
