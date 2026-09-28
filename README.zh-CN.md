@@ -12,7 +12,7 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 - 主分配器可切换为 Codex 订阅或兼容 OpenAI API 的 HTTPS 模型，负责选择路由和执行 Harness；分配器本身不会实现任务。用户可以手动固定 Harness、模型和思考强度中的任意字段。结果仍由独立的只读 Codex 会话审核。
 - 执行默认值会从设置页持久保存为全局选择和按规范仓库路径匹配的项目选择。每个字段按任务手动选择 → 匹配的项目默认值 → 全局默认值 → 主分配器的顺序确定；未设置的字段逐级继承，最后由分配器补全。
 - API 分配器在 Web 界面中配置：`baseUrl` 必须是 HTTPS 地址，`model` 是分配器模型，`keyEnv` 是 Zero 服务进程可读取的环境变量名称。Zero 只保存变量名，不保存 API 密钥；密钥由 Zero 服务进程环境提供。Codex Reviewer 保持不变。
-- Codex、DeepSeek Harness（DSH）和 ZCode 适配器。存在适配器不代表 Harness/模型组合已可用于路由：Zero 要求先验证绑定。DSH 和隔离式 ZCode CLI 绑定使用 Zero 自有配置档。现有桌面 ZCode `app-server` 适配器已用本机配置的三种 API 模型和显式思考等级通过 nonce 验证；绑定保存在 Zero 本地数据中。CI 构建的安装版已让一项 GLM Flash API 任务经过 Codex 分配、Zero 检查、Codex 审核、结果提交和报告归档并到达 `done`。此前一次安装版任务在正确写入后失败，原因尚未定位，不能将这次通过泛化为任意任务的无人值守可靠性。验证边界见[服务端配置](src/server/README.md)和[真实任务验证记录](docs/live-validation.md)。
+- Codex、DeepSeek Harness（DSH）和 ZCode 适配器。存在适配器不代表 Harness/模型组合已可用于路由：Zero 要求先验证绑定。DSH 和隔离式 ZCode CLI 绑定使用 Zero 自有配置档。现有桌面 ZCode `app-server` 适配器已用本机配置的三种 API 模型和显式思考等级通过 nonce 验证；绑定保存在 Zero 本地数据中。CI 构建的安装版已完成 GLM Flash API 任务和 GLM Flash → DeepSeek Flash 两阶段任务，均经过 Codex 分配、Zero 检查、独立 Codex 审核、结果提交和报告归档并到达 `done`。此前一次安装版任务在正确写入后失败，原因尚未定位；这两次验收不能证明任意任务的无人值守可靠性。验证边界见[服务端配置](src/server/README.md)和[真实任务验证记录](docs/live-validation.md)。
 - 每个任务使用独立 Git worktree，运行配置的验证命令，限制返工次数，并归档包含执行、测试、审核和 Git 证据的报告。成功任务的分支保留在源代码仓库中；Zero 不会自动合并或推送分支。
 - 有序 `executionStages` 已通过核心、HTTP API 和 CLI 的 `--stages-file` 选项实现，会在同一个任务 worktree 中串行执行。每个阶段会记录关联尝试、工作树指纹，以及由 Zero 实测事实构成的版本化交接单；报告收录这些阶段记录。
 - 可持久保存并按序执行多个任务步骤，可通过 Web 界面或 API 提交，并用 CLI 查询。每一步都是普通任务，可分别手动指定 Harness、模型和思考强度；留空字段先继承匹配的项目和全局默认值，再由当前分配器补全。同一仓库中的步骤会在前一步达到 `done`、并具有权威应用提交和完整报告后，从该步骤的已验证结果提交开始。
@@ -25,7 +25,7 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 
 ## 尚属设计或待验证的目标
 
-- ZCode 桌面接入已有三组基于 nonce 的 `selector_only` 本机验证证据，分别对应用户配置的 GLM Flash、DeepSeek Flash 和 DeepSeek Pro API 模型。空会话目录会列出精确提供方/模型标识及可选思考等级；CI 构建的正式安装版已完成一项 GLM Flash 任务的执行、测试、Codex 审核、提交和报告归档。此前一次安装版任务在正确写入后失败，原因尚未定位；这次通过不能证明任意任务的无人值守可靠性。其余两组 API 目前只验证了 selector，Start Plan 未出现在本次目录中，仍未验证。适配器不会声称已确认实际响应模型身份、计费来源，也不会迁移桌面会话上下文。详见[接入设计](docs/zcode-existing-desktop-enrollment.md)和[真实任务验证记录](docs/live-validation.md)。
+- ZCode 桌面接入已有三组基于 nonce 的 `selector_only` 本机验证证据，分别对应用户配置的 GLM Flash、DeepSeek Flash 和 DeepSeek Pro API 模型。空会话目录会列出精确提供方/模型标识及可选思考等级；CI 构建的正式安装版已完成 GLM Flash 任务和 GLM Flash → DeepSeek Flash 两阶段任务的执行、检查、独立 Codex 审核、提交和报告归档。DeepSeek Flash 已有该真实接力任务证据；DeepSeek Pro 仍仅通过 selector 验证。此前一次安装版任务在正确写入后失败，原因尚未定位；成功验收不能证明任意任务的无人值守可靠性。Start Plan 未出现在本次目录中，仍未验证。适配器不会声称已确认实际响应模型身份、计费来源，也不会迁移桌面会话上下文。详见[接入设计](docs/zcode-existing-desktop-enrollment.md)和[真实任务验证记录](docs/live-validation.md)。
 - DSH 和隔离式 ZCode CLI 不会仅因适配器存在就加入路由。必须先在 Zero 隔离的数据目录中创建并验证绑定；可用性和证据等级取决于本机 CLI 版本及验证结果。详见[服务端配置](src/server/README.md)。
 - 当前审核使用新的 Codex 会话，但不保证审核模型一定不同于执行模型：当执行 Harness 也是 Codex 时，模型层面的独立性取决于审核绑定配置。
 

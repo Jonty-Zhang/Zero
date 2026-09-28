@@ -4,7 +4,7 @@
 
 核查日期：2026-09-24。本文区分已由项目官方仓库核实的能力与 Zero 的设计判断。上游功能、CLI 参数及许可证应在实施时锁定具体版本再复核。
 
-**实施状态更新（2026-09-28）：**安装版已通过真实 Codex 任务、两步 Goal、一次单阶段执行崩溃恢复和一项 ZCode GLM Flash API 任务。GLM Flash、DeepSeek Flash、DeepSeek Pro 的现有桌面模型已建立本机 nonce 验证绑定，证据为 `selector_only`。首次安装版 ZCode 任务在写入后失败，原因尚未定位；同提示词重试成功，不能把成功泛化为偶发问题已修复。Start Plan、自然额度恢复和 DSH 真实模型执行仍未验证。最新实施与验收事实以 [README](../README.zh-CN.md)和[真实任务验证记录](live-validation.md)为准，下面保留带日期的研究及早期设计背景。
+**实施状态更新（2026-09-28）：**安装版已通过真实 Codex 任务、两步 Goal、一次单阶段执行崩溃恢复、一项 ZCode GLM Flash API 任务，以及一项 GLM Flash → DeepSeek Flash 两阶段接力任务。三个现有桌面模型均有本机 nonce selector 绑定；DeepSeek Pro 仍只有 selector 验证证据。安装版接力证明了这条任务路径，但未确认服务端实际模型身份或计费来源。首次安装版 ZCode 任务在写入后失败，原因尚未定位；同提示词重试成功，不能把成功泛化为偶发问题已修复。Start Plan、自然五小时额度重置和 DSH 真实模型执行仍未验证。最新实施与验收事实以 [README](../README.zh-CN.md)和[真实任务验证记录](live-validation.md)为准，下面保留带日期的研究及早期设计背景。
 
 **当前决策（2026-09-26）：**主分配器可切换为 Codex 订阅或兼容 OpenAI API 的 HTTPS 协调器。两者只负责从 Zero 已验证的执行绑定中选择路由，不实现任务；Zero 的执行器和状态机负责实际工作，独立 Reviewer 仍固定使用 Codex。API 密钥只通过 Zero 服务进程环境提供，配置中的 `keyEnv` 是环境变量名称。下文中明确标注为 Codex 分配器的部分保留早期 Codex 优先方案的分析；当前路由契约见[主分配与审核契约](route-review-contract.md)。
 
@@ -94,7 +94,7 @@ normalize(raw_output) -> RunResult
 
 - Codex：采用官方 [OpenAI Docs 的 `codex exec` 无交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)，用 JSONL 事件及显式模型与 sandbox 配置；review 阶段只读。
 - DSH：已核实 `@deepseek-ai/dsh@0.1.5-rc.2` 的 Windows headless CLI 形式为 `dsh --profile <name> <task...>`；headless 模板帮助展示 task 为位置参数，未发现 stdin 输入契约，也不支持 `--json`。stdout 是最终文本，reasoning 输出到 stderr，因此 Adapter 不把 stdout 当作 JSONL。实测 `--dump-config` 中 `agent-default-model` 为 `provider: deepseek-official`、`model: deepseek-flash`。Zero 将 `DSH_HOME` 固定到自己的数据目录；probe 和执行前均比对命名 profile 的有效 provider/model 与已验证绑定，并按 CLI 版本固定。`zero verify-binding dsh <model-id> --profile <name>` 会在隔离目录进行最小真实调用，成功后才登记绑定。DSH 不会因 CLI 可运行就被 Router 选中；当前本机尚未通过 DSH 真实模型调用，也没有可路由的 DSH 绑定。Windows npm 安装的 `.cmd` 启动器不能直接用于无 shell 子进程；可用 `ZERO_DSH_ENTRY` 指向绝对 JavaScript 入口，由 Node 启动。
-- ZCode：现有桌面接入使用官方 `app-server --stdio`，每条 v4 `sendText` 固定准确的 `providerId/modelId/options.reasoningLevel`，并传入 `modelExecution.selectionScope: execution`；工作目录指向任务 worktree。GLM Flash、DeepSeek Flash、DeepSeek Pro 已通过 nonce selector 验证，安装版 GLM Flash 已完成执行、检查与独立 Codex 审核。仅展示实际验证过的思考强度；成功未报告服务端实际模型身份时标为 `selector_only`。Zero 独立 `.zcode/cli/config.json` 仍是可选隔离 CLI 模式，不代表桌面配置。不得复制、移动、修改用户现有 ZCode 配置或凭据。
+- ZCode：现有桌面接入使用官方 `app-server --stdio`，每条 v4 `sendText` 固定准确的 `providerId/modelId/options.reasoningLevel`，并传入 `modelExecution.selectionScope: execution`；工作目录指向任务 worktree。GLM Flash、DeepSeek Flash、DeepSeek Pro 已通过 nonce selector 验证；安装版 GLM Flash 单阶段任务及 GLM Flash → DeepSeek Flash 两阶段接力均完成执行、检查、独立 Codex 审核和归档。仅展示实际验证过的思考强度；成功未报告服务端实际模型身份时仍标为 `selector_only`。Zero 独立 `.zcode/cli/config.json` 仍是可选隔离 CLI 模式，不代表桌面配置。不得复制、移动、修改用户现有 ZCode 配置或凭据。
 
 ## Harness 与 Model 解耦
 
@@ -139,7 +139,7 @@ bindings:
 
 ## 实施顺序与验收门槛
 
-1. **环境与仓库**：建立 Zero 的 Git 仓库与公开 GitHub 仓库，Zero 原创代码采用 Apache-2.0；建立忽略规则、密钥扫描、CI。逐个验证 Codex、DSH、ZCode 在目标机器上的 CLI 版本、认证、模型绑定和无头任务。公开仓库、隐私检查和 CI 已建立。安装版 Codex 已完成真实任务与 Goal 流程；现有桌面 ZCode 的三组 API selector 已通过 nonce 验证，GLM Flash 也完成安装版执行→检查→独立 Codex 审核→归档任务。DSH 已隔离安装并完成无模型请求的 CLI 版本、headless 帮助及配置检查，但缺少真实模型绑定。Windows 开机或登录自启不属于当前要求。具体证据与失败记录见[真实任务验证记录](live-validation.md)。
+1. **环境与仓库**：建立 Zero 的 Git 仓库与公开 GitHub 仓库，Zero 原创代码采用 Apache-2.0；建立忽略规则、密钥扫描、CI。逐个验证 Codex、DSH、ZCode 在目标机器上的 CLI 版本、认证、模型绑定和无头任务。公开仓库、隐私检查和 CI 已建立。安装版 Codex 已完成真实任务与 Goal 流程；现有桌面 ZCode 的三组 API selector 已通过 nonce 验证，安装版也已完成 GLM Flash 单阶段任务及 GLM Flash → DeepSeek Flash 两阶段接力，均经过执行、检查、独立 Codex 审核和归档。DSH 已隔离安装并完成无模型请求的 CLI 版本、headless 帮助及配置检查，但缺少真实模型绑定。Windows 开机或登录自启不属于当前要求。具体证据与失败记录见[真实任务验证记录](live-validation.md)。
 2. **状态核心**：SQLite schema、task/event/attempt、原子领取、lease/恢复、HTTP API 与 CLI submit/status/cancel；用假 Adapter 证明掉电重启后不丢任务、不重复 DONE。
 3. **工作区与测试**：worktree 创建/保留/清理、范围检查、测试执行器、进程超时与日志归档；证明并行任务互不影响。
 4. **三个 Harness Adapter**：先实现 Codex，再接 DSH 和 ZCode；每个 binding 通过真实冒烟测试才进入 Router 候选。原始事件与标准结果均存档。
