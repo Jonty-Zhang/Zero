@@ -403,13 +403,20 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     const toolCallId = nonEmptyString(payload.toolCallId);
     const toolName = nonEmptyString(payload.toolName);
     const state = this.subscriptions.get(sessionId);
-    const record = requestId ? this.permissionInteractions.get(sessionId)?.get(requestId) : undefined;
-    if (!state || !record || record.toolCallId !== toolCallId || record.toolName !== toolName) return false;
+    if (!state || !requestId || !toolCallId || !isOneShotFileToolName(toolName) ||
+      this.profileMode !== 'existing-desktop' || !this.interactionGatedSessions.has(sessionId)) return false;
     const deadline = Date.now() + APPROVED_INTERACTION_RESOLUTION_TIMEOUT_MS;
     while (true) {
       if (state.error) throw state.error;
       const current = this.permissionInteractions.get(sessionId)?.get(requestId!);
-      if (!current || current.toolCallId !== toolCallId || current.toolName !== toolName || current.state === 'denied') return false;
+      // ZCode publishes permission.requested before it starts the reverse RPC. Wait briefly
+      // for that exact validated request record; the event itself never authorizes anything.
+      if (!current) {
+        if (Date.now() >= deadline) return false;
+        await new Promise(resolveWait => setTimeout(resolveWait, APPROVED_INTERACTION_RESOLUTION_POLL_MS));
+        continue;
+      }
+      if (current.toolCallId !== toolCallId || current.toolName !== toolName || current.state === 'denied') return false;
       const stillPending = (state.pendingInteractions ?? []).some(item => matchesApprovedInteraction(item, new Map([[requestId!, current]])));
       if (current.state === 'approved' && !stillPending) {
         this.permissionInteractions.get(sessionId)?.delete(requestId!);
@@ -671,22 +678,26 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
   }
 
   private async waitForApprovedInteractionsToResolve(state: SubscriptionState): Promise<unknown[]> {
-    const sessionApprovals = this.permissionInteractions.get(state.sessionId);
-    if (!sessionApprovals?.size) return [...state.pendingInteractions!];
+    const canAwaitTaskPermission = this.profileMode === 'existing-desktop' &&
+      this.interactionGatedSessions.has(state.sessionId);
     const deadline = Date.now() + APPROVED_INTERACTION_RESOLUTION_TIMEOUT_MS;
     while (true) {
       if (state.error) throw state.error;
       const pending = state.pendingInteractions ?? [];
+      const sessionApprovals = this.permissionInteractions.get(state.sessionId);
       const unknownPending = pending.filter(item => {
-        if (!isRecord(item) || typeof item.interactionId !== 'string') return true;
-        const expected = sessionApprovals.get(item.interactionId);
-        return !expected || expected.state === 'denied' || !matchesApprovedInteraction(item, new Map([[item.interactionId, expected]]));
+        if (!canAwaitTaskPermission || !isPotentialOneShotPermissionInteraction(item)) return true;
+        const expected = sessionApprovals?.get(item.interactionId);
+        return expected !== undefined && (expected.state === 'denied' ||
+          !matchesApprovedInteraction(item, new Map([[item.interactionId, expected]])));
       });
       if (unknownPending.length > 0) return [...pending];
       if (pending.length === 0) return [];
-      const awaitingDecision = pending.some(item => sessionApprovals.get(asRecord(item).interactionId as string)?.state === 'evaluating');
-      const awaitingResolution = pending.some(item => sessionApprovals.get(asRecord(item).interactionId as string)?.state === 'approved');
-      if (!awaitingDecision && !awaitingResolution) return [...pending];
+      const waitingForRequest = pending.some(item => !sessionApprovals?.has(asRecord(item).interactionId as string));
+      const awaitingDecision = pending.some(item => sessionApprovals?.get(asRecord(item).interactionId as string)?.state === 'evaluating');
+      const awaitingResolution = pending.some(item => sessionApprovals?.get(asRecord(item).interactionId as string)?.state === 'approved');
+      if (waitingForRequest && Date.now() >= deadline) return [...pending];
+      if (!waitingForRequest && !awaitingDecision && !awaitingResolution) return [...pending];
       if (Date.now() >= deadline) {
         const error = new Error('ZCode approved permission did not clear from v4 interaction state before timeout');
         this.setSubscriptionError(state, error);
@@ -1149,6 +1160,18 @@ function matchesApprovedInteraction(
   const expected = approved.get(value.interactionId);
   return Boolean(expected && value.payload.kind === 'permission' &&
     value.payload.toolCallId === expected.toolCallId && value.payload.toolName === expected.toolName);
+}
+
+function isOneShotFileToolName(value: unknown): value is 'Edit' | 'Write' {
+  return value === 'Edit' || value === 'Write';
+}
+
+function isPotentialOneShotPermissionInteraction(
+  value: unknown,
+): value is Record<string, unknown> & { interactionId: string } {
+  if (!isRecord(value) || value.kind !== 'permission' || !nonEmptyString(value.interactionId) || !isRecord(value.payload)) return false;
+  return Boolean(value.payload.kind === 'permission' && nonEmptyString(value.payload.toolCallId) &&
+    isOneShotFileToolName(value.payload.toolName));
 }
 
 function permissionDenied(reason: string): Record<string, unknown> {

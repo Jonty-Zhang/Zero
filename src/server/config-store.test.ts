@@ -90,6 +90,20 @@ test('desktop tuple registration changes only Zero models and does not verify or
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
+test('legacy configuration reads without execution defaults and persists new defaults without losing existing state', async () => {
+  const f = await fixture();
+  try {
+    const legacy = await f.store.read();
+    assert.equal(legacy.executionDefaults, undefined);
+    await f.store.write({ ...legacy, executionDefaults: { global: { model: 'glm-main' }, projects: { 'C:/repo': { harness: 'zcode' } } } });
+    const persisted = await f.store.read();
+    assert.deepEqual(persisted.executionDefaults, { global: { model: 'glm-main' }, projects: { 'C:/repo': { harness: 'zcode' } } });
+    assert.deepEqual(persisted.bindings, legacy.bindings);
+    assert.deepEqual(persisted.verifications, legacy.verifications);
+    assert.deepEqual(persisted.secretRefs, legacy.secretRefs);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
 test('desktop tuple registration rejects collisions without changing config bytes', async () => {
   const cases = [
     { model: { id: 'glm-main', provider: 'other', modelId: 'different' }, error: /already registered with a different tuple/ },

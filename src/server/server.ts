@@ -10,7 +10,7 @@ import type { AdapterConfig } from '../adapters/base.js';
 import { DshAdapter } from '../adapters/dsh.js';
 import { ZCodeCompositeAdapter } from '../adapters/zcode-composite.js';
 import type { ModelBinding } from '../adapters/types.js';
-import type { Attempt, CheckDefinition, CheckResult, HarnessAdapter, ReviewResult, RouteDecision, SequenceGoalReview, TaskEvent, TaskRecord, TaskSequenceMetadata, TaskSequenceRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
+import type { Attempt, CheckDefinition, CheckResult, ExecutionSelection, HarnessAdapter, ReviewResult, RouteDecision, SequenceGoalReview, TaskEvent, TaskRecord, TaskSequenceMetadata, TaskSequenceRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
 
 type HarnessName = 'codex' | 'dsh' | 'zcode';
 export type AdapterMap = Partial<Record<HarnessName, HarnessAdapter>>;
@@ -223,6 +223,10 @@ async function readPublicConfig(options: ZeroServerOptions) {
       ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) },
     reviewer: { modelId: config.reviewer.modelId && modelIds.has(config.reviewer.modelId) ? config.reviewer.modelId : null,
       reasoningEffort: config.reviewer.reasoningEffort && efforts.has(config.reviewer.reasoningEffort) ? config.reviewer.reasoningEffort : null },
+    executionDefaults: {
+      global: publicExecutionSelection(config.executionDefaults?.global ?? null),
+      projects: Object.entries(config.executionDefaults?.projects ?? {}).map(([repoPath, execution]) => ({ repoPath, execution: publicExecutionSelection(execution)! })),
+    },
   };
 }
 
@@ -267,8 +271,63 @@ async function updatePublicConfig(options: ZeroServerOptions, raw: unknown) {
     ? { kind, modelId: null, reasoningEffort: null, api: api! }
     : { ...pick('allocator'), kind, ...(api ? { api } : {}) };
   config.reviewer = pick('reviewer');
+  if (input.executionDefaults !== undefined) config.executionDefaults = await parseExecutionDefaults(input.executionDefaults, active);
   await options.config.write(config);
-  return { allocator: { ...config.allocator, ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) }, reviewer: config.reviewer };
+  return { allocator: { ...config.allocator, ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) }, reviewer: config.reviewer,
+    executionDefaults: { global: publicExecutionSelection(config.executionDefaults?.global ?? null), projects: Object.entries(config.executionDefaults?.projects ?? {}).map(([repoPath, execution]) => ({ repoPath, execution: publicExecutionSelection(execution)! })) } };
+}
+
+function publicExecutionSelection(selection: ExecutionSelection | null): { harnessId?: string; modelId?: string; reasoningEffort?: string } | null {
+  if (!selection) return null;
+  return { ...(selection.harness ? { harnessId: selection.harness } : {}), ...(selection.model ? { modelId: selection.model } : {}), ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}) };
+}
+
+async function parseExecutionDefaults(raw: unknown, capability: Awaited<ReturnType<typeof capabilities>>): Promise<NonNullable<LocalZeroConfig['executionDefaults']>> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, 'executionDefaults 必须是对象');
+  const input = raw as Record<string, unknown>;
+  for (const key of Object.keys(input)) if (key !== 'global' && key !== 'projects') throw new HttpError(400, `executionDefaults.${key} 不是支持的配置项`);
+  const parse = (value: unknown, label: string): ExecutionSelection | null => {
+    if (value == null) return null;
+    const parsed = parsePublicSelection(value, label);
+    validateAvailableSelection(parsed, capability, label);
+    const selection = toExecutionSelection(parsed);
+    if (!selection) throw new HttpError(400, `${label} 至少需要一个执行选项`);
+    return selection;
+  };
+  const global = parse(input.global ?? null, 'executionDefaults.global');
+  if (!Array.isArray(input.projects) || input.projects.length > 500) throw new HttpError(400, 'executionDefaults.projects 必须是项目配置数组');
+  const projects: Record<string, ExecutionSelection> = {};
+  for (const [index, rawProject] of input.projects.entries()) {
+    if (!rawProject || typeof rawProject !== 'object' || Array.isArray(rawProject)) throw new HttpError(400, `executionDefaults.projects[${index}] 必须是对象`);
+    const project = rawProject as Record<string, unknown>;
+    if (Object.keys(project).some(key => key !== 'repoPath' && key !== 'execution')) throw new HttpError(400, `executionDefaults.projects[${index}] 包含不支持的字段`);
+    const rawPath = stringField(project.repoPath, `executionDefaults.projects[${index}].repoPath`, 1, 4096);
+    const repoPath = await canonicalRepositoryPath(rawPath, `executionDefaults.projects[${index}].repoPath`);
+    if (projects[repoPath]) throw new HttpError(400, `项目仓库重复：${repoPath}`);
+    const execution = parse(project.execution, `executionDefaults.projects[${index}].execution`);
+    if (!execution) throw new HttpError(400, `executionDefaults.projects[${index}].execution 至少需要一个执行选项`);
+    validateAvailableSelection({ ...selectionFields(global), ...selectionFields(execution) }, capability, `executionDefaults.projects[${index}] effective selection`);
+    projects[repoPath] = execution;
+  }
+  return { global, projects };
+}
+
+function selectionFields(selection: ExecutionSelection | null): Record<string, string> {
+  if (!selection) return {};
+  return { ...(selection.harness ? { harness: selection.harness } : {}), ...(selection.model ? { model: selection.model } : {}),
+    ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}) };
+}
+
+async function canonicalRepositoryPath(rawPath: string, label: string): Promise<string> {
+  if (!isAbsolute(rawPath)) throw new HttpError(400, `${label} 必须是绝对路径`);
+  let repoPath: string;
+  try { repoPath = await realpath(rawPath); } catch { throw new HttpError(400, `${label} 不存在或无法访问`); }
+  if (!(await stat(repoPath)).isDirectory()) throw new HttpError(400, `${label} 必须是目录`);
+  const git = spawnSync('git', ['-C', repoPath, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+  if (git.error || git.status !== 0) throw new HttpError(400, `${label} 必须是可访问的 Git 工作区`);
+  const root = await realpath(git.stdout.trim()).catch(() => undefined);
+  if (!root) throw new HttpError(400, `${label} 无法解析为 Git 仓库根目录`);
+  return root;
 }
 
 async function parseSubmission(raw: unknown, options: ZeroServerOptions, capabilitySnapshot?: Awaited<ReturnType<typeof capabilities>>): Promise<TaskSubmission> {

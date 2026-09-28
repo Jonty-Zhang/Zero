@@ -87,4 +87,9 @@ export type Config = {
     api?: { baseUrl: string | null; model: string | null; keyEnv: string | null };
   };
   reviewer: { modelId: string | null; reasoningEffort: string | null };
+  executionDefaults?: {
+    global: ExecutionSelection | null;
+    projects: Array<{ repoPath: string; execution: ExecutionSelection }>;
+  };
 };
+export type ExecutionSelection = { harnessId?: string | null; modelId?: string | null; reasoningEffort?: string | null };

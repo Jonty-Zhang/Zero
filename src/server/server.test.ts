@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { HarnessAdapter, HarnessCapabilities, RunRequest, RunResult, TaskSubmission } from '../domain/types.js';
@@ -54,6 +54,7 @@ interface Fixture {
 }
 
 const model = { id: 'glm-main', provider: 'zai', modelId: 'glm-5' };
+const codexModel = { id: 'codex-main', provider: 'openai', modelId: 'gpt-6-sol' };
 const binding: ModelBinding = {
   harness: 'zcode', model, selector: 'isolated_config', configDir: 'unused-in-probe-test', mode: 'yolo', verified: true,
   reasoningEfforts: ['low', 'high'], verificationSource: 'smoke_test', verifiedCliVersion: 'zcode-test-1',
@@ -101,10 +102,10 @@ test('Codex adapter maps ZERO_CODEX_WINDOWS_SANDBOX to a per-invocation config o
   }
 });
 
-function testConfig(hasLiveVerification: boolean): LocalZeroConfig {
+function testConfig(hasLiveVerification: boolean, includeCodex = false): LocalZeroConfig {
   return {
-    models: [model],
-    bindings: [binding],
+    models: [model, ...(includeCodex ? [codexModel] : [])],
+    bindings: [binding, ...(includeCodex ? [{ harness: 'codex' as const, model: codexModel, selector: 'cli_argument' as const, verified: true as const, reasoningEfforts: ['high' as const] }] : [])],
     allocator: { modelId: null, reasoningEffort: null },
     reviewer: { modelId: null, reasoningEffort: null },
     verifications: hasLiveVerification ? {
@@ -112,11 +113,15 @@ function testConfig(hasLiveVerification: boolean): LocalZeroConfig {
         verifiedAt: '2026-09-24T00:00:00.000Z', cliVersion: 'zcode-test-1', requestedModel: 'glm-5',
         exitCode: 0, level: 'event_confirmed', actualModel: 'glm-5', reasoningEfforts: ['low', 'high'],
       },
+      ...(includeCodex ? { 'codex:codex-main': {
+        verifiedAt: '2026-09-24T00:00:00.000Z', cliVersion: 'codex-test-1', requestedModel: 'gpt-6-sol',
+        exitCode: 0 as const, level: 'event_confirmed' as const, actualModel: 'gpt-6-sol', reasoningEfforts: ['high' as const],
+      } } : {}),
     } : {},
   };
 }
 
-async function createFixture(hasLiveVerification = true, enqueue?: (taskId: string, store: TaskStore) => void | Promise<void>): Promise<Fixture> {
+async function createFixture(hasLiveVerification = true, enqueue?: (taskId: string, store: TaskStore) => void | Promise<void>, includeCodex = false): Promise<Fixture> {
   const root = await mkdtemp(join(process.cwd(), '.zero-server-test-'));
   const repoPath = join(root, 'repo');
   const artifactRoot = join(root, 'artifacts');
@@ -130,7 +135,7 @@ async function createFixture(hasLiveVerification = true, enqueue?: (taskId: stri
 
   const configPath = join(root, 'config', 'zero.json');
   await mkdir(join(root, 'config'), { recursive: true });
-  await writeFile(configPath, `${JSON.stringify(testConfig(hasLiveVerification), null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await writeFile(configPath, `${JSON.stringify(testConfig(hasLiveVerification, includeCodex), null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   const config = new ConfigStore(configPath);
   const store = new TaskStore(join(root, 'tasks.sqlite'));
   const capability: HarnessCapabilities = {
@@ -138,7 +143,11 @@ async function createFixture(hasLiveVerification = true, enqueue?: (taskId: stri
     reasoningEfforts: ['low', 'high'], roles: ['implement', 'revise'],
     probeEvidence: { versionAndHelp: 'passed', authentication: 'not_checked', modelSmokeTest: 'not_checked', configuredBindings: 'declared_verified' },
   };
-  const adapters = { zcode: new ProbeOnlyAdapter('zcode', capability) };
+  const codexCapability: HarnessCapabilities = {
+    harness: 'codex', version: 'codex-test-1', available: true, models: ['codex-main'], reasoningEfforts: ['high'], roles: ['implement', 'revise'],
+    probeEvidence: { versionAndHelp: 'passed', authentication: 'not_checked', modelSmokeTest: 'not_checked', configuredBindings: 'declared_verified' },
+  };
+  const adapters = { zcode: new ProbeOnlyAdapter('zcode', capability), ...(includeCodex ? { codex: new ProbeOnlyAdapter('codex', codexCapability) } : {}) };
   const server = createZeroServer({ store, config, adapters, artifactRoot, staticDir: join(root, 'web'), ...(enqueue ? { enqueue: taskId => enqueue(taskId, store) } : {}) });
   await new Promise<void>((resolveListen, reject) => {
     server.once('error', reject);
@@ -537,5 +546,55 @@ test('PUT and GET /api/config persist an API coordinator reference without any k
     }) });
     assert.equal(invalid.status, 400);
     assert.match((await invalid.json() as { error: string }).error, /HTTPS/);
+  } finally { await f.close(); }
+});
+
+test('PUT and GET /api/config persist canonical global and project execution defaults', async () => {
+  const f = await createFixture();
+  try {
+    const configured = await fetch(`${f.url}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      allocator: { kind: 'codex', modelId: null, reasoningEffort: null },
+      reviewer: { modelId: null, reasoningEffort: null },
+      executionDefaults: {
+        global: { modelId: 'glm-main', reasoningEffort: 'low' },
+        projects: [{ repoPath: join(f.repoPath, '.'), execution: { harnessId: 'zcode', reasoningEffort: 'high' } }],
+      },
+    }) });
+    assert.equal(configured.status, 200);
+    const saved = await configured.json() as { executionDefaults: { global: unknown; projects: Array<{ repoPath: string; execution: unknown }> } };
+    assert.deepEqual(saved.executionDefaults, {
+      global: { modelId: 'glm-main', reasoningEffort: 'low' },
+      projects: [{ repoPath: f.repoPath, execution: { harnessId: 'zcode', reasoningEffort: 'high' } }],
+    });
+    assert.deepEqual((await f.config.read()).executionDefaults, {
+      global: { model: 'glm-main', reasoningEffort: 'low' },
+      projects: { [f.repoPath]: { harness: 'zcode', reasoningEffort: 'high' } },
+    });
+    const read = await fetch(`${f.url}/api/config`);
+    assert.equal(read.status, 200);
+    assert.deepEqual((await read.json() as typeof saved).executionDefaults, saved.executionDefaults);
+
+    const invalid = await fetch(`${f.url}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      allocator: { kind: 'codex', modelId: null, reasoningEffort: null }, reviewer: { modelId: null, reasoningEffort: null },
+      executionDefaults: { global: { harnessId: 'unknown' }, projects: [] },
+    }) });
+    assert.equal(invalid.status, 400);
+  } finally { await f.close(); }
+});
+
+test('PUT /api/config rejects an incompatible merged global and project preset without changing config', async () => {
+  const f = await createFixture(true, undefined, true);
+  try {
+    const before = await readFile(f.config.path, 'utf8');
+    const response = await fetch(`${f.url}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      allocator: { kind: 'codex', modelId: null, reasoningEffort: null }, reviewer: { modelId: null, reasoningEffort: null },
+      executionDefaults: {
+        global: { modelId: 'glm-main' },
+        projects: [{ repoPath: f.repoPath, execution: { harnessId: 'codex' } }],
+      },
+    }) });
+    assert.equal(response.status, 400);
+    assert.match((await response.json() as { error: string }).error, /effective selection/);
+    assert.equal(await readFile(f.config.path, 'utf8'), before);
   } finally { await f.close(); }
 });

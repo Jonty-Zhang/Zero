@@ -17,6 +17,6 @@ npm run build
 - `GET /api/tasks/:id`：任务详情，建议包含 `id`, `status`, `prompt`, `acceptanceCriteria`, `repoPath`, `baseRef`, `createdAt`, `route`, `attempts`, `tests`, `review`, `logs`, `report`, `error`。
 - `POST /api/tasks`：接收 `{ repoPath, baseRef, prompt, acceptanceCriteria, maxRevisions, checkCommands, execution: { harnessId, modelId, reasoningEffort }, executionStages: [{ harnessId, modelId, reasoningEffort }] }`。手动项可为 `null`；`executionStages` 可省略，若提供则需包含 1 到 16 个阶段。`execution` 是任务级默认值，阶段字段会覆盖默认值；服务端会验证每个最终组合均对应当前可用且已验证的绑定，并保留阶段顺序。
 - `POST /api/tasks/:id/cancel`：取消 pending 或活跃任务。
-- `GET /api/config` 与 `PUT /api/config`：配置 `{ allocator: { modelId, reasoningEffort }, reviewer: { modelId, reasoningEffort } }`。字段可为 `null` 以交给 Codex 自动选择。密钥不属于此配置，不会读取、显示或写入浏览器存储。
+- `GET /api/config` 与 `PUT /api/config`：配置包含 `allocator`、`reviewer` 和 `executionDefaults: { global, projects }`。`global` 为可空的 `{ harnessId?, modelId?, reasoningEffort? }`；`projects` 为 `{ repoPath, execution }` 数组，`repoPath` 是规范绝对仓库路径，`execution` 支持相同的可选字段。每个任务字段按手动任务值 → 匹配项目默认值 → 全局默认值 → 分配器的顺序解析，未设置字段逐级继承。密钥不属于此配置，不会读取、显示或写入浏览器存储。
 
 Harness 健康条显示 Codex、DSH 和 ZCode 的 `available` 状态；不可用时展示 API 返回的 `reason`。模型及思考强度选择不硬编码，来源完全是 capabilities 响应。

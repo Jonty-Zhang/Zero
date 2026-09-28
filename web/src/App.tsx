@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import { Activity, AlertCircle, ArrowDown, ArrowRight, ArrowUp, Check, CheckCircle2, ChevronDown, CircleHelp, Clock3, Code2, FileText, FolderGit2, ListOrdered, LoaderCircle, Plus, RefreshCw, Settings2, ShieldCheck, Target, TerminalSquare, X, XCircle } from 'lucide-react';
 import { api } from './api';
-import type { Binding, Capabilities, Choice, Config, HarnessHealth, Status, Task, TaskSequence, TestResult } from './types';
+import type { Binding, Capabilities, Choice, Config, ExecutionSelection, HarnessHealth, Status, Task, TaskSequence, TestResult } from './types';
 
 const columns: { id: Status; label: string; tone: string }[] = [
   { id: 'pending', label: '待处理', tone: 'slate' }, { id: 'running', label: '执行中', tone: 'blue' },
@@ -19,7 +19,18 @@ const routeName = (route?: Task['route']) => [route?.harnessId, route?.modelId, 
 const taskTitle = (task: Task) => task.title || task.prompt?.split('\n')[0]?.slice(0, 72) || `任务 ${task.id.slice(0, 8)}`;
 type ApiAllocatorConfig = NonNullable<Config['allocator']['api']>;
 const emptyApiAllocatorConfig: ApiAllocatorConfig = { baseUrl: null, model: null, keyEnv: null };
-const normalizeConfig = (config: Config): Config => ({ ...config, allocator: { ...config.allocator, api: config.allocator.api ?? { ...emptyApiAllocatorConfig } } });
+const normalizeSelection = (selection: ExecutionSelection | null | undefined): ExecutionSelection | null => {
+  const normalized = Object.fromEntries(Object.entries(selection ?? {}).filter(([, value]) => typeof value === 'string' && value.trim())) as ExecutionSelection;
+  return Object.keys(normalized).length ? normalized : null;
+};
+const normalizeConfig = (config: Config): Config => ({
+  ...config,
+  allocator: { ...config.allocator, api: config.allocator.api ?? { ...emptyApiAllocatorConfig } },
+  executionDefaults: {
+    global: normalizeSelection(config.executionDefaults?.global),
+    projects: (config.executionDefaults?.projects ?? []).map(project => ({ ...project, execution: normalizeSelection(project.execution) ?? {} })),
+  },
+});
 
 function asTasks(data: unknown): Task[] { return Array.isArray(data) ? data as Task[] : ((data as { tasks?: Task[] })?.tasks ?? []); }
 function asSequences(data: TaskSequence[] | { sequences: TaskSequence[] }): TaskSequence[] { return Array.isArray(data) ? data : data.sequences ?? []; }
@@ -191,11 +202,11 @@ function SequenceSubmitModal({ capabilities, onClose, onCreated }: { capabilitie
         return <section className="sequence-step-editor" key={index}><div className="execution-stage-title"><b>步骤 {index + 1}</b><div className="stage-actions"><button type="button" className="link-button" aria-label={`将步骤 ${index + 1} 上移`} title="上移" disabled={index === 0} onClick={() => setSteps(current => current.map((item, i) => i === index - 1 ? current[index]! : i === index ? current[index - 1]! : item))}><ArrowUp size={13} /></button><button type="button" className="link-button" aria-label={`将步骤 ${index + 1} 下移`} title="下移" disabled={index === steps.length - 1} onClick={() => setSteps(current => current.map((item, i) => i === index ? current[index + 1]! : i === index + 1 ? current[index]! : item))}><ArrowDown size={13} /></button><button type="button" className="link-button" disabled={steps.length <= 2} onClick={() => setSteps(current => current.filter((_, i) => i !== index))}><X size={13} />移除</button></div></div>
         <Field label={`步骤 ${index + 1} 描述 *`}><textarea required minLength={8} rows={3} value={step.prompt} onChange={e => updateStep(index, 'prompt', e.target.value)} placeholder="描述这一阶段要实现或验证的内容" /></Field>
         <div className="form-grid"><Field label="步骤验收标准" hint="可选，逐行填写"><textarea rows={2} value={step.criteria} onChange={e => updateStep(index, 'criteria', e.target.value)} placeholder="此步骤需要满足的条件" /></Field><Field label="检查命令" hint="可选，每行一条命令"><textarea rows={2} value={step.checks} onChange={e => updateStep(index, 'checks', e.target.value)} placeholder={'例如\nnpm test'} /></Field></div>
-        <div className="form-grid three"><Field label="Harness"><Select value={step.harnessId} onChange={value => updateStep(index, 'harnessId', value)} choices={harnessChoices} placeholder="分配器自动选择" /></Field><Field label="模型"><Select value={step.modelId} onChange={value => updateStep(index, 'modelId', value)} choices={modelChoices} placeholder="分配器自动选择" disabled={!capabilities || !stepBindings.length} /></Field><Field label="思考强度"><Select value={step.reasoningEffort} onChange={value => updateStep(index, 'reasoningEffort', value)} choices={effortChoices} placeholder="分配器自动选择" disabled={!step.modelId || effortChoices.length === 0} /></Field></div>
+        <div className="form-grid three"><Field label="Harness"><Select value={step.harnessId} onChange={value => updateStep(index, 'harnessId', value)} choices={harnessChoices} placeholder="继承项目/全局后自动分配" /></Field><Field label="模型"><Select value={step.modelId} onChange={value => updateStep(index, 'modelId', value)} choices={modelChoices} placeholder="继承项目/全局后自动分配" disabled={!capabilities || !stepBindings.length} /></Field><Field label="思考强度"><Select value={step.reasoningEffort} onChange={value => updateStep(index, 'reasoningEffort', value)} choices={effortChoices} placeholder="继承项目/全局后自动分配" disabled={!step.modelId || effortChoices.length === 0} /></Field></div>
       </section>;
       })}
       <Button onClick={() => setSteps(current => current.length < 16 ? [...current, blankStep()] : current)} disabled={steps.length >= 16}><Plus size={14} />添加步骤</Button>
-      {capabilities && bindings.length > 0 ? <div className="inline-info sequence-allocator-note"><Activity size={14} />每个步骤可单独指定 Harness、模型和思考强度；留空字段由当前分配器自动选择。</div> : <div className="inline-warning sequence-allocator-note"><AlertCircle size={14} />当前没有可用的已验证执行组合；所有留空选项将由分配器决定。</div>}
+      {capabilities && bindings.length > 0 ? <div className="inline-info sequence-allocator-note"><Activity size={14} />每个步骤可单独指定 Harness、模型和思考强度；留空字段先继承项目/全局预设，再由分配器补全。</div> : <div className="inline-warning sequence-allocator-note"><AlertCircle size={14} />当前没有可用的已验证执行组合；留空字段仍会先继承项目/全局预设，再交由分配器选择。</div>}
       {error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}<div className="modal-footer"><Button onClick={onClose}>取消</Button><Button variant="primary" type="submit" disabled={busy || !repoPath.trim() || steps.some(step => step.prompt.trim().length < 8)}>{busy ? <><LoaderCircle size={15} className="spin" />正在提交</> : <><ListOrdered size={16} />提交目标序列</>}</Button></div>
     </form></section></div>;
 }
@@ -244,7 +255,7 @@ function SubmitModal({ capabilities, capabilityError, allocatorKind, onClose, on
     <form onSubmit={submit} className="submit-form"><div className="form-grid"><Field label="仓库路径 *" hint="本机 Git 仓库的绝对路径"><input required value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="例如 C:\\projects\\my-app" /></Field><Field label="基础分支 / Ref"><input value={baseRef} onChange={e => setBaseRef(e.target.value)} placeholder="main" /></Field></div>
       <Field label="任务描述 *"><textarea required minLength={8} rows={4} value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="描述要实现或修复的内容、相关背景和约束…" /></Field><Field label="验收标准" hint="逐行填写，系统会交给执行器与 Reviewer"><textarea rows={3} value={criteria} onChange={e => setCriteria(e.target.value)} placeholder={'例如：\n- 登录失败时显示明确错误\n- 原有测试保持通过'} /></Field>
       <div className="section-divider"><span>执行偏好</span><span>每项可单独留空</span></div>
-      <div className="form-grid three"><Field label="Harness"><Select value={harnessId} onChange={v => { setHarnessId(v); setModelId(''); setEffort(''); }} choices={harnessChoices} placeholder={`${allocatorName} 自动分配`} /></Field><Field label="模型"><Select value={modelId} onChange={v => { setModelId(v); setEffort(''); }} choices={modelChoices} placeholder={`${allocatorName} 自动分配`} disabled={!capabilities || !bindings.length} /></Field><Field label="思考强度"><Select value={effort} onChange={setEffort} choices={effortChoices} placeholder={`${allocatorName} 自动分配`} disabled={!modelId || effortChoices.length === 0} /></Field></div>
+      <div className="form-grid three"><Field label="Harness"><Select value={harnessId} onChange={v => { setHarnessId(v); setModelId(''); setEffort(''); }} choices={harnessChoices} placeholder="继承项目/全局后自动分配" /></Field><Field label="模型"><Select value={modelId} onChange={v => { setModelId(v); setEffort(''); }} choices={modelChoices} placeholder="继承项目/全局后自动分配" disabled={!capabilities || !bindings.length} /></Field><Field label="思考强度"><Select value={effort} onChange={setEffort} choices={effortChoices} placeholder="继承项目/全局后自动分配" disabled={!modelId || effortChoices.length === 0} /></Field></div>
       <div className="stage-editor-head"><div><b>执行阶段</b><span>可选；阶段字段会覆盖上方任务默认值</span></div><Button onClick={() => setStages(current => current.length < 16 ? [...current, { harnessId: '', modelId: '', reasoningEffort: '' }] : current)} disabled={stages.length >= 16}><Plus size={14} />添加阶段</Button></div>
       {stages.map((stage, index) => {
         const effectiveHarness = stage.harnessId || harnessId;
@@ -291,11 +302,31 @@ function Review({ review }: { review: NonNullable<Task['review']> }) {
   return <div className="review-card"><div className="review-head"><span className={`review-verdict ${pass ? 'pass' : 'needs'}`}>{pass ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}{nice(review.verdict)}</span>{review.modelId && <span className="muted">{review.modelId}</span>}</div>{review.summary && <p>{review.summary}</p>}{review.findings?.map((f, i) => <div className="finding" key={i}><b>{f.severity || '意见'}</b>{f.file && <code>{f.file}{f.line ? `:${f.line}` : ''}</code>}<span>{f.message}</span></div>)}</div>;
 }
 
+function ExecutionPresetFields({ value, onChange, capabilities, title }: { value: ExecutionSelection; onChange: (next: ExecutionSelection) => void; capabilities: Capabilities | null; title: string }) {
+  const bindings = (capabilities?.bindings ?? []).filter(b => b.available && capabilities?.harnesses.some(h => h.id === b.harnessId && h.available));
+  const compatible = bindings.filter(b => !value.harnessId || b.harnessId === value.harnessId);
+  const harnessChoices = [...new Map(bindings.map(b => [b.harnessId, b])).values()].map(b => ({ id: b.harnessId, label: capabilities?.harnesses.find(h => h.id === b.harnessId)?.name || b.harnessId }));
+  const modelChoices = [...new Map(compatible.map(b => [b.modelId, b])).values()].map(b => ({ id: b.modelId, label: b.modelName || b.modelId }));
+  const effortBindings = compatible.filter(b => !value.modelId || b.modelId === value.modelId);
+  const effortChoices = [...new Map(effortBindings.flatMap(b => b.reasoningEfforts ?? []).map(choice => [choice.id, choice])).values()];
+  return <div className="form-grid three execution-preset-fields" aria-label={title}>
+    <Field label="Harness"><Select value={value.harnessId || ''} onChange={harnessId => onChange({ ...value, harnessId: harnessId || null, modelId: null, reasoningEffort: null })} choices={harnessChoices} placeholder="留空继承或自动分配" disabled={!capabilities || bindings.length === 0} /></Field>
+    <Field label="模型"><Select value={value.modelId || ''} onChange={modelId => onChange({ ...value, modelId: modelId || null, reasoningEffort: null })} choices={modelChoices} placeholder="留空继承或自动分配" disabled={!capabilities || compatible.length === 0} /></Field>
+    <Field label="思考强度" hint={!value.modelId ? '可单独锁定，系统会选择支持该强度的可用组合。' : undefined}><Select value={value.reasoningEffort || ''} onChange={reasoningEffort => onChange({ ...value, reasoningEffort: reasoningEffort || null })} choices={effortChoices} placeholder="留空继承或自动分配" disabled={!capabilities || effortChoices.length === 0} /></Field>
+  </div>;
+}
+
 function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabilities | null; onSaved: (message: string, kind: Config['allocator']['kind']) => void; onRetry: () => Promise<void> }) {
   const [config, setConfig] = useState<Config | null>(null); const [loading, setLoading] = useState(true); const [error, setError] = useState(''); const [busy, setBusy] = useState(false); const [saved, setSaved] = useState(false);
+  const [projectPath, setProjectPath] = useState('');
   useEffect(() => { let live = true; api.config().then(c => { if (live) { setConfig(normalizeConfig(c)); setError(''); } }).catch(e => { if (live) setError(e instanceof Error ? e.message : '配置读取失败'); }).finally(() => { if (live) setLoading(false); }); return () => { live = false; }; }, []);
   const save = async () => {
     if (!config) return;
+    const emptyProject = config.executionDefaults?.projects.find(project => !normalizeSelection(project.execution));
+    if (emptyProject) {
+      setError(`项目“${emptyProject.repoPath}”尚未设置执行偏好；请至少选择一个字段，或移除该项目。`);
+      return;
+    }
     if (config.allocator.kind === 'api') {
       let secureEndpoint = false;
       const apiConfig = config.allocator.api ?? emptyApiAllocatorConfig;
@@ -309,6 +340,17 @@ function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabi
   };
   const update = (role: 'allocator' | 'reviewer', key: 'modelId' | 'reasoningEffort', value: string) => setConfig(prev => prev ? { ...normalizeConfig(prev), [role]: { ...prev[role], [key]: value || null, ...(key === 'modelId' ? { reasoningEffort: null } : {}) } } : prev);
   const updateApi = (key: keyof ApiAllocatorConfig, value: string) => setConfig(prev => prev ? { ...normalizeConfig(prev), allocator: { ...prev.allocator, api: { ...(prev.allocator.api ?? emptyApiAllocatorConfig), [key]: value || null } } } : prev);
+  const updateGlobalDefault = (execution: ExecutionSelection | null) => setConfig(prev => { if (!prev) return prev; const normalized = normalizeConfig(prev); return { ...normalized, executionDefaults: { ...normalized.executionDefaults!, global: normalizeSelection(execution) } }; });
+  const updateProjectDefault = (index: number, execution: ExecutionSelection) => setConfig(prev => { if (!prev) return prev; const normalized = normalizeConfig(prev); return { ...normalized, executionDefaults: { ...normalized.executionDefaults!, projects: normalized.executionDefaults!.projects.map((project, i) => i === index ? { ...project, execution } : project) } }; });
+  const addProjectDefault = () => {
+    const path = projectPath.trim();
+    if (!path || !/^([a-zA-Z]:[\\/]|\\\\|\/)/.test(path)) { setError('请输入仓库的绝对路径。'); return; }
+    const projects = config?.executionDefaults?.projects ?? [];
+    if (projects.some(project => project.repoPath.trim().replaceAll('\\', '/').toLowerCase() === path.replaceAll('\\', '/').toLowerCase())) { setError('这个仓库路径已添加。'); return; }
+    setConfig(prev => { if (!prev) return prev; const normalized = normalizeConfig(prev); const defaults = normalized.executionDefaults!; return { ...normalized, executionDefaults: { ...defaults, projects: [...defaults.projects, { repoPath: path, execution: {} }] } }; });
+    setProjectPath(''); setError('');
+  };
+  const removeProjectDefault = (index: number) => setConfig(prev => { if (!prev) return prev; const normalized = normalizeConfig(prev); return { ...normalized, executionDefaults: { ...normalized.executionDefaults!, projects: normalized.executionDefaults!.projects.filter((_, i) => i !== index) } }; });
   const options = (role: 'allocator' | 'reviewer', key: 'models' | 'reasoningEfforts') => capabilities?.[role]?.[key] ?? [];
   const effortOptions = (role: 'allocator' | 'reviewer') => {
     const modelId = config?.[role].modelId;
@@ -329,6 +371,13 @@ function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabi
           </> : <div className="form-grid" style={{ marginTop: 14 }}><Field label="默认模型"><Select value={config.allocator.modelId || ''} onChange={v => update('allocator', 'modelId', v)} choices={options('allocator', 'models')} placeholder="使用 Codex CLI 默认模型" /></Field><Field label="默认思考强度"><Select value={config.allocator.reasoningEffort || ''} onChange={v => update('allocator', 'reasoningEffort', v)} choices={effortOptions('allocator')} placeholder="使用 Codex CLI 默认值" /></Field></div>}
         </section>
         <section className="settings-card"><div className="settings-card-head"><div className="role-icon reviewer"><ShieldCheck size={18} /></div><div><h2>Codex Reviewer</h2><p>独立只读会话审核改动、测试证据和验收标准。</p></div><span className="fixed-badge">固定 Codex</span></div><div className="form-grid"><Field label="审核模型"><Select value={config.reviewer.modelId || ''} onChange={v => update('reviewer', 'modelId', v)} choices={options('reviewer', 'models')} placeholder="Codex 自动选择" /></Field><Field label="审核思考强度"><Select value={config.reviewer.reasoningEffort || ''} onChange={v => update('reviewer', 'reasoningEffort', v)} choices={effortOptions('reviewer')} placeholder="Codex 自动选择" /></Field></div></section>
+        <section className="settings-card"><div className="settings-card-head"><div className="role-icon codex"><Settings2 size={18} /></div><div><h2>执行默认值</h2><p>为新任务设置可选的全局默认值；每个字段都可留空，由分配器自动选择。</p></div><button className="button quiet preset-clear" disabled={!config.executionDefaults?.global} onClick={() => updateGlobalDefault(null)}>清除全局预设</button></div>
+          <ExecutionPresetFields title="全局执行默认值" value={config.executionDefaults?.global ?? {}} onChange={updateGlobalDefault} capabilities={capabilities} />
+        </section>
+        <section className="settings-card"><div className="settings-card-head"><div className="role-icon codex"><FolderGit2 size={18} /></div><div><h2>项目默认值</h2><p>按本机仓库绝对路径保存执行偏好；任务手动设置仍优先。</p></div></div>
+          <div className="project-preset-add"><Field label="仓库绝对路径"><input value={projectPath} onChange={e => setProjectPath(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addProjectDefault(); } }} placeholder="例如 C:\\projects\\my-app" /></Field><Button onClick={addProjectDefault}><Plus size={14} />添加项目</Button></div>
+          {(config.executionDefaults?.projects ?? []).length === 0 ? <div className="project-preset-empty">尚未添加项目默认值。</div> : <div className="project-preset-list">{config.executionDefaults!.projects.map((project, index) => <div className="project-preset-row" key={`${project.repoPath}-${index}`}><div className="project-preset-heading"><b title={project.repoPath}>{project.repoPath}</b><button className="button danger" onClick={() => removeProjectDefault(index)}><X size={13} />移除</button></div><ExecutionPresetFields title={`${project.repoPath} 执行默认值`} value={project.execution} onChange={execution => updateProjectDefault(index, execution)} capabilities={capabilities} /></div>)}</div>}
+        </section>
         <div className="settings-save-row"><span><ShieldCheck size={14} />界面只保存密钥环境变量名，不读取或保存 API 密钥原文。</span><Button variant="primary" disabled={busy || saved} onClick={() => void save()}>{busy ? <><LoaderCircle size={15} className="spin" />保存中</> : saved ? <><Check size={15} />已保存</> : '保存设置'}</Button></div>{error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}
       </>}
     </div><aside className="settings-aside"><div className="aside-icon"><ShieldCheck size={19} /></div><h3>选择优先级</h3><p>每个任务的手动指定优先于项目预设与全局预设；未指定字段由 {allocatorName} 补全。</p><div className="priority-stack"><div><span>1</span><b>任务指定</b></div><ArrowDown size={14} /><div><span>2</span><b>项目预设</b></div><ArrowDown size={14} /><div><span>3</span><b>全局预设</b></div><ArrowDown size={14} /><div><span>4</span><b>{allocatorName} 分配</b></div></div><button className="link-button" onClick={() => void onRetry()}><RefreshCw size={13} />刷新能力状态</button></aside></div>

@@ -2,12 +2,15 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { ModelBinding, ModelConfig, ReasoningEffort } from '../adapters/types.js';
+import type { ExecutionSelection } from '../domain/types.js';
 
 export interface LocalZeroConfig {
   models: ModelConfig[];
   bindings: ModelBinding[];
   allocator: { kind?: 'codex' | 'api'; modelId: string | null; reasoningEffort: ReasoningEffort | null; api?: { baseUrl: string; model: string; keyEnv: string } };
   reviewer: { modelId: string | null; reasoningEffort: ReasoningEffort | null };
+  /** Optional for compatibility with config files written before execution presets existed. */
+  executionDefaults?: { global: ExecutionSelection | null; projects: Record<string, ExecutionSelection> };
   verifications: Record<string, { verifiedAt: string; cliVersion: string; requestedModel: string; exitCode: 0; level: 'selector_only' | 'event_confirmed'; actualModel?: string; profile?: string; configDir?: string; mode?: string; reasoningEfforts: ReasoningEffort[]; effortEvidence?: Record<string, { verifiedAt: string; cliVersion: string; exitCode: 0 }> }>;
   /** Environment variable name -> secret reference; never returned by HTTP APIs. */
   secretRefs?: Record<string, string>;
@@ -36,6 +39,7 @@ const EMPTY: LocalZeroConfig = {
   bindings: [],
   allocator: { modelId: null, reasoningEffort: null },
   reviewer: { modelId: null, reasoningEffort: null },
+  executionDefaults: { global: null, projects: {} },
   verifications: {},
 };
 
@@ -52,6 +56,7 @@ export class ConfigStore {
           modelId: parsed.allocator?.modelId ?? null, reasoningEffort: parsed.allocator?.reasoningEffort ?? null,
           ...(parsed.allocator?.api ? { api: parsed.allocator.api } : {}) },
         reviewer: { modelId: parsed.reviewer?.modelId ?? null, reasoningEffort: parsed.reviewer?.reasoningEffort ?? null },
+        ...(parsed.executionDefaults && typeof parsed.executionDefaults === 'object' ? { executionDefaults: normalizeExecutionDefaults(parsed.executionDefaults) } : {}),
         verifications: parsed.verifications ?? {},
         ...(parsed.secretRefs ? { secretRefs: parsed.secretRefs } : {}),
       };
@@ -68,6 +73,7 @@ export class ConfigStore {
       ...previous,
       allocator: value.allocator,
       reviewer: value.reviewer,
+      ...(value.executionDefaults !== undefined ? { executionDefaults: value.executionDefaults } : {}),
     };
     await this.persist(next);
   }
@@ -246,6 +252,17 @@ export class ConfigStore {
       throw error;
     }
   }
+}
+
+function normalizeExecutionDefaults(value: NonNullable<LocalZeroConfig['executionDefaults']>): NonNullable<LocalZeroConfig['executionDefaults']> {
+  const input = value as unknown as Record<string, unknown>;
+  const rawProjects = input.projects;
+  const projects = rawProjects && typeof rawProjects === 'object' && !Array.isArray(rawProjects)
+    ? rawProjects as Record<string, ExecutionSelection>
+    : {};
+  const rawGlobal = input.global;
+  const global = rawGlobal && typeof rawGlobal === 'object' && !Array.isArray(rawGlobal) ? rawGlobal as ExecutionSelection : null;
+  return { global, projects };
 }
 
 function isSafeDshProfile(profile: string): boolean {

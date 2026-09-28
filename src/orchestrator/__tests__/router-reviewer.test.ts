@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { HarnessAdapter, HarnessCapabilities, RunRequest, RunResult, TaskRecord } from '../../domain/types.js';
 import { TaskRouter, type RouteCandidate } from '../router.js';
+import { executionDefaultsForTask } from '../../server/main.js';
 import { parseReviewOutput, TaskReviewer } from '../reviewer.js';
 import { createTrustedCodexCwd, isWithin } from '../trusted-codex-cwd.js';
 import type { WorktreeInfo } from '../../core/git-worktree.js';
@@ -116,9 +117,12 @@ test('router applies task over project over global and still calls Codex when al
     const codex = new FakeCodex();
     codex.response.final = routeResponse({ reasoningEffort: 'high' });
     const router = new TaskRouter({ codex, coordinatorModel: 'coord-model', cwd: workspace, artifactDir });
+    const defaults = executionDefaultsForTask({
+      executionDefaults: { global: { reasoningEffort: 'high' }, projects: { [dir]: { harness: 'dsh', model: 'glm' } } },
+    }, dir);
     const result = await router.decide({
       taskId: 'task-2', submission: { repoPath: dir, baseRef: 'main', prompt: 'Debug', selection: { harness: 'zcode' } },
-      projectSelection: { harness: 'dsh', model: 'glm' }, globalSelection: { reasoningEffort: 'high' },
+      ...defaults,
       candidates, repositorySummary: 'repo',
     });
     assert.equal(codex.calls.length, 1);

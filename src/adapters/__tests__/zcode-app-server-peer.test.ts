@@ -189,6 +189,17 @@ rl.on('line', raw => {
     respond(id, { ok: true });
     return;
   }
+  if (method === 'test/pending-before-delayed-reverse') {
+    const interaction = {
+      interactionId: params.requestId, kind: 'permission', anchorRowId: null, createdAt: 2,
+      payload: { kind: 'permission', toolCallId: params.toolCallId, toolName: params.toolName,
+        summary: 'Write file', detail: {}, options: [] },
+    };
+    write({ method: 'v4/conversation/frame', params: deltaWire('sub-one', [interaction]) });
+    respond(id, { ok: true });
+    setTimeout(() => write({ id: 'reverse-permission', method: 'interaction/requestPermission', params }), 60);
+    return;
+  }
   if (method === 'test/reverse-user-input') {
     write({ id: 'reverse-user-input', method: 'interaction/requestUserInput', params: {
       sessionId: 'session-one', requestId: 'user-input-one',
@@ -712,6 +723,72 @@ test('one-shot permission waits for the matching v4 interaction to clear before 
     assert.equal(await peer.consumeApprovedPermissionEvent?.('session-one', { type: 'permission.requested' }, {
       requestId: 'unapproved-request', toolCallId: request.toolCallId, toolName: request.toolName,
     }), false);
+  }, undefined, 'existing-desktop');
+});
+
+test('pending snapshot and permission event can arrive before the matching reverse request', async () => {
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    const request = permissionRequest({ input: { file_path: join(dirs.worktree, 'ordered-late.txt'), content: 'safe' } });
+    await debugRequest(peer, 'test/pending-before-delayed-reverse', request);
+
+    const [pending, eventConsumed] = await Promise.all([
+      peer.readPendingInteractions('session-one'),
+      peer.consumeApprovedPermissionEvent?.('session-one', { type: 'permission.requested' }, {
+        requestId: request.requestId, toolCallId: request.toolCallId, toolName: request.toolName,
+      }),
+    ]);
+
+    assert.deepEqual(pending, []);
+    assert.equal(eventConsumed, true);
+    const result = await debugRequest(peer, 'test/reverse-response') as { response?: Record<string, unknown> };
+    assert.deepEqual(result.response, { decision: 'allow', reason: 'Approved once' });
+  }, undefined, 'existing-desktop');
+});
+
+test('permission event arriving before pending snapshot and reverse request waits for exact approval', async () => {
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    const request = permissionRequest({ input: { file_path: join(dirs.worktree, 'event-first.txt'), content: 'safe' } });
+    const eventConsumed = peer.consumeApprovedPermissionEvent?.('session-one', { type: 'permission.requested' }, {
+      requestId: request.requestId, toolCallId: request.toolCallId, toolName: request.toolName,
+    });
+    assert.ok(eventConsumed);
+
+    await debugRequest(peer, 'test/pending-before-delayed-reverse', request);
+    assert.equal(await eventConsumed, true);
+    assert.deepEqual(await peer.readPendingInteractions('session-one'), []);
+    const result = await debugRequest(peer, 'test/reverse-response') as { response?: Record<string, unknown> };
+    assert.deepEqual(result.response, { decision: 'allow', reason: 'Approved once' });
+  }, undefined, 'existing-desktop');
+});
+
+test('early permission event does not unblock a high-risk request without an eligible reverse RPC', async () => {
+  await withFakeServer(async (peer, dirs) => {
+    await createSession(peer);
+    await peer.readPendingInteractions('session-one');
+    const request = permissionRequest({
+      riskLevel: 'high',
+      input: { file_path: join(dirs.worktree, 'must-stay-pending.txt'), content: 'safe' },
+    });
+    const eventConsumed = peer.consumeApprovedPermissionEvent?.('session-one', { type: 'permission.requested' }, {
+      requestId: request.requestId, toolCallId: request.toolCallId, toolName: request.toolName,
+    });
+    assert.ok(eventConsumed);
+
+    await debugRequest(peer, 'test/pending-before-delayed-reverse', request);
+    const [pending, consumed] = await Promise.all([
+      peer.readPendingInteractions('session-one'),
+      eventConsumed,
+    ]);
+
+    assert.equal(consumed, false);
+    assert.ok(Array.isArray(pending));
+    assert.equal(pending.length, 1);
+    const result = await debugRequest(peer, 'test/reverse-response') as { response?: Record<string, unknown> };
+    assert.equal(result.response?.decision, 'deny');
   }, undefined, 'existing-desktop');
 });
 

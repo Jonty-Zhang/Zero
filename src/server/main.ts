@@ -27,7 +27,7 @@ import { QuotaLimitError } from '../core/quota.js';
 import { TaskWorker } from '../orchestrator/worker.js';
 import { ConfigStore } from './config-store.js';
 import { createCodexAdapter, createDefaultAdapters, createZeroServer } from './server.js';
-import type { HarnessAdapter, TaskSequenceRecord, TaskStatus } from '../domain/types.js';
+import type { ExecutionSelection, HarnessAdapter, TaskSequenceRecord, TaskStatus } from '../domain/types.js';
 import { DshAdapter } from '../adapters/dsh.js';
 import { ZCodeAdapter } from '../adapters/zcode.js';
 
@@ -89,6 +89,14 @@ export function startupGenerationAttestation(dataDir: string, env: NodeJS.Proces
   return { id: generation!, lockId: lockId!, predecessorDrained: true, evidenceKind: 'guardian_startup_verified' };
 }
 
+/** Presets are read from disk for each route so settings changes apply to the next queued task. */
+export function executionDefaultsForTask(config: Pick<Awaited<ReturnType<ConfigStore['read']>>, 'executionDefaults'>, repoPath: string): { globalSelection?: ExecutionSelection; projectSelection?: ExecutionSelection } {
+  return {
+    ...(config.executionDefaults?.global ? { globalSelection: config.executionDefaults.global } : {}),
+    ...(config.executionDefaults?.projects[repoPath] ? { projectSelection: config.executionDefaults.projects[repoPath] } : {}),
+  };
+}
+
 export async function startZeroServer(options: { host?: string; port?: number } = {}) {
   const host = options.host ?? process.env.ZERO_HOST ?? '127.0.0.1';
   const port = options.port ?? Number(process.env.ZERO_PORT ?? 4179);
@@ -129,18 +137,21 @@ export async function startZeroServer(options: { host?: string; port?: number } 
   const router = {
     route: async (task: Parameters<TaskRouter['route']>[0], context: Parameters<TaskRouter['route']>[1]) => {
       const cfg = await config.read();
+      const executionDefaults = executionDefaultsForTask(cfg, task.repoPath);
       if (cfg.allocator.kind === 'api') {
         const api = cfg.allocator.api;
         if (!api) throw new Error('API coordinator configuration is incomplete; configure allocator.api in Zero settings');
         const coordinator = new OpenAICompatibleCoordinator(api);
         return new TaskRouter({ codex, api: coordinator, coordinatorKind: 'api', coordinatorModel: api.model,
-          cwd: context.cwd, artifactDir: resolve(dataRoot, 'artifacts', task.id, 'router'), getCandidates: candidateProvider }).route(task, context);
+          cwd: context.cwd, artifactDir: resolve(dataRoot, 'artifacts', task.id, 'router'), getCandidates: candidateProvider,
+          ...executionDefaults }).route(task, context);
       }
       const caps = await codex.probe();
       const model = cfg.allocator.modelId && caps.models.includes(cfg.allocator.modelId) ? cfg.allocator.modelId : caps.models[0];
       if (!model) throw new Error('No verified Codex model is available for allocation; run `zero verify-binding codex <model-id>` first');
       return new TaskRouter({ codex, coordinatorModel: model, coordinatorReasoningEffort: cfg.allocator.reasoningEffort ?? undefined,
-        cwd: context.cwd, artifactDir: resolve(dataRoot, 'artifacts', task.id, 'router'), getCandidates: candidateProvider }).route(task, context);
+        cwd: context.cwd, artifactDir: resolve(dataRoot, 'artifacts', task.id, 'router'), getCandidates: candidateProvider,
+        ...executionDefaults }).route(task, context);
     },
   };
   const reviewer = {

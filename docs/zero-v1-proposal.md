@@ -4,6 +4,8 @@
 
 核查日期：2026-09-24。本文区分已由项目官方仓库核实的能力与 Zero 的设计判断。上游功能、CLI 参数及许可证应在实施时锁定具体版本再复核。
 
+**实施状态更新（2026-09-28）：**安装版已通过真实 Codex 任务、两步 Goal、一次单阶段执行崩溃恢复和一项 ZCode GLM Flash API 任务。GLM Flash、DeepSeek Flash、DeepSeek Pro 的现有桌面模型已建立本机 nonce 验证绑定，证据为 `selector_only`。首次安装版 ZCode 任务在写入后失败，原因尚未定位；同提示词重试成功，不能把成功泛化为偶发问题已修复。Start Plan、自然额度恢复和 DSH 真实模型执行仍未验证。最新实施与验收事实以 [README](../README.zh-CN.md)和[真实任务验证记录](live-validation.md)为准，下面保留带日期的研究及早期设计背景。
+
 **当前决策（2026-09-26）：**主分配器可切换为 Codex 订阅或兼容 OpenAI API 的 HTTPS 协调器。两者只负责从 Zero 已验证的执行绑定中选择路由，不实现任务；Zero 的执行器和状态机负责实际工作，独立 Reviewer 仍固定使用 Codex。API 密钥只通过 Zero 服务进程环境提供，配置中的 `keyEnv` 是环境变量名称。下文中明确标注为 Codex 分配器的部分保留早期 Codex 优先方案的分析；当前路由契约见[主分配与审核契约](route-review-contract.md)。
 
 **接入路径更新：**用户现有 ZCode 桌面配置位于 ZCode 自己的 v2 数据根，并已配置 GLM 和 DeepSeek。早期设计的 Zero 独立 `.zcode/cli/config.json` 绑定仅是可选隔离 CLI 路径，不能代表这台电脑正在使用的桌面模型配置。当前优先研究 ZCode `app-server` 的会话级模型选择；[共享工作区与跨 Harness 接力设计](workspace-handoff-design.md)记录新的实施边界。Zero 不移动或改写现有 ZCode 配置/凭据。
@@ -92,7 +94,7 @@ normalize(raw_output) -> RunResult
 
 - Codex：采用官方 [OpenAI Docs 的 `codex exec` 无交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)，用 JSONL 事件及显式模型与 sandbox 配置；review 阶段只读。
 - DSH：已核实 `@deepseek-ai/dsh@0.1.5-rc.2` 的 Windows headless CLI 形式为 `dsh --profile <name> <task...>`；headless 模板帮助展示 task 为位置参数，未发现 stdin 输入契约，也不支持 `--json`。stdout 是最终文本，reasoning 输出到 stderr，因此 Adapter 不把 stdout 当作 JSONL。实测 `--dump-config` 中 `agent-default-model` 为 `provider: deepseek-official`、`model: deepseek-flash`。Zero 将 `DSH_HOME` 固定到自己的数据目录；probe 和执行前均比对命名 profile 的有效 provider/model 与已验证绑定，并按 CLI 版本固定。`zero verify-binding dsh <model-id> --profile <name>` 会在隔离目录进行最小真实调用，成功后才登记绑定。DSH 不会因 CLI 可运行就被 Router 选中；当前本机尚未通过 DSH 真实模型调用，也没有可路由的 DSH 绑定。Windows npm 安装的 `.cmd` 启动器不能直接用于无 shell 子进程；可用 `ZERO_DSH_ENTRY` 指向绝对 JavaScript 入口，由 Node 启动。
-- ZCode：当前已发布的 headless adapter 使用 Zero 独立数据根和 `.zcode/cli/config.json`，属于可选隔离模式，不能直接接入用户在 ZCode 桌面界面配置的 GLM/DeepSeek。面向这台电脑的新接入方向是官方 `app-server --stdio` 协议：创建独立任务会话时传入准确的 `providerId/modelId`，工作目录指向任务 worktree，并按该会话选择模型。只读源码核对表明选择会写会话局部状态，不修改全局模型默认配置；仍需真实协议测试确认。`thoughtLevel` 有协议字段，但每个模型支持哪些等级仍需验证，未经验证不得显示为已生效的思考强度。不得复制、移动、修改用户现有 ZCode 配置或凭据。
+- ZCode：现有桌面接入使用官方 `app-server --stdio`，每条 v4 `sendText` 固定准确的 `providerId/modelId/options.reasoningLevel`，并传入 `modelExecution.selectionScope: execution`；工作目录指向任务 worktree。GLM Flash、DeepSeek Flash、DeepSeek Pro 已通过 nonce selector 验证，安装版 GLM Flash 已完成执行、检查与独立 Codex 审核。仅展示实际验证过的思考强度；成功未报告服务端实际模型身份时标为 `selector_only`。Zero 独立 `.zcode/cli/config.json` 仍是可选隔离 CLI 模式，不代表桌面配置。不得复制、移动、修改用户现有 ZCode 配置或凭据。
 
 ## Harness 与 Model 解耦
 
@@ -115,7 +117,7 @@ bindings:
   - {harness: zcode, model: deepseek_primary, selector: session_protocol}
 ```
 
-`models` 记录模型能力、上下文上限、成本/配额元数据（若已核实）；`bindings` 才代表 Harness **实际可调用** 某模型。每个 binding 需要 `probe` 证明 CLI 版本、认证、模型选择和最小调用通过。无法确认 profile 选择的模型时将其置为 `unavailable`；若 CLI 在成功调用中不报告实际模型，报告以 `selector_only` 标明证据范围。若 DSH/ZCode 的配置只能修改全局状态，则先做运行级隔离或串行化，不允许并发任务互相改写默认模型。DSH 和 ZCode 当前的 per-run reasoning effort 不可验证，因此不展示为可选能力。配置快照及有效模型写入报告。
+`models` 记录模型能力、上下文上限、成本/配额元数据（若已核实）；`bindings` 才代表 Harness **实际可调用** 某模型。每个 binding 需要 `probe` 证明 CLI 版本、认证、模型选择和最小调用通过。无法确认 profile 选择的模型时将其置为 `unavailable`；若 CLI 在成功调用中不报告实际模型，报告以 `selector_only` 标明证据范围。若 DSH/ZCode 的配置只能修改全局状态，则先做运行级隔离或串行化，不允许并发任务互相改写默认模型。思考强度按绑定逐项验证；现有桌面 ZCode 只展示已验证的档位，未验证的 DSH 档位不展示。配置快照及有效模型写入报告。
 
 ## 主分配器与双层路由
 
@@ -137,24 +139,24 @@ bindings:
 
 ## 实施顺序与验收门槛
 
-1. **环境与仓库**：建立 Zero 的 Git 仓库与公开 GitHub 仓库，Zero 原创代码采用 Apache-2.0；建立忽略规则、密钥扫描、CI。逐个验证 Codex、DSH、ZCode 在目标机器上的 CLI 版本、认证、模型绑定和无头任务。2026-09-24 已发布公开仓库、配置隐私检查和 CI；Codex 已通过一次真实的分配→执行→检查→审核→归档任务。DSH 已隔离安装并完成无模型请求的 CLI 版本、headless 帮助及配置检查；它仍缺少认证和模型调用证据。ZCode 已从官方源码隔离构建 v0.16.9 并通过版本/帮助探测；2026-09-27，现有桌面 CLI 的无模型诊断和 `list-zcode-desktop-models` 命令在空会话中返回了 4 组提供方/模型标识，但没有建立绑定或执行模型调用，不能据此启用路由。Windows 未签名安装包已在目标电脑安装并手动启动；真实 Codex 订阅绑定检查通过进程级系统代理成功，但由已安装程序完成完整任务尚未验证：嵌套 Codex CLI 的额度限制和审批状态处理仍有歧义。Windows 开机或登录自启不属于当前要求。
+1. **环境与仓库**：建立 Zero 的 Git 仓库与公开 GitHub 仓库，Zero 原创代码采用 Apache-2.0；建立忽略规则、密钥扫描、CI。逐个验证 Codex、DSH、ZCode 在目标机器上的 CLI 版本、认证、模型绑定和无头任务。公开仓库、隐私检查和 CI 已建立。安装版 Codex 已完成真实任务与 Goal 流程；现有桌面 ZCode 的三组 API selector 已通过 nonce 验证，GLM Flash 也完成安装版执行→检查→独立 Codex 审核→归档任务。DSH 已隔离安装并完成无模型请求的 CLI 版本、headless 帮助及配置检查，但缺少真实模型绑定。Windows 开机或登录自启不属于当前要求。具体证据与失败记录见[真实任务验证记录](live-validation.md)。
 2. **状态核心**：SQLite schema、task/event/attempt、原子领取、lease/恢复、HTTP API 与 CLI submit/status/cancel；用假 Adapter 证明掉电重启后不丢任务、不重复 DONE。
 3. **工作区与测试**：worktree 创建/保留/清理、范围检查、测试执行器、进程超时与日志归档；证明并行任务互不影响。
 4. **三个 Harness Adapter**：先实现 Codex，再接 DSH 和 ZCode；每个 binding 通过真实冒烟测试才进入 Router 候选。原始事件与标准结果均存档。
 5. **主分配器与 Reviewer**：实现候选过滤、Codex 结构化分配、可选 API 协调器、用户模型覆盖、route 快照、Codex 独立只读 review、结构化 verdict。验证 reviewer 不会写工作区。
 6. **返工闭环**：测试或审核失败后生成 revision brief；达到 `max_revisions` 准确 FAILED；通过后重跑门禁再 DONE。
-7. **应用界面与手动常驻部署**：同一服务托管 React 界面，提供提交、状态看板、任务详情、日志与报告下载；提供单一安装体验和用户手动启动的前台 launcher，由 guardian 监督服务并在异常退出后退避重启。Zero 在常开 Windows 电脑上由用户按需启动；不注册开机触发器或 Task Scheduler 任务，也不请求账户密码。目标电脑上的安装、手动启动和真实 Codex 订阅绑定检查已验证；完成从已安装程序启动的真实仓库任务、独立审核并归档到 `done` 仍是验收项，当前受嵌套 Codex CLI 的额度限制/审批状态处理歧义阻碍。目标机故障恢复仍待验证；发布状态见[Windows 应用打包](windows-app-packaging.md)和[实时验证记录](live-validation.md)。
+7. **应用界面与手动常驻部署**：同一服务托管 React 界面，提供提交、状态看板、任务详情、日志与报告下载；提供单一安装体验和用户手动启动的前台 launcher，由 guardian 监督服务并在异常退出后退避重启。Zero 在常开 Windows 电脑上由用户按需启动；不注册开机触发器或 Task Scheduler 任务，也不请求账户密码。目标电脑已通过安装清单、手动启动、真实 Codex 任务与 Goal、一项 ZCode API 任务，以及单阶段执行崩溃恢复。自然额度恢复和其他崩溃边界仍需验证；发布状态见[Windows 应用打包](windows-app-packaging.md)和[真实任务验证记录](live-validation.md)。
 
 每个阶段由主负责人定义验收标准和审查结果；具体实现及部分验证交给 `gpt-6-luna high` 子 agent。主负责人保留架构、底座选择、集成审查和发布判断。
 
 ### v1 放行用例
 
 - 手动指定 Harness、模型、思考强度时，主分配器不能改写这三项；只填其中一项时，它只补全其余字段，并且 Zero 校验组合确实可运行。
-- 三项都留空时，主分配器给出结构化选择与理由；无健康 binding、无有效模型或输出无效时任务失败并留下诊断，不会静默使用 CLI 默认值。
+- 每个字段按任务指定、项目预设、全局预设依次继承，剩余字段由主分配器给出结构化选择与理由。预设保存在 Zero 自己的配置中，按规范仓库路径匹配；无健康 binding、组合冲突或输出无效时保留诊断，不静默替换用户选择。
 - 实施为 Codex、DSH 或 ZCode 时，审核始终启动**另一个只读 Codex 会话**；测试红灯、审核未完成或 verdict 为 `changes_requested` 时不能 DONE。
-- `max_revisions=0` 时首次失败直接 FAILED；`max_revisions=2` 时最多执行三轮。断电或 worker 重启不会产生重复提交、重复报告或丢失任务。
+- `max_revisions=0` 时首次内容返工要求直接 FAILED；`max_revisions=2` 时最多执行三轮。提交与报告采用持久操作记录和内容核对；只有确认旧进程已终止且恢复证据一致才自动续接。无法证明断电后的副作用状态时保留工作区并要求检查，不承诺任意断电下自动重放。
 - 同一仓库两项任务同时运行时各自 worktree 与模型配置互不覆盖；任务成功后可从报告定位结果分支、commit、diff、测试和审核证据。
 
 ## 可推翻本方案的观察
 
-最关键的是**模型选择能否按任务被强制执行**：如果 ZCode 会话协议或 DSH profile 无法在本机稳定运行指定模型，对应 binding 必须停用，不能通过修改用户桌面全局默认值伪装成双层路由。若目标节点改为稳定 Linux/WSL 环境，且 CAO 的 DSH/ZCode Provider 实测能提供可靠完成事件、隔离工作树和输出，重新评估将 CAO 作为 Zero 的运行时后端。当前没有对这些付费模型执行实机任务，质量排序保持待测。
+最关键的是**模型选择能否按任务被强制执行**：如果 ZCode 会话协议或 DSH profile 无法在本机稳定运行指定模型，对应 binding 必须停用，不能通过修改用户桌面全局默认值伪装成双层路由。若目标节点改为稳定 Linux/WSL 环境，且 CAO 的 DSH/ZCode Provider 实测能提供可靠完成事件、隔离工作树和输出，重新评估将 CAO 作为 Zero 的运行时后端。当前真实调用只证明已记录的 selector 和验收任务通过，不能证明服务端实际模型身份或品牌质量排序。
