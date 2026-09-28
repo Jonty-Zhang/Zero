@@ -399,6 +399,7 @@ test('session creation requires confirmed auto-resolution disablement before sen
       commandId: 'input-one', clientId: 'client-one', sessionId: 'session-one', type: 'sendText',
       payload: {
         text: 'No model call in this fake peer test', requestedDelivery: 'startNow',
+        toolDisallowlist: ['Bash'],
         modelSelection: { providerId: 'account:zai-start-plan', modelId: 'GLM-5.3-Flash' },
         modelExecution: {
           selectionScope: 'execution', memoryExtraction: 'skip',
@@ -410,10 +411,20 @@ test('session creation requires confirmed auto-resolution disablement before sen
     assert.equal(await peer.request('v4/command', sendParams).then(() => 'sent'), 'sent');
     await assert.rejects(peer.request('v4/command', {
       ...sendParams,
+      commandId: 'input-no-disallowlist',
+      payload: { ...sendParams.payload, toolDisallowlist: undefined },
+    }), /execution-scoped model/);
+    await assert.rejects(peer.request('v4/command', {
+      ...sendParams,
+      commandId: 'input-other-disallowlist',
+      payload: { ...sendParams.payload, toolDisallowlist: ['Write'] },
+    }), /execution-scoped model/);
+    await assert.rejects(peer.request('v4/command', {
+      ...sendParams,
       commandId: 'input-two',
       payload: { ...sendParams.payload, modelExecution: { selectionScope: 'turn' } },
     }), /execution-scoped model/);
-  });
+  }, undefined, 'existing-desktop');
 
   await withFakeServer(async peer => {
     await debugRequest(peer, 'test/set-mode', { mode: 'pref-bad' });

@@ -315,7 +315,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
         throw new Error('ZCode command refused because it does not target an interaction-gated task session');
       }
       if (params.type === 'sendText') {
-        if (!hasSafeSendTextExecution(params.payload)) {
+        if (!hasSafeSendTextExecution(params.payload, this.profileMode === 'existing-desktop')) {
           throw new Error('ZCode sendText refused without execution-scoped model, memory, and subagent safeguards');
         }
       } else if (params.type === 'stop') {
@@ -986,10 +986,13 @@ function validatePendingInteractions(values: unknown[]): void {
   }
 }
 
-function hasSafeSendTextExecution(value: unknown): boolean {
+function hasSafeSendTextExecution(value: unknown, requireBashDisallowlist: boolean): boolean {
   if (!isRecord(value)) return false;
-  const payloadKeys = ['text', 'requestedDelivery', 'modelSelection', 'modelExecution'];
+  const payloadKeys = ['text', 'requestedDelivery', 'modelSelection', 'modelExecution', 'toolDisallowlist'];
   if (Object.keys(value).some(key => !payloadKeys.includes(key))) return false;
+  if (requireBashDisallowlist) {
+    if (!Array.isArray(value.toolDisallowlist) || value.toolDisallowlist.length !== 1 || value.toolDisallowlist[0] !== 'Bash') return false;
+  } else if (Object.hasOwn(value, 'toolDisallowlist')) return false;
   if (typeof value.text !== 'string' || !value.text.trim() || value.requestedDelivery !== 'startNow') return false;
   const selection = isRecord(value.modelSelection) ? value.modelSelection : undefined;
   if (!selection || Object.keys(selection).some(key => !['providerId', 'modelId', 'options'].includes(key))) return false;

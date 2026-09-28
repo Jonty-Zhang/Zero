@@ -87,7 +87,7 @@ test('protocol bridge pins the requested provider/model and waits for the matchi
     }
     return originalRequest(method, params);
   };
-  const result = await runZCodeProtocolSession(fake.peer, request('task-1'));
+  const result = await runZCodeProtocolSession(fake.peer, request('task-1', { disableBash: true }));
 
   assert.equal(result.response, 'done');
   assert.deepEqual(result.requestedModel, request('task-1').model);
@@ -107,9 +107,29 @@ test('protocol bridge pins the requested provider/model and waits for the matchi
     memoryExtraction: 'skip',
     subagents: { foregroundModel: 'submission', background: 'deny' },
   });
+  assert.deepEqual((send.params.payload as Record<string, unknown>).toolDisallowlist, ['Bash']);
   assert.equal(fake.calls[2]?.params.afterSeq, 0);
   assert.equal(fake.calls[3]?.params.afterSeq, 1);
   assert.equal(fake.isClosed(), true);
+});
+
+test('generic protocol sessions omit the desktop Bash disallowlist unless requested', async () => {
+  const fake = fakePeer({ eventsByPoll: [
+    [{ seq: 1, type: 'turn.started', turnId: 'turn-current', payload: { inputId: '$command-id', foregroundExecutionId: 'exec-current' } }],
+    [{ seq: 2, type: 'turn.completed', turnId: 'turn-current', payload: { inputId: '$command-id', resultType: 'success', response: 'done' } }],
+  ] });
+  const originalRequest = fake.peer.request.bind(fake.peer);
+  fake.peer.request = async (method, params) => {
+    if (method === 'session/events') {
+      const response = await originalRequest(method, params) as { events: Array<Record<string, unknown>> };
+      const inputId = fake.calls.find(call => call.method === 'v4/command' && call.params.type === 'sendText')?.params.commandId;
+      return { events: response.events.map(event => ({ ...event, payload: { ...(event.payload as object), inputId } })) };
+    }
+    return originalRequest(method, params);
+  };
+  await runZCodeProtocolSession(fake.peer, request('generic-no-bash-policy'));
+  const send = fake.calls.find(call => call.method === 'v4/command')!;
+  assert.equal(Object.hasOwn(send.params.payload as Record<string, unknown>, 'toolDisallowlist'), false);
 });
 
 test('sendText rejects non-accepted acknowledgements without polling', async () => {

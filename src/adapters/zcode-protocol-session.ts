@@ -33,6 +33,8 @@ export interface ZCodeProtocolSessionRequest {
   timeoutMs?: number;
   pollIntervalMs?: number;
   signal?: AbortSignal;
+  /** Hide Bash from this turn's model tool catalog for existing-desktop tasks. */
+  disableBash?: boolean;
 }
 
 export interface ZCodeProtocolSessionResult {
@@ -170,6 +172,9 @@ export async function runZCodeProtocolSession(
       payload: {
         text: request.prompt,
         requestedDelivery: 'startNow',
+        // Keep Bash out of the provider-visible tools for this execution when
+        // requested by the existing-desktop task runner.
+        ...(request.disableBash ? { toolDisallowlist: ['Bash'] } : {}),
         modelSelection: selection,
         // 0.16.9 execution scope avoids changing the persisted session selection.
         // memoryExtraction: skip disables Project Memory extraction only; it is

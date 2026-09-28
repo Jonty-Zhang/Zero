@@ -287,6 +287,7 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
         prompt: request.prompt,
         timeoutMs,
         signal: controller.signal,
+        disableBash: true,
       });
       return {
         status: 'completed',

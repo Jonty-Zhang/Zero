@@ -14,6 +14,8 @@
 
 上述权限门不等于操作系统沙盒。ZCode 子进程仍以启动 Zero 的用户身份运行；worktree 和单次写入路径核验不能证明只读工具无法访问该用户可读的其他文件。对不可信仓库和高敏感数据，后续还需进程级隔离设计和验证。
 
+现有桌面任务及 nonce 验证还在每条 `sendText` 中传入 `toolDisallowlist: ['Bash']`，使模型看到的工具与已有的不批准 Bash 策略一致；peer 不接受缺失或替换该列表的桌面执行请求。上游 v4 命令将该列表传入运行时，由工具目录过滤器按本轮生效，不改桌面配置。通用会话和隔离 CLI 路径不改变原有行为。Zero 的检查命令仍由独立 Test Runner 执行。
+
 0.16.9 上游源码（提交 `328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f`）的 [permission-flow](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/executor/permission-flow.ts#L160) 先等待权限事件发出，再调用 broker；[interaction-broker](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/interaction-broker.ts#L59) 随后才发送反向权限 RPC。Zero 原先在请求记录尚未到达时立即拒绝事件或待处理快照，存在可复现的时序问题。当前 peer 在原有两秒上限内等待完全匹配的 Edit/Write 请求；事件和快照本身不构成批准，仍须通过反向请求的风险、路径和策略核对，且匹配的 pending 状态消失。回归测试覆盖事件先到、快照先到和延迟高风险拒绝。此前真实任务未保存足够诊断，无法据此追认它们的具体失败原因。
 
 接入验证与后续目录诊断分开：
