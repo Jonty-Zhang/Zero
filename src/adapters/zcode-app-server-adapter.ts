@@ -9,6 +9,16 @@ import type { ModelBinding, ModelConfig, ReasoningEffort } from './types.js';
 import { runProcess } from './process-runner.js';
 
 export type ExistingDesktopBinding = Extract<ModelBinding, { harness: 'zcode'; selector: 'app_server_existing_desktop' }>;
+export type ZCodeAppServerFailureCategory =
+  | 'permission_resolution'
+  | 'interaction_blocked'
+  | 'peer_rpc'
+  | 'peer_transport'
+  | 'session_timeout'
+  | 'peer_shutdown'
+  | 'protocol_state'
+  | 'provider_quota'
+  | 'other';
 
 export interface ZCodeAppServerAdapterConfig {
   /** Absolute JavaScript CLI entry used by both the help probe and app-server. */
@@ -301,12 +311,20 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
           requestedModel: binding.model.modelId,
           harnessVersion: probe.version,
           quota: error.quota,
+          metadata: { failureCategory: 'provider_quota' satisfies ZCodeAppServerFailureCategory },
         });
       }
+      const failureCategory: ZCodeAppServerFailureCategory = timedOut
+        ? 'session_timeout'
+        : classifyZCodeAppServerFailure(error);
       return result(cancelled ? 'cancelled' : timedOut ? 'timed_out' : 'failed',
-        cancelled ? 'ZCode app-server run was cancelled' : timedOut ? 'ZCode app-server run timed out' : 'ZCode app-server execution failed; protocol logs were not retained',
+        cancelled ? 'ZCode app-server run was cancelled' : timedOut ? 'ZCode app-server run timed out' : `ZCode app-server execution failed (${failureCategory}); protocol logs were not retained`,
         started,
-        { requestedModel: binding.model.modelId, harnessVersion: probe.version });
+        {
+          requestedModel: binding.model.modelId,
+          harnessVersion: probe.version,
+          metadata: { failureCategory },
+        });
     } finally {
       clearTimeout(timer);
       this.active.delete(activeKey);
@@ -429,6 +447,36 @@ function boundedText(value: string): string { return value.slice(0, MAX_PROBE_OU
 
 function result(status: RunResult['status'], error: string, started: number, extra: Partial<RunResult> = {}): RunResult {
   return { status, exitCode: null, durationMs: Date.now() - started, error, ...extra };
+}
+
+function classifyZCodeAppServerFailure(error: unknown): ZCodeAppServerFailureCategory {
+  const messages: string[] = [];
+  const errorTypes: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current && typeof current === 'object'; depth++) {
+    const record = current as Record<string, unknown>;
+    if (typeof record.message === 'string') messages.push(record.message);
+    const constructor = record.constructor;
+    if (constructor && typeof constructor === 'function' && typeof constructor.name === 'string') errorTypes.push(constructor.name);
+    current = record.cause;
+  }
+  if (errorTypes.includes('ZCodeAppServerRpcError')) return 'peer_rpc';
+  if (errorTypes.includes('ZCodeAppServerTransportError')) return 'peer_transport';
+  if (messages.some(message => message === 'ZCode approved permission did not clear from v4 interaction state before timeout' ||
+    message === 'ZCode approved permission event did not resolve in v4 interaction state before timeout')) return 'permission_resolution';
+  if (messages.some(isUnattendedInteractionBlocker)) return 'interaction_blocked';
+  if (messages.some(message => message === 'ZCode app-server process exit could not be confirmed; isolate the task and do not continue' ||
+    message === 'ZCode app-server process tree termination failed')) return 'peer_shutdown';
+  if (messages.some(message => message === 'ZCode app-server run timed out' ||
+    /^ZCode protocol session timed out after \d+ms$/.test(message))) return 'session_timeout';
+  if (messages.some(message => message === 'ZCode v4 conversation snapshot has no pendingInteractions state' ||
+    message === 'ZCode session/events returned an invalid events field' ||
+    message === 'ZCode protocol response must be an object')) return 'protocol_state';
+  return 'other';
+}
+
+function isUnattendedInteractionBlocker(message: string): boolean {
+  return /^ZCode (?:permission\.requested|userInput\.requested|interaction\.requested)(?: \([^()\r\n]{1,80}\))? blocked unattended execution; no interaction was auto-approved$/.test(message);
 }
 
 function isTimeoutSignal(signal: AbortSignal): boolean {

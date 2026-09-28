@@ -49,7 +49,7 @@ function probeCommand(version = '0.16.9', help = 'Usage: zcode [options]\n  app-
   return { calls, run };
 }
 
-function fakePeer(options: { blockAfterStart?: boolean; turnFailure?: unknown; closeError?: Error } = {}) {
+function fakePeer(options: { blockAfterStart?: boolean; turnFailure?: unknown; closeError?: Error; pendingFailure?: Error } = {}) {
   const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
   let closed = false;
   let sendStarted!: () => void;
@@ -90,7 +90,10 @@ function fakePeer(options: { blockAfterStart?: boolean; turnFailure?: unknown; c
       }
       return {};
     },
-    async readPendingInteractions() { return []; },
+    async readPendingInteractions() {
+      if (options.pendingFailure) throw options.pendingFailure;
+      return [];
+    },
     async close() { closed = true; if (options.closeError) throw options.closeError; },
   };
   return { peer, calls, sendObserved, turnObserved, isClosed: () => closed };
@@ -372,14 +375,58 @@ test('quota-like peer close failures and transient turn errors remain ordinary f
   const closeResult = await adapterHarness({ peer: uncertainClose }).adapter.run(request());
   assert.equal(closeResult.status, 'failed');
   assert.equal(closeResult.quota, undefined);
-  assert.equal(closeResult.error, 'ZCode app-server execution failed; protocol logs were not retained');
+  assert.equal(closeResult.error, 'ZCode app-server execution failed (other); protocol logs were not retained');
 
   for (const message of ['authentication failed', 'network connection reset', 'provider rate limit exceeded']) {
     const peer = fakePeer({ turnFailure: { message } });
     const result = await adapterHarness({ peer }).adapter.run(request());
     assert.equal(result.status, 'failed', message);
     assert.equal(result.quota, undefined, message);
-    assert.equal(result.error, 'ZCode app-server execution failed; protocol logs were not retained');
+    assert.equal(result.error, 'ZCode app-server execution failed (other); protocol logs were not retained');
+    assert.equal(result.metadata?.failureCategory, 'other');
+    assert.equal(peer.isClosed(), true);
+  }
+});
+
+test('failed runs expose fixed safe categories without returning protocol or provider text', async () => {
+  const cases = [
+    ['ZCode approved permission did not clear from v4 interaction state before timeout', 'permission_resolution'],
+    ['ZCode permission.requested (Write) blocked unattended execution; no interaction was auto-approved', 'interaction_blocked'],
+    ['CANARY_PROVIDER_TEXT api_key=CANARY_SECRET C:/private/worktree', 'other'],
+  ] as const;
+  for (const [message, failureCategory] of cases) {
+    const peer = fakePeer({ turnFailure: { message } });
+    const result = await adapterHarness({ peer }).adapter.run(request());
+    assert.equal(result.status, 'failed');
+    assert.equal(result.metadata?.failureCategory, failureCategory);
+    assert.equal(result.error, `ZCode app-server execution failed (${failureCategory}); protocol logs were not retained`);
+    assert.equal(JSON.stringify(result).includes(message), false);
+    assert.equal(JSON.stringify(result).includes('CANARY_SECRET'), false);
+    assert.equal(peer.isClosed(), true);
+  }
+});
+
+test('failure categories inspect bounded cause chains while keeping error text private', async () => {
+  class ZCodeAppServerRpcError extends Error {}
+  class ZCodeAppServerTransportError extends Error {}
+  const rpcError = new Error('CANARY outer RPC detail');
+  Object.defineProperty(rpcError, 'cause', { value: new ZCodeAppServerRpcError('private peer detail') });
+  const transportError = new Error('CANARY outer transport detail');
+  Object.defineProperty(transportError, 'cause', { value: new ZCodeAppServerTransportError('private peer detail') });
+  const cases = [
+    [rpcError, 'peer_rpc'],
+    [transportError, 'peer_transport'],
+    [new Error('CANARY wrapper', { cause: new Error('ZCode protocol session timed out after 2000ms') }), 'session_timeout'],
+    [new Error('CANARY wrapper', { cause: new Error('ZCode app-server process tree termination failed') }), 'peer_shutdown'],
+  ] as const;
+  for (const [pendingFailure, failureCategory] of cases) {
+    const peer = fakePeer({ pendingFailure });
+    const result = await adapterHarness({ peer }).adapter.run(request());
+    assert.equal(result.status, 'failed');
+    assert.equal(result.metadata?.failureCategory, failureCategory);
+    assert.equal(result.error, `ZCode app-server execution failed (${failureCategory}); protocol logs were not retained`);
+    assert.equal(JSON.stringify(result).includes('CANARY'), false);
+    assert.equal(JSON.stringify(result).includes('private peer detail'), false);
     assert.equal(peer.isClosed(), true);
   }
 });

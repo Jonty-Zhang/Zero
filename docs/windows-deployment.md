@@ -53,4 +53,4 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "$env:LOCALAPPDATA
 - Zero 只监听本机回环地址；不要通过端口转发或防火墙规则对外开放。
 - Zero 只会在用户手动启动后运行。需要 Zero 工作时，请保持电脑开机且不休眠；Windows 重启后需重新登录并手动启动。
 - Harness 和验证命令以启动 Zero 的 Windows 用户身份运行。Git worktree 不是操作系统安全沙箱；只对可信仓库运行任务。
-- CI 构建的发布目录已在目标电脑的隔离数据目录通过手动启动、健康检查、guardian 证据和启动器退出后的停止验证；目标电脑上的实际安装、真实 Harness 任务和崩溃恢复故障注入仍待验证。
+- 目标电脑已通过安装文件清单核验、手动启动、真实 Codex 任务和 Goal 流程、一次单阶段执行崩溃恢复，以及一项安装版 ZCode GLM Flash API 任务。Start Plan、自然额度恢复和其他崩溃边界仍未验证；一次 ZCode 写入后的失败原因尚未定位。详见[真实任务验证记录](live-validation.md)。
