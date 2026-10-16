@@ -10,7 +10,7 @@ import type { HarnessAdapter, HarnessCapabilities, RunRequest, RunResult, TaskSu
 import type { ModelBinding } from '../adapters/types.js';
 import { TaskStore } from '../core/task-store.js';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
-import { createCodexAdapter, createZeroServer } from './server.js';
+import { createCodexAdapter, createZeroServer, type TaskStorePort } from './server.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -121,7 +121,8 @@ function testConfig(hasLiveVerification: boolean, includeCodex = false): LocalZe
   };
 }
 
-async function createFixture(hasLiveVerification = true, enqueue?: (taskId: string, store: TaskStore) => void | Promise<void>, includeCodex = false): Promise<Fixture> {
+async function createFixture(hasLiveVerification = true, enqueue?: (taskId: string, store: TaskStore) => void | Promise<void>, includeCodex = false,
+  storePort: (store: TaskStore) => TaskStorePort = store => store): Promise<Fixture> {
   const root = await mkdtemp(join(process.cwd(), '.zero-server-test-'));
   const repoPath = join(root, 'repo');
   const artifactRoot = join(root, 'artifacts');
@@ -148,7 +149,7 @@ async function createFixture(hasLiveVerification = true, enqueue?: (taskId: stri
     probeEvidence: { versionAndHelp: 'passed', authentication: 'not_checked', modelSmokeTest: 'not_checked', configuredBindings: 'declared_verified' },
   };
   const adapters = { zcode: new ProbeOnlyAdapter('zcode', capability), ...(includeCodex ? { codex: new ProbeOnlyAdapter('codex', codexCapability) } : {}) };
-  const server = createZeroServer({ store, config, adapters, artifactRoot, staticDir: join(root, 'web'), ...(enqueue ? { enqueue: taskId => enqueue(taskId, store) } : {}) });
+  const server = createZeroServer({ store: storePort(store), config, adapters, artifactRoot, staticDir: join(root, 'web'), ...(enqueue ? { enqueue: taskId => enqueue(taskId, store) } : {}) });
   await new Promise<void>((resolveListen, reject) => {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolveListen(); });
@@ -161,7 +162,7 @@ async function createFixture(hasLiveVerification = true, enqueue?: (taskId: stri
     close: async () => {
       await new Promise<void>(resolveClose => server.close(() => resolveClose()));
       store.close();
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     },
   };
 }
@@ -214,6 +215,145 @@ test('GET /api/tasks exposes recovery_required status and saved evidence', async
     assert.equal(recovered?.status, 'recovery_required');
     assert.match(recovered?.recoveryReason ?? '', /lease expired/);
     assert.equal(recovered?.recoveryEvidence?.leaseOwner, 'expired-api-worker');
+  } finally { await f.close(); }
+});
+
+test('task detail exposes ordered stages, linked attempts and public handoff evidence from TaskStore', async () => {
+  const f = await createFixture();
+  try {
+    const task = f.store.submit({
+      repoPath: f.repoPath, baseRef: 'main', prompt: 'Implement and verify the parser handoff.',
+      executionStages: [{ harness: 'zcode', model: 'glm-main', reasoningEffort: 'high' }, {}],
+    }, 'api-stage-handoff');
+    const owner = 'api-stage-worker';
+    assert.equal(f.store.claimNext(owner)?.id, task.id);
+    const stage = f.store.createStage(task.id, {
+      role: 'implement', harness: 'zcode', harnessVersion: 'test-cli-1', model: 'glm-main', reasoningEffort: 'high',
+      processStartId: 'private-process', bindingVersion: 'private-binding', configHash: 'private-config-hash',
+      inputFingerprint: 'input-fingerprint',
+    });
+    f.store.startStage(stage.id, owner, 'private-process');
+    const attempt = f.store.createAttempt(task.id, 'implement', {
+      owner, stageId: stage.id, harness: 'zcode', harnessVersion: 'test-cli-1', model: 'glm-main', reasoningEffort: 'high',
+      bindingVersion: 'private-binding', configHash: 'private-config-hash', metadata: { summary: 'Parser implemented', privateConfig: 'do-not-project' },
+    });
+    f.store.finishAttempt(attempt.id, { status: 'succeeded', exitCode: 0 }, { owner, processStartId: 'private-process' });
+    const finished = f.store.finishStage(stage.id, owner, 'private-process', 'succeeded', 'output-fingerprint');
+    const handoff = f.store.saveHandoff({
+      schemaVersion: 1, taskId: task.id, stageId: stage.id, createdAt: '2026-10-17T00:00:00.000Z',
+      source: { attemptId: attempt.id, harness: 'zcode', model: 'glm-main', harnessVersion: 'test-cli-1',
+        bindingVersion: 'private-binding', configHash: 'private-config-hash', processStartId: 'private-process' },
+      task: { objective: task.prompt, acceptanceCriteria: ['Reject invalid UTF-8'] },
+      workspace: { baseCommit: 'base-commit', headCommit: 'head-commit', fingerprint: 'output-fingerprint', state: 'dirty', changedFiles: ['src/parser.ts'] },
+      completed: ['Added parser validation'], currentState: 'Ready for independent verification',
+      decisions: [{ decision: 'Reject malformed input', rationale: 'Avoid silent data loss' }],
+      rejectedOptions: [{ option: 'Silently replace bytes', reason: 'Loses source data' }],
+      keyFiles: [{ path: 'src/parser.ts', reason: 'UTF-8 validation' }],
+      checks: [{ id: 'parser-tests', status: 'passed', evidence: 'Three focused cases passed' }],
+      blockers: ['Full suite pending'], risks: ['Legacy encodings remain unsupported'], nextSteps: ['Run the full suite'],
+    });
+    const next = f.store.createStage(task.id, {
+      role: 'implement', predecessorStageId: stage.id, harness: 'codex', model: 'codex-main',
+      processStartId: 'second-private-process', inputFingerprint: 'output-fingerprint',
+    });
+    f.store.startStage(next.id, owner, 'second-private-process');
+    const nextAttempt = f.store.createAttempt(task.id, 'implement', { owner, stageId: next.id, harness: 'codex', model: 'codex-main' });
+    f.store.finishAttempt(nextAttempt.id, { status: 'failed', exitCode: 2, error: 'Verification failed' }, { owner, processStartId: 'second-private-process' });
+    const failed = f.store.finishStage(next.id, owner, 'second-private-process', 'failed');
+    f.store.fail(task.id, 'running', 'Verification failed', owner);
+
+    const response = await fetch(`${f.url}/api/tasks/${task.id}`);
+    assert.equal(response.status, 200);
+    const detail = await response.json() as {
+      status: string; executionStages: unknown[]; stages: Array<Record<string, unknown>>;
+      attempts: Array<Record<string, unknown>>; handoffs: Array<Record<string, unknown>>;
+    };
+    assert.equal(detail.status, 'failed');
+    assert.deepEqual(detail.executionStages, [{ harnessId: 'zcode', modelId: 'glm-main', reasoningEffort: 'high' }, {}]);
+    assert.deepEqual(detail.stages, [{
+      id: stage.id, sequence: 1, role: 'implement', status: 'succeeded', harness: 'zcode', harnessVersion: 'test-cli-1',
+      model: 'glm-main', reasoningEffort: 'high', inputFingerprint: 'input-fingerprint', outputFingerprint: 'output-fingerprint',
+      createdAt: stage.createdAt, startedAt: finished.startedAt, finishedAt: finished.finishedAt,
+    }, {
+      id: next.id, sequence: 2, role: 'implement', status: 'failed', predecessorStageId: stage.id,
+      harness: 'codex', model: 'codex-main', inputFingerprint: 'output-fingerprint',
+      createdAt: next.createdAt, startedAt: failed.startedAt, finishedAt: failed.finishedAt, error: 'stage completed without success',
+    }]);
+    assert.deepEqual(detail.attempts.map(value => ({ id: value.id, stageId: value.stageId, role: value.role, exitCode: value.exitCode })), [
+      { id: attempt.id, stageId: stage.id, role: 'implement', exitCode: 0 },
+      { id: nextAttempt.id, stageId: next.id, role: 'implement', exitCode: 2 },
+    ]);
+    assert.equal(detail.attempts[0]?.summary, 'Parser implemented');
+    assert.deepEqual(detail.handoffs, [{
+      id: handoff.id, stageId: stage.id, createdAt: '2026-10-17T00:00:00.000Z',
+      source: { attemptId: attempt.id, harness: 'zcode', model: 'glm-main' },
+      workspace: { baseCommit: 'base-commit', headCommit: 'head-commit', fingerprint: 'output-fingerprint', state: 'dirty', changedFiles: ['src/parser.ts'] },
+      completed: ['Added parser validation'], currentState: 'Ready for independent verification',
+      decisions: [{ decision: 'Reject malformed input', rationale: 'Avoid silent data loss' }],
+      keyFiles: [{ path: 'src/parser.ts', reason: 'UTF-8 validation' }],
+      checks: [{ id: 'parser-tests', status: 'passed', evidence: 'Three focused cases passed' }],
+      blockers: ['Full suite pending'], risks: ['Legacy encodings remain unsupported'], nextSteps: ['Run the full suite'],
+    }]);
+    assert.equal(JSON.stringify(detail.stages).includes('private-'), false);
+    assert.equal(JSON.stringify(detail.handoffs).includes('private-'), false);
+    assert.equal(JSON.stringify(detail.attempts).includes('do-not-project'), false);
+  } finally { await f.close(); }
+});
+
+test('task detail returns empty evidence for legacy tasks and stores without optional evidence reads', async () => {
+  for (const legacyPort of [false, true]) {
+    const f = await createFixture(true, undefined, false, store => legacyPort ? {
+      submit: store.submit.bind(store), createSequence: store.createSequence.bind(store),
+      getSequence: store.getSequence.bind(store), listSequences: store.listSequences.bind(store),
+      get: store.get.bind(store), list: store.list.bind(store), fail: store.fail.bind(store),
+      attempts: store.attempts.bind(store), getRoute: store.getRoute.bind(store),
+      checks: store.checks.bind(store), reviews: store.reviews.bind(store), events: store.events.bind(store),
+    } : store);
+    try {
+      const task = f.store.submit({ repoPath: f.repoPath, baseRef: 'main', prompt: 'Inspect a legacy task without stage records.' });
+      const attempt = f.store.createAttempt(task.id, 'route', { harness: 'codex', model: 'codex-main' });
+      f.store.finishAttempt(attempt.id, { status: 'failed', exitCode: 1 });
+      const response = await fetch(`${f.url}/api/tasks/${task.id}`);
+      assert.equal(response.status, 200);
+      const detail = await response.json() as { executionStages: unknown[]; stages: unknown[]; handoffs: unknown[]; attempts: Array<Record<string, unknown>> };
+      assert.deepEqual(detail.executionStages, []);
+      assert.deepEqual(detail.stages, []);
+      assert.deepEqual(detail.handoffs, []);
+      assert.equal(detail.attempts[0]?.id, attempt.id);
+      assert.equal(detail.attempts[0]?.role, 'route');
+      assert.equal(Object.hasOwn(detail.attempts[0]!, 'stageId'), false);
+    } finally { await f.close(); }
+  }
+});
+
+test('task detail includes bounded check stdout and stderr while excluding artifacts outside its root', async () => {
+  const f = await createFixture();
+  try {
+    const task = f.store.submit({ repoPath: f.repoPath, baseRef: 'main', prompt: 'Diagnose failing validation with archived check output.' });
+    await mkdir(f.artifactRoot, { recursive: true });
+    const stdoutPath = join(f.artifactRoot, 'check.stdout.log');
+    const stderrPath = join(f.artifactRoot, 'check.stderr.log');
+    const outsidePath = join(f.root, 'private.txt');
+    const oversizedPath = join(f.artifactRoot, 'oversized.log');
+    await writeFile(stdoutPath, 'Parser regression: expected rejection');
+    await writeFile(stderrPath, 'AssertionError: invalid bytes accepted');
+    await writeFile(outsidePath, 'outside-root-private-content');
+    await writeFile(oversizedPath, 'x'.repeat(256 * 1024 + 1));
+    f.store.saveCheck(task.id, { id: 'parser', argv: ['node', '--test'], status: 'failed', exitCode: 1, durationMs: 42,
+      error: 'Check exited with code 1', stdoutPath, stderrPath });
+    f.store.saveCheck(task.id, { id: 'outside', argv: ['node'], status: 'failed', exitCode: 1, durationMs: 1,
+      stdoutPath: outsidePath, stderrPath: join(f.artifactRoot, 'missing.log') });
+    f.store.saveCheck(task.id, { id: 'oversized', argv: ['node'], status: 'failed', exitCode: 1, durationMs: 1, stdoutPath: oversizedPath });
+    const response = await fetch(`${f.url}/api/tasks/${task.id}`);
+    assert.equal(response.status, 200);
+    const detail = await response.json() as { tests: Array<Record<string, unknown>> };
+    assert.deepEqual(detail.tests[0], {
+      name: 'parser', command: 'node --test', status: 'failed', exitCode: 1, durationMs: 42,
+      output: 'Check exited with code 1\n--- stdout ---\nParser regression: expected rejection\n--- stderr ---\nAssertionError: invalid bytes accepted',
+    });
+    assert.equal(Object.hasOwn(detail.tests[1]!, 'output'), false);
+    assert.equal(detail.tests[2]?.output, '--- stdout ---\n[日志超过单次详情读取上限]');
+    assert.equal(JSON.stringify(detail.tests).includes('outside-root-private-content'), false);
   } finally { await f.close(); }
 });
 

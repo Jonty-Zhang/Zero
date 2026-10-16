@@ -10,7 +10,7 @@ import type { AdapterConfig } from '../adapters/base.js';
 import { DshAdapter } from '../adapters/dsh.js';
 import { ZCodeCompositeAdapter } from '../adapters/zcode-composite.js';
 import type { ModelBinding } from '../adapters/types.js';
-import type { Attempt, CheckDefinition, CheckResult, ExecutionSelection, HarnessAdapter, ReviewResult, RouteDecision, SequenceGoalReview, TaskEvent, TaskRecord, TaskSequenceMetadata, TaskSequenceRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
+import type { Attempt, CheckDefinition, CheckResult, ExecutionSelection, HandoffRecord, HarnessAdapter, ReviewResult, RouteDecision, SequenceGoalReview, StageRecord, TaskEvent, TaskRecord, TaskSequenceMetadata, TaskSequenceRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
 
 type HarnessName = 'codex' | 'dsh' | 'zcode';
 export type AdapterMap = Partial<Record<HarnessName, HarnessAdapter>>;
@@ -23,6 +23,8 @@ export interface TaskStorePort {
   list(status?: TaskStatus): TaskRecord[];
   fail(id: string, expected: TaskStatus | TaskStatus[], reason: string, owner?: string): TaskRecord;
   attempts(taskId: string): Attempt[];
+  stages?(taskId: string): StageRecord[];
+  handoffs?(taskId: string): HandoffRecord[];
   getRoute(taskId: string): RouteDecision | undefined;
   checks(taskId: string): CheckResult[];
   reviews(taskId: string): ReviewResult[];
@@ -477,6 +479,8 @@ async function taskDetail(res: ServerResponse, id: string, options: ZeroServerOp
   const reviews = options.store.reviews(id);
   const events = options.store.events(id);
   const route = options.store.getRoute(id);
+  const stages = options.store.stages?.(id) ?? [];
+  const handoffs = options.store.handoffs?.(id) ?? [];
   const attemptDetails = await Promise.all(attempts.map(async attempt => {
     const stdout = await readArtifactText(attempt.stdoutPath, options.artifactRoot);
     const stderr = await readArtifactText(attempt.stderrPath, options.artifactRoot);
@@ -484,11 +488,18 @@ async function taskDetail(res: ServerResponse, id: string, options: ZeroServerOp
     return { ...mapAttempt(attempt), ...(text ? { logs: text } : {}) };
   }));
   const logs = attemptDetails.map((attempt, index) => attempt.logs ? `Attempt ${index + 1}\n${attempt.logs}` : '').filter(Boolean).join('\n\n');
+  const checkDetails = await Promise.all(checks.map(async check => {
+    const stdout = await readArtifactText(check.stdoutPath, options.artifactRoot);
+    const stderr = await readArtifactText(check.stderrPath, options.artifactRoot);
+    const output = [check.error, stdout ? `--- stdout ---\n${stdout}` : '', stderr ? `--- stderr ---\n${stderr}` : ''].filter(Boolean).join('\n');
+    return { ...mapCheck(check), output: output || undefined };
+  }));
   const reportPath = options.artifactRoot && /^[a-zA-Z0-9_-]{1,128}$/.test(id) ? join(resolve(options.artifactRoot), id, 'report.json') : undefined;
   const report = reportPath && (await access(reportPath).then(() => true).catch(() => false)) ? `/api/tasks/${encodeURIComponent(id)}/report` : undefined;
   json(res, 200, { ...mapTaskList(task), prompt: task.prompt, acceptanceCriteria: task.acceptanceCriteria?.join('\n'), baseRef: task.baseRef,
     maxRevisions: task.maxRevisions, route: route ? mapRoute(route) : undefined,
-    attempts: attemptDetails, tests: checks.map(mapCheck), review: reviews.length ? mapReview(reviews.at(-1)!) : undefined,
+    executionStages: (task.executionStages ?? []).map(publicExecutionSelection), stages: stages.map(mapStage), handoffs: handoffs.map(mapHandoff),
+    attempts: attemptDetails, tests: checkDetails, review: reviews.length ? mapReview(reviews.at(-1)!) : undefined,
     logs, report, error: task.failureReason, events: events.map(event => ({ type: event.type, at: event.at, payload: event.payload })) });
 }
 
@@ -531,10 +542,34 @@ function mapSequenceGoalReview(review: SequenceGoalReview) {
 function mapRoute(route: Record<string, unknown> | RouteDecision) { const value = route as Record<string, unknown>; return { harnessId: value.harness, modelId: value.model, reasoningEffort: value.effectiveReasoningEffort ?? value.reasoningEffort, selectionSource: value.selectionSource, reason: value.reason }; }
 function mapAttempt(value: Attempt) {
   const metadata = value.metadata ?? {};
-  return { number: value.sequence, status: value.status, startedAt: value.startedAt, endedAt: value.finishedAt,
+  return { id: value.id, stageId: value.stageId, role: value.role, exitCode: value.exitCode,
+    number: value.sequence, status: value.status, startedAt: value.startedAt, endedAt: value.finishedAt,
     route: value.harness || value.model ? { harnessId: value.harness, modelId: value.model, reasoningEffort: value.reasoningEffort } : undefined,
     sessionId: typeof metadata.sessionId === 'string' ? metadata.sessionId : undefined,
     summary: value.error ?? metadata.summary };
+}
+function mapStage(value: StageRecord) {
+  return {
+    id: value.id, sequence: value.sequence, role: value.role, status: value.status, predecessorStageId: value.predecessorStageId,
+    harness: value.harness, harnessVersion: value.harnessVersion, model: value.model, reasoningEffort: value.reasoningEffort,
+    inputFingerprint: value.inputFingerprint, outputFingerprint: value.outputFingerprint,
+    createdAt: value.createdAt, startedAt: value.startedAt, finishedAt: value.finishedAt, error: value.error,
+  };
+}
+function mapHandoff(value: HandoffRecord) {
+  return {
+    id: value.id, stageId: value.stageId, createdAt: value.createdAt,
+    source: { attemptId: value.source.attemptId, harness: value.source.harness, model: value.source.model },
+    workspace: {
+      baseCommit: value.workspace.baseCommit, headCommit: value.workspace.headCommit, fingerprint: value.workspace.fingerprint,
+      state: value.workspace.state, changedFiles: value.workspace.changedFiles,
+    },
+    completed: value.completed, currentState: value.currentState,
+    decisions: value.decisions.map(item => ({ decision: item.decision, rationale: item.rationale })),
+    keyFiles: value.keyFiles.map(item => ({ path: item.path, reason: item.reason })),
+    checks: value.checks.map(item => ({ id: item.id, status: item.status, evidence: item.evidence })),
+    blockers: value.blockers, risks: value.risks, nextSteps: value.nextSteps,
+  };
 }
 function mapCheck(value: CheckResult) { return { name: value.id, command: value.argv.join(' '), status: value.status, exitCode: value.exitCode, durationMs: value.durationMs, output: value.error }; }
 function mapReview(value: ReviewResult) {
