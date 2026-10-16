@@ -23,6 +23,10 @@ export type RouteInfo = {
   reason?: string;
 };
 export type Attempt = {
+  id?: string;
+  stageId?: string;
+  role?: string;
+  exitCode?: number | null;
   number?: number;
   status?: string;
   startedAt?: string;
@@ -57,6 +61,25 @@ export type Task = {
   report?: string;
   error?: string;
   maxRevisions?: number;
+  executionStages?: ExecutionSelection[];
+  stages?: ExecutionStage[];
+  handoffs?: Handoff[];
+};
+export type ExecutionStage = {
+  id: string; sequence: number; role: 'implement' | 'revise' | 'route' | 'review'; status: 'pending' | 'running' | 'succeeded' | 'failed' | 'interrupted'; predecessorStageId?: string;
+  harness?: string; model?: string; reasoningEffort?: string;
+  inputFingerprint?: string; outputFingerprint?: string;
+  createdAt: string; startedAt?: string; finishedAt?: string; error?: string;
+};
+export type Handoff = {
+  id: string; stageId: string; createdAt: string;
+  source: { attemptId: string; harness: string; model: string };
+  workspace: { baseCommit?: string; headCommit?: string; fingerprint?: string; state: string; changedFiles?: string[] };
+  completed: string[]; currentState: string;
+  decisions: Array<{ decision: string; rationale: string }>;
+  keyFiles: Array<{ path: string; reason: string }>;
+  checks: Array<{ id: string; status: string; evidence?: string }>;
+  blockers: string[]; risks: string[]; nextSteps: string[];
 };
 export type TaskSequenceStatus = 'queued' | 'running' | 'waiting' | 'blocked' | 'steps_completed' | 'completed';
 export type SequenceGoalReview = {

@@ -21,6 +21,10 @@ jobs:
         run: npm test
       - name: Install web dependencies
         run: npm --prefix web ci
+      - name: Test web interactions and request lifecycle
+        run: |
+          npm --prefix web test
+          node --test web/tests/api.test.mjs
       - name: Build web application
         run: npm --prefix web run build
 
@@ -76,8 +80,10 @@ jobs:
         shell: pwsh
         run: |
           npm ci
-          npm run build
+          npm test
           npm --prefix web ci
+          npm --prefix web test
+          node --test web/tests/api.test.mjs
           npm --prefix web run build
       - name: Verify Windows release staging
         shell: pwsh
