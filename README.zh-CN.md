@@ -8,6 +8,7 @@ Zero 是一个由 Node.js 服务、本地 React Web 界面和 CLI 组成的独�
 
 ## 当前已实现
 
+- 跨 Agent 任务工作台，支持列表/看板切换、关键词与状态/仓库/Harness 筛选。任务详情展示真实执行阶段、交接摘要、工作树指纹、检查输出及独立审核；刷新失败保留上次证据并提示数据可能过期。窄屏可访问任务与设置，提交前必须填写检查命令。详见[网页说明](web/README.md)与[本轮研究记录](docs/2026-10-17-project-audit.md)。
 - 基于 SQLite 的任务队列和本地 HTTP API，任务状态包括 `pending`、`running`、`reviewing`、`revision`、`waiting`、`recovery_required`、`done` 和 `failed`。
 - 主分配器可切换为 Codex 订阅或兼容 OpenAI API 的 HTTPS 模型，负责选择路由和执行 Harness；分配器本身不会实现任务。用户可以手动固定 Harness、模型和思考强度中的任意字段。结果仍由独立的只读 Codex 会话审核。
 - 执行默认值会从设置页持久保存为全局选择和按规范仓库路径匹配的项目选择。每个字段按任务手动选择 → 匹配的项目默认值 → 全局默认值 → 主分配器的顺序确定；未设置的字段逐级继承，最后由分配器补全。

@@ -30,9 +30,9 @@
 
 **Files:** `docs/2026-10-17-project-audit.md`, this plan.
 
-- [ ] Install locked dependencies and run existing core suite, typecheck, web build and public-tree scan; record actual outcomes.
-- [ ] Review independent frontend and core audit findings; add only confirmed findings to the audit.
-- [ ] Commit and push research and implementation decisions.
+- [x] Install locked dependencies and run existing core suite, typecheck, web build and public-tree scan; record actual outcomes.
+- [x] Review independent frontend and core audit findings; add only confirmed findings to the audit.
+- [x] Commit and push research and implementation decisions.
 
 ### Task 2: Read-only stage and handoff API
 
@@ -40,10 +40,10 @@
 
 **Interfaces:** Add optional store reads `stages(taskId)` and `handoffs(taskId)` to the HTTP store port for legacy-compatible test/integration stores. Task detail returns `executionStages`, `stages`, `handoffs`, and attempts with `id`, `stageId`, `role`. Project only intentional public fields; do not expose raw configuration, logs or runtime registry data through new projections.
 
-- [ ] Add a real TaskStore API regression for a two-stage task, attempt links, ordered stages and HandoffV1; assert legacy tasks return empty evidence arrays.
-- [ ] Run the focused test and observe missing fields fail.
-- [ ] Implement the additive projections and linked attempt fields.
-- [ ] Run server tests and typecheck; review, commit and push.
+- [x] Add a real TaskStore API regression for a two-stage task, attempt links, ordered stages and HandoffV1; assert legacy tasks return empty evidence arrays.
+- [x] Run the focused test and observe missing fields fail.
+- [x] Implement the additive projections and linked attempt fields.
+- [x] Run server tests and typecheck; review, commit and push.
 
 ### Task 3: Reliable task details and refresh
 

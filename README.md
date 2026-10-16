@@ -8,6 +8,7 @@ Zero is an application made of one Node.js service, a local React web UI, and a 
 
 ## What works today
 
+- An agent workspace with list/board views and search, status, repository, and Harness filters. Task details show actual execution stages, handoff summaries, workspace fingerprints, validation output, and independent review. Failed refreshes retain evidence with a stale-data notice; mobile navigation keeps tasks and settings reachable. Web submissions require validation commands. See [web documentation](web/README.md) and the [current project audit](docs/2026-10-17-project-audit.md).
 - A SQLite-backed task queue and local HTTP API, with `pending`, `running`, `reviewing`, `revision`, `waiting`, `recovery_required`, `done`, and `failed` task states.
 - A configurable master coordinator: choose the Codex subscription or an OpenAI-compatible HTTPS API model to route and oversee tasks. The coordinator only chooses among verified Harness/model bindings; it does not implement tasks. A separate read-only Codex session reviews the result. You can manually pin any subset of the execution Harness, model, and reasoning effort.
 - Execution defaults persist from Settings as a global selection and per-project selections keyed by canonical repository path. Per field, routing priority is task selection → matching project default → global default → configured coordinator; unset fields inherit from the next level, and the coordinator fills any remainder.
