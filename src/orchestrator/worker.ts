@@ -1823,9 +1823,6 @@ export class TaskWorker {
       if (statusBefore !== statusAfter || JSON.stringify(pathsBefore) !== JSON.stringify(pathsAfter)) {
         throw new Error("Worktree moved while building handoff snapshot");
       }
-      if (pathsAfter.length > 40 || pathsAfter.some(path => path.length > 512)) {
-        throw new Error("Changed path list exceeds the bounded handoff representation");
-      }
       workspaceState = statusAfter ? "dirty" : "clean";
       changedFiles = pathsAfter;
     } catch {
@@ -1848,12 +1845,16 @@ export class TaskWorker {
           ...(result ? { evidence: `exitCode=${String(result.exitCode)}; durationMs=${result.durationMs}` } : { evidence: "not run" }),
         };
       });
+      // The display budget limits only the handoff projection. The fingerprint
+      // above must continue to cover every changed path, including omitted ones.
+      const changed = (changedFiles ?? []).filter(path => path.length <= 512).slice(0, 40);
+      const pathsOmitted = changed.length < (changedFiles?.length ?? 0);
       const risks = [
-        ...(snapshotFailed ? ["Workspace snapshot is incomplete or exceeded the handoff path limits; inspect the archived task evidence."] : []),
+        ...(snapshotFailed ? ["Workspace snapshot is incomplete; inspect the archived task evidence."] : []),
+        ...(pathsOmitted ? ["Changed paths were omitted from this bounded handoff list; the fingerprint covers the full worktree. Inspect the task worktree and archived diff for the complete changes."] : []),
         ...((task.checks?.length ?? 0) > 40 ? ["Only the first 40 configured checks fit the handoff schema; see the task report for all checks."] : []),
       ];
       const completed = [summary, ...observedChecks.filter(check => check.status === "passed").map(check => `Validation check passed: ${check.id}`)].slice(0, 40);
-      const changed = changedFiles ?? [];
       const handoff: HandoffV1 = {
         schemaVersion: 1,
         taskId: task.id,

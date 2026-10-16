@@ -130,7 +130,7 @@ test("ordinary execution crash resumes only with fresh attempts, checks, route, 
       }
     } finally {
       store.close();
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }
 });
@@ -185,7 +185,7 @@ test("ordinary crash recovery quarantines changed worktrees and waits for a guar
       }
     } finally {
       store.close();
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }
 });
@@ -263,7 +263,7 @@ test("quota pause during recovered routing preserves crash recovery lineage and 
     assert.equal(report?.routeDecisions.length, 1);
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -444,7 +444,7 @@ test("worker runs checks, reviewer revision, commits, archives and marks DONE", 
     assert.deepEqual(await (await import("node:fs/promises")).readFile(report!.diffPath!), reportOperations[0]!.diffBytes);
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -509,7 +509,7 @@ test("sequence handoff starts the next same-repository task at the prior DONE re
     assert.equal(store.getSequence(sequence.id)?.status, "completed");
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -556,7 +556,7 @@ test("worker leaves a raced reviewed branch failed with its candidate intent and
     assert.match(store.commitOperations(task.id)[0]?.candidateSha ?? "", /^[a-f0-9]{40,64}$/);
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -762,7 +762,7 @@ test("guardian review rework recovery restarts route and validation from the reg
       }
     } finally {
       store.close();
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }
 });
@@ -814,7 +814,7 @@ test("reviewer-requested revision consumes failed checks once and retries within
     assert.equal(store.checkRuns(task.id).length, 3);
     assert.equal(store.checkRuns(task.id)[1]?.status, "failed");
     assert.equal(store.checkRuns(task.id)[2]?.status, "completed");
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("review rework quota resumes its saved revision after guardian reboot without consuming another revision", async () => {
@@ -891,7 +891,7 @@ test("review rework quota resumes its saved revision after guardian reboot witho
     assert.equal(store.checkRuns(task.id).length, quotaAfterFailedCheck ? 3 : 2);
     assert.equal(store.events(task.id).some(event => event.type === "task.review_rework_quota_resumed"), true);
     assert.ok(store.getReviewReworkContinuation(task.id));
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
   }
 });
 
@@ -969,7 +969,7 @@ test("review recovery resumes commit intent, applied candidate, and completed re
     } finally {
       releaseBoundary();
       store.close();
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }
 });
@@ -1071,7 +1071,7 @@ test("recovered reviewer quota waits until due, then resumes only review under s
       assert.equal(store.commitOperations(task.id).length, 1);
       assert.equal(store.reportOperations(task.id).length, 1);
       assert.equal(store.reviewRecoveryClaims(task.id).length, restart ? 2 : 1);
-    } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+    } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
   }
 });
 
@@ -1135,7 +1135,7 @@ test("review recovery keeps a moved branch quarantined without routing, writing,
     assert.equal(writerCalls, 0);
     assert.equal(store.commitOperations(task.id).length, 0);
     assert.equal(store.reviewRecoveryClaims(task.id).length, 0);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("worker binds passing checks to the reviewed Git tree and rejects check mutations", async () => {
@@ -1193,7 +1193,7 @@ test("worker binds passing checks to the reviewed Git tree and rejects check mut
       }
     } finally {
       store.close();
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }
 });
@@ -1227,7 +1227,7 @@ test("review package creation failure closes the check run and never calls Revie
     assert.equal(checkRuns[0]?.status, "failed");
     assert.match(checkRuns[0]?.terminalReason ?? "", /Review package creation failed/);
     assert.deepEqual(store.checkRunResults(checkRuns[0]!.id).map(check => check.id), ["passed-check"]);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("review snapshot mutation and failed reviewer process never persist a passing verdict", async () => {
@@ -1255,7 +1255,7 @@ test("review snapshot mutation and failed reviewer process never persist a passi
       assert.equal(store.packageReviewVerdicts(task.id).length, 0);
       assert.equal(store.reviews(task.id).length, 0);
       assert.equal(store.attempts(task.id).find(item => item.role === "review")?.status, "failed");
-    } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+    } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
   }
 });
 
@@ -1286,7 +1286,7 @@ test("ambiguous post-add failure retains intent and quarantines without a second
     await assert.doesNotReject(exec("git", ["show-ref", "--verify", `refs/heads/zero/${task.id}`], { cwd: repo }));
     assert.equal(routes, 0);
     assert.equal(store.claimNext("second-worker"), undefined);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("worker refuses a late allowed-path edit injected after review checks and before commit", async () => {
@@ -1356,7 +1356,7 @@ test("worker refuses a late allowed-path edit injected after review checks and b
       && (event.payload as { to?: string } | undefined)?.to === "done").length, 0);
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -1391,7 +1391,7 @@ test("worker cannot mark DONE when checks fail and revision budget is exhausted"
     assert.equal((await worker.readReport(task.id))?.finalStatus, "failed");
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -1431,7 +1431,7 @@ test("worker refuses DONE when Harness creates only an empty commit", async () =
     assert.equal(store.commitOperations(task.id).length, 0);
     assert.equal(store.events(task.id).filter(event => event.type === "task.transition"
       && (event.payload as { to?: string } | undefined)?.to === "done").length, 0);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("worker cancels a running validation process and cannot mark DONE", async () => {
@@ -1473,7 +1473,7 @@ test("worker cancels a running validation process and cannot mark DONE", async (
     assert.equal(store.handoffs(task.id)[0]?.source.attemptId, store.attempts(task.id).find(item => item.stageId)?.id);
     assert.match(store.handoffs(task.id)[0]?.currentState ?? "", /stage was cancelled/);
     assert.ok(store.events(task.id).some(event => event.type === "task.transition" && event.payload?.reason === "Cancelled by user"));
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("worker rechecks changed paths after test commands and rejects test-created files", async () => {
@@ -1506,7 +1506,7 @@ test("worker rechecks changed paths after test commands and rejects test-created
     assert.equal(store.reviews(task.id).length, 0);
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -1542,7 +1542,7 @@ test("periodic worker scan quarantines expired task with existing worktree befor
     assert.equal(routed, false);
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -1583,7 +1583,7 @@ test("worker reclaims an expired pre-intent lease after restart when its worktre
     assert.equal(store.events(task.id).filter(event => event.type === "task.requeued_pre_write_intent").length, 1);
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -1605,7 +1605,7 @@ test("worker keeps a lease-expiry quarantine when a creation intent exists witho
     assert.equal(await worker.runNext("new-worker"), undefined);
     assert.equal(store.get(task.id)?.status, "recovery_required");
     assert.equal(store.claimNext("another-worker"), undefined);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("an unsafe expired task cannot block the worker from claiming unrelated pending work", async () => {
@@ -1636,7 +1636,7 @@ test("an unsafe expired task cannot block the worker from claiming unrelated pen
     assert.equal(executions, 1);
     assert.equal(store.get(unsafe.id)?.status, "recovery_required");
     assert.equal(store.attempts(unsafe.id)[0]?.status, "interrupted");
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("quota pause survives service restart and resumes partial work without consuming a revision", async () => {
@@ -1714,7 +1714,7 @@ test("quota pause survives service restart and resumes partial work without cons
     assert.equal((await createWorker().readReport(task.id))?.finalStatus, "done");
   } finally {
     store.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -1757,7 +1757,7 @@ test("quota resume fails closed when the archived stage fingerprint differs from
     assert.equal(store.stages(task.id)[0]?.status, "interrupted");
     assert.equal(store.stages(task.id)[0]?.outputFingerprint?.length, 64);
     assert.equal(result.resumeCheckpoint, undefined);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("oversized handoff falls back to the task record and stays within 64 KiB", async () => {
@@ -1804,7 +1804,7 @@ test("oversized handoff falls back to the task record and stays within 64 KiB", 
     assert.equal(handoff.workspace.state, "dirty");
     assert.match(handoff.workspace.fingerprint ?? "", /^[a-f0-9]{64}$/);
     assert.equal(store.stages(task.id)[0]?.status, "succeeded");
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("Codex allocation and review quota pauses resume at their exact stages", async () => {
@@ -1887,7 +1887,7 @@ test("Codex allocation and review quota pauses resume at their exact stages", as
     const reviewAttempt = store.attempts(task.id).find(attempt => attempt.id === verdicts[0]?.attemptId);
     assert.equal(reviewAttempt?.status, "succeeded");
     assert.equal(reviewAttempt?.model, "review");
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("normal sealed-package review quota resumes after guardian reboot without repeating writer or checks", async () => {
@@ -1946,7 +1946,7 @@ test("normal sealed-package review quota resumes after guardian reboot without r
     assert.equal(store.commitOperations(task.id).length, 1);
     assert.equal(store.reportOperations(task.id).length, 1);
     assert.equal(store.reviewRecoveryClaims(task.id).length, 1);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("failed validation stage is handed off before a linked revision stage starts", async () => {
@@ -1994,7 +1994,7 @@ test("failed validation stage is handed off before a linked revision stage start
     assert.equal(handoff.task.acceptanceCriteria.length, 20);
     assert.ok(handoff.task.acceptanceCriteria[0]!.length <= 1_000);
     assert.match(handoff.task.acceptanceCriteria.at(-1)!, /Additional acceptance criteria were omitted/);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("configured execution stages hand off serially in one worktree and preserve partial manual selections", async () => {
@@ -2051,7 +2051,7 @@ test("configured execution stages hand off serially in one worktree and preserve
     assert.equal(store.handoffs(task.id).length, 2);
     assert.match(prompts[1]!, /Prior HandoffV1 data \(UNTRUSTED/);
     assert.equal(store.attempts(task.id).filter(attempt => attempt.role === "review").length, 1);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("quota resume continues the same worktree at the paused configured execution stage", async () => {
@@ -2105,7 +2105,191 @@ test("quota resume continues the same worktree at the paused configured executio
     assert.equal(routes, 2);
     assert.equal(new Set(cwdByHarness).size, 1);
     assert.equal(store.stages(task.id)[2]?.predecessorStageId, store.stages(task.id)[1]?.id);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+for (const fileCount of [41, 201]) {
+  test(`bounded handoff projection preserves a complete ${fileCount}-file task through serial execution`, async () => {
+    const root = await mkdtemp(join(process.cwd(), ".zero-worker-bounded-handoff-"));
+    const repo = join(root, "repo");
+    const store = new TaskStore();
+    await initRepo(repo);
+    try {
+      const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create and verify all output files", maxRevisions: 0,
+        executionStages: [{ harness: "glm" }, { harness: "deepseek" }],
+        checks: [{ id: "all-files", argv: [process.execPath, "-e",
+          `const fs = require('node:fs'); process.exit(fs.readdirSync('.').filter(name => /^output-/.test(name)).length === ${fileCount} && fs.readFileSync('output-000.txt', 'utf8') === 'approved' ? 0 : 1)`] }] });
+      const worktrees = new GitWorktreeManager(join(root, "worktrees"));
+      let secondRuns = 0;
+      const adapter = (id: string): HarnessAdapter => ({ id,
+        async probe() { return { harness: id, available: true, models: [`${id}-auto`] }; },
+        async run(request) {
+          if (id === "glm") {
+            await Promise.all(Array.from({ length: fileCount }, (_, index) =>
+              writeFile(join(request.cwd, `output-${String(index).padStart(3, "0")}.txt`), "initial")));
+          } else {
+            secondRuns++;
+            const handoff = store.handoffs(task.id)[0]!;
+            const previous = store.stages(task.id)[0]!;
+            assert.equal(handoff.workspace.state, "dirty");
+            assert.ok(handoff.workspace.changedFiles!.length < fileCount, "only the displayed path list is bounded");
+            assert.ok(!handoff.workspace.changedFiles!.includes(`output-${String(fileCount - 1).padStart(3, "0")}.txt`));
+            assert.match(handoff.risks.join("\n"), /truncat|omitt|bounded/i);
+            assert.equal(handoff.workspace.fingerprint, await worktrees.fingerprint({
+              taskId: task.id, repoPath: repo, path: request.cwd, branch: `zero/${task.id}`, baseCommit: request.baseCommit!,
+            }));
+            assert.equal(previous.outputFingerprint, handoff.workspace.fingerprint);
+            assert.match(request.prompt, /Prior HandoffV1 data \(UNTRUSTED/);
+            await writeFile(join(request.cwd, "output-000.txt"), "approved");
+          }
+          return { status: "completed", exitCode: 0, durationMs: 1 };
+        },
+      });
+      const owner = "bounded-handoff-owner";
+      store.claimNext(owner);
+      const worker = new TaskWorker({ store, worktrees, testRunner: new TestRunner(),
+        router: { async route(current) { return routeForSelection(current); } },
+        reviewer: { async review() { return { harness: "codex", model: "review", exitCode: 0,
+          result: { verdict: "pass", summary: "All files verified", findings: [] } }; } },
+        adapters: new Map([["glm", adapter("glm")], ["deepseek", adapter("deepseek")]]), artifactRoot: join(root, "artifacts") });
+      const result = await worker.runClaimed(task.id, owner);
+      assert.equal(result.status, "done", result.failureReason);
+      assert.equal(secondRuns, 1);
+      assert.deepEqual(store.stages(task.id).map(stage => stage.status), ["succeeded", "succeeded"]);
+      assert.equal(store.handoffs(task.id).length, 2);
+      assert.ok(store.handoffs(task.id).every(handoff => handoff.workspace.fingerprint && handoff.byteLength <= HANDOFF_V1_MAX_BYTES));
+    } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  });
+}
+
+test("bounded handoff projection preserves fingerprints for paths longer than its display budget", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-long-handoff-path-"));
+  const repo = join(root, "repo");
+  const store = new TaskStore();
+  await initRepo(repo);
+  try {
+    await exec("git", ["config", "core.longpaths", "true"], { cwd: repo });
+    const longPath = [...Array.from({ length: 6 }, (_, index) => `folder-${index}-${"x".repeat(78)}`), "result.txt"].join("/");
+    assert.ok(longPath.length > 512 && longPath.length < 1024);
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Write the nested result", maxRevisions: 0,
+      executionStages: [{ harness: "glm" }, { harness: "deepseek" }],
+      checks: [{ id: "nested-result", argv: [process.execPath, "-e",
+        `process.exit(require('node:fs').readFileSync(${JSON.stringify(longPath)}, 'utf8') === 'approved' ? 0 : 1)`] }] });
+    const worktrees = new GitWorktreeManager(join(root, "worktrees"));
+    const adapter = (id: string): HarnessAdapter => ({ id,
+      async probe() { return { harness: id, available: true, models: [`${id}-auto`] }; },
+      async run(request) {
+        if (id === "glm") {
+          await mkdir(join(request.cwd, ...longPath.split("/").slice(0, -1)), { recursive: true });
+          await writeFile(join(request.cwd, longPath), "approved");
+        } else {
+          const handoff = store.handoffs(task.id)[0]!;
+          assert.equal(handoff.workspace.state, "dirty");
+          assert.ok(!handoff.workspace.changedFiles!.includes(longPath));
+          assert.match(handoff.risks.join("\n"), /truncat|omitt|bounded/i);
+          assert.equal(handoff.workspace.fingerprint, await worktrees.fingerprint({
+            taskId: task.id, repoPath: repo, path: request.cwd, branch: `zero/${task.id}`, baseCommit: request.baseCommit!,
+          }));
+          assert.equal(await readFile(join(request.cwd, longPath), "utf8"), "approved");
+        }
+        return { status: "completed", exitCode: 0, durationMs: 1 };
+      },
+    });
+    const owner = "long-handoff-path-owner";
+    store.claimNext(owner);
+    const worker = new TaskWorker({ store, worktrees, testRunner: new TestRunner(),
+      router: { async route(current) { return routeForSelection(current); } },
+      reviewer: { async review() { return { harness: "codex", model: "review", exitCode: 0,
+        result: { verdict: "pass", summary: "Nested file verified", findings: [] } }; } },
+      adapters: new Map([["glm", adapter("glm")], ["deepseek", adapter("deepseek")]]), artifactRoot: join(root, "artifacts") });
+    const result = await worker.runClaimed(task.id, owner);
+    assert.equal(result.status, "done", result.failureReason);
+    assert.equal(store.handoffs(task.id).length, 2);
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test("a late write to a path omitted from a bounded handoff still blocks the next writer", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-bounded-handoff-late-write-"));
+  const repo = join(root, "repo");
+  const store = new TaskStore();
+  await initRepo(repo);
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create all output files", maxRevisions: 0,
+      executionStages: [{ harness: "glm" }, { harness: "deepseek" }],
+      checks: [{ id: "smoke", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+    let secondRuns = 0;
+    let routes = 0;
+    let worktreePath = "";
+    const glm: HarnessAdapter = { id: "glm", async probe() { return { harness: "glm", available: true, models: ["glm-auto"] }; },
+      async run(request) {
+        worktreePath = request.cwd;
+        await Promise.all(Array.from({ length: 201 }, (_, index) =>
+          writeFile(join(request.cwd, `output-${String(index).padStart(3, "0")}.txt`), "initial")));
+        return { status: "completed", exitCode: 0, durationMs: 1 };
+      } };
+    const deepseek: HarnessAdapter = { id: "deepseek", async probe() { return { harness: "deepseek", available: true, models: ["deepseek-auto"] }; },
+      async run() { secondRuns++; return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+    const owner = "bounded-handoff-late-write-owner";
+    store.claimNext(owner);
+    const worker = new TaskWorker({ store, worktrees: new GitWorktreeManager(join(root, "worktrees")), testRunner: new TestRunner(),
+      router: { async route(current) {
+        if (++routes === 2) {
+          const handoff = store.handoffs(task.id)[0]!;
+          assert.ok(!handoff.workspace.changedFiles!.includes("output-200.txt"));
+          await writeFile(join(worktreePath, "output-200.txt"), "changed");
+        }
+        return routeForSelection(current);
+      } }, reviewer: { async review() { throw new Error("must not review"); } },
+      adapters: new Map([["glm", glm], ["deepseek", deepseek]]), artifactRoot: join(root, "artifacts") });
+    const result = await worker.runClaimed(task.id, owner);
+    assert.equal(result.status, "failed");
+    assert.match(result.failureReason ?? "", /Worktree changed after the preceding execution stage completed/);
+    assert.equal(routes, 2, "the first stage must complete before the late write is injected");
+    assert.equal(secondRuns, 0);
+    assert.deepEqual(store.stages(task.id).map(stage => stage.status), ["succeeded"]);
+    assert.match(store.handoffs(task.id)[0]!.workspace.fingerprint ?? "", /^[a-f0-9]{64}$/);
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+test("a failed handoff fingerprint capture still blocks the next writer", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-worker-handoff-snapshot-failure-"));
+  const repo = join(root, "repo");
+  const store = new TaskStore();
+  await initRepo(repo);
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create result", maxRevisions: 0,
+      executionStages: [{ harness: "glm" }, { harness: "deepseek" }],
+      checks: [{ id: "smoke", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+    class UnreadableOutputManager extends GitWorktreeManager {
+      refuseFingerprint = false;
+      override async fingerprint(info: WorktreeInfo): Promise<string> {
+        if (this.refuseFingerprint) throw new Error("Cannot read changed file for fingerprint");
+        return super.fingerprint(info);
+      }
+    }
+    const worktrees = new UnreadableOutputManager(join(root, "worktrees"));
+    let secondRuns = 0;
+    const glm: HarnessAdapter = { id: "glm", async probe() { return { harness: "glm", available: true, models: ["glm-auto"] }; },
+      async run(request) {
+        await writeFile(join(request.cwd, "result.txt"), "initial");
+        worktrees.refuseFingerprint = true;
+        return { status: "completed", exitCode: 0, durationMs: 1 };
+      } };
+    const deepseek: HarnessAdapter = { id: "deepseek", async probe() { return { harness: "deepseek", available: true, models: ["deepseek-auto"] }; },
+      async run() { secondRuns++; return { status: "completed", exitCode: 0, durationMs: 1 }; } };
+    const owner = "handoff-snapshot-failure-owner";
+    store.claimNext(owner);
+    const worker = new TaskWorker({ store, worktrees, testRunner: new TestRunner(),
+      router: { async route(current) { return routeForSelection(current); } },
+      reviewer: { async review() { throw new Error("must not review"); } },
+      adapters: new Map([["glm", glm], ["deepseek", deepseek]]), artifactRoot: join(root, "artifacts") });
+    const result = await worker.runClaimed(task.id, owner);
+    assert.equal(result.status, "failed");
+    assert.equal(secondRuns, 0);
+    assert.deepEqual(store.stages(task.id).map(stage => stage.status), ["failed"]);
+    assert.equal(store.stages(task.id)[0]?.outputFingerprint, undefined);
+    assert.deepEqual(store.handoffs(task.id)[0]?.workspace, { state: "unknown" });
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("a failed configured execution stage stops the pipeline before the next writer", async () => {
@@ -2129,7 +2313,7 @@ test("a failed configured execution stage stops the pipeline before the next wri
     assert.equal(failed.status, "failed");
     assert.equal(deepseekRuns, 0);
     assert.deepEqual(store.stages(task.id).map(stage => stage.status), ["failed"]);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("a late write after one stage is fingerprinted prevents the next writer from starting", async () => {
@@ -2166,5 +2350,5 @@ test("a late write after one stage is fingerprinted prevents the next writer fro
     assert.match(failed.failureReason ?? "", /Worktree changed after the preceding execution stage completed/);
     assert.equal(secondRuns, 0);
     assert.deepEqual(store.stages(task.id).map(stage => stage.status), ["succeeded"]);
-  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
