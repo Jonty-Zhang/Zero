@@ -22,6 +22,11 @@ export interface ExecutionSelection {
   reasoningEffort?: string;
 }
 
+export interface ExecutionStageDefinition extends ExecutionSelection {
+  /** User-authored work for this stage; never part of model routing selection. */
+  objective?: string;
+}
+
 export interface TaskSubmission {
   repoPath: string;
   baseRef: string;
@@ -34,7 +39,7 @@ export interface TaskSubmission {
   /** Any omitted field is selected by the configured coordinator. */
   selection?: ExecutionSelection;
   /** Ordered execution stages in one task worktree. Omitted fields are completed by the configured coordinator. */
-  executionStages?: ExecutionSelection[];
+  executionStages?: ExecutionStageDefinition[];
 }
 
 /** A durable user-authored ordered collection of tasks. Sequence completion is derived from task records. */
@@ -196,6 +201,8 @@ export interface HandoffV1 {
   };
   completed: string[];
   currentState: string;
+  /** Bounded executor-authored context, retained as untrusted plain text. */
+  executorSummary?: string;
   decisions: Array<{ decision: string; rationale: string }>;
   rejectedOptions: Array<{ option: string; reason: string }>;
   keyFiles: Array<{ path: string; reason: string }>;

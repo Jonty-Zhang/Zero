@@ -29,7 +29,7 @@ import { materializeReportProjection } from "../core/report-projection.js";
 import { inspectReviewRecovery } from "./review-recovery-inspector.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
-import { HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
+import { boundExecutorSummary, HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
 
 type ResumeStage = "route" | "execute" | "review";
 interface ReviewReworkRunContext {
@@ -560,6 +560,7 @@ export class TaskWorker {
           && !revisionSteps.some(step => step.failedCheckRunId === latestCheckRun.id)) {
           const retry = this.#options.store.beginReviewReworkCheckRetry(taskId, reworkResume.continuation.id, {
             checkRunId: latestCheckRun.id, owner, generationId: task.claimGenerationId!,
+            fingerprint: reopened.fingerprint,
           });
           if (retry.kind === "revision_limit") return retry.task;
           task = retry.task;
@@ -568,19 +569,22 @@ export class TaskWorker {
         }
         revision = revisionSteps.at(-1)?.revisionAfter ?? reworkResume.continuation.revisionAfter;
         if (task.revisionCount !== revision) throw new Error("Review rework revision count differs from its append-only revision high-water");
-        const reviewVerdict = this.#options.store.getPackageReviewVerdict(reworkResume.continuation.verdictId);
-        if (!reviewVerdict || reviewVerdict.packageId !== reworkResume.continuation.packageId
-          || reviewVerdict.result.verdict !== "changes_requested") {
-          throw new Error("Review rework continuation verdict binding is missing or no longer requests changes");
-        }
+        const reviewRequirements = this.#reviewReworkRequirements(taskId, reworkResume.continuation.id);
         if (latestFailedStep) {
           const failedChecks = this.#options.store.checkRunResults(latestFailedStep.failedCheckRunId);
+          if (latestFailedStep.integrityFailureHash) {
+            const integrity = this.#options.store.checkRunIntegrityFailure(latestFailedStep.failedCheckRunId);
+            if (!integrity || hash(JSON.stringify(integrity)) !== latestFailedStep.integrityFailureHash) {
+              throw new Error("Review rework revision step has no matching persisted integrity failure evidence");
+            }
+            failedChecks.push(this.#integrityFailureCheck());
+          }
           if (!failedChecks.length || failedChecks.every(check => check.status === "passed")) {
             throw new Error("Review rework revision step has no persisted failed check results");
           }
-          revisionBrief = this.#revisionBrief(task, failedChecks, undefined, revision);
+          revisionBrief = this.#revisionBrief(task, failedChecks, reviewRequirements, revision);
         } else {
-          revisionBrief = this.#revisionBrief(task, [], reviewVerdict.result, revision);
+          revisionBrief = this.#revisionBrief(task, [], reviewRequirements, revision);
         }
         finalRoute = undefined;
         finalChecks = [];
@@ -786,6 +790,8 @@ export class TaskWorker {
           cwd: worktree.path,
           prompt: [
             executionBrief,
+            this.#executionStageBrief(task, executionStageIndex),
+            "In your final reply, summarize the changes, decisions and their rationale, unfinished work, risks, and what a following agent should inspect or do next. Zero retains this as your unverified account; Git observations, configured checks and independent review determine task completion.",
             ...(isFirstRecoveredStage && revision === 0 && executionStageIndex === 0
               ? ["The checkout may contain incomplete edits from an interrupted earlier writer. Inspect the current changes, preserve correct work, and finish the task from this state. The earlier attempt did not complete or pass review."] : []),
             ...(isFirstReworkRecoveryWriter
@@ -809,7 +815,8 @@ export class TaskWorker {
           stderrPath: runResult.stderrPath,
           resultPath: runResult.eventsPath,
           error: runResult.error,
-          metadata: { actualModel: runResult.actualModel, durationMs: runResult.durationMs, sessionId: runResult.sessionId },
+          metadata: { actualModel: runResult.actualModel, durationMs: runResult.durationMs, sessionId: runResult.sessionId,
+            executorSummary: boundExecutorSummary(runResult.final) },
         }, { owner, processStartId });
         activeAttempt = undefined;
         active.adapter = undefined;
@@ -895,14 +902,34 @@ export class TaskWorker {
         }
         if (checkTreeError || !checksAfter || !sameReviewSnapshot(checksSnapshot, checksAfter)
           || branchAfterChecks?.ref !== branchHead.ref || branchAfterChecks?.head !== branchHead.head) {
-          const integrityCheck: CheckResult = {
-            id: "__zero_worktree_integrity__", argv: [], status: "failed", exitCode: null, durationMs: 0,
-            error: `Worktree or task branch changed while validation checks ran${checkTreeError ? `: ${checkTreeError}` : "; their results do not apply to the final tree"}`,
-          };
+          const integrityCheck = this.#integrityFailureCheck(checkTreeError);
           checks.push(integrityCheck);
+          finalChecks = checks;
+          executionChecks = checks;
           this.#options.store.saveCheck(taskId, integrityCheck, attempt.id);
-          this.#options.store.finishCheckRun(checkRun.id, { owner, generationId }, "failed", integrityCheck.error ?? "Worktree integrity check failed");
-          activeCheckRunId = undefined;
+          try {
+            // These two errors mean a known unstaged change. Other capture
+            // failures remain uncertain even if a later Git read happens to work.
+            if (checkTreeError && !["Worktree has unstaged tracked changes", "Worktree has unstaged untracked files"].includes(checkTreeError)) {
+              throw new Error(`Validation integrity inspection failed: ${checkTreeError}`);
+            }
+            const creation = this.#options.store.getWorktreeCreation(taskId);
+            if (!creation || creation.status !== "created" || !creation.plan || !creation.observed) {
+              throw new Error("Validation integrity inspection has no registered worktree");
+            }
+            const reopened = await this.#options.worktrees.reopenFromEvidence(
+              creation.plan as WorktreeCreationPlan, creation.observed as WorktreeCreationEvidence);
+            const inspection = await this.#inspectReviewReworkGit(task, reopened);
+            if (inspection.gitState.branchRef !== branchHead.ref || inspection.gitState.head !== branchHead.head) {
+              throw new Error("Task branch or HEAD moved during validation; automatic rework is unsafe");
+            }
+            this.#options.store.failCheckRunForIntegrity(checkRun.id, { owner, generationId }, inspection);
+            activeCheckRunId = undefined;
+          } catch (error) {
+            this.#options.store.finishCheckRun(checkRun.id, { owner, generationId }, "failed", integrityCheck.error!);
+            activeCheckRunId = undefined;
+            throw error;
+          }
         }
         finalChecks = checks;
         executionChecks = checks;
@@ -913,18 +940,23 @@ export class TaskWorker {
               `Validation checks failed: ${failedChecks.map(check => check.id).join(", ")}`);
             activeCheckRunId = undefined;
           }
-          await this.#finishExecutionStage({
+          const failedOutputFingerprint = await this.#finishExecutionStage({
             task, worktree, stage: executionStage, attempt: executionAttempt, route, owner,
             status: "failed", checks, summary: "Zero observed one or more failed validation checks.",
           });
+          const integrityFailure = this.#options.store.checkRunIntegrityFailure(checkRun.id);
+          if (integrityFailure && failedOutputFingerprint !== integrityFailure.gitState.snapshot.fingerprint) {
+            throw new Error("Worktree changed or became unreadable after the integrity failure inspection; automatic rework is unsafe");
+          }
           if (reviewReworkContinuationId) {
             const retry = this.#options.store.beginReviewReworkCheckRetry(taskId, reviewReworkContinuationId, {
               checkRunId: checkRun.id, owner, generationId,
+              fingerprint: failedOutputFingerprint,
             });
             if (retry.kind === "revision_limit") return retry.task;
             task = retry.task;
             revision = retry.step.revisionAfter;
-            revisionBrief = this.#revisionBrief(task, failedChecks, undefined, revision);
+            revisionBrief = this.#revisionBrief(task, failedChecks, this.#reviewReworkRequirements(taskId, reviewReworkContinuationId), revision);
             executionStage = undefined;
             executionAttempt = undefined;
             finalRoute = undefined;
@@ -1721,8 +1753,15 @@ export class TaskWorker {
   #taskForExecutionStage(task: TaskRecord, index: number): TaskRecord {
     const stageSelection = task.executionStages?.[index];
     if (!stageSelection) return task;
-    const selection = { ...task.selection, ...stageSelection };
-    return { ...task, selection };
+    const { objective, ...executionSelection } = stageSelection;
+    const selection = { ...task.selection, ...executionSelection };
+    return { ...task, selection, ...(objective ? { prompt: `${task.prompt}\n\n${this.#executionStageBrief(task, index)}` } : {}) };
+  }
+
+  #executionStageBrief(task: TaskRecord, index: number): string {
+    const objective = task.executionStages?.[index]?.objective;
+    if (!objective) return "";
+    return `Execution stage ${index + 1} of ${task.executionStages!.length} objective:\n${objective}\nThis stage scope supplements the overall task. Preserve the original task and acceptance criteria, and address all reviewer-requested changes during revisions. Later stages receive this same worktree; describe unfinished work in your final reply.`;
   }
 
   #assertAllowedPaths(task: TaskRecord, paths: string[]): void {
@@ -1735,12 +1774,28 @@ export class TaskWorker {
     if (denied.length) throw new Error(`Changed files outside allowedPaths: ${denied.join(", ")}`);
   }
 
+  #reviewReworkRequirements(taskId: string, continuationId: string): ReviewResult {
+    const continuation = this.#options.store.getReviewReworkContinuation(taskId, continuationId);
+    const verdict = continuation && this.#options.store.getPackageReviewVerdict(continuation.verdictId);
+    if (!continuation || continuation.id !== this.#options.store.getReviewReworkContinuation(taskId)?.id
+      || !verdict || verdict.taskId !== taskId || verdict.packageId !== continuation.packageId
+      || verdict.result.verdict !== "changes_requested") {
+      throw new Error("Review rework continuation verdict binding is missing or no longer requests changes");
+    }
+    return verdict.result;
+  }
+
   #revisionBrief(task: TaskRecord, failed: CheckResult[], review: ReviewResult | undefined, revision: number): string {
     const chunks = [task.prompt, `\n\nZero revision ${revision} requested. Preserve the original task and address all evidence below.`];
     if (failed.length) chunks.push(`Failed checks:\n${failed.map(item => `- ${item.id}: status=${item.status}; exitCode=${String(item.exitCode)}${item.error ? `; error=${item.error.slice(0, 500)}` : ""}`).join("\n")}`);
     if (review) chunks.push(`Reviewer verdict: ${review.verdict}\n${review.summary}\n${review.findings.map(item => `- ${item.severity}${item.file ? ` ${item.file}${item.line ? `:${item.line}` : ""}` : ""}: ${item.evidence} Required change: ${item.requestedChange}`).join("\n")}`);
     if (task.acceptanceCriteria?.length) chunks.push(`Acceptance criteria:\n${task.acceptanceCriteria.map(item => `- ${item}`).join("\n")}`);
     return chunks.join("\n");
+  }
+
+  #integrityFailureCheck(detail?: string): CheckResult {
+    return { id: "__zero_worktree_integrity__", argv: [], status: "failed", exitCode: null, durationMs: 0,
+      error: `Worktree or task branch changed while validation checks ran${detail ? `: ${detail}` : "; their results do not apply to the final tree"}` };
   }
 
   #initialExecutionBrief(task: TaskRecord, brief: string): string {
@@ -1823,9 +1878,6 @@ export class TaskWorker {
       if (statusBefore !== statusAfter || JSON.stringify(pathsBefore) !== JSON.stringify(pathsAfter)) {
         throw new Error("Worktree moved while building handoff snapshot");
       }
-      if (pathsAfter.length > 40 || pathsAfter.some(path => path.length > 512)) {
-        throw new Error("Changed path list exceeds the bounded handoff representation");
-      }
       workspaceState = statusAfter ? "dirty" : "clean";
       changedFiles = pathsAfter;
     } catch {
@@ -1838,6 +1890,11 @@ export class TaskWorker {
     const finalStatus = input.status === "succeeded" && snapshotFailed ? "failed" : input.status;
     this.#options.store.finishStage(stage.id, owner, stage.processStartId, finalStatus, fingerprint);
     if (attempt) {
+      // The in-memory Attempt predates finishAttempt. Read the durable final so
+      // all finalization/recovery paths carry the same bounded executor claim.
+      const savedAttempt = this.#options.store.attempts(task.id).find(item => item.id === attempt.id && item.stageId === stage.id);
+      const executorSummary = typeof savedAttempt?.metadata?.executorSummary === "string"
+        ? boundExecutorSummary(savedAttempt.metadata.executorSummary) : undefined;
       const observedChecks = (task.checks ?? []).slice(0, 40).map(definition => {
         const result = checks.find(item => item.id === definition.id);
         return {
@@ -1848,12 +1905,16 @@ export class TaskWorker {
           ...(result ? { evidence: `exitCode=${String(result.exitCode)}; durationMs=${result.durationMs}` } : { evidence: "not run" }),
         };
       });
+      // The display budget limits only the handoff projection. The fingerprint
+      // above must continue to cover every changed path, including omitted ones.
+      const changed = (changedFiles ?? []).filter(path => path.length <= 512).slice(0, 40);
+      const pathsOmitted = changed.length < (changedFiles?.length ?? 0);
       const risks = [
-        ...(snapshotFailed ? ["Workspace snapshot is incomplete or exceeded the handoff path limits; inspect the archived task evidence."] : []),
+        ...(snapshotFailed ? ["Workspace snapshot is incomplete; inspect the archived task evidence."] : []),
+        ...(pathsOmitted ? ["Changed paths were omitted from this bounded handoff list; the fingerprint covers the full worktree. Inspect the task worktree and archived diff for the complete changes."] : []),
         ...((task.checks?.length ?? 0) > 40 ? ["Only the first 40 configured checks fit the handoff schema; see the task report for all checks."] : []),
       ];
       const completed = [summary, ...observedChecks.filter(check => check.status === "passed").map(check => `Validation check passed: ${check.id}`)].slice(0, 40);
-      const changed = changedFiles ?? [];
       const handoff: HandoffV1 = {
         schemaVersion: 1,
         taskId: task.id,
@@ -1875,6 +1936,7 @@ export class TaskWorker {
           : { baseCommit: worktree.baseCommit, fingerprint: fingerprint!, state: workspaceState, changedFiles: changed },
         completed,
         currentState: summary,
+        ...(executorSummary ? { executorSummary } : {}),
         decisions: [],
         rejectedOptions: [],
         keyFiles: changed.slice(0, 20).map(path => ({ path, reason: "Git reports this path changed from the task base." })),

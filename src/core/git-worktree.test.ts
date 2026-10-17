@@ -40,7 +40,7 @@ test("reviewed candidate is deterministic and only moves the task branch after C
     assert.equal((await manager.readTaskBranchHead(info)).head, first.commit);
     await manager.applyReviewedCommitCandidate(info, first, reviewed);
     await manager.verifyReviewedCommit(info, first.commit, reviewed);
-  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  } finally { await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("a fresh manager verifies an applied candidate after restart without its old pre-CAS fingerprint", async () => {
@@ -53,7 +53,7 @@ test("a fresh manager verifies an applied candidate after restart without its ol
     const restartedManager = new GitWorktreeManager(join(root, "worktrees"));
     await restartedManager.verifyAppliedReviewedCommitCandidate(info, candidate, reviewed);
     assert.equal((await restartedManager.readTaskBranchHead(info)).head, candidate.commit);
-  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  } finally { await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("recovery can verify an existing candidate object before CAS and fails closed when it is missing", async () => {
@@ -69,7 +69,7 @@ test("recovery can verify an existing candidate object before CAS and fails clos
       /not a valid|missing or is not a commit|could not get object info/i,
     );
     assert.deepEqual(await manager.readTaskBranchHead(info), branch);
-  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  } finally { await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("restart verification rejects index pollution, wrong candidate metadata, and a moved branch", async () => {
@@ -98,7 +98,7 @@ test("restart verification rejects index pollution, wrong candidate metadata, an
       restartedManager.verifyAppliedReviewedCommitCandidate(info, candidate, reviewed),
       /Task branch did not move to the reviewed candidate/,
     );
-  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  } finally { await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("reviewed candidate refuses a competing branch ref update", async () => {
@@ -111,7 +111,7 @@ test("reviewed candidate refuses a competing branch ref update", async () => {
     assert.notEqual(competingHead, branch.head);
     await assert.rejects(manager.applyReviewedCommitCandidate(info, candidate, reviewed), /moved before candidate apply/);
     assert.equal((await manager.readTaskBranchHead(info)).head, competingHead);
-  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  } finally { await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("reviewed candidate apply fails closed when the candidate object is missing", async () => {
@@ -124,7 +124,7 @@ test("reviewed candidate apply fails closed when the candidate object is missing
       /not a valid|missing or is not a commit|could not get object info/i,
     );
     assert.equal((await manager.readTaskBranchHead(info)).head, branch.head);
-  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  } finally { await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("reviewed candidate refuses a dirty index without moving the branch", async () => {
@@ -136,7 +136,7 @@ test("reviewed candidate refuses a dirty index without moving the branch", async
     await exec("git", ["add", "seed.txt"], { cwd: info.path });
     await assert.rejects(manager.applyReviewedCommitCandidate(info, candidate, reviewed), /no longer matches the reviewed snapshot/);
     assert.equal((await manager.readTaskBranchHead(info)).head, branch.head);
-  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  } finally { await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("reviewed candidate accepts a self-committed pre-HEAD with the reviewed tree", async () => {
@@ -153,7 +153,7 @@ test("reviewed candidate accepts a self-committed pre-HEAD with the reviewed tre
     assert.equal((await manager.readTaskBranchHead(info)).head, branch.head);
     await manager.applyReviewedCommitCandidate(info, candidate, reviewed);
     await manager.verifyAppliedReviewedCommitCandidate(info, candidate, reviewed);
-  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  } finally { await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 const exec = promisify(execFile);
@@ -187,7 +187,7 @@ test("worktree is isolated, diff includes untracked files, and commit records ou
     assert.equal((await readFile(join(info.path, "new.txt"), "utf8")), "new data\n");
     await manager.remove(info, { deleteBranch: true });
     await assert.rejects(manager.create("../escape", repo, "main"), /unsafe path/);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("worktree creation plan rejects path or repository identity drift before Git writes", async () => {
@@ -208,7 +208,7 @@ test("worktree creation plan rejects path or repository identity drift before Gi
     await assert.rejects(manager.executePlan({ ...plan, commonGitDir: join(root, "other.git") }), /Git common directory changed/);
     await assert.equal(await manager.exists("plan_drift"), false);
     await assert.rejects(exec("git", ["show-ref", "--verify", "refs/heads/zero/plan_drift"], { cwd: repo }));
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("reopenFromEvidence verifies registered identity and returns a fresh fingerprint", async () => {
@@ -233,7 +233,7 @@ test("reopenFromEvidence verifies registered identity and returns a fresh finger
     assert.match(reopened.fingerprint, /^[a-f0-9]{64}$/);
     assert.notEqual(reopened.fingerprint, evidence.fingerprint);
     assert.equal((await manager.fingerprint(reopened.info)), reopened.fingerprint);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("reopenFromEvidence fails closed on persisted and registered identity tampering", async () => {
@@ -257,7 +257,7 @@ test("reopenFromEvidence fails closed on persisted and registered identity tampe
 
     await exec("git", ["branch", "-m", "zero/tamper_task", "renamed-task-branch"], { cwd: plan.path });
     await assert.rejects(manager.reopenFromEvidence(plan, evidence), /registration is missing, ambiguous, or has an unexpected branch identity/);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("reopenFromEvidence rejects HEAD changes during fresh fingerprinting", async () => {
@@ -288,7 +288,7 @@ test("reopenFromEvidence rejects HEAD changes during fresh fingerprinting", asyn
     manager.changeHeadAfterFingerprint = true;
 
     await assert.rejects(manager.reopenFromEvidence(plan, evidence), /HEAD changed while reopening/);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("commit refuses a harness-created empty commit when base-to-HEAD has no changes", async () => {
@@ -310,7 +310,7 @@ test("commit refuses a harness-created empty commit when base-to-HEAD has no cha
     const reviewed = await manager.prepareReview(info);
     assert.equal(await manager.commit(info, "Zero result", reviewed), undefined);
     await manager.remove(info, { deleteBranch: true });
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("review snapshot stages complete text and binary diffs and commit preserves its exact tree", async () => {
@@ -346,7 +346,7 @@ test("review snapshot stages complete text and binary diffs and commit preserves
     assert.equal(tree.trim(), reviewed.treeId);
     assert.equal(await readFile(join(info.path, "new.txt"), "utf8"), "new text\n");
     await manager.remove(info, { deleteBranch: true });
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("worktree fingerprint detects same-length untracked binary replacement that diff and status miss", async () => {
@@ -373,7 +373,7 @@ test("worktree fingerprint detects same-length untracked binary replacement that
     assert.equal(oldAfter, oldBefore);
     assert.notEqual(after, before);
     assert.match(before, /^[a-f0-9]{64}$/);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("worktree fingerprint includes index and HEAD identity and rejects oversized files and escaped paths", async () => {
@@ -406,7 +406,7 @@ test("worktree fingerprint includes index and HEAD identity and rejects oversize
     await writeFile(largeFile, Buffer.alloc(0));
     await truncate(largeFile, WORKTREE_FINGERPRINT_MAX_FILE_BYTES + 1);
     await assert.rejects(manager.fingerprint(info), /exceeds .* byte limit/);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("worktree fingerprint fails closed for assume-unchanged and skip-worktree index flags", async () => {
@@ -435,5 +435,5 @@ test("worktree fingerprint fails closed for assume-unchanged and skip-worktree i
     await assert.rejects(manager.fingerprint(info), /assume-unchanged or skip-worktree/);
     await writeFile(join(info.path, "seed.txt"), "base\n");
     await exec("git", ["update-index", "--no-skip-worktree", "seed.txt"], { cwd: info.path });
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });

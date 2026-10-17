@@ -220,7 +220,7 @@ function pauseReviewReworkQuota(f: ReturnType<typeof reviewFixture>, observed: u
   return { pkg, verdict, continuation: begun.continuation, stage, attempt, retryAt, task, inspection };
 }
 
-function failedReworkCheckRun(f: ReturnType<typeof reviewFixture>, continuationId: string, omitLastResult = false) {
+function failedReworkCheckRun(f: ReturnType<typeof reviewFixture>, continuationId: string, omitLastResult = false, passingCommands = false) {
   const stage = f.store.createStage(f.task.id, { role: "revise", processStartId: "failed-rework-check-stage",
     harness: "zcode", model: "model-x" });
   f.store.startStage(stage.id, f.owner, "failed-rework-check-stage");
@@ -235,17 +235,166 @@ function failedReworkCheckRun(f: ReturnType<typeof reviewFixture>, continuationI
     executionAttemptId: attempt.id, executionStageId: stage.id, routeAttemptId: f.routeAttempt.id, route: f.route,
     branchRef: `refs/heads/zero/${f.task.id}`, snapshot: f.snapshot, checkDefinitionHash,
     expectedCheckIds: (f.task.checks ?? []).map(check => check.id) });
-  const failedId = (f.task.checks ?? [])[0]?.id;
+  const failedId = passingCommands ? undefined : (f.task.checks ?? [])[0]?.id;
   for (const [index, check] of (f.task.checks ?? []).entries()) {
     if (omitLastResult && index === (f.task.checks ?? []).length - 1) continue;
     f.store.recordCheckResult(run.id, { owner: f.owner, generationId: f.generationId },
       { id: check.id, argv: check.argv, status: check.id === failedId ? "failed" : "passed",
         exitCode: check.id === failedId ? 1 : 0, durationMs: 5 });
   }
-  f.store.finishCheckRun(run.id, { owner: f.owner, generationId: f.generationId }, "failed", "validation checks failed");
-  f.store.finishStage(stage.id, f.owner, "failed-rework-check-stage", "failed");
+  if (!passingCommands) {
+    f.store.finishCheckRun(run.id, { owner: f.owner, generationId: f.generationId }, "failed", "validation checks failed");
+    f.store.finishStage(stage.id, f.owner, "failed-rework-check-stage", "failed");
+  }
   return { stage, attempt, run };
 }
+
+function integrityFailureInspection(f: ReturnType<typeof reviewFixture>, observed: unknown) {
+  const diff = "diff --git a/a b/a\n+changed by check\n";
+  const snapshot = { ...f.snapshot, treeId: "e".repeat(40), fingerprint: "c".repeat(64), diff,
+    diffHash: createHash("sha256").update(diff).digest("hex") };
+  return reviewReworkRecoveryInput(f, observed, new Date(), snapshot, ["a"]);
+}
+
+test("independent integrity evidence is guarded and does not expand the submitted check IDs", () => {
+  const f = reviewFixture(undefined, 60_000, ":memory:", undefined, 3);
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const begun = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: f.owner, generationId: f.generationId });
+    if (begun.kind !== "started") throw new Error("fixture did not begin rework");
+    const { run, stage } = failedReworkCheckRun(f, begun.continuation.id, false, true);
+    const guard = { owner: f.owner, generationId: f.generationId };
+    const inspection = integrityFailureInspection(f, observed);
+    assert.throws(() => f.store.failCheckRunForIntegrity(run.id, { ...guard, owner: "other" }, inspection), /owner and generation/);
+    assert.throws(() => f.store.failCheckRunForIntegrity(run.id, { ...guard, generationId: "other" }, inspection), /owner and generation/);
+    assert.throws(() => f.store.failCheckRunForIntegrity("another-run", guard, inspection), /owner and generation/);
+    assert.throws(() => f.store.failCheckRunForIntegrity(run.id, guard, {
+      ...inspection, gitState: { ...inspection.gitState, head: "f".repeat(40) },
+    }), /same-HEAD/);
+    assert.throws(() => f.store.failCheckRunForIntegrity(run.id, guard, {
+      ...inspection, gitState: { ...inspection.gitState, allowedPathsVerified: false as unknown as true },
+    }), /allowed-path/);
+    assert.throws(() => f.store.failCheckRunForIntegrity(run.id, guard, {
+      ...inspection, identity: { ...inspection.identity, checkedAt: new Date(Date.now() - 120_000).toISOString() },
+    }), /fresh/i);
+    assert.equal(f.store.checkRunIntegrityFailure(run.id), undefined);
+    const evidence = f.store.failCheckRunForIntegrity(run.id, guard, inspection);
+    assert.equal(evidence.taskId, f.task.id);
+    assert.equal(evidence.runId, run.id);
+    assert.equal(f.store.getCheckRun(run.id)?.status, "failed");
+    assert.deepEqual(f.store.getCheckRun(run.id)?.expectedCheckIds, ["unit"]);
+    assert.ok(f.store.checkRunResults(run.id).every(result => result.status === "passed"));
+    f.store.finishStage(stage.id, f.owner, "failed-rework-check-stage", "failed", inspection.gitState.snapshot.fingerprint);
+    const first = f.store.beginReviewReworkCheckRetry(f.task.id, begun.continuation.id,
+      { ...guard, checkRunId: run.id, fingerprint: inspection.gitState.snapshot.fingerprint });
+    assert.equal(first.kind, "started");
+    if (first.kind !== "started") throw new Error("retry did not begin");
+    assert.deepEqual(first.step.failedCheckIds, ["__zero_worktree_integrity__"]);
+    assert.equal(first.step.integrityFailureHash, createHash("sha256").update(JSON.stringify(evidence)).digest("hex"));
+    const duplicate = f.store.beginReviewReworkCheckRetry(f.task.id, begun.continuation.id,
+      { ...guard, checkRunId: run.id, fingerprint: inspection.gitState.snapshot.fingerprint });
+    assert.equal(duplicate.kind, "started");
+    if (duplicate.kind === "started") assert.equal(duplicate.alreadyApplied, true);
+    assert.equal(f.store.get(f.task.id)?.revisionCount, 2);
+  } finally { f.store.close(); }
+});
+
+test("integrity retries require the completed stage and fresh worktree to match the recorded failure", () => {
+  for (const boundary of ["missing-stage", "changed-stage", "missing-fresh", "changed-fresh"] as const) {
+    const f = reviewFixture(undefined, 60_000, ":memory:", undefined, 3);
+    try {
+      const { observed } = registerReviewRecoveryWorktree(f);
+      const pkg = completeReviewPackage(f);
+      const verdict = finishChangesRequested(f, pkg.id);
+      const begun = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+        owner: f.owner, generationId: f.generationId });
+      if (begun.kind !== "started") throw new Error("fixture did not begin rework");
+      const { run, stage } = failedReworkCheckRun(f, begun.continuation.id, false, true);
+      const inspection = integrityFailureInspection(f, observed);
+      const fingerprint = inspection.gitState.snapshot.fingerprint;
+      f.store.failCheckRunForIntegrity(run.id, { owner: f.owner, generationId: f.generationId }, inspection);
+      f.store.finishStage(stage.id, f.owner, "failed-rework-check-stage", "failed",
+        boundary === "missing-stage" ? undefined : boundary === "changed-stage" ? "f".repeat(64) : fingerprint);
+      const retryInput = { owner: f.owner, generationId: f.generationId, checkRunId: run.id,
+        fingerprint: boundary === "missing-fresh" ? undefined : boundary === "changed-fresh" ? "f".repeat(64) : fingerprint };
+      assert.throws(() => f.store.beginReviewReworkCheckRetry(f.task.id, begun.continuation.id, retryInput), /fingerprint/, boundary);
+      assert.equal(f.store.get(f.task.id)?.revisionCount, 1, boundary);
+      assert.equal(f.store.reviewReworkRevisionSteps(f.task.id, begun.continuation.id).length, 0, boundary);
+    } finally { f.store.close(); }
+  }
+});
+
+test("all-passing commands and a failure reason alone cannot authorize a rework retry", () => {
+  const f = reviewFixture(undefined, 60_000, ":memory:", undefined, 3);
+  try {
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const begun = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: f.owner, generationId: f.generationId });
+    if (begun.kind !== "started") throw new Error("fixture did not begin rework");
+    const { run, stage } = failedReworkCheckRun(f, begun.continuation.id, false, true);
+    f.store.finishCheckRun(run.id, { owner: f.owner, generationId: f.generationId }, "failed", "__zero_worktree_integrity__");
+    f.store.finishStage(stage.id, f.owner, "failed-rework-check-stage", "failed");
+    assert.throws(() => f.store.beginReviewReworkCheckRetry(f.task.id, begun.continuation.id,
+      { owner: f.owner, generationId: f.generationId, checkRunId: run.id }), /real failure/);
+    assert.equal(f.store.get(f.task.id)?.revisionCount, 1);
+  } finally { f.store.close(); }
+});
+
+test("independent integrity evidence survives guardian reclaims and is consumed only once", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-integrity-reclaim-"));
+  const path = join(root, "tasks.sqlite");
+  const lockId = "d".repeat(64);
+  const generations = ["d1".repeat(16), "d2".repeat(16), "d3".repeat(16)];
+  const f = reviewFixture(undefined, 60_000, path,
+    { id: generations[0]!, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" }, 3);
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const begun = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: f.owner, generationId: f.generationId });
+    if (begun.kind !== "started") throw new Error("fixture did not begin rework");
+    const { run, stage } = failedReworkCheckRun(f, begun.continuation.id, false, true);
+    const inspection = integrityFailureInspection(f, observed);
+    const evidence = f.store.failCheckRunForIntegrity(run.id, { owner: f.owner, generationId: f.generationId }, inspection);
+    f.store.finishStage(stage.id, f.owner, "failed-rework-check-stage", "failed", inspection.gitState.snapshot.fingerprint);
+    const raw = new DatabaseSync(path);
+    try {
+      assert.throws(() => raw.prepare("UPDATE check_run_integrity_failures SET owner='other' WHERE run_id=?").run(run.id), /immutable/);
+      assert.throws(() => raw.prepare("DELETE FROM check_run_integrity_failures WHERE run_id=?").run(run.id), /immutable/);
+      // A row copied to another run cannot turn a complete, all-passing run into failure evidence.
+      raw.prepare("INSERT INTO check_run_integrity_failures(run_id,task_id,generation_id,owner,payload,created_at) VALUES(?,?,?,?,?,?)")
+        .run(pkg.checkRunId, evidence.taskId, evidence.generationId, evidence.owner, JSON.stringify(evidence), evidence.createdAt);
+      assert.throws(() => f.store.checkRunIntegrityFailure(pkg.checkRunId), /exact check run/);
+    } finally { raw.close(); }
+
+    for (const [index, generationId] of generations.slice(1).entries()) {
+      f.store.recoverExpired(new Date(Date.now() + 120_000));
+      f.store.close();
+      f.store = new TaskStore(path, { id: generationId, lockId, predecessorDrained: true, evidenceKind: "guardian_startup_verified" });
+      const owner = `integrity-reclaim-${index}`;
+      const recovery = f.store.claimReviewReworkContinuation(f.task.id, owner,
+        reviewReworkRecoveryInput(f, observed, new Date(), inspection.gitState.snapshot, ["a"]));
+      assert.equal(recovery?.claimGenerationId, generationId);
+      assert.deepEqual(f.store.checkRunIntegrityFailure(run.id), evidence);
+      const consumed = f.store.beginReviewReworkCheckRetry(f.task.id, begun.continuation.id,
+        { checkRunId: run.id, owner, generationId, fingerprint: inspection.gitState.snapshot.fingerprint });
+      assert.equal(consumed.kind, "started");
+      if (consumed.kind !== "started") throw new Error("retry did not begin");
+      assert.equal(consumed.alreadyApplied, index > 0);
+      const duplicate = f.store.beginReviewReworkCheckRetry(f.task.id, begun.continuation.id,
+        { checkRunId: run.id, owner, generationId, fingerprint: inspection.gitState.snapshot.fingerprint });
+      assert.equal(duplicate.kind, "started");
+      if (duplicate.kind === "started") assert.equal(duplicate.alreadyApplied, true);
+      assert.equal(f.store.get(f.task.id)?.revisionCount, 2);
+      assert.equal(f.store.reviewReworkRevisionSteps(f.task.id, begun.continuation.id).length, 1);
+    }
+  } finally { f.store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
 
 test("beginReviewRework consumes a changes-requested verdict and increments the revision only once", () => {
   const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, ":memory:", undefined, 1);
@@ -2013,6 +2162,49 @@ test("execution stage submissions reject an empty stage list and persist valid s
     const task = store.submit(submission, "execution_stages_store_test");
     assert.deepEqual(task.executionStages, submission.executionStages);
     assert.deepEqual(store.get(task.id)?.executionStages, submission.executionStages);
+  } finally { store.close(); }
+});
+
+test("stage objectives persist with their own selection across database reopen and sequence creation", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-stage-objectives-"));
+  const path = join(root, "tasks.sqlite");
+  let store = new TaskStore(path);
+  try {
+    const submission = {
+      repoPath: ".", baseRef: "main", prompt: "Implement then verify the parser.", selection: { harness: "zcode" },
+      executionStages: [{ model: "glm-main", objective: "Implement UTF-8 rejection" }, { objective: "Verify boundary cases" }, {}],
+    } as TaskSubmission;
+    const task = store.submit(submission, "durable-stage-objectives");
+    const sequence = store.createSequence([submission, { repoPath: ".", baseRef: "main", prompt: "Legacy follow-up" }]);
+    assert.deepEqual(task.selection, { harness: "zcode" });
+    store.close();
+    store = new TaskStore(path);
+    assert.deepEqual(store.get(task.id)?.executionStages, [
+      { model: "glm-main", objective: "Implement UTF-8 rejection" }, { objective: "Verify boundary cases" }, {},
+    ]);
+    assert.deepEqual(store.getSequence(sequence.id)?.steps[0]?.task.executionStages, [
+      { model: "glm-main", objective: "Implement UTF-8 rejection" }, { objective: "Verify boundary cases" }, {},
+    ]);
+    assert.equal(store.getSequence(sequence.id)?.steps[1]?.task.executionStages, undefined);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("stage objective validation rejects invalid direct submissions atomically and accepts the normalized length boundary", () => {
+  const store = new TaskStore();
+  const base = { repoPath: ".", baseRef: "main", prompt: "Validate stage goals" };
+  try {
+    for (const objective of ["", " \r\n\t ", " untrimmed", "untrimmed ", 42, null, {}, "x".repeat(4001)]) {
+      const invalid = { ...base, executionStages: [{ objective }] } as unknown as TaskSubmission;
+      assert.throws(() => store.submit(invalid), /objective/, `must reject ${JSON.stringify(objective)}`);
+      assert.throws(() => store.createSequence([base, invalid]), /objective/);
+      assert.equal(store.list().length, 0);
+      assert.equal(store.listSequences().length, 0);
+    }
+    const task = store.submit({ ...base, executionStages: [{ objective: "x".repeat(4000) }] } as TaskSubmission);
+    assert.equal((store.get(task.id)?.executionStages?.[0] as { objective?: string }).objective?.length, 4000);
   } finally { store.close(); }
 });
 

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
-import { Activity, AlertCircle, ArrowDown, ArrowRight, ArrowUp, Check, CheckCircle2, ChevronDown, CircleHelp, Clock3, Code2, FileText, FolderGit2, ListOrdered, LoaderCircle, Plus, RefreshCw, Settings2, ShieldCheck, Target, TerminalSquare, X, XCircle } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { Activity, Search, LayoutList, Columns3, Layers3, AlertCircle, ArrowDown, ArrowRight, ArrowUp, Check, CheckCircle2, ChevronDown, CircleHelp, Clock3, Code2, FileText, FolderGit2, ListOrdered, LoaderCircle, Plus, RefreshCw, Settings2, ShieldCheck, Target, TerminalSquare, X, XCircle } from 'lucide-react';
 import { api } from './api';
+import { usePolling } from './usePolling';
 import type { Binding, Capabilities, Choice, Config, ExecutionSelection, HarnessHealth, Status, Task, TaskSequence, TestResult } from './types';
 
 const columns: { id: Status; label: string; tone: string }[] = [
@@ -13,6 +14,8 @@ const columns: { id: Status; label: string; tone: string }[] = [
 const statusLabel: Record<string, string> = Object.fromEntries(columns.map(x => [x.id, x.label]));
 const sequenceStatusLabel: Record<TaskSequence['status'], string> = { queued: '排队中', running: '执行中', waiting: '等待额度恢复', blocked: '被阻塞', steps_completed: '步骤已完成，待目标验收', completed: '已完成' };
 const nice = (value?: string) => value ? value.replaceAll('_', ' ') : '—';
+const roleLabel = (value?: string) => ({ implement: '执行', revise: '返工', route: '路由', review: '审核' } as Record<string, string>)[value || ''] || nice(value);
+const stageStatusLabel = (value: string) => ({ pending: '待处理', running: '执行中', succeeded: '已完成', failed: '失败', interrupted: '已中断' } as Record<string, string>)[value] || nice(value);
 const date = (value?: string) => value ? new Date(value).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '时间未知';
 const retryDate = (value?: string) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
 const routeName = (route?: Task['route']) => [route?.harnessId, route?.modelId, route?.reasoningEffort].filter(Boolean).join(' · ') || '等待路由分配';
@@ -44,84 +47,106 @@ function Button({ children, onClick, variant = 'secondary', disabled, type = 'bu
   return <button className={`button ${variant}`} type={type} onClick={onClick} disabled={disabled}>{children}</button>;
 }
 
+function useDialog(onClose: () => void, busy = false) {
+  const ref = useRef<HTMLElement>(null);
+  const state = useRef({ onClose, busy });
+  state.current = { onClose, busy };
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    const element = ref.current;
+    if (!element) return;
+    const controls = () => Array.from(element.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), a[href], summary, [tabindex="0"]')).filter(node => {
+      if (node.closest('fieldset:disabled') || node.getAttribute('tabindex') === '-1' || node.getAttribute('type') === 'hidden') return false;
+      if (node.tagName === 'SUMMARY' && (node.parentElement?.tagName !== 'DETAILS' || Array.from(node.parentElement.children).find(child => child.tagName === 'SUMMARY') !== node)) return false;
+      for (let ancestor: HTMLElement | null = node; ancestor; ancestor = ancestor.parentElement) {
+        const style = getComputedStyle(ancestor);
+        if (ancestor.hidden || ancestor.hasAttribute('inert') || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (ancestor.tagName === 'DETAILS' && !ancestor.hasAttribute('open')) {
+          const summary = Array.from(ancestor.children).find(child => child.tagName === 'SUMMARY');
+          if (!summary?.contains(node)) return false;
+        }
+        if (ancestor === element) break;
+      }
+      return true;
+    });
+    (controls()[0] ?? element).focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.preventDefault(); if (!state.current.busy) state.current.onClose(); }
+      if (event.key === 'Tab') {
+        const items = controls(); const first = items[0]; const last = items.at(-1);
+        if (!first) { event.preventDefault(); element.focus(); }
+        else if (event.shiftKey && (document.activeElement === first || document.activeElement === element)) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && (document.activeElement === last || document.activeElement === element)) { event.preventDefault(); first.focus(); }
+      }
+    };
+    element.addEventListener('keydown', onKey);
+    return () => { element.removeEventListener('keydown', onKey); previous?.focus(); };
+  }, []);
+  return ref;
+}
+
+const loadTasks = async (_key: string, signal: AbortSignal) => asTasks(await api.tasks({ signal }));
+const loadCapabilities = (_key: string, signal: AbortSignal) => api.capabilities({ signal });
+const loadSequences = async (_key: string, signal: AbortSignal) => asSequences(await api.sequences({ signal }));
+const loadTask = async (id: string, signal: AbortSignal) => { const task = await api.task(id, { signal }); if (task.id !== id) throw new Error('任务身份不匹配，请重新加载'); return task; };
+const loadSequence = async (id: string, signal: AbortSignal) => { const result = await api.sequence(id, { signal }); if (result.id !== id) throw new Error('目标身份不匹配，请重新加载'); return result; };
+
 export default function App() {
   const [page, setPage] = useState<'tasks' | 'settings'>('tasks');
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [sequences, setSequences] = useState<TaskSequence[]>([]);
-  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
+  const taskState = usePolling('tasks', loadTasks);
+  const capState = usePolling('capabilities', loadCapabilities, 15000);
+  const seqState = usePolling('sequences', loadSequences);
+  const tasks = taskState.data ?? [];
+  const capabilities = capState.data;
   const [allocatorKind, setAllocatorKind] = useState<Config['allocator']['kind']>('codex');
-  const [capError, setCapError] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [tasksApiConnected, setTasksApiConnected] = useState(false);
-  const [capabilitiesApiConnected, setCapabilitiesApiConnected] = useState(false);
-  const serviceConnected = tasksApiConnected || capabilitiesApiConnected;
-  const [loadError, setLoadError] = useState('');
-  const [sequenceError, setSequenceError] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Task | null>(null);
-  const [selectedError, setSelectedError] = useState('');
+  const detail = usePolling(selectedId, loadTask, 3500);
   const [showSubmit, setShowSubmit] = useState(false);
   const [showSequenceSubmit, setShowSequenceSubmit] = useState(false);
   const [selectedSequenceId, setSelectedSequenceId] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
-  const [refreshing, setRefreshing] = useState(false);
-
-  const refreshTasks = useCallback(async (quiet = false) => {
-    if (!quiet) setRefreshing(true);
-    try { setTasks(asTasks(await api.tasks())); setLoadError(''); setTasksApiConnected(true); }
-    catch (e) { setLoadError(e instanceof Error ? e.message : '无法读取任务'); setTasksApiConnected(false); }
-    finally { setLoading(false); setRefreshing(false); }
-  }, []);
-  const refreshCapabilities = useCallback(async () => {
-    try { setCapabilities(await api.capabilities()); setCapError(''); setCapabilitiesApiConnected(true); }
-    catch (e) { setCapabilities(null); setCapError(e instanceof Error ? e.message : '无法读取 Harness 能力'); setCapabilitiesApiConnected(false); }
-  }, []);
-
-  const refreshSequences = useCallback(async () => {
-    try { setSequences(asSequences(await api.sequences())); setSequenceError(''); }
-    catch (e) { setSequenceError(e instanceof Error ? e.message : '无法读取目标序列'); }
-  }, []);
-
-  useEffect(() => { void refreshTasks(); void refreshCapabilities(); void refreshSequences(); void api.config().then(config => setAllocatorKind(config.allocator.kind)).catch(() => {}); const timer = window.setInterval(() => { void refreshTasks(true); void refreshSequences(); }, 4500); return () => window.clearInterval(timer); }, [refreshTasks, refreshCapabilities, refreshSequences]);
-  useEffect(() => {
-    if (!selectedId) { setSelected(null); setSelectedError(''); return; }
-    let live = true;
-    const update = async () => { try { const task = await api.task(selectedId); if (live) { setSelected(task); setSelectedError(''); } } catch (e) { if (live) setSelectedError(e instanceof Error ? e.message : '无法读取任务详情'); } };
-    void update(); const timer = window.setInterval(() => { void update(); }, 3500);
-    return () => { live = false; window.clearInterval(timer); };
-  }, [selectedId]);
-
-  const counts = useMemo(() => Object.fromEntries(columns.map(c => [c.id, tasks.filter(t => t.status === c.id).length])) as Record<Status, number>, [tasks]);
-  const activeHarnesses = useMemo(() => capabilities?.harnesses ?? [], [capabilities]);
-  const onCreated = (task: Task) => { setShowSubmit(false); setSelectedId(task.id); setNotice('任务已加入队列'); window.setTimeout(() => setNotice(''), 3200); void refreshTasks(true); };
-
+  const [search, setSearch] = useState(''); const [status, setStatus] = useState('');
+  const [repo, setRepo] = useState(''); const [harness, setHarness] = useState('');
+  const [view, setView] = useState<'list' | 'board'>('list');
+  const connected = Boolean(taskState.lastSynced && !taskState.error);
+  const degraded = connected && Boolean(capState.error || seqState.error);
+  const connectionLabel = connected ? degraded ? '部分接口暂不可用' : '本地服务已连接' : taskState.loading ? '正在连接本地服务' : '本地服务未连接';
+  useEffect(() => { const controller = new AbortController(); void api.config({ signal: controller.signal }).then(config => { if (!controller.signal.aborted) setAllocatorKind(config.allocator.kind); }).catch(() => {}); return () => controller.abort(); }, []);
+  useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(''), 3200); return () => clearTimeout(timer); }, [notice]);
+  const refreshAll = () => { void taskState.refresh(); void capState.refresh(); void seqState.refresh(); };
+  const counts = Object.fromEntries(columns.map(c => [c.id, tasks.filter(t => t.status === c.id).length])) as Record<Status, number>;
+  const repos = [...new Set(tasks.map(task => task.repoPath).filter((value): value is string => Boolean(value)))].sort();
+  const harnesses = [...new Set(tasks.map(task => task.route?.harnessId).filter((value): value is string => Boolean(value)))].sort();
+  const filtered = tasks.filter(task => (!search.trim() || [task.title, task.repoPath, task.id, task.route?.modelId].join(' ').toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())) && (!status || task.status === status) && (!repo || task.repoPath === repo) && (!harness || task.route?.harnessId === harness)).sort((a, b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || ''));
+  const clearFilters = () => { setSearch(''); setStatus(''); setRepo(''); setHarness(''); };
   return <div className="app-shell">
-    <aside className="sidebar">
-      <div className="brand"><div className="brand-mark"><Activity size={19} /></div><div><strong>Zero</strong><small>智能任务节点</small></div></div>
-      <div className="sidebar-label">工作区</div>
-      <button className={`nav-item ${page === 'tasks' ? 'active' : ''}`} onClick={() => setPage('tasks')}><FolderGit2 size={17} />任务看板<span className="nav-count">{tasks.length}</span></button>
-      <button className={`nav-item ${page === 'settings' ? 'active' : ''}`} onClick={() => setPage('settings')}><Settings2 size={17} />路由设置</button>
-      <div className="sidebar-bottom"><div className="node-status"><span className={`pulse-dot ${serviceConnected ? '' : 'offline'}`} /><div><b>Zero 节点</b><small>{serviceConnected ? '本地服务已连接' : '本地服务未连接'}</small></div></div><div className="sidebar-version">v1 · 单机执行节点</div></div>
+    <aside className="sidebar" aria-label="工作区导航"><div className="brand"><div className="brand-mark"><Layers3 size={23} /></div><div><strong>zero<span> / </span></strong><small>AGENT WORKSPACE</small></div></div><div className="sidebar-label">工作空间</div>
+      <nav><button aria-label="任务工作台" aria-current={page === 'tasks' ? 'page' : undefined} className={`nav-item ${page === 'tasks' ? 'active' : ''}`} onClick={() => setPage('tasks')}><LayoutList size={18} /><span className="nav-text">任务工作台</span><span className="nav-count">{tasks.length}</span></button><button aria-label="路由设置" aria-current={page === 'settings' ? 'page' : undefined} className={`nav-item ${page === 'settings' ? 'active' : ''}`} onClick={() => setPage('settings')}><Settings2 size={18} /><span className="nav-text">路由设置</span></button></nav>
+      <div className="sidebar-note"><div className="sidebar-label">执行流程</div><p>提交任务 → Agent 执行<br />运行检查 → 独立审核<br />通过门禁 → 交付归档</p></div><div className="sidebar-bottom"><div className="node-status"><span className={`pulse-dot ${connected ? '' : 'offline'}`} /><div><b>本地执行节点</b><small>{connectionLabel}</small></div></div><div className="sidebar-version">ZERO / LOCAL FIRST</div></div>
     </aside>
-    <main className="main-area">
-      <header className="topbar"><div className="breadcrumb">Zero <span>/</span> {page === 'tasks' ? '任务看板' : '路由设置'}</div><div className="top-actions"><button className="icon-button" title="刷新任务" onClick={() => { void refreshTasks(); void refreshCapabilities(); void refreshSequences(); }}><RefreshCw size={16} className={refreshing ? 'spin' : ''} /></button>{page === 'tasks' && <Button onClick={() => setShowSequenceSubmit(true)}><ListOrdered size={15} />提交目标</Button>}<Button variant="primary" onClick={() => setShowSubmit(true)}><Plus size={16} />提交任务</Button></div></header>
-      {page === 'tasks' ? <>
-        <section className="page-heading"><div><div className="eyebrow">任务调度</div><h1>任务看板</h1><p>从提交到审核归档，跟踪每一步执行结果。</p></div><div className="heading-chip"><span className="pulse-dot" />自动调度已开启</div></section>
-        <HarnessStrip harnesses={activeHarnesses} error={capError} />
-        <section className="metrics-row">{columns.map((c) => <div className="metric" key={c.id}><span className={`metric-dot ${c.tone}`} /><span>{c.label}</span><b>{counts[c.id]}</b></div>)}</section>
-        <SequenceProgressSection sequences={sequences} error={sequenceError} onOpen={id => setSelectedSequenceId(id)} onCreate={() => setShowSequenceSubmit(true)} />
-        {loadError && <div className="alert error"><AlertCircle size={17} /><div><b>任务列表加载失败</b><span>{loadError}</span></div><button onClick={() => void refreshTasks()}><RefreshCw size={14} />重试</button></div>}
-        {loading ? <div className="loading-state"><LoaderCircle className="spin" size={24} /><span>正在连接 Zero 服务…</span></div> : tasks.length === 0 ? <div className="empty-state"><div className="empty-icon"><TerminalSquare size={24} /></div><h2>还没有任务</h2><p>提交一个任务，Zero 会自动选择执行路线、运行检查并交由 Codex 审核。</p><Button variant="primary" onClick={() => setShowSubmit(true)}><Plus size={16} />创建第一个任务</Button></div> : <div className="board">{columns.map(col => { const items = tasks.filter(t => t.status === col.id).sort((a,b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || '')); return <section className="board-column" key={col.id}><div className="column-heading"><span className={`column-dot ${col.tone}`} /><b>{col.label}</b><span className="column-count">{items.length}</span></div><div className="cards">{items.map(task => <TaskCard key={task.id} task={task} onClick={() => setSelectedId(task.id)} />)}{items.length === 0 && <div className="column-empty">暂无任务</div>}</div></section>; })}</div>}
-      </> : <SettingsPage capabilities={capabilities} onSaved={(message, kind) => { setAllocatorKind(kind); setNotice(message); window.setTimeout(() => setNotice(''), 3200); }} onRetry={refreshCapabilities} />}
+    <main className="main-area"><header className="topbar"><div className="breadcrumb">工作空间 <span>/</span><b>{page === 'tasks' ? '任务工作台' : '路由设置'}</b></div><div className="top-actions"><button className="icon-button" aria-label="刷新工作区" onClick={refreshAll}><RefreshCw size={17} className={taskState.refreshing ? 'spin' : ''} /></button>{page === 'tasks' && <Button onClick={() => setShowSequenceSubmit(true)}><ListOrdered size={16} />提交目标</Button>}<Button variant="primary" onClick={() => setShowSubmit(true)}><Plus size={17} />提交任务</Button></div></header>
+      {page === 'tasks' ? <><section className="page-heading"><div><div className="eyebrow">AGENT WORKSPACE</div><h1>任务工作台<span> / 每一步，都有据可查。</span></h1><p>跟踪任务执行、跨 Agent 接力与独立验收结果。</p></div><div className={`connection-state ${connected ? 'connected' : ''}`}><div><span className={`pulse-dot ${connected ? '' : 'offline'}`} /><b>{connectionLabel}</b></div><small>{taskState.lastSynced ? `上次同步 ${date(taskState.lastSynced)}` : '等待首次同步'}</small></div></section>
+        <section className="overview" aria-label="任务概览">{[{ label: '全部任务', count: tasks.length, icon: <Layers3 size={19} />, detail: '当前节点', tone: 'slate' }, { label: '正在进行', count: counts.running + counts.reviewing + counts.revision, icon: <Activity size={19} />, detail: '执行 · 审核 · 返工', tone: 'blue' }, { label: '需要关注', count: counts.failed + counts.recovery_required, icon: <AlertCircle size={19} />, detail: '失败 · 需要恢复', tone: 'amber' }, { label: '已完成', count: counts.done, icon: <CheckCircle2 size={19} />, detail: '通过检查与审核', tone: 'green' }].map(item => <div key={item.label} className={`overview-card ${item.tone}`} aria-label={`${item.label} ${item.count}`}><div><span>{item.label}</span>{item.icon}</div><strong>{item.count}<small>{item.detail}</small></strong></div>)}</section>
+        <HarnessStrip harnesses={capabilities?.harnesses ?? []} error={capState.error} />
+        <SequenceProgressSection sequences={seqState.data ?? []} error={seqState.error} onOpen={setSelectedSequenceId} onCreate={() => setShowSequenceSubmit(true)} />
+        <section className="task-workspace" aria-label="执行任务"><div className="workspace-heading"><div><h2>执行任务 <span>{tasks.length}</span></h2><p>{counts.pending + counts.waiting} 个任务待处理或等待额度恢复</p></div><div className="view-toggle" aria-label="任务视图"><button aria-label="列表视图" aria-pressed={view === 'list'} className={view === 'list' ? 'active' : ''} onClick={() => setView('list')}><LayoutList size={16} />列表</button><button aria-label="看板视图" aria-pressed={view === 'board'} className={view === 'board' ? 'active' : ''} onClick={() => setView('board')}><Columns3 size={16} />看板</button></div></div>
+          <div className="task-toolbar"><label className="task-search"><Search size={17} /><input type="search" aria-label="搜索任务" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题、仓库、模型或 ID…" /></label><select aria-label="状态筛选" value={status} onChange={e => setStatus(e.target.value)}><option value="">全部状态</option>{columns.map(col => <option key={col.id} value={col.id}>{col.label} ({counts[col.id]})</option>)}</select><select aria-label="仓库筛选" value={repo} onChange={e => setRepo(e.target.value)}><option value="">全部仓库</option>{repos.map(path => <option key={path} value={path}>{path}</option>)}</select><select aria-label="Harness 筛选" value={harness} onChange={e => setHarness(e.target.value)}><option value="">全部 Harness</option>{harnesses.map(id => <option key={id} value={id}>{id}</option>)}</select></div>
+          {taskState.error && <div className="alert error" role="alert"><AlertCircle size={17} /><div><b>{taskState.data ? '连接中断，当前显示上次同步的任务' : '无法连接 Zero 服务'}</b><span>{taskState.error}。请确认本地服务已启动。</span></div><button onClick={() => void taskState.refresh()}><RefreshCw size={14} />重试</button></div>}
+          {taskState.loading ? <div className="loading-state"><LoaderCircle className="spin" size={24} /><span>正在连接 Zero 服务…</span></div> : !tasks.length ? <div className="empty-state"><div className="empty-icon"><TerminalSquare size={26} /></div><h2>{taskState.error ? '等待本地服务连接' : '准备好开始第一个任务'}</h2><p>{taskState.error ? '连接恢复后，已有任务会显示在这里。' : '描述目标，设置检查命令，然后查看 Agent 的执行与审核结果。'}</p>{!taskState.error && <Button variant="primary" onClick={() => setShowSubmit(true)}><Plus size={16} />创建第一个任务</Button>}</div> : !filtered.length ? <div className="empty-state filter-empty"><Search size={27} /><h2>没有符合条件的任务</h2><p>试试其他关键词，或清除筛选查看全部任务。</p><Button onClick={clearFilters}>清除筛选</Button></div> : view === 'list' ? <TaskTable tasks={filtered} onOpen={setSelectedId} /> : <div className="board">{columns.map(col => { const items = filtered.filter(task => task.status === col.id); return <section className="board-column" key={col.id}><div className="column-heading"><span className={`column-dot ${col.tone}`} /><b>{col.label}</b><span className="column-count">{items.length}</span></div><div className="cards">{items.map(task => <TaskCard key={task.id} task={task} onClick={() => setSelectedId(task.id)} />)}{!items.length && <div className="column-empty">暂无任务</div>}</div></section>; })}</div>}
+          {!!tasks.length && <div className="table-footer">显示 {filtered.length} / {tasks.length} 个任务<span>任务状态来自本地执行节点</span></div>}
+        </section></> : <SettingsPage capabilities={capabilities} onSaved={(message, kind) => { setAllocatorKind(kind); setNotice(message); }} onRetry={capState.refresh} />}
     </main>
-    {selectedId && <TaskDrawer task={selected} loading={!selected && !selectedError} loadError={selectedError} onClose={() => setSelectedId(null)} onCancel={async () => { await api.cancelTask(selectedId); setNotice('已发送取消请求'); window.setTimeout(() => setNotice(''), 3200); void refreshTasks(true); }} />}
-    {showSubmit && <SubmitModal capabilities={capabilities} capabilityError={capError} allocatorKind={allocatorKind} onClose={() => setShowSubmit(false)} onCreated={task => { onCreated(task); void refreshSequences(); }} />}
-    {showSequenceSubmit && <SequenceSubmitModal capabilities={capabilities} onClose={() => setShowSequenceSubmit(false)} onCreated={sequence => { setShowSequenceSubmit(false); setSelectedSequenceId(sequence.id); void refreshSequences(); void refreshTasks(true); }} />}
-    {selectedSequenceId && <SequenceDrawer id={selectedSequenceId} onClose={() => setSelectedSequenceId(null)} onOpenTask={id => { setSelectedSequenceId(null); setSelectedId(id); }} />}
-    {notice && <div className="toast"><CheckCircle2 size={16} />{notice}</div>}
+    {selectedId && <TaskDrawer key={selectedId} task={detail.data} loading={detail.loading} loadError={detail.error} onClose={() => setSelectedId(null)} onCancel={async () => { if (!detail.data || detail.data.id !== selectedId) return; await api.cancelTask(detail.data.id); setNotice('已发送取消请求'); void detail.refresh(); void taskState.refresh(); }} />}
+    {showSubmit && <SubmitModal capabilities={capabilities} capabilityError={capState.error} allocatorKind={allocatorKind} onClose={() => setShowSubmit(false)} onCreated={task => { setShowSubmit(false); setSelectedId(task.id); setNotice('任务已加入队列'); refreshAll(); }} />}
+    {showSequenceSubmit && <SequenceSubmitModal capabilities={capabilities} onClose={() => setShowSequenceSubmit(false)} onCreated={sequence => { setShowSequenceSubmit(false); setSelectedSequenceId(sequence.id); refreshAll(); }} />}
+    {selectedSequenceId && <SequenceDrawer key={selectedSequenceId} id={selectedSequenceId} onClose={() => setSelectedSequenceId(null)} onOpenTask={id => { setSelectedSequenceId(null); setSelectedId(id); }} />}
+    {notice && <div className="toast" role="status"><CheckCircle2 size={16} />{notice}</div>}
   </div>;
 }
 
+function TaskTable({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: string) => void }) {
+  return <div className="table-scroll"><table className="task-table"><thead><tr><th>任务</th><th>状态</th><th>执行 Agent</th><th>仓库</th><th>最近更新</th><th aria-label="打开任务" /></tr></thead><tbody>{tasks.map(task => <tr key={task.id}><td><button className="task-title-button" onClick={() => onOpen(task.id)}>{taskTitle(task)}</button><small className="task-id">{task.id.slice(0, 12)}</small></td><td><span className={`status-pill ${task.status}`}><span />{statusLabel[task.status] || task.status}</span></td><td><div className="table-agent"><span className="agent-avatar">{(task.route?.harnessId || '?').slice(0, 1).toUpperCase()}</span><div>{task.route?.harnessId || '待分配'}<small>{task.route?.modelId || '等待路由结果'}</small></div></div></td><td><div className="table-repo" title={task.repoPath}><FolderGit2 size={14} /><span>{task.repoPath?.split(/[\\/]/).filter(Boolean).at(-1) || '未指定'}</span></div><small className="task-id">{task.baseRef || '—'}</small></td><td className="table-time">{date(task.updatedAt || task.createdAt)}</td><td><button className="icon-button" aria-label={`查看任务 ${taskTitle(task)}`} onClick={() => onOpen(task.id)}><ArrowRight size={16} /></button></td></tr>)}</tbody></table></div>;
+}
 function HarnessStrip({ harnesses, error }: { harnesses: HarnessHealth[]; error: string }) {
   const order = ['codex', 'dsh', 'zcode'];
   return <section className="harness-strip"><div className="strip-title"><div className="strip-icon"><Code2 size={16} /></div><div><b>Harness 能力</b><small>执行器可用性实时状态</small></div></div>
@@ -165,17 +190,18 @@ function activeGoalRevisionTask(sequence: TaskSequence) {
   return sequence.steps.find((step, index) => isGoalRevisionStep(sequence, index) && ['pending', 'running', 'reviewing', 'revision', 'waiting'].includes(step.task.status));
 }
 function SequenceSubmitModal({ capabilities, onClose, onCreated }: { capabilities: Capabilities | null; onClose: () => void; onCreated: (sequence: TaskSequence) => void }) {
-  const [repoPath, setRepoPath] = useState(''); const [baseRef, setBaseRef] = useState('main'); const [objective, setObjective] = useState(''); const [goalCriteria, setGoalCriteria] = useState('');
+  const [repoPath, setRepoPath] = useState(''); const [baseRef, setBaseRef] = useState('HEAD'); const [objective, setObjective] = useState(''); const [goalCriteria, setGoalCriteria] = useState('');
   const [maxRevisions, setMaxRevisions] = useState(2); const [maxGoalRevisions, setMaxGoalRevisions] = useState(2);
   const blankStep = (): SequenceStepDraft => ({ prompt: '', criteria: '', checks: '', harnessId: '', modelId: '', reasoningEffort: '' });
   const [steps, setSteps] = useState<SequenceStepDraft[]>([blankStep(), blankStep()]);
   const [busy, setBusy] = useState(false); const [error, setError] = useState('');
+  const dialogRef = useDialog(onClose, busy);
   const bindings = useMemo(() => (capabilities?.bindings ?? []).filter(binding => binding.available && capabilities?.harnesses.some(harness => harness.id === binding.harnessId && harness.available)), [capabilities]);
   const harnessChoices = [...new Map(bindings.map(binding => [binding.harnessId, binding])).values()].map(binding => ({ id: binding.harnessId, label: capabilities?.harnesses.find(harness => harness.id === binding.harnessId)?.name || binding.harnessId }));
   const updateStep = (index: number, key: keyof SequenceStepDraft, value: string) => setSteps(current => current.map((step, i) => i === index ? { ...step, [key]: value, ...(key === 'harnessId' ? { modelId: '', reasoningEffort: '' } : key === 'modelId' ? { reasoningEffort: '' } : {}) } : step));
   const submit = async (event: FormEvent) => {
-    event.preventDefault(); setError('');
-    if (steps.length < 2 || steps.some(step => step.prompt.trim().length < 8)) { setError('至少需要两个步骤，每个步骤的描述至少填写 8 个字符。'); return; }
+    event.preventDefault(); if (busy) return; setError('');
+    if (steps.length < 2 || steps.some(step => step.prompt.trim().length < 8 || !step.checks.trim())) { setError('至少需要两个步骤，每个步骤的描述至少填写 8 个字符，并提供检查命令。'); return; }
     for (const [index, step] of steps.entries()) {
       const candidates = bindings.filter(binding => (!step.harnessId || binding.harnessId === step.harnessId) && (!step.modelId || binding.modelId === step.modelId));
       if ((step.harnessId || step.modelId || step.reasoningEffort) && !candidates.length) { setError(`步骤 ${index + 1} 的 Harness 与模型没有通过验证的可用组合。`); return; }
@@ -188,8 +214,8 @@ function SequenceSubmitModal({ capabilities, onClose, onCreated }: { capabilitie
     } catch (e) { setError(e instanceof Error ? e.message : '目标提交失败，请稍后重试'); }
     finally { setBusy(false); }
   };
-  return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}><section className="modal submit-modal sequence-submit-modal"><div className="modal-heading"><div><div className="eyebrow">目标执行</div><h2>提交有序任务序列</h2><p>Zero 会按顺序执行这些步骤，后续步骤接续前一步的结果。</p></div><button className="icon-button" onClick={onClose}><X size={18} /></button></div>
-    <form onSubmit={submit} className="submit-form"><div className="form-grid"><Field label="仓库路径 *" hint="所有步骤使用此仓库"><input required value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="例如 C:\\projects\\my-app" /></Field><Field label="基础分支 / Ref" hint="所有步骤使用此 Ref"><input value={baseRef} onChange={e => setBaseRef(e.target.value)} placeholder="main" /></Field></div>
+  return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="提交有序任务序列" className="modal submit-modal sequence-submit-modal"><div className="modal-heading"><div><div className="eyebrow">目标执行</div><h2>提交有序任务序列</h2><p>Zero 会按顺序执行这些步骤，后续步骤接续前一步的结果。</p></div><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
+    <form onSubmit={submit} className="submit-form"><fieldset disabled={busy}><div className="form-grid"><Field label="仓库路径 *" hint="所有步骤使用此仓库"><input required value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="例如 C:\\projects\\my-app" /></Field><Field label="基础分支 / Ref" hint="所有步骤使用此 Ref"><input value={baseRef} onChange={e => setBaseRef(e.target.value)} placeholder="HEAD" /></Field></div>
       <Field label="整体目标" hint="可选；留空时按步骤完成情况结束序列。"><input value={objective} onChange={e => setObjective(e.target.value)} placeholder="例如：为服务添加可靠的登录与账户管理" /></Field>
       <Field label="目标级验收标准" hint="可选，逐行填写。这些标准不会由单个步骤的完成状态自动判定。"><textarea rows={2} value={goalCriteria} onChange={e => setGoalCriteria(e.target.value)} placeholder="列出需要整体评估的目标条件" /></Field>
       <div className="form-grid"><Field label="每个步骤的最大返工次数" hint="单个任务执行时允许的内容返工次数"><input type="number" min="0" max="10" value={maxRevisions} onChange={e => setMaxRevisions(Number(e.target.value))} /></Field><Field label="自动目标返工上限" hint="整体目标验收要求修改后，最多自动追加的返工任务数（0–5）"><input type="number" min="0" max="5" value={maxGoalRevisions} onChange={e => setMaxGoalRevisions(Math.max(0, Math.min(5, Number(e.target.value))))} /></Field></div>
@@ -201,31 +227,27 @@ function SequenceSubmitModal({ capabilities, onClose, onCreated }: { capabilitie
         const effortChoices = step.modelId ? [...new Map(matchingBindings.flatMap(binding => binding.reasoningEfforts ?? []).map(choice => [choice.id, choice])).values()] : [];
         return <section className="sequence-step-editor" key={index}><div className="execution-stage-title"><b>步骤 {index + 1}</b><div className="stage-actions"><button type="button" className="link-button" aria-label={`将步骤 ${index + 1} 上移`} title="上移" disabled={index === 0} onClick={() => setSteps(current => current.map((item, i) => i === index - 1 ? current[index]! : i === index ? current[index - 1]! : item))}><ArrowUp size={13} /></button><button type="button" className="link-button" aria-label={`将步骤 ${index + 1} 下移`} title="下移" disabled={index === steps.length - 1} onClick={() => setSteps(current => current.map((item, i) => i === index ? current[index + 1]! : i === index + 1 ? current[index]! : item))}><ArrowDown size={13} /></button><button type="button" className="link-button" disabled={steps.length <= 2} onClick={() => setSteps(current => current.filter((_, i) => i !== index))}><X size={13} />移除</button></div></div>
         <Field label={`步骤 ${index + 1} 描述 *`}><textarea required minLength={8} rows={3} value={step.prompt} onChange={e => updateStep(index, 'prompt', e.target.value)} placeholder="描述这一阶段要实现或验证的内容" /></Field>
-        <div className="form-grid"><Field label="步骤验收标准" hint="可选，逐行填写"><textarea rows={2} value={step.criteria} onChange={e => updateStep(index, 'criteria', e.target.value)} placeholder="此步骤需要满足的条件" /></Field><Field label="检查命令" hint="可选，每行一条命令"><textarea rows={2} value={step.checks} onChange={e => updateStep(index, 'checks', e.target.value)} placeholder={'例如\nnpm test'} /></Field></div>
+        <div className="form-grid"><Field label="步骤验收标准" hint="可选，逐行填写"><textarea rows={2} value={step.criteria} onChange={e => updateStep(index, 'criteria', e.target.value)} placeholder="此步骤需要满足的条件" /></Field><Field label="检查命令 *" hint="必填，每行一条。没有检查命令将无法通过验收。"><textarea required rows={2} value={step.checks} onChange={e => updateStep(index, 'checks', e.target.value)} placeholder={'例如\nnpm test'} /></Field></div>
         <div className="form-grid three"><Field label="Harness"><Select value={step.harnessId} onChange={value => updateStep(index, 'harnessId', value)} choices={harnessChoices} placeholder="继承项目/全局后自动分配" /></Field><Field label="模型"><Select value={step.modelId} onChange={value => updateStep(index, 'modelId', value)} choices={modelChoices} placeholder="继承项目/全局后自动分配" disabled={!capabilities || !stepBindings.length} /></Field><Field label="思考强度"><Select value={step.reasoningEffort} onChange={value => updateStep(index, 'reasoningEffort', value)} choices={effortChoices} placeholder="继承项目/全局后自动分配" disabled={!step.modelId || effortChoices.length === 0} /></Field></div>
       </section>;
       })}
       <Button onClick={() => setSteps(current => current.length < 16 ? [...current, blankStep()] : current)} disabled={steps.length >= 16}><Plus size={14} />添加步骤</Button>
       {capabilities && bindings.length > 0 ? <div className="inline-info sequence-allocator-note"><Activity size={14} />每个步骤可单独指定 Harness、模型和思考强度；留空字段先继承项目/全局预设，再由分配器补全。</div> : <div className="inline-warning sequence-allocator-note"><AlertCircle size={14} />当前没有可用的已验证执行组合；留空字段仍会先继承项目/全局预设，再交由分配器选择。</div>}
-      {error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}<div className="modal-footer"><Button onClick={onClose}>取消</Button><Button variant="primary" type="submit" disabled={busy || !repoPath.trim() || steps.some(step => step.prompt.trim().length < 8)}>{busy ? <><LoaderCircle size={15} className="spin" />正在提交</> : <><ListOrdered size={16} />提交目标序列</>}</Button></div>
-    </form></section></div>;
+      {error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}<div className="modal-footer"><Button disabled={busy} onClick={onClose}>取消</Button><Button variant="primary" type="submit" disabled={busy || !repoPath.trim() || steps.some(step => step.prompt.trim().length < 8 || !step.checks.trim())}>{busy ? <><LoaderCircle size={15} className="spin" />正在提交</> : <><ListOrdered size={16} />提交目标序列</>}</Button></div>
+    </fieldset></form></section></div>;
 }
 
 function SequenceDrawer({ id, onClose, onOpenTask }: { id: string; onClose: () => void; onOpenTask: (taskId: string) => void }) {
-  const [sequence, setSequence] = useState<TaskSequence | null>(null); const [error, setError] = useState('');
-  useEffect(() => {
-    let live = true;
-    const update = async () => { try { const result = await api.sequence(id); if (live) { setSequence(result); setError(''); } } catch (e) { if (live) setError(e instanceof Error ? e.message : '无法读取目标详情'); } };
-    void update(); const timer = window.setInterval(() => { void update(); }, 4500);
-    return () => { live = false; window.clearInterval(timer); };
-  }, [id]);
+  const state = usePolling(id, loadSequence);
+  const sequence = state.data; const error = state.error;
+  const dialogRef = useDialog(onClose);
   const status = sequence?.status;
   const allStepsDone = Boolean(sequence && sequence.steps.length > 0 && sequence.steps.every(step => step.task.status === 'done'));
   const activeGoalRevision = sequence ? activeGoalRevisionTask(sequence) : undefined;
   const hasGoalRevisionSteps = Boolean(sequence && sequence.goalRevisionCount > 0);
   const goalCapExhausted = Boolean(sequence && allStepsDone && !activeGoalRevision && sequence.goalReview?.state === 'verdict' && sequence.goalReview.result?.verdict === 'changes_requested' && sequence.goalRevisionCount >= sequence.maxGoalRevisions);
-  return <div className="drawer-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}><aside className="task-drawer sequence-drawer"><header className="drawer-header"><div><div className="eyebrow">目标进度</div><h2>{sequence?.objective || (sequence ? taskTitle(sequence.steps[0]?.task ?? { id: sequence.id, status: 'pending' }) : '正在读取目标')}</h2></div><button className="icon-button" onClick={onClose}><X size={18} /></button></header>
-    {error && !sequence ? <div className="alert error"><AlertCircle size={17} /><div><b>目标读取失败</b><span>{error}</span></div></div> : !sequence ? <div className="loading-state"><LoaderCircle className="spin" size={22} />正在读取目标进度…</div> : <div className="drawer-content">
+  return <div className="drawer-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}><aside ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="目标进度" className="task-drawer sequence-drawer"><header className="drawer-header"><div><div className="eyebrow">目标进度</div><h2>{sequence?.objective || (sequence ? taskTitle(sequence.steps[0]?.task ?? { id: sequence.id, status: 'pending' }) : '正在读取目标')}</h2></div><button className="icon-button" aria-label="关闭详情" onClick={onClose}><X size={18} /></button></header>
+    {error && !sequence ? <div className="alert error"><AlertCircle size={17} /><div><b>目标读取失败</b><span>{error}</span></div></div> : !sequence ? <div className="loading-state"><LoaderCircle className="spin" size={22} />正在读取目标进度…</div> : <div className="drawer-content">{error && <div className="alert stale-banner" role="alert">刷新失败，显示上次同步内容：{error}</div>}
       <div className="drawer-status-row"><span className={`sequence-state ${status}`}>{sequenceStatusLabel[sequence.status]}</span><span className="muted">{sequence.steps.filter(step => step.task.status === 'done').length}/{sequence.steps.length} 步骤已完成 · 自动目标返工 {sequence.goalRevisionCount}/{sequence.maxGoalRevisions}</span></div>
       {sequence.status === 'steps_completed' && <section className="sequence-goal-callout pending"><Target size={17} /><div><b>步骤已完成，等待目标级 Codex 验收</b><p>步骤完成本身不代表整体目标已通过。</p></div></section>}
       {sequence.goalReview?.state === 'running' && <section className="sequence-goal-callout pending"><Activity size={17} /><div><b>正在进行目标级 Codex 验收</b><p>验收根据完整序列结果和目标条件进行。</p></div></section>}
@@ -239,24 +261,25 @@ function SequenceDrawer({ id, onClose, onOpenTask }: { id: string; onClose: () =
 }
 
 function SubmitModal({ capabilities, capabilityError, allocatorKind, onClose, onCreated }: { capabilities: Capabilities | null; capabilityError: string; allocatorKind: Config['allocator']['kind']; onClose: () => void; onCreated: (task: Task) => void }) {
-  const [repoPath, setRepoPath] = useState(''); const [baseRef, setBaseRef] = useState('main'); const [prompt, setPrompt] = useState(''); const [criteria, setCriteria] = useState(''); const [maxRevisions, setMaxRevisions] = useState(2); const [checks, setChecks] = useState('');
+  const [repoPath, setRepoPath] = useState(''); const [baseRef, setBaseRef] = useState('HEAD'); const [prompt, setPrompt] = useState(''); const [criteria, setCriteria] = useState(''); const [maxRevisions, setMaxRevisions] = useState(2); const [checks, setChecks] = useState('');
   const [harnessId, setHarnessId] = useState(''); const [modelId, setModelId] = useState(''); const [effort, setEffort] = useState('');
-  const [stages, setStages] = useState<Array<{ harnessId: string; modelId: string; reasoningEffort: string }>>([]);
+  const [stages, setStages] = useState<Array<{ harnessId: string; modelId: string; reasoningEffort: string; objective: string }>>([]);
   const [busy, setBusy] = useState(false); const [error, setError] = useState('');
+  const dialogRef = useDialog(onClose, busy);
   const bindings = useMemo(() => (capabilities?.bindings ?? []).filter(b => b.available && capabilities?.harnesses.some(h => h.id === b.harnessId && h.available)), [capabilities]);
   const filteredBindings = bindings.filter(b => !harnessId || b.harnessId === harnessId);
   const harnessChoices = [...new Map(bindings.map(b => [b.harnessId, b])).values()].map(b => ({ id: b.harnessId, label: capabilities?.harnesses.find(h => h.id === b.harnessId)?.name || b.harnessId }));
   const modelChoices = [...new Map(filteredBindings.map(b => [b.modelId, b])).values()].map(b => ({ id: b.modelId, label: b.modelName || b.modelId }));
   const selectedBinding: Binding | undefined = bindings.find(b => b.modelId === modelId && (!harnessId || b.harnessId === harnessId));
   const effortChoices = selectedBinding?.reasoningEfforts ?? (modelId ? [...new Map(bindings.filter(b => b.modelId === modelId).flatMap(b => b.reasoningEfforts ?? []).map(e => [e.id, e])).values()] : []);
-  const submit = async (event: FormEvent) => { event.preventDefault(); setError(''); setBusy(true); try { const created = await api.createTask({ repoPath: repoPath.trim(), baseRef: baseRef.trim() || null, prompt: prompt.trim(), acceptanceCriteria: criteria.trim(), maxRevisions, checkCommands: checks.split('\n').map(s => s.trim()).filter(Boolean), execution: { harnessId: harnessId || null, modelId: modelId || null, reasoningEffort: effort || null }, ...(stages.length ? { executionStages: stages.map(stage => ({ ...(stage.harnessId ? { harnessId: stage.harnessId } : {}), ...(stage.modelId ? { modelId: stage.modelId } : {}), ...(stage.reasoningEffort ? { reasoningEffort: stage.reasoningEffort } : {}) })) } : {}) }); onCreated(created); } catch (e) { setError(e instanceof Error ? e.message : '提交失败，请稍后重试'); } finally { setBusy(false); } };
+  const submit = async (event: FormEvent) => { event.preventDefault(); if (busy) return; if (!checks.trim()) { setError('请至少填写一条检查命令。'); return; } setError(''); setBusy(true); try { const created = await api.createTask({ repoPath: repoPath.trim(), baseRef: baseRef.trim() || null, prompt: prompt.trim(), acceptanceCriteria: criteria.trim(), maxRevisions, checkCommands: checks.split('\n').map(s => s.trim()).filter(Boolean), execution: { harnessId: harnessId || null, modelId: modelId || null, reasoningEffort: effort || null }, ...(stages.length ? { executionStages: stages.map(stage => ({ ...(stage.objective.trim() ? { objective: stage.objective.trim() } : {}), ...(stage.harnessId ? { harnessId: stage.harnessId } : {}), ...(stage.modelId ? { modelId: stage.modelId } : {}), ...(stage.reasoningEffort ? { reasoningEffort: stage.reasoningEffort } : {}) })) } : {}) }); onCreated(created); } catch (e) { setError(e instanceof Error ? e.message : '提交失败，请稍后重试'); } finally { setBusy(false); } };
   const allocatorName = allocatorKind === 'api' ? 'API 模型' : 'Codex';
-  return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}><section className="modal submit-modal"><div className="modal-heading"><div><div className="eyebrow">新建任务</div><h2>提交执行任务</h2><p>未指定的执行选项由 {allocatorName} 分配器根据可用能力补全。</p></div><button className="icon-button" onClick={onClose}><X size={18} /></button></div>
-    <form onSubmit={submit} className="submit-form"><div className="form-grid"><Field label="仓库路径 *" hint="本机 Git 仓库的绝对路径"><input required value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="例如 C:\\projects\\my-app" /></Field><Field label="基础分支 / Ref"><input value={baseRef} onChange={e => setBaseRef(e.target.value)} placeholder="main" /></Field></div>
+  return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="提交执行任务" className="modal submit-modal"><div className="modal-heading"><div><div className="eyebrow">新建任务</div><h2>提交执行任务</h2><p>未指定的执行选项由 {allocatorName} 分配器根据可用能力补全。</p></div><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
+    <form onSubmit={submit} className="submit-form"><fieldset disabled={busy}><div className="form-grid"><Field label="仓库路径 *" hint="本机 Git 仓库的绝对路径"><input required value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="例如 C:\\projects\\my-app" /></Field><Field label="基础分支 / Ref"><input value={baseRef} onChange={e => setBaseRef(e.target.value)} placeholder="HEAD" /></Field></div>
       <Field label="任务描述 *"><textarea required minLength={8} rows={4} value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="描述要实现或修复的内容、相关背景和约束…" /></Field><Field label="验收标准" hint="逐行填写，系统会交给执行器与 Reviewer"><textarea rows={3} value={criteria} onChange={e => setCriteria(e.target.value)} placeholder={'例如：\n- 登录失败时显示明确错误\n- 原有测试保持通过'} /></Field>
       <div className="section-divider"><span>执行偏好</span><span>每项可单独留空</span></div>
       <div className="form-grid three"><Field label="Harness"><Select value={harnessId} onChange={v => { setHarnessId(v); setModelId(''); setEffort(''); }} choices={harnessChoices} placeholder="继承项目/全局后自动分配" /></Field><Field label="模型"><Select value={modelId} onChange={v => { setModelId(v); setEffort(''); }} choices={modelChoices} placeholder="继承项目/全局后自动分配" disabled={!capabilities || !bindings.length} /></Field><Field label="思考强度"><Select value={effort} onChange={setEffort} choices={effortChoices} placeholder="继承项目/全局后自动分配" disabled={!modelId || effortChoices.length === 0} /></Field></div>
-      <div className="stage-editor-head"><div><b>执行阶段</b><span>可选；阶段字段会覆盖上方任务默认值</span></div><Button onClick={() => setStages(current => current.length < 16 ? [...current, { harnessId: '', modelId: '', reasoningEffort: '' }] : current)} disabled={stages.length >= 16}><Plus size={14} />添加阶段</Button></div>
+      <div className="stage-editor-head"><div><b>执行阶段</b><span>按顺序接力；可为每个 Agent 指定目标与执行偏好</span></div><Button onClick={() => setStages(current => current.length < 16 ? [...current, { harnessId: '', modelId: '', reasoningEffort: '', objective: '' }] : current)} disabled={stages.length >= 16}><Plus size={14} />添加阶段</Button></div>
       {stages.map((stage, index) => {
         const effectiveHarness = stage.harnessId || harnessId;
         const effectiveModel = stage.modelId || modelId;
@@ -264,29 +287,30 @@ function SubmitModal({ capabilities, capabilityError, allocatorKind, onClose, on
         const stageModels = [...new Map(stageBindings.map(binding => [binding.modelId, binding])).values()].map(binding => ({ id: binding.modelId, label: binding.modelName || binding.modelId }));
         const matchingStageBindings = bindings.filter(binding => (!effectiveHarness || binding.harnessId === effectiveHarness) && (!effectiveModel || binding.modelId === effectiveModel));
         const stageEfforts = [...new Map(matchingStageBindings.flatMap(binding => binding.reasoningEfforts ?? []).map(choice => [choice.id, choice])).values()];
-        const updateStage = (key: 'harnessId' | 'modelId' | 'reasoningEffort', value: string) => setStages(current => current.map((item, i) => i === index ? { ...item, [key]: value, ...(key === 'harnessId' ? { modelId: '', reasoningEffort: '' } : key === 'modelId' ? { reasoningEffort: '' } : {}) } : item));
-        return <div className="execution-stage" key={index}><div className="execution-stage-title"><b>阶段 {index + 1}</b><div className="stage-actions"><button type="button" className="link-button" aria-label={`将阶段 ${index + 1} 上移`} title="上移" disabled={index === 0} onClick={() => setStages(current => current.map((item, i) => i === index - 1 ? current[index]! : i === index ? current[index - 1]! : item))}><ArrowUp size={13} /></button><button type="button" className="link-button" aria-label={`将阶段 ${index + 1} 下移`} title="下移" disabled={index === stages.length - 1} onClick={() => setStages(current => current.map((item, i) => i === index ? current[index + 1]! : i === index + 1 ? current[index]! : item))}><ArrowDown size={13} /></button><button type="button" className="link-button" onClick={() => setStages(current => current.filter((_, i) => i !== index))}><X size={13} />移除</button></div></div><div className="form-grid three"><Field label="Harness"><Select value={stage.harnessId} onChange={v => updateStage('harnessId', v)} choices={harnessChoices} placeholder="继承任务默认值或自动分配" /></Field><Field label="模型"><Select value={stage.modelId} onChange={v => updateStage('modelId', v)} choices={stageModels} placeholder="继承任务默认值或自动分配" disabled={!capabilities || !bindings.length} /></Field><Field label="思考强度"><Select value={stage.reasoningEffort} onChange={v => updateStage('reasoningEffort', v)} choices={stageEfforts} placeholder="继承任务默认值或自动分配" disabled={stageEfforts.length === 0} /></Field></div></div>;
+        const updateStage = (key: 'harnessId' | 'modelId' | 'reasoningEffort' | 'objective', value: string) => setStages(current => current.map((item, i) => i === index ? { ...item, [key]: value, ...(key === 'harnessId' ? { modelId: '', reasoningEffort: '' } : key === 'modelId' ? { reasoningEffort: '' } : {}) } : item));
+        return <div className="execution-stage" key={index}><div className="execution-stage-title"><b>阶段 {index + 1}</b><div className="stage-actions"><button type="button" className="link-button" aria-label={`将阶段 ${index + 1} 上移`} title="上移" disabled={index === 0} onClick={() => setStages(current => current.map((item, i) => i === index - 1 ? current[index]! : i === index ? current[index - 1]! : item))}><ArrowUp size={13} /></button><button type="button" className="link-button" aria-label={`将阶段 ${index + 1} 下移`} title="下移" disabled={index === stages.length - 1} onClick={() => setStages(current => current.map((item, i) => i === index ? current[index + 1]! : i === index + 1 ? current[index]! : item))}><ArrowDown size={13} /></button><button type="button" className="link-button" aria-label={`移除阶段 ${index + 1}`} onClick={() => setStages(current => current.filter((_, i) => i !== index))}><X size={13} />移除</button></div></div><Field label={`阶段 ${index + 1} 目标`}><textarea rows={2} maxLength={4000} value={stage.objective} onChange={event => updateStage('objective', event.target.value)} placeholder="可选；说明此 Agent 需要完成的工作，留空沿用整体任务" /></Field><div className="form-grid three"><Field label="Harness"><Select value={stage.harnessId} onChange={v => updateStage('harnessId', v)} choices={harnessChoices} placeholder="继承任务默认值或自动分配" /></Field><Field label="模型"><Select value={stage.modelId} onChange={v => updateStage('modelId', v)} choices={stageModels} placeholder="继承任务默认值或自动分配" disabled={!capabilities || !bindings.length} /></Field><Field label="思考强度"><Select value={stage.reasoningEffort} onChange={v => updateStage('reasoningEffort', v)} choices={stageEfforts} placeholder="继承任务默认值或自动分配" disabled={stageEfforts.length === 0} /></Field></div></div>;
       })}
-      {capabilityError ? <div className="inline-warning"><AlertCircle size={15} />暂时无法验证执行能力，建议刷新后再提交。提交时所有执行项将交由分配器决定。</div> : !bindings.length ? <div className="inline-warning"><AlertCircle size={15} />当前没有通过能力验证的执行组合，执行选项不可手动选择。</div> : <div className="inline-info"><ShieldCheck size={15} />仅显示已通过探测的 Harness、模型组合与思考强度。</div>}
-      <div className="form-grid lower-grid"><Field label="最大返工次数"><input type="number" min="0" max="10" value={maxRevisions} onChange={e => setMaxRevisions(Number(e.target.value))} /></Field><Field label="检查命令" hint="每行一条命令，由 Zero Test Runner 执行"><textarea rows={2} value={checks} onChange={e => setChecks(e.target.value)} placeholder={'例如\nnpm test\nnpm run build'} /></Field></div>
-      {error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}<div className="modal-footer"><Button onClick={onClose}>取消</Button><Button variant="primary" type="submit" disabled={busy || !repoPath.trim() || prompt.trim().length < 8}>{busy ? <><LoaderCircle size={15} className="spin" />正在提交</> : <><Plus size={16} />加入任务队列</>}</Button></div>
-    </form></section></div>;
+      {capabilityError ? <div className="inline-warning"><AlertCircle size={15} />暂时无法验证执行能力，建议刷新后再提交。已选执行项仍会保留；可用性由服务端再次验证。</div> : !bindings.length ? <div className="inline-warning"><AlertCircle size={15} />当前没有通过能力验证的执行组合，执行选项不可手动选择。</div> : <div className="inline-info"><ShieldCheck size={15} />仅显示已通过探测的 Harness、模型组合与思考强度。</div>}
+      <div className="form-grid lower-grid"><Field label="最大返工次数"><input type="number" min="0" max="10" value={maxRevisions} onChange={e => setMaxRevisions(Number(e.target.value))} /></Field><Field label="检查命令 *" hint="必填，每行一条。由 Zero 执行，作为完成门禁。"><textarea required rows={2} value={checks} onChange={e => setChecks(e.target.value)} placeholder={'例如\nnpm test\nnpm run build'} /></Field></div>
+      {error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}<div className="modal-footer"><Button disabled={busy} onClick={onClose}>取消</Button><Button variant="primary" type="submit" disabled={busy || !repoPath.trim() || prompt.trim().length < 8 || !checks.trim()}>{busy ? <><LoaderCircle size={15} className="spin" />正在提交</> : <><Plus size={16} />加入任务队列</>}</Button></div>
+    </fieldset></form></section></div>;
 }
 
 function TaskDrawer({ task, loading, loadError, onClose, onCancel }: { task: Task | null; loading: boolean; loadError: string; onClose: () => void; onCancel: () => Promise<void> }) {
   const [cancelBusy, setCancelBusy] = useState(false); const [cancelError, setCancelError] = useState('');
+  const dialogRef = useDialog(onClose);
   const cancel = async () => { setCancelBusy(true); setCancelError(''); try { await onCancel(); } catch (e) { setCancelError(e instanceof Error ? e.message : '取消请求失败'); } finally { setCancelBusy(false); } };
   const attempts = task?.attempts ?? [];
   const logs = Array.isArray(task?.logs) ? task?.logs.join('\n') : task?.logs;
-  return <div className="drawer-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}><aside className="task-drawer"><header className="drawer-header"><div><div className="eyebrow">任务详情</div><h2>{task ? taskTitle(task) : '正在读取任务'}</h2></div><button className="icon-button" onClick={onClose}><X size={18} /></button></header>
-    {loading ? <div className="loading-state"><LoaderCircle className="spin" size={22} />正在读取任务详情…</div> : loadError || !task ? <div className="alert error drawer-load-error"><AlertCircle size={17} /><div><b>任务详情加载失败</b><span>{loadError}</span></div></div> : <div className="drawer-content"><div className="drawer-status-row"><span className={`status-pill ${task.status}`}>{statusLabel[task.status] || task.status}</span><span className="muted">创建于 {date(task.createdAt)}</span>{['pending', 'running', 'reviewing', 'revision', 'waiting'].includes(task.status) && <Button variant="danger" disabled={cancelBusy} onClick={() => void cancel()}>{cancelBusy ? '正在取消…' : '取消任务'}</Button>}</div>
+  return <div className="drawer-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}><aside ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="任务详情" className="task-drawer"><header className="drawer-header"><div><div className="eyebrow">任务详情</div><h2>{task ? taskTitle(task) : '正在读取任务'}</h2></div><button className="icon-button" aria-label="关闭详情" onClick={onClose}><X size={18} /></button></header>
+    {loading ? <div className="loading-state"><LoaderCircle className="spin" size={22} />正在读取任务详情…</div> : !task ? <div className="alert error drawer-load-error"><AlertCircle size={17} /><div><b>任务详情加载失败</b><span>{loadError}</span></div></div> : <div className="drawer-content">{loadError && <div className="alert stale-banner" role="alert"><AlertCircle size={16} /><div><b>刷新失败，显示上次同步内容</b><span>{loadError}</span></div></div>}<div className="drawer-status-row"><span className={`status-pill ${task.status}`}>{statusLabel[task.status] || task.status}</span><span className="muted">创建于 {date(task.createdAt)}</span>{['pending', 'running', 'reviewing', 'revision', 'waiting'].includes(task.status) && <Button variant="danger" disabled={cancelBusy} onClick={() => void cancel()}>{cancelBusy ? '正在取消…' : '取消任务'}</Button>}</div>
       {task.status === 'waiting' && <section className="quota-wait-panel"><div className="quota-wait-icon"><Clock3 size={17} /></div><div><b>模型额度暂时受限</b><p>Zero 会保留当前进度，并在可重试时自动继续这个任务。</p><span>{retryDate(task.retryAt) ? `下一次自动重试：${retryDate(task.retryAt)}` : '下一次重试时间暂未确定；Zero 会在额度恢复后继续。'}</span>{task.error && <small>{task.error}</small>}</div></section>}
       {task.status === 'recovery_required' && <section className="quota-wait-panel recovery-required-panel"><div className="quota-wait-icon"><AlertCircle size={17} /></div><div><b>任务需要人工检查</b><p>{task.recoveryReason || '执行租约已过期。租约过期不能证明原进程已停止，因此 Zero 未自动重试。'}</p><span>请检查旧 worker 进程和任务 worktree，再决定如何继续。</span>{task.recoveryEvidence && <small>恢复证据：{JSON.stringify(task.recoveryEvidence)}</small>}</div></section>}
       {cancelError && <div className="alert error compact"><AlertCircle size={15} />{cancelError}</div>}
-      <div className="detail-block"><h3><FolderGit2 size={15} />仓库与任务</h3><dl className="detail-list"><div><dt>仓库</dt><dd>{task.repoPath || '—'}</dd></div><div><dt>基础 Ref</dt><dd>{task.baseRef || '—'}</dd></div><div><dt>最大返工</dt><dd>{task.maxRevisions ?? '—'} 次</dd></div></dl><p className="pre-wrap">{task.prompt || '无任务描述'}</p>{task.acceptanceCriteria && <><div className="sub-label">验收标准</div><p className="pre-wrap">{task.acceptanceCriteria}</p></>}</div>
+      <div className="detail-block"><h3><FolderGit2 size={15} />仓库与任务</h3><dl className="detail-list"><div><dt>任务 ID</dt><dd><code>{task.id}</code></dd></div><div><dt>仓库</dt><dd>{task.repoPath || '—'}</dd></div><div><dt>基础 Ref</dt><dd>{task.baseRef || '—'}</dd></div><div><dt>最大返工</dt><dd>{task.maxRevisions ?? '—'} 次</dd></div></dl><p className="pre-wrap">{task.prompt || '无任务描述'}</p>{task.acceptanceCriteria && <><div className="sub-label">验收标准</div><p className="pre-wrap">{task.acceptanceCriteria}</p></>}</div>
       <div className="detail-block"><h3><Activity size={15} />路由决策</h3><div className="route-detail"><div><span>执行路线</span><b>{routeName(task.route)}</b></div><div><span>选择来源</span><b>{nice(task.route?.selectionSource)}</b></div>{task.route?.reason && <p>{task.route.reason}</p>}</div></div>
-      <div className="detail-block"><h3><ArrowDown size={15} />执行记录 <span className="count-badge">{attempts.length}</span></h3>{attempts.length ? <div className="attempt-list">{attempts.map((attempt, i) => <article className="attempt" key={attempt.number ?? i}><div className="attempt-head"><b>Attempt {attempt.number ?? i + 1}</b><span className={`tiny-status ${attempt.status || 'pending'}`}>{nice(attempt.status)}</span><span className="muted">{date(attempt.startedAt)}</span></div>{attempt.route && <div className="attempt-route">{routeName(attempt.route)}</div>}{attempt.sessionId && <div className="attempt-route">执行会话 ID：<code style={{ userSelect: 'all', overflowWrap: 'anywhere' }}>{attempt.sessionId}</code></div>}{attempt.summary && <p>{attempt.summary}</p>}{attempt.tests && <TestList tests={attempt.tests} />}{attempt.review && <Review review={attempt.review} />}{attempt.logs && <pre className="log-box">{Array.isArray(attempt.logs) ? attempt.logs.join('\n') : attempt.logs}</pre>}</article>)}</div> : <div className="soft-empty">任务开始后，执行尝试和测试结果会显示在这里。</div>}</div>
-      {!attempts.length && task.tests && task.tests.length > 0 && <div className="detail-block"><h3><CheckCircle2 size={15} />测试结果</h3><TestList tests={task.tests} /></div>}
+      <StageTimeline task={task} /><div className="detail-block"><h3><ArrowDown size={15} />执行记录 <span className="count-badge">{attempts.length}</span></h3>{attempts.length ? <div className="attempt-list">{attempts.map((attempt, i) => <article className="attempt" key={attempt.id ?? attempt.number ?? i}><div className="attempt-head"><b>尝试 {attempt.number ?? i + 1}{attempt.role ? ` · ${roleLabel(attempt.role)}` : ""}</b><span className={`tiny-status ${attempt.status || 'pending'}`}>{nice(attempt.status)}</span><span className="muted">{date(attempt.startedAt)}</span></div>{attempt.stageId && <div className="attempt-route">阶段：{attempt.stageId}</div>}{attempt.exitCode != null && <div className="attempt-route">退出码：{attempt.exitCode}</div>}{attempt.route && <div className="attempt-route">{routeName(attempt.route)}</div>}{attempt.sessionId && <div className="attempt-route">执行会话 ID：<code style={{ userSelect: 'all', overflowWrap: 'anywhere' }}>{attempt.sessionId}</code></div>}{attempt.summary && attempt.summary !== attempt.executorSummary && <p>{attempt.summary}</p>}{attempt.executorSummary && <section className="executor-summary" aria-label="执行者自述"><b>执行者自述，需结合检查与审查确认</b><p>{attempt.executorSummary}</p></section>}{attempt.tests && <TestList tests={attempt.tests} />}{attempt.review && <Review review={attempt.review} />}{attempt.logs && <pre className="log-box">{Array.isArray(attempt.logs) ? attempt.logs.join('\n') : attempt.logs}</pre>}</article>)}</div> : <div className="soft-empty">任务开始后，执行尝试和测试结果会显示在这里。</div>}</div>
+      <CheckEvidence task={task} />
       {task.review && <div className="detail-block"><h3><ShieldCheck size={15} />Codex 审核</h3><Review review={task.review} /></div>}
       {task.error && <div className="detail-block"><h3><AlertCircle size={15} />错误信息</h3><pre className="error-box">{task.error}</pre></div>}
       {logs && <div className="detail-block"><h3><TerminalSquare size={15} />任务日志</h3><pre className="log-box large">{logs}</pre></div>}
@@ -294,8 +318,45 @@ function TaskDrawer({ task, loading, loadError, onClose, onCancel }: { task: Tas
     </div>}</aside></div>;
 }
 
+function CheckEvidence({ task }: { task: Task }) {
+  const evidence = task.checkEvidence;
+  const current = evidence?.state === 'current';
+  const tests = task.tests ?? [];
+  const history = task.historicalTests ?? [];
+  return <div className="detail-block check-evidence"><h3><CheckCircle2 size={15} />检查与验证 <span className="count-badge">{tests.length} 项{history.length ? ` · ${history.length} 项历史` : ''}</span></h3>
+    <section aria-label={current ? '当前检查结果' : '检查结果（归属未确认）'}>
+      {current ? <p className="evidence-note">当前检查结果仅对应下方执行批次。</p> : <p className="evidence-note"><b>{evidence?.state === 'historical' ? '当前执行尚无有效检查结果' : '检查归属尚未确认'}</b>；历史或缺少归属的结果不能确认当前改动已通过检查。</p>}
+      {evidence?.runId && <dl className="detail-list check-run-identity"><div><dt>检查批次</dt><dd>{evidence.runId}</dd></div>{evidence.attemptId && <div><dt>执行尝试</dt><dd>{evidence.attemptId}</dd></div>}{evidence.stageId && <div><dt>执行阶段</dt><dd>{evidence.stageId}</dd></div>}</dl>}
+      {tests.length ? <TestList tests={tests} /> : <div className="soft-empty">尚未产生可归属于当前执行的检查结果。</div>}
+    </section>
+    {history.length > 0 && <details className="historical-checks"><summary>历史检查记录 ({history.length})</summary><p className="evidence-note">保留用于排查返工与恢复过程；这些结果不作为当前检查结论。</p><TestList tests={history} /></details>}
+  </div>;
+}
+
 function TestList({ tests }: { tests: TestResult[] }) {
-  return <div className="test-list">{tests.map((t, i) => { const good = t.status === 'passed' || t.status === 'success'; return <div className="test-row" key={i}><span className={`test-icon ${good ? 'good' : t.status === 'failed' ? 'bad' : ''}`}>{good ? <CheckCircle2 size={15} /> : t.status === 'failed' ? <XCircle size={15} /> : <Clock3 size={15} />}</span><div><b>{t.name || t.command || `检查 ${i + 1}`}</b>{t.command && t.name && <code>{t.command}</code>}</div><span className={`test-status ${good ? 'good' : t.status === 'failed' ? 'bad' : ''}`}>{nice(t.status)}{t.exitCode != null ? ` · ${t.exitCode}` : ''}</span></div>; })}</div>;
+  return <div className="test-list">{tests.map((test, i) => {
+    const good = ['passed', 'success'].includes(test.status || '');
+    const bad = ['failed', 'timed_out', 'spawn_error', 'error'].includes(test.status || '');
+    const label = ({ passed: '通过', success: '通过', failed: '失败', timed_out: '超时', spawn_error: '启动失败', pending: '等待中', running: '检查中' } as Record<string, string>)[test.status || ''] || nice(test.status);
+    return <div className={`check-result ${bad ? 'failed' : ''}`} key={i}><div className="test-row"><span className={`test-icon ${good ? 'good' : bad ? 'bad' : ''}`}>{good ? <CheckCircle2 size={16} /> : bad ? <XCircle size={16} /> : <Clock3 size={16} />}</span><div><b>{test.name || test.command || `检查 ${i + 1}`}</b>{test.command && test.name && <code>{test.command}</code>}</div><span className={`test-status ${good ? 'good' : bad ? 'bad' : ''}`}>{label}{test.exitCode != null ? ` · ${test.exitCode}` : ''}</span></div>{test.durationMs != null && <div className="check-duration">{Number((test.durationMs / 1000).toFixed(2))} 秒</div>}{test.output && <pre className="log-box check-output">{test.output}</pre>}</div>;
+  })}</div>;
+}
+
+function StageTimeline({ task }: { task: Task }) {
+  const stages = [...(task.stages ?? [])].sort((a, b) => a.sequence - b.sequence);
+  const handoffs = task.handoffs ?? [];
+  return <div className="detail-block"><h3><Layers3 size={16} />Agent 接力 <span className="count-badge">{stages.length} 阶段 · {handoffs.length} 交接</span></h3>
+    {!stages.length && <div className="soft-empty">尚无阶段执行记录。历史任务可能未记录阶段与交接证据。</div>}
+    {!!task.executionStages?.length && <details className="planned-stages"><summary>提交的执行阶段 ({task.executionStages.length})</summary>{task.executionStages.map((stage, index) => <div className="planned-stage" key={index}><b>阶段 {index + 1}</b><p>{[stage.harnessId, stage.modelId, stage.reasoningEffort].filter(Boolean).join(' / ') || '继承任务设置或自动分配'}</p>{stage.objective && <p className="stage-objective">{stage.objective}</p>}</div>)}</details>}
+    <div className="stage-timeline">{stages.map((stage, index) => <article className="stage-evidence" key={stage.id}><div className="stage-number">{index + 1}</div><div className="stage-body"><div className="stage-heading"><b>阶段 {index + 1} · {roleLabel(stage.role)}</b><span className={`tiny-status ${stage.status}`}>{stageStatusLabel(stage.status)}</span></div><p className="stage-route">{[stage.harness, stage.model, stage.reasoningEffort].filter(Boolean).join(' · ') || '尚未分配执行路线'}</p><div className="stage-meta">{date(stage.startedAt || stage.createdAt)}{stage.finishedAt ? ` → ${date(stage.finishedAt)}` : ''}</div><details><summary>阶段标识与工作区指纹</summary><dl className="detail-list"><div><dt>阶段 ID</dt><dd>{stage.id}</dd></div>{stage.predecessorStageId && <div><dt>前置阶段</dt><dd>{stage.predecessorStageId}</dd></div>}<div><dt>输入指纹</dt><dd>{stage.inputFingerprint || '尚未记录'}</dd></div><div><dt>输出指纹</dt><dd>{stage.outputFingerprint || '尚未记录'}</dd></div></dl></details>{stage.error && <pre className="error-box">{stage.error}</pre>}{handoffs.filter(handoff => handoff.stageId === stage.id).map(handoff => <HandoffCard key={handoff.id} handoff={handoff} />)}</div></article>)}</div>
+    {handoffs.filter(handoff => !stages.some(stage => stage.id === handoff.stageId)).map(handoff => <HandoffCard key={handoff.id} handoff={handoff} />)}
+    {!handoffs.length && <p className="evidence-note">尚未产生 Agent 交接记录。</p>}
+  </div>;
+}
+
+function HandoffCard({ handoff }: { handoff: NonNullable<Task['handoffs']>[number] }) {
+  const groups = [{ title: '已完成', items: handoff.completed }, { title: '阻塞项', items: handoff.blockers }, { title: '风险', items: handoff.risks }, { title: '下一步', items: handoff.nextSteps }];
+  return <details className="handoff-card" open><summary><ArrowRight size={14} />交接摘要 · {handoff.source.harness} / {handoff.source.model}</summary>{handoff.executorSummary && <section className="executor-summary" aria-label="执行者自述"><b>执行者自述，需结合检查与审查确认</b><p>{handoff.executorSummary}</p></section>}<p className="pre-wrap">{handoff.currentState || '未填写当前状态'}</p><div className="handoff-meta">{date(handoff.createdAt)} · 工作区 {nice(handoff.workspace.state)}</div>{groups.filter(group => group.items?.length).map(group => <div className="handoff-group" key={group.title}><b>{group.title}</b><ul>{group.items.map((item, i) => <li key={i}>{item}</li>)}</ul></div>)}{!!handoff.decisions?.length && <div className="handoff-group"><b>关键决策</b><ul>{handoff.decisions.map((item, i) => <li key={i}>{item.decision}<small>{item.rationale}</small></li>)}</ul></div>}{!!handoff.keyFiles?.length && <div className="handoff-group"><b>关键文件</b><ul>{handoff.keyFiles.map((item, i) => <li key={i}><code>{item.path}</code> · {item.reason}</li>)}</ul></div>}{!!handoff.workspace.changedFiles?.length && <div className="handoff-group"><b>变更文件</b><ul>{handoff.workspace.changedFiles.map(file => <li key={file}><code>{file}</code></li>)}</ul></div>}{!!handoff.checks?.length && <div className="handoff-group"><b>交接检查证据</b>{handoff.checks.map((check, i) => <p key={i}>{check.id} · {nice(check.status)}{check.evidence && <small>{check.evidence}</small>}</p>)}</div>}<details className="handoff-identifiers"><summary>交接与版本标识</summary><dl className="detail-list">{Object.entries({ '交接 ID': handoff.id, '来源尝试': handoff.source.attemptId, '基础提交': handoff.workspace.baseCommit, '当前提交': handoff.workspace.headCommit, '工作区指纹': handoff.workspace.fingerprint }).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value || '未记录'}</dd></div>)}</dl></details></details>;
 }
 function Review({ review }: { review: NonNullable<Task['review']> }) {
   const pass = review.verdict === 'pass' || review.verdict === 'approved';
@@ -362,7 +423,7 @@ function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabi
   const apiAllocatorConfig = config?.allocator.api ?? emptyApiAllocatorConfig;
   return <><section className="page-heading"><div><div className="eyebrow">执行策略</div><h1>路由设置</h1><p>可选择 Codex 订阅或 API 模型作为分配器，审核始终由 Codex Reviewer 完成。</p></div></section>
     <div className="settings-layout"><div className="settings-main">
-      {loading ? <div className="settings-card loading-state"><LoaderCircle className="spin" size={21} />正在读取设置…</div> : error && !config ? <div className="alert error"><AlertCircle size={17} /><div><b>设置暂不可用</b><span>{error}</span></div><Button onClick={() => { setLoading(true); api.config().then(c => setConfig(normalizeConfig(c))).catch(e => setError(String(e))).finally(() => setLoading(false)); }}>重试</Button></div> : config && <>
+      {loading ? <div className="settings-card loading-state"><LoaderCircle className="spin" size={21} />正在读取设置…</div> : error && !config ? <div className="alert error"><AlertCircle size={17} /><div><b>设置暂不可用</b><span>{error}</span></div><Button onClick={() => { setLoading(true); api.config().then(c => setConfig(normalizeConfig(c))).catch(e => setError(String(e))).finally(() => setLoading(false)); }}>重试</Button></div> : config && <fieldset disabled={busy} className="settings-fields" aria-label="路由设置表单">
         <section className="settings-card"><div className="settings-card-head"><div className="role-icon codex"><Activity size={18} /></div><div><h2>{allocatorName}分配器</h2><p>{config.allocator.kind === 'api' ? '使用兼容 OpenAI API 的模型决定任务执行路线。' : '使用 Codex 订阅和 Codex CLI 配置决定任务执行路线。'}</p></div><span className="fixed-badge">可切换</span></div>
           <Field label="分配器来源"><Select value={config.allocator.kind} onChange={kind => setConfig(prev => prev ? { ...normalizeConfig(prev), allocator: { ...prev.allocator, kind: kind as Config['allocator']['kind'] } } : prev)} choices={[{ id: 'codex', label: 'Codex 订阅' }, { id: 'api', label: 'API 模型' }]} placeholder="选择分配器" /></Field>
           {config.allocator.kind === 'api' ? <>
@@ -379,7 +440,7 @@ function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabi
           {(config.executionDefaults?.projects ?? []).length === 0 ? <div className="project-preset-empty">尚未添加项目默认值。</div> : <div className="project-preset-list">{config.executionDefaults!.projects.map((project, index) => <div className="project-preset-row" key={`${project.repoPath}-${index}`}><div className="project-preset-heading"><b title={project.repoPath}>{project.repoPath}</b><button className="button danger" onClick={() => removeProjectDefault(index)}><X size={13} />移除</button></div><ExecutionPresetFields title={`${project.repoPath} 执行默认值`} value={project.execution} onChange={execution => updateProjectDefault(index, execution)} capabilities={capabilities} /></div>)}</div>}
         </section>
         <div className="settings-save-row"><span><ShieldCheck size={14} />界面只保存密钥环境变量名，不读取或保存 API 密钥原文。</span><Button variant="primary" disabled={busy || saved} onClick={() => void save()}>{busy ? <><LoaderCircle size={15} className="spin" />保存中</> : saved ? <><Check size={15} />已保存</> : '保存设置'}</Button></div>{error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}
-      </>}
+      </fieldset>}
     </div><aside className="settings-aside"><div className="aside-icon"><ShieldCheck size={19} /></div><h3>选择优先级</h3><p>每个任务的手动指定优先于项目预设与全局预设；未指定字段由 {allocatorName} 补全。</p><div className="priority-stack"><div><span>1</span><b>任务指定</b></div><ArrowDown size={14} /><div><span>2</span><b>项目预设</b></div><ArrowDown size={14} /><div><span>3</span><b>全局预设</b></div><ArrowDown size={14} /><div><span>4</span><b>{allocatorName} 分配</b></div></div><button className="link-button" onClick={() => void onRetry()}><RefreshCw size={13} />刷新能力状态</button></aside></div>
   </>;
 }

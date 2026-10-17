@@ -4,27 +4,37 @@ import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
-import { TaskStore } from '../core/task-store.js';
+import { TaskStore, type CheckRunRecord, type CheckRunIntegrityFailureRecord } from '../core/task-store.js';
+import { selectTaskCheckEvidence } from './task-check-evidence.js';
 import { CodexAdapter } from '../adapters/codex.js';
+import { IdempotencyConflictError, submissionRequestHash, validateSubmissionKey } from '../core/submission-idempotency.js';
 import type { AdapterConfig } from '../adapters/base.js';
 import { DshAdapter } from '../adapters/dsh.js';
 import { ZCodeCompositeAdapter } from '../adapters/zcode-composite.js';
 import type { ModelBinding } from '../adapters/types.js';
-import type { Attempt, CheckDefinition, CheckResult, ExecutionSelection, HarnessAdapter, ReviewResult, RouteDecision, SequenceGoalReview, TaskEvent, TaskRecord, TaskSequenceMetadata, TaskSequenceRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
+import type { Attempt, CheckDefinition, CheckResult, ExecutionSelection, HandoffRecord, HarnessAdapter, ReviewResult, RouteDecision, SequenceGoalReview, StageRecord, TaskEvent, TaskRecord, TaskSequenceMetadata, TaskSequenceRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
 
 type HarnessName = 'codex' | 'dsh' | 'zcode';
 export type AdapterMap = Partial<Record<HarnessName, HarnessAdapter>>;
 export interface TaskStorePort {
   submit(submission: TaskSubmission): TaskRecord;
   createSequence(submissions: TaskSubmission[], id?: string, metadata?: TaskSequenceMetadata): TaskSequenceRecord;
+  lookupSubmissionRequest?(key: string, kind: 'task' | 'sequence', requestHash: string): { resourceId: string } | undefined;
+  submitIdempotent?(submission: TaskSubmission, request: { key: string; requestHash: string }): { record: TaskRecord; replayed: boolean };
+  createSequenceIdempotent?(submissions: TaskSubmission[], metadata: TaskSequenceMetadata, request: { key: string; requestHash: string }): { record: TaskSequenceRecord; replayed: boolean };
   getSequence(id: string): (TaskSequenceRecord & { goalReview?: SequenceGoalReview }) | undefined;
   listSequences(): Array<TaskSequenceRecord & { goalReview?: SequenceGoalReview }>;
   get(id: string): TaskRecord | undefined;
   list(status?: TaskStatus): TaskRecord[];
   fail(id: string, expected: TaskStatus | TaskStatus[], reason: string, owner?: string): TaskRecord;
   attempts(taskId: string): Attempt[];
+  stages?(taskId: string): StageRecord[];
+  handoffs?(taskId: string): HandoffRecord[];
   getRoute(taskId: string): RouteDecision | undefined;
   checks(taskId: string): CheckResult[];
+  checkRuns?(taskId: string): CheckRunRecord[];
+  checkRunResults?(runId: string): CheckResult[];
+  checkRunIntegrityFailure?(runId: string): CheckRunIntegrityFailureRecord | undefined;
   reviews(taskId: string): ReviewResult[];
   events(taskId: string): TaskEvent[];
 }
@@ -100,9 +110,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
       if (url.pathname === '/api/config' && req.method === 'PUT') return json(res, 200, await updatePublicConfig(options, await bodyJson(req, options.maxBodyBytes)));
       if (url.pathname === '/api/sequences' && req.method === 'GET') return json(res, 200, options.store.listSequences().map(mapSequence));
       if (url.pathname === '/api/sequences' && req.method === 'POST') {
-        const { submissions, metadata } = await parseSequence(await bodyJson(req, options.maxBodyBytes), options);
-        const sequence = options.store.createSequence(submissions, undefined, metadata);
-        if (options.enqueue) {
+        const raw = await bodyJson(req, options.maxBodyBytes);
+        const identity = submissionIdentity(req, raw, 'sequence', options.store);
+        const previous = identity && options.store.lookupSubmissionRequest!(identity.key, 'sequence', identity.requestHash);
+        if (previous) {
+          const sequence = options.store.getSequence(previous.resourceId);
+          if (!sequence) throw new HttpError(500, 'Persisted idempotency request refers to a missing sequence');
+          return json(res, 201, mapSequence(sequence));
+        }
+        const { submissions, metadata } = await parseSequence(raw, options);
+        const { record: sequence, replayed } = identity
+          ? options.store.createSequenceIdempotent!(submissions, metadata, identity)
+          : { record: options.store.createSequence(submissions, undefined, metadata), replayed: false };
+        if (options.enqueue && !replayed) {
           for (const step of sequence.steps) void Promise.resolve().then(() => options.enqueue!(step.task.id)).catch((error: unknown) => {
             try { options.store.fail(step.task.id, 'pending', `Scheduler enqueue failed: ${message(error)}`); } catch { /* A worker may have claimed it already. */ }
           });
@@ -118,9 +138,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
       }
       if (url.pathname === '/api/tasks' && req.method === 'GET') return json(res, 200, options.store.list().map(mapTaskList));
       if (url.pathname === '/api/tasks' && req.method === 'POST') {
-        const submission = await parseSubmission(await bodyJson(req, options.maxBodyBytes), options);
-        const task = options.store.submit(submission);
-        if (options.enqueue) void Promise.resolve(options.enqueue(task.id)).catch((error: unknown) => {
+        const raw = await bodyJson(req, options.maxBodyBytes);
+        const identity = submissionIdentity(req, raw, 'task', options.store);
+        const previous = identity && options.store.lookupSubmissionRequest!(identity.key, 'task', identity.requestHash);
+        if (previous) {
+          const task = options.store.get(previous.resourceId);
+          if (!task) throw new HttpError(500, 'Persisted idempotency request refers to a missing task');
+          return json(res, 201, mapTaskList(task));
+        }
+        const submission = await parseSubmission(raw, options);
+        const { record: task, replayed } = identity
+          ? options.store.submitIdempotent!(submission, identity)
+          : { record: options.store.submit(submission), replayed: false };
+        if (options.enqueue && !replayed) void Promise.resolve(options.enqueue(task.id)).catch((error: unknown) => {
           try { options.store.fail(task.id, 'pending', `Scheduler enqueue failed: ${message(error)}`); } catch { /* A worker may have claimed it already. */ }
         });
         return json(res, 201, mapTaskList(task));
@@ -136,9 +166,22 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     }
     await staticFile(res, url.pathname, options.staticDir);
   } catch (error) {
-    const code = error instanceof HttpError ? error.status : 500;
+    const code = error instanceof HttpError ? error.status : error instanceof IdempotencyConflictError ? 409 : 500;
     json(res, code, { error: message(error) });
   }
+}
+
+function submissionIdentity(req: IncomingMessage, raw: unknown, kind: 'task' | 'sequence', store: TaskStorePort): { key: string; requestHash: string } | undefined {
+  const header = req.headers['x-idempotency-key'];
+  if (header === undefined) return undefined;
+  let key: string;
+  try { key = validateSubmissionKey(header); }
+  catch (error) { throw new HttpError(400, message(error)); }
+  if (!store.lookupSubmissionRequest || !(kind === 'task' ? store.submitIdempotent : store.createSequenceIdempotent)) {
+    throw new HttpError(501, 'Durable submission idempotency is not supported by this task store');
+  }
+  try { return { key, requestHash: submissionRequestHash(raw) }; }
+  catch (error) { throw new HttpError(400, message(error)); }
 }
 
 async function parseSequence(raw: unknown, options: ZeroServerOptions): Promise<{ submissions: TaskSubmission[]; metadata: TaskSequenceMetadata }> {
@@ -355,23 +398,37 @@ async function parseSubmission(raw: unknown, options: ZeroServerOptions, capabil
   if (!Number.isInteger(maxRevisions) || maxRevisions < 0 || maxRevisions > 10) throw new HttpError(400, 'maxRevisions 必须在 0 到 10 之间');
   const checks = parseChecks(input.checkCommands);
   const capability = capabilitySnapshot ?? await capabilities(options);
+  // Match runtime precedence at the canonical repository root, but persist only
+  // user-authored locks so future routes still observe current project settings.
+  const defaults = (await options.config.read()).executionDefaults;
+  const inherited = { ...selectionFields(defaults?.global ?? null), ...selectionFields(defaults?.projects[repoPath] ?? null) };
   if (input.executionStages !== undefined) {
     const global = input.execution == null ? {} : parsePublicSelection(input.execution, 'execution');
-    const stages = validateExecutionStages(input.executionStages, global, capability);
+    const stages = validateExecutionStages(input.executionStages, { ...inherited, ...global }, capability);
     const selection = toExecutionSelection(global);
     return { repoPath, baseRef, prompt, acceptanceCriteria: criteria, maxRevisions, checks,
       ...(selection ? { selection } : {}), executionStages: stages };
   }
   const selection = input.execution == null ? undefined : validateSelection(input.execution, capability);
+  validateAvailableSelection({ ...inherited, ...selectionFields(selection ?? null) }, capability, 'execution effective selection');
   return { repoPath, baseRef, prompt, acceptanceCriteria: criteria, maxRevisions, checks, ...(selection ? { selection } : {}) };
 }
 
 function validateExecutionStages(rawStages: unknown, global: Record<string, string>, capability: Awaited<ReturnType<typeof capabilities>>): NonNullable<TaskSubmission['executionStages']> {
   if (!Array.isArray(rawStages) || rawStages.length < 1 || rawStages.length > 16) throw new HttpError(400, 'executionStages 必须包含 1 到 16 个阶段');
   return rawStages.map((rawStage, index) => {
-    const stage = parsePublicSelection(rawStage, `executionStages[${index}]`);
+    const label = `executionStages[${index}]`;
+    if (!rawStage || typeof rawStage !== 'object' || Array.isArray(rawStage)) throw new HttpError(400, `${label} 必须是对象`);
+    const { objective, ...selection } = rawStage as Record<string, unknown>;
+    const stage = parsePublicSelection(selection, label);
     const merged = { ...global, ...stage };
-    validateAvailableSelection(merged, capability, `executionStages[${index}]`);
+    validateAvailableSelection(merged, capability, label);
+    if (Object.hasOwn(rawStage, 'objective')) {
+      if (typeof objective !== 'string' || !objective.trim() || objective.trim().length > 4000) {
+        throw new HttpError(400, `${label}.objective 必须是 1 到 4000 个字符的非空文本`);
+      }
+      return { ...stage, objective: objective.trim() };
+    }
     return stage;
   });
 }
@@ -424,7 +481,7 @@ function parseChecks(value: unknown): CheckDefinition[] {
     if (line.length > 2000 || /[\0\r\n]/.test(line) || /[;&|<>`$]/.test(line)) throw new HttpError(400, `第 ${index + 1} 条检查命令包含不支持的 shell 控制字符`);
     const argv = tokenize(line);
     if (!argv.length) throw new HttpError(400, `第 ${index + 1} 条检查命令为空`);
-    if (argv.some(arg => arg.startsWith('@(') || arg.startsWith('$(') || arg.startsWith('-') && arg === '--')) throw new HttpError(400, `第 ${index + 1} 条检查命令参数无效`);
+    if (argv.some(arg => arg.startsWith('@(') || arg.startsWith('$('))) throw new HttpError(400, `第 ${index + 1} 条检查命令参数无效`);
     return { id: `check-${index + 1}`, argv };
   });
 }
@@ -477,6 +534,12 @@ async function taskDetail(res: ServerResponse, id: string, options: ZeroServerOp
   const reviews = options.store.reviews(id);
   const events = options.store.events(id);
   const route = options.store.getRoute(id);
+  const stages = options.store.stages?.(id) ?? [];
+  const handoffs = options.store.handoffs?.(id) ?? [];
+  const evidence = selectTaskCheckEvidence({ task, attempts, events, checks,
+    runs: options.store.checkRuns?.(id), results: options.store.checkRunResults?.bind(options.store),
+    integrityFailure: runId => options.store.checkRunIntegrityFailure?.(runId)
+      ? 'Worktree changed during validation; passing command exits do not validate the final checkout.' : undefined });
   const attemptDetails = await Promise.all(attempts.map(async attempt => {
     const stdout = await readArtifactText(attempt.stdoutPath, options.artifactRoot);
     const stderr = await readArtifactText(attempt.stderrPath, options.artifactRoot);
@@ -484,11 +547,23 @@ async function taskDetail(res: ServerResponse, id: string, options: ZeroServerOp
     return { ...mapAttempt(attempt), ...(text ? { logs: text } : {}) };
   }));
   const logs = attemptDetails.map((attempt, index) => attempt.logs ? `Attempt ${index + 1}\n${attempt.logs}` : '').filter(Boolean).join('\n\n');
+  const readCheck = async (check: CheckResult) => {
+    const stdout = await readArtifactText(check.stdoutPath, options.artifactRoot);
+    const stderr = await readArtifactText(check.stderrPath, options.artifactRoot);
+    const output = [check.error, stdout ? `--- stdout ---\n${stdout}` : '', stderr ? `--- stderr ---\n${stderr}` : ''].filter(Boolean).join('\n');
+    return { ...mapCheck(check), output: output || undefined };
+  };
+  const [checkDetails, historicalTests] = await Promise.all([
+    Promise.all(evidence.tests.map(readCheck)), Promise.all(evidence.historicalTests.map(readCheck)),
+  ]);
   const reportPath = options.artifactRoot && /^[a-zA-Z0-9_-]{1,128}$/.test(id) ? join(resolve(options.artifactRoot), id, 'report.json') : undefined;
   const report = reportPath && (await access(reportPath).then(() => true).catch(() => false)) ? `/api/tasks/${encodeURIComponent(id)}/report` : undefined;
   json(res, 200, { ...mapTaskList(task), prompt: task.prompt, acceptanceCriteria: task.acceptanceCriteria?.join('\n'), baseRef: task.baseRef,
     maxRevisions: task.maxRevisions, route: route ? mapRoute(route) : undefined,
-    attempts: attemptDetails, tests: checks.map(mapCheck), review: reviews.length ? mapReview(reviews.at(-1)!) : undefined,
+    executionStages: (task.executionStages ?? []).map(stage => ({ ...publicExecutionSelection(stage), ...(stage.objective !== undefined ? { objective: stage.objective } : {}) })),
+    stages: stages.map(mapStage), handoffs: handoffs.map(mapHandoff),
+    attempts: attemptDetails, tests: checkDetails, historicalTests, checkEvidence: evidence.checkEvidence,
+    review: reviews.length ? mapReview(reviews.at(-1)!) : undefined,
     logs, report, error: task.failureReason, events: events.map(event => ({ type: event.type, at: event.at, payload: event.payload })) });
 }
 
@@ -531,10 +606,35 @@ function mapSequenceGoalReview(review: SequenceGoalReview) {
 function mapRoute(route: Record<string, unknown> | RouteDecision) { const value = route as Record<string, unknown>; return { harnessId: value.harness, modelId: value.model, reasoningEffort: value.effectiveReasoningEffort ?? value.reasoningEffort, selectionSource: value.selectionSource, reason: value.reason }; }
 function mapAttempt(value: Attempt) {
   const metadata = value.metadata ?? {};
-  return { number: value.sequence, status: value.status, startedAt: value.startedAt, endedAt: value.finishedAt,
+  const executorSummary = typeof metadata.executorSummary === 'string' && metadata.executorSummary.trim() ? metadata.executorSummary : undefined;
+  return { id: value.id, stageId: value.stageId, role: value.role, exitCode: value.exitCode,
+    number: value.sequence, status: value.status, startedAt: value.startedAt, endedAt: value.finishedAt,
     route: value.harness || value.model ? { harnessId: value.harness, modelId: value.model, reasoningEffort: value.reasoningEffort } : undefined,
     sessionId: typeof metadata.sessionId === 'string' ? metadata.sessionId : undefined,
-    summary: value.error ?? metadata.summary };
+    summary: value.error ?? executorSummary ?? metadata.summary, executorSummary };
+}
+function mapStage(value: StageRecord) {
+  return {
+    id: value.id, sequence: value.sequence, role: value.role, status: value.status, predecessorStageId: value.predecessorStageId,
+    harness: value.harness, harnessVersion: value.harnessVersion, model: value.model, reasoningEffort: value.reasoningEffort,
+    inputFingerprint: value.inputFingerprint, outputFingerprint: value.outputFingerprint,
+    createdAt: value.createdAt, startedAt: value.startedAt, finishedAt: value.finishedAt, error: value.error,
+  };
+}
+function mapHandoff(value: HandoffRecord) {
+  return {
+    id: value.id, stageId: value.stageId, createdAt: value.createdAt,
+    source: { attemptId: value.source.attemptId, harness: value.source.harness, model: value.source.model },
+    workspace: {
+      baseCommit: value.workspace.baseCommit, headCommit: value.workspace.headCommit, fingerprint: value.workspace.fingerprint,
+      state: value.workspace.state, changedFiles: value.workspace.changedFiles,
+    },
+    completed: value.completed, currentState: value.currentState, executorSummary: value.executorSummary,
+    decisions: value.decisions.map(item => ({ decision: item.decision, rationale: item.rationale })),
+    keyFiles: value.keyFiles.map(item => ({ path: item.path, reason: item.reason })),
+    checks: value.checks.map(item => ({ id: item.id, status: item.status, evidence: item.evidence })),
+    blockers: value.blockers, risks: value.risks, nextSteps: value.nextSteps,
+  };
 }
 function mapCheck(value: CheckResult) { return { name: value.id, command: value.argv.join(' '), status: value.status, exitCode: value.exitCode, durationMs: value.durationMs, output: value.error }; }
 function mapReview(value: ReviewResult) {

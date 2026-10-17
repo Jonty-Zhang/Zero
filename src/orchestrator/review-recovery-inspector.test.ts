@@ -64,7 +64,7 @@ test("review recovery accepts the exact pre-commit package with no operation or 
     const intent = await inspectReviewRecovery(f.manager, f.creation, f.reviewPackage, f.operation("intent"));
     assert.equal(intent.gitState.kind, "pre_commit");
     assert.equal(intent.gitState.snapshot.diff, f.reviewPackage.snapshot.diff);
-  } finally { await rm(f.root, { recursive: true, force: true }); }
+  } finally { await rm(f.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("persisted candidate before CAS is verified but classified as pre-commit", async () => {
@@ -82,7 +82,7 @@ test("persisted candidate before CAS is verified but classified as pre-commit", 
       f.operation("candidate", candidate.commit));
     assert.equal(result.gitState.kind, "pre_commit");
     assert.equal((await f.manager.readTaskBranchHead(f.original.info)).head, f.reviewPackage.snapshot.preHead);
-  } finally { await rm(f.root, { recursive: true, force: true }); }
+  } finally { await rm(f.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("applied candidate is verified after manager restart without comparing the old fingerprint", async () => {
@@ -104,7 +104,7 @@ test("applied candidate is verified after manager restart without comparing the 
     assert.equal(result.gitState.kind, "applied_candidate");
     if (result.gitState.kind === "applied_candidate") assert.equal(result.gitState.candidateSha, candidate.commit);
     assert.notEqual(result.identity.fingerprint, f.reviewPackage.snapshot.fingerprint);
-  } finally { await rm(f.root, { recursive: true, force: true }); }
+  } finally { await rm(f.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("recovery fails closed for moved refs, missing candidate objects, and dirty applied indexes", async () => {
@@ -128,7 +128,7 @@ test("recovery fails closed for moved refs, missing candidate objects, and dirty
       inspectReviewRecovery(f.manager, f.creation, f.reviewPackage, f.operation("candidate", candidate.commit)),
       /no longer points at the sealed package pre-HEAD|moved away/i,
     );
-  } finally { await rm(f.root, { recursive: true, force: true }); }
+  } finally { await rm(f.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("recovery rejects staged index pollution before CAS and after applied CAS", async () => {
@@ -159,7 +159,7 @@ test("recovery rejects staged index pollution before CAS and after applied CAS",
       inspectReviewRecovery(f.manager, f.creation, f.reviewPackage, f.operation("candidate", candidate.commit)),
       /clean worktree matching the reviewed snapshot/i,
     );
-  } finally { await rm(f.root, { recursive: true, force: true }); }
+  } finally { await rm(f.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("persisted self-committed candidate equal to pre-HEAD uses applied verification", async () => {
@@ -173,5 +173,5 @@ test("persisted self-committed candidate equal to pre-HEAD uses applied verifica
     const operation = { ...f.operation("candidate", head), preHead: head, treeId: snapshot.treeId, diffHash: snapshot.diffHash };
     const result = await inspectReviewRecovery(f.manager, f.creation, reviewPackage, operation);
     assert.equal(result.gitState.kind, "applied_candidate");
-  } finally { await rm(f.root, { recursive: true, force: true }); }
+  } finally { await rm(f.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
