@@ -29,6 +29,114 @@ const context = (overrides: Partial<RunContext> = {}): RunContext => ({
   prompt: 'Fix the thing; keep spaces intact.', ...overrides,
 });
 
+/** Runs only a deterministic local node child; no provider calls or configuration reads. */
+class OutputFixtureAdapter extends BaseHarnessAdapter {
+  readonly id: 'codex' | 'dsh' | 'zcode';
+  constructor(private readonly script: string, private readonly parse: Invocation['parseOutput'] = parseJsonLines,
+    config: AdapterConfig = {}, harness: 'codex' | 'dsh' | 'zcode' = 'codex') {
+    super({ bindings: [harness === 'dsh' ? dshBinding : harness === 'zcode' ? zcodeBinding : codexBinding], ...config });
+    this.id = harness;
+  }
+  async probe() { return { harness: this.id, available: true, models: this.bindings.map(binding => binding.model.id) }; }
+  async prepare(ctx: RunContext): Promise<Invocation> {
+    return { harness: this.id, executable: process.execPath, args: ['-e', this.script], cwd: ctx.cwd, env: {}, parseOutput: this.parse };
+  }
+  protected parseOutput(stdout: string, stderr: string): ParsedOutput { return this.parse(stdout, stderr); }
+}
+const fixtureRequest = () => ({ taskId: 'offline-output', attemptId: 'fixture-1', role: 'implement' as const,
+  harness: 'codex' as const, model: 'gpt-main', cwd: process.cwd(), prompt: 'offline deterministic fixture' });
+
+test('streaming protocol retains the actual final beyond the log cap and an oversized tool line', async () => {
+  const script = `console.log(JSON.stringify({type:'thread.started',thread_id:'session-original',model:'gpt-5-codex'}));
+    console.log(JSON.stringify({type:'item.completed',item:{type:'reasoning',text:'intermediate reasoning'}}));
+    console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',aggregated_output:'x'.repeat(3*1024*1024)}}));
+    console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'TRUE_LAST_AGENT_SUMMARY'}}));`;
+  const result = await new OutputFixtureAdapter(script).run(fixtureRequest());
+  assert.equal(result.status, 'completed');
+  assert.equal(result.final, 'TRUE_LAST_AGENT_SUMMARY');
+  assert.equal(result.sessionId, 'session-original');
+  assert.equal(result.actualModel, 'gpt-5-codex');
+});
+
+test('only agent completion can replace a typed agent final; reasoning and tool text cannot', () => {
+  const parsed = parseJsonLines([
+    { type: 'item.completed', item: { type: 'agent_message', text: 'actual final' } },
+    { type: 'item.completed', item: { type: 'reasoning', text: 'private reasoning' } },
+    { type: 'item.completed', item: { type: 'mcp_tool_call', text: 'tool output' } },
+  ].map(value => JSON.stringify(value)).join('\n'));
+  assert.equal(parsed.finalText, 'actual final');
+});
+
+test('streamed final decodes split UTF-8 and redacts secrets spanning process chunks and beyond log truncation', async () => {
+  const secret = 'fixture-secret-跨界';
+  const script = `console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',aggregated_output:'x'.repeat(3*1024*1024)}}));
+    const b=Buffer.from(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'接力完成 😀 fixture-secret-跨界 下一步验证'}})+'\\n');
+    const split=b.indexOf(Buffer.from('😀'))+1;process.stdout.write(b.subarray(0,split));
+    setTimeout(()=>{const split2=b.indexOf(Buffer.from('secret'))+3;process.stdout.write(b.subarray(split,split2));
+      setTimeout(()=>process.stdout.write(b.subarray(split2)),10);},10);`;
+  const result = await new OutputFixtureAdapter(script, parseJsonLines, {
+    maxLogBytes: 1024, secretRefs: { FIXTURE_TOKEN: 'fixture-secret' }, resolveSecret: () => secret,
+  }).run(fixtureRequest());
+  assert.equal(result.status, 'completed');
+  assert.equal(result.final, '接力完成 😀 [REDACTED] 下一步验证');
+  assert.ok(!JSON.stringify(result).includes(secret));
+});
+
+test('structured agent and tool quotes never classify an unrelated failure as provider quota', async () => {
+  for (const script of [
+    `console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'Implemented: usage limit reached'}}));console.error('Permission denied');process.exitCode=1;`,
+    `console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',text:'quota exceeded'}}));console.error("You've hit your usage limit");process.exitCode=1;`,
+    `console.log(JSON.stringify({type:'error',message:'invalid API key'}));console.error('tool stderr: usage limit reached');process.exitCode=1;`,
+  ]) {
+    const result = await new OutputFixtureAdapter(script).run(fixtureRequest());
+    assert.equal(result.status, 'failed');
+    assert.equal(result.quota, undefined);
+  }
+});
+
+test('provider error events past truncated tool output retain quota while plain provider stderr stays supported', async () => {
+  const scripts = [
+    `console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',aggregated_output:'x'.repeat(3*1024*1024)}}));console.log(JSON.stringify({type:'turn.failed',error:{message:"You've hit your usage limit. Retry-After: 60"}}));process.exitCode=1;`,
+    `console.error("Error: You've hit your usage limit. Retry-After: 60");process.exitCode=1;`,
+  ];
+  for (const script of scripts) {
+    const result = await new OutputFixtureAdapter(script, parseJsonLines, { maxLogBytes: 1024 }).run(fixtureRequest());
+    assert.equal(result.status, 'failed');
+    assert.equal(result.quota?.source, 'retry_after');
+  }
+  const quoted = await new OutputFixtureAdapter(`console.error('tool stderr: usage limit reached');process.exitCode=1;`).run(fixtureRequest());
+  assert.equal(quoted.quota, undefined);
+});
+
+test('a later matching model cannot erase an earlier mismatched model identity', async () => {
+  const result = await new OutputFixtureAdapter(`console.log(JSON.stringify({type:'thread.started',model:'different-model'}));
+    console.log(JSON.stringify({type:'turn.completed',model:'gpt-5-codex'}));`).run(fixtureRequest());
+  assert.equal(result.status, 'failed');
+  assert.match(result.error ?? '', /model/i);
+});
+
+test('oversized final fails explicitly instead of relaying an earlier reasoning message', async () => {
+  const result = await new OutputFixtureAdapter(`console.log(JSON.stringify({type:'item.completed',item:{type:'reasoning',text:'stale thought'}}));
+    console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'x'.repeat(3*1024*1024)}}));`).run(fixtureRequest());
+  assert.equal(result.status, 'failed');
+  assert.equal(result.final, undefined);
+  assert.match(result.error ?? '', /output|line|final|limit/i);
+});
+
+test('streaming preserves the official ZCode response final and DSH multiline plaintext final', async () => {
+  const zcode = new ZCodeAdapter();
+  const zcodeParser = (stdout: string, stderr: string) => Reflect.get(zcode, 'parseOutput').call(zcode, stdout, stderr) as ParsedOutput;
+  const zcodeResult = await new OutputFixtureAdapter(`console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',aggregated_output:'x'.repeat(3*1024*1024)}}));
+    console.log(JSON.stringify({type:'result',response:'ZCODE_OFFICIAL_FINAL',sessionId:'zcode-session'}));`, zcodeParser, {}, 'zcode')
+    .run({ ...fixtureRequest(), harness: 'zcode', model: 'glm-main' });
+  assert.equal(zcodeResult.final, 'ZCODE_OFFICIAL_FINAL');
+  assert.equal(zcodeResult.sessionId, 'zcode-session');
+  const plain = (stdout: string, stderr: string) => ({ finalText: stdout.trim(), events: [{ type: 'output', message: stdout }, { type: 'stderr', message: stderr }] });
+  const dshResult = await new OutputFixtureAdapter(`process.stdout.write('Implementation complete\\nNext agent: check edge cases\\n');`, plain, {}, 'dsh')
+    .run({ ...fixtureRequest(), harness: 'dsh', model: 'deepseek-main' });
+  assert.equal(dshResult.final, 'Implementation complete\nNext agent: check edge cases');
+});
+
 test('Codex builds argv with an explicit model, workspace sandbox and reasoning effort', async () => {
   const adapter = new CodexAdapter();
   const invocation = await adapter.prepare(context({ reasoningEffort: 'high', outputSchemaPath: 'C:/artifacts/result schema.json' }), codexBinding);

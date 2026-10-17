@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { buildChildEnv, runProcess } from './process-runner.js';
 import type { AdapterRunResult, HarnessId, Invocation, ModelBinding, ParsedOutput, ReasoningEffort, RunContext } from './types.js';
 import { classifyQuota } from '../core/quota.js';
+import { plaintextProviderError, StreamingOutputParser } from './output-parser.js';
 
 export interface AdapterConfig {
   executable?: string;
@@ -74,6 +75,8 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
       const startedAt = new Date().toISOString();
       const started = Date.now();
       const child = buildChildEnv(ctx.envAllowlist, ctx.secretRefs, ctx.resolveSecret, invocation.env);
+      const outputFormat = invocation.outputFormat ?? (this.id === 'dsh' ? 'text' : 'jsonl');
+      const streamedOutput = outputFormat === 'jsonl' ? new StreamingOutputParser(invocation.parseOutput, child.secrets) : undefined;
       const controller = new AbortController();
       const activeKey = `${request.taskId}:${request.attemptId}`;
       this.active.set(activeKey, controller);
@@ -93,14 +96,15 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
           lifecycleTracePath,
           secrets: child.secrets,
           signal: controller.signal,
+          ...(streamedOutput ? { onStdoutChunk: (chunk: Buffer | string) => streamedOutput.consume(chunk) } : {}),
         });
       } finally { this.active.delete(activeKey); }
-      const parsed = invocation.parseOutput(outcome.stdout, outcome.stderr);
-      const modelMismatch = Boolean(parsed.actualModel && parsed.actualModel !== binding.model.modelId);
-      const status = modelMismatch ? 'failed' : outcome.status === 'completed' && outcome.exitCode !== 0 ? 'failed' : outcome.status;
-      const runError = modelMismatch
-        ? `Harness reported model ${parsed.actualModel}, expected ${binding.model.modelId}`
-        : outcome.error;
+      const parsed = { ...invocation.parseOutput(outcome.stdout, outcome.stderr), ...streamedOutput?.finish() };
+      const modelMismatch = Boolean(parsed.modelConflict || parsed.actualModel && parsed.actualModel !== binding.model.modelId);
+      const status = modelMismatch || parsed.outputError ? 'failed' : outcome.status === 'completed' && outcome.exitCode !== 0 ? 'failed' : outcome.status;
+      const runError = parsed.modelConflict ? 'Harness reported conflicting model identities'
+        : modelMismatch ? `Harness reported model ${parsed.actualModel}, expected ${binding.model.modelId}`
+          : parsed.outputError ?? outcome.error;
       const artifactPaths = request.artifactDir
         ? await this.persistArtifacts(request.artifactDir, request.taskId, request.attemptId, outcome.stdout, outcome.stderr, parsed)
         : {};
@@ -120,8 +124,8 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
         sessionId: parsed.sessionId,
         error: runError,
       };
-      const quota = outcome.status === 'failed' && outcome.exitCode !== 0
-        ? classifyQuota(`${outcome.stdout}\n${outcome.stderr}\n${parsed.events.map(event => event.message ?? '').join('\n')}`)
+      const quota = outcome.status === 'failed' && outcome.exitCode !== 0 && !modelMismatch
+        ? classifyQuota(parsed.hasStructuredOutput ? (parsed.providerErrors ?? []).join('\n') : plaintextProviderError(outcome.stderr))
         : undefined;
       return {
         status: result.status,
@@ -231,6 +235,9 @@ export function parseJsonLines(stdout: string, stderr = ''): ParsedOutput {
   let finalText: string | undefined;
   let actualModel: string | undefined;
   let sessionId: string | undefined;
+  let modelConflict = false;
+  let hasStructuredOutput = false;
+  const providerErrors: string[] = [];
   for (const line of stdout.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let value: unknown;
@@ -238,22 +245,48 @@ export function parseJsonLines(stdout: string, stderr = ''): ParsedOutput {
       events.push({ type: 'unparsed', message: line });
       continue;
     }
-    if (!value || typeof value !== 'object') {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
       events.push({ type: 'unparsed', data: value });
       continue;
     }
     const item = value as Record<string, unknown>;
     const type = typeof item.type === 'string' ? item.type : typeof item.event === 'string' ? item.event : 'message';
+    hasStructuredOutput ||= typeof item.type === 'string' || typeof item.event === 'string';
     if (typeof item.session_id === 'string') sessionId = item.session_id;
-    if (typeof item.model === 'string') actualModel = item.model;
+    if (typeof item.model === 'string') {
+      modelConflict ||= Boolean(actualModel && actualModel !== item.model);
+      actualModel ??= item.model;
+    }
     if (type === 'thread.started' && typeof item.thread_id === 'string') sessionId = item.thread_id;
-    if (type === 'turn.completed' && typeof item.model === 'string') actualModel = item.model;
     const text = extractText(item);
-    if (text && /completed|final|result|assistant_message/i.test(type)) finalText = text;
+    if (text && isFinalEvent(type, item)) finalText = text;
+    const error = providerError(type, item);
+    if (error) providerErrors.push(error);
     events.push({ type, ...(text ? { message: text } : {}), data: item });
   }
   if (stderr.trim()) events.push({ type: 'stderr', message: stderr.trim() });
-  return { events, finalText, actualModel, sessionId };
+  return { events, finalText, actualModel, sessionId,
+    ...(modelConflict ? { modelConflict: true } : {}),
+    ...(hasStructuredOutput ? { hasStructuredOutput: true } : {}),
+    ...(providerErrors.length ? { providerErrors } : {}),
+  };
+}
+
+function isFinalEvent(type: string, item: Record<string, unknown>): boolean {
+  if (type === 'item.completed') {
+    const nested = item.item;
+    return !nested || typeof nested !== 'object' || !('type' in nested) || nested.type === 'agent_message';
+  }
+  return /^(?:final|result|completed|assistant_message|assistant\.message\.completed|response\.completed|message\.completed)$/i.test(type);
+}
+
+function providerError(type: string, item: Record<string, unknown>): string | undefined {
+  const failedResult = type === 'result' && (item.is_error === true || item.isError === true || item.success === false || item.status === 'failed' || item.status === 'error');
+  if (!['error', 'turn.failed', 'response.failed'].includes(type) && !failedResult) return undefined;
+  const error = item.error;
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message;
+  return typeof item.message === 'string' ? item.message : failedResult && typeof item.response === 'string' ? item.response : extractText(item);
 }
 
 function extractText(item: Record<string, unknown>): string | undefined {

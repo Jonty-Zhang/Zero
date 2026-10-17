@@ -48,6 +48,7 @@ export async function runProcess(options: ProcessRunnerOptions): Promise<Process
   child.stdout?.on('data', (chunk: Buffer | string) => {
     stdoutBytes = capture(stdout, chunk, stdoutBytes);
     lifecycleTrace?.consume(chunk);
+    options.onStdoutChunk?.(chunk);
   });
   child.stderr?.on('data', (chunk: Buffer | string) => { stderrBytes = capture(stderr, chunk, stderrBytes); });
   child.stdin?.on('error', () => { /* Early child exit may close stdin; the exit status remains authoritative. */ });

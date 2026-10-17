@@ -113,6 +113,8 @@ export interface Invocation {
   env: NodeJS.ProcessEnv;
   requestedModel?: string;
   reasoningEffort?: ReasoningEffort;
+  /** Existing Codex/ZCode invocations default to JSONL; DSH defaults to plaintext. */
+  outputFormat?: 'jsonl' | 'text';
   parseOutput: (stdout: string, stderr: string) => ParsedOutput;
 }
 
@@ -121,6 +123,11 @@ export interface ParsedOutput {
   finalText?: string;
   actualModel?: string;
   sessionId?: string;
+  modelConflict?: boolean;
+  /** Explicit provider error event messages, never agent or tool prose. */
+  providerErrors?: string[];
+  hasStructuredOutput?: boolean;
+  outputError?: string;
 }
 
 export interface ProcessOutcome {
@@ -143,6 +150,8 @@ export interface ProcessRunnerOptions {
   lifecycleTracePath?: string;
   secrets?: string[];
   signal?: AbortSignal;
+  /** Trusted in-memory protocol observer. Raw chunks must never be persisted by the observer. */
+  onStdoutChunk?: (chunk: Buffer | string) => void;
   /** Injectable for deterministic tests. Production runner owns cancellation and process-tree termination. */
   spawnProcess?: (executable: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; windowsHide: boolean; stdio: 'pipe' }) => ChildProcess;
 }
