@@ -240,12 +240,26 @@ function SequenceSubmitModal({ capabilities, onClose, onCreated }: { capabilitie
 function SequenceDrawer({ id, onClose, onOpenTask }: { id: string; onClose: () => void; onOpenTask: (taskId: string) => void }) {
   const state = usePolling(id, loadSequence);
   const sequence = state.data; const error = state.error;
+  const [retryBusy, setRetryBusy] = useState(false);
+  const [retryError, setRetryError] = useState('');
+  const [acknowledgedAttempt, setAcknowledgedAttempt] = useState<string | null>(null);
   const dialogRef = useDialog(onClose);
   const status = sequence?.status;
   const allStepsDone = Boolean(sequence && sequence.steps.length > 0 && sequence.steps.every(step => step.task.status === 'done'));
   const activeGoalRevision = sequence ? activeGoalRevisionTask(sequence) : undefined;
   const hasGoalRevisionSteps = Boolean(sequence && sequence.goalRevisionCount > 0);
   const goalCapExhausted = Boolean(sequence && allStepsDone && !activeGoalRevision && sequence.goalReview?.state === 'verdict' && sequence.goalReview.result?.verdict === 'changes_requested' && sequence.goalRevisionCount >= sequence.maxGoalRevisions);
+  const retryEligible = Boolean(sequence && allStepsDone && (sequence.objective || sequence.acceptanceCriteria?.length)
+    && sequence.goalReview?.state === 'verdict' && sequence.goalReview.result?.verdict === 'blocked' && sequence.goalReview.attemptId);
+  const retryQueued = Boolean(sequence?.goalReview?.retryRequestedAt || sequence?.goalReview?.attemptId && acknowledgedAttempt === sequence.goalReview.attemptId);
+  const retryGoalReview = async () => {
+    const attemptId = sequence?.goalReview?.attemptId;
+    if (!retryEligible || !attemptId || retryBusy || retryQueued) return;
+    setRetryBusy(true); setRetryError('');
+    try { await api.retrySequenceGoalReview(id, attemptId); setAcknowledgedAttempt(attemptId); }
+    catch (error) { setRetryError(error instanceof Error ? error.message : '重新验收请求失败，请稍后重试'); }
+    finally { setRetryBusy(false); void state.refresh(); }
+  };
   return <div className="drawer-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}><aside ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="目标进度" className="task-drawer sequence-drawer"><header className="drawer-header"><div><div className="eyebrow">目标进度</div><h2>{sequence?.objective || (sequence ? taskTitle(sequence.steps[0]?.task ?? { id: sequence.id, status: 'pending' }) : '正在读取目标')}</h2></div><button className="icon-button" aria-label="关闭详情" onClick={onClose}><X size={18} /></button></header>
     {error && !sequence ? <div className="alert error"><AlertCircle size={17} /><div><b>目标读取失败</b><span>{error}</span></div></div> : !sequence ? <div className="loading-state"><LoaderCircle className="spin" size={22} />正在读取目标进度…</div> : <div className="drawer-content">{error && <div className="alert stale-banner" role="alert">刷新失败，显示上次同步内容：{error}</div>}
       <div className="drawer-status-row"><span className={`sequence-state ${status}`}>{sequenceStatusLabel[sequence.status]}</span><span className="muted">{sequence.steps.filter(step => step.task.status === 'done').length}/{sequence.steps.length} 步骤已完成 · 自动目标返工 {sequence.goalRevisionCount}/{sequence.maxGoalRevisions}</span></div>
@@ -253,6 +267,8 @@ function SequenceDrawer({ id, onClose, onOpenTask }: { id: string; onClose: () =
       {sequence.goalReview?.state === 'running' && <section className="sequence-goal-callout pending"><Activity size={17} /><div><b>正在进行目标级 Codex 验收</b><p>验收根据完整序列结果和目标条件进行。</p></div></section>}
       {sequence.goalReview?.state === 'quota' && <section className="sequence-goal-callout pending"><Clock3 size={17} /><div><b>目标级验收等待额度恢复</b><p>{sequence.goalReview.retryAt ? `计划重试时间：${date(sequence.goalReview.retryAt)}` : '额度恢复后将重试。'}</p></div></section>}
       {sequence.goalReview?.state === 'verdict' && <section className={`sequence-goal-callout ${sequence.goalReview.result?.verdict === 'pass' ? 'done' : 'pending'}`}><Target size={17} /><div><b>{hasGoalRevisionSteps && sequence.goalReview.result?.verdict === 'changes_requested' ? '上一轮目标验收：CHANGES_REQUESTED' : `目标验收：${sequence.goalReview.result?.verdict?.toUpperCase() || '未知'}`}</b><p>{sequence.goalReview.result?.summary}</p>{activeGoalRevision && sequence.goalReview.result?.verdict === 'changes_requested' && <p>自动目标返工正在处理；上方结果属于上一轮验收，不代表当前最终状态。</p>}{hasGoalRevisionSteps && !activeGoalRevision && allStepsDone && !goalCapExhausted && sequence.goalReview.result?.verdict === 'changes_requested' && <p>返工步骤已完成；最新验收仍要求修改，下一轮自动返工正在排队。</p>}{hasGoalRevisionSteps && !activeGoalRevision && !allStepsDone && sequence.goalReview.result?.verdict === 'changes_requested' && <p>上一轮验收要求的自动返工步骤未能完成；请查看步骤状态和错误详情。</p>}{goalCapExhausted && <p>自动目标返工额度已用完（{sequence.goalRevisionCount}/{sequence.maxGoalRevisions}），序列保持阻塞。原因：{sequence.blockedReason?.reason || '整体目标验收仍未通过。'}</p>}{sequence.goalReview.result?.verdict !== 'pass' && !activeGoalRevision && !goalCapExhausted && !hasGoalRevisionSteps && <p>请依据以下发现处理。</p>}{sequence.goalReview.result?.findings?.length ? <ul className="sequence-criteria">{sequence.goalReview.result.findings.map((finding, index) => <li key={index}><b>{finding.severity || 'finding'}</b>{finding.file ? ` · ${finding.file}${finding.line ? `:${finding.line}` : ''}` : ''} — {finding.message}</li>)}</ul> : null}</div></section>}
+      {retryEligible && <div className="sequence-goal-callout pending"><RefreshCw size={17} /><div><Button disabled={retryBusy || retryQueued} onClick={() => void retryGoalReview()}>{retryBusy ? '正在提交重新验收…' : '重新验收'}</Button>{retryQueued && <p role="status">重新验收已排队；上一轮验收结果保留，等待新的验收开始。</p>}</div></div>}
+      {retryError && <div className="alert error compact" role="alert"><AlertCircle size={15} />{retryError}</div>}
       {sequence.status === 'completed' && !sequence.goalReview && <section className="sequence-goal-callout done"><CheckCircle2 size={17} /><div><b>序列已完成</b><p>所有任务步骤已完成；此序列未配置额外的目标级验收条件。</p></div></section>}
       {sequence.blockedReason && <div className="alert error compact"><AlertCircle size={15} /><span>{goalCapExhausted || allStepsDone && sequence.goalReview?.state === 'verdict' && sequence.goalReview.result?.verdict !== 'pass' ? '目标验收受阻' : '步骤受阻'}：{sequence.blockedReason.reason || statusLabel[sequence.blockedReason.status] || sequence.blockedReason.status}</span></div>}
       {sequence.acceptanceCriteria?.length ? <div className="detail-block"><h3><Target size={15} />目标级验收标准</h3><ul className="sequence-criteria">{sequence.acceptanceCriteria.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul></div> : sequence.objective && <div className="detail-block"><h3><Target size={15} />整体目标</h3><p className="pre-wrap">{sequence.objective}</p></div>}
