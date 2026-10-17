@@ -24,6 +24,69 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 describe('task workspace', () => {
+  it('keeps stage goals with their execution routes when reordered and removed before submission', async () => {
+    vi.mocked(api.capabilities).mockResolvedValue({ ...capability, bindings: [{ harnessId: 'codex', modelId: 'model-a', available: true, reasoningEfforts: [] }] });
+    vi.mocked(api.createTask).mockResolvedValue({ ...tasks[0]!, id: 'created-relay' });
+    vi.mocked(api.task).mockResolvedValue({ ...tasks[0]!, id: 'created-relay' });
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
+    fireEvent.change(within(dialog).getByLabelText(/仓库路径/), { target: { value: 'C:/repo/zero' } });
+    fireEvent.change(within(dialog).getByLabelText('任务描述 *'), { target: { value: '实现登录并由另一名执行者补全检查' } });
+    fireEvent.change(within(dialog).getByLabelText(/检查命令/), { target: { value: 'npm test' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: '添加阶段' }));
+    fireEvent.change(within(dialog).getByLabelText('阶段 1 目标'), { target: { value: '  实现登录接口  ' } });
+    const firstStage = within(dialog).getByLabelText('阶段 1 目标').closest('.execution-stage')!;
+    fireEvent.change(within(firstStage as HTMLElement).getByLabelText('Harness'), { target: { value: 'codex' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: '添加阶段' }));
+    fireEvent.change(within(dialog).getByLabelText('阶段 2 目标'), { target: { value: '补充失败路径的检查' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: '将阶段 2 上移' }));
+    expect((within(dialog).getByLabelText('阶段 1 目标') as HTMLTextAreaElement).value).toBe('补充失败路径的检查');
+    fireEvent.click(within(dialog).getByRole('button', { name: '添加阶段' }));
+    fireEvent.change(within(dialog).getByLabelText('阶段 3 目标'), { target: { value: '应移除的临时阶段' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: '移除阶段 3' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: '加入任务队列' }));
+    await screen.findByRole('button', { name: '关闭详情' });
+    expect(api.createTask).toHaveBeenCalledWith(expect.objectContaining({ executionStages: [
+      { objective: '补充失败路径的检查' }, { harnessId: 'codex', objective: '实现登录接口' },
+    ] }));
+  });
+  it('renders submitted stage goals and labels executor summaries as untrusted plain text', async () => {
+    const summary = '<img src=x onerror=alert(1)> 已修改接口，检查尚未执行';
+    vi.mocked(api.task).mockResolvedValue({ ...tasks[0]!, executionStages: [{ objective: '先实现，再补充异常检查' }],
+      handoffs: [{ id: 'semantic-handoff', stageId: 'stage-one', createdAt: '', source: { attemptId: 'a1', harness: 'codex', model: 'model-a' }, workspace: { state: 'dirty' }, completed: [], currentState: '等待后续处理', decisions: [], keyFiles: [], checks: [], blockers: [], risks: [], nextSteps: [], executorSummary: summary }],
+    } as Task);
+    render(<App />);
+    fireEvent.click(await screen.findByText('修复登录回调'));
+    expect(await screen.findByText('先实现，再补充异常检查')).toBeTruthy();
+    expect(screen.getByText(summary)).toBeTruthy();
+    expect(screen.getByText('执行者自述，需结合检查与审查确认')).toBeTruthy();
+    expect(screen.getByRole('dialog').querySelector('img')).toBeNull();
+  });
+  it('separates superseded checks from the current verified run', async () => {
+    vi.mocked(api.task).mockResolvedValue({ ...tasks[1]!, tests: [{ command: 'current-unit-check', status: 'passed' }],
+      historicalTests: [{ command: 'superseded-unit-check', status: 'failed', output: 'before revision' }],
+      checkEvidence: { state: 'current', runId: 'run-2', stageId: 'stage-2', attemptId: 'attempt-2', status: 'passed' },
+    } as Task);
+    render(<App />);
+    fireEvent.click(await screen.findByText('更新文档'));
+    await screen.findByText('current-unit-check');
+    const current = screen.getByRole('region', { name: '当前检查结果' });
+    const historical = screen.getByText(/历史检查记录/).closest('details')!;
+    expect(within(current).getByText('current-unit-check')).toBeTruthy();
+    expect(within(current).queryByText('superseded-unit-check')).toBeNull();
+    expect(within(historical).getByText('superseded-unit-check')).toBeTruthy();
+    expect(screen.getByText('run-2')).toBeTruthy();
+  });
+  it('does not describe unattributed legacy checks as current validation', async () => {
+    vi.mocked(api.task).mockResolvedValue({ ...tasks[1]!, tests: [{ command: 'legacy-check', status: 'passed' }], checkEvidence: { state: 'unattributed' } } as Task);
+    render(<App />);
+    fireEvent.click(await screen.findByText('更新文档'));
+    await screen.findByText('legacy-check');
+    expect(screen.getByText('检查归属尚未确认')).toBeTruthy();
+    expect(screen.queryByRole('region', { name: '当前检查结果' })).toBeNull();
+  });
   it('combines list-title search, status, repository and Harness filters in the default table', async () => {
     render(<App />);
     await screen.findByText('修复登录回调');

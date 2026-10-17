@@ -2165,6 +2165,49 @@ test("execution stage submissions reject an empty stage list and persist valid s
   } finally { store.close(); }
 });
 
+test("stage objectives persist with their own selection across database reopen and sequence creation", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-stage-objectives-"));
+  const path = join(root, "tasks.sqlite");
+  let store = new TaskStore(path);
+  try {
+    const submission = {
+      repoPath: ".", baseRef: "main", prompt: "Implement then verify the parser.", selection: { harness: "zcode" },
+      executionStages: [{ model: "glm-main", objective: "Implement UTF-8 rejection" }, { objective: "Verify boundary cases" }, {}],
+    } as TaskSubmission;
+    const task = store.submit(submission, "durable-stage-objectives");
+    const sequence = store.createSequence([submission, { repoPath: ".", baseRef: "main", prompt: "Legacy follow-up" }]);
+    assert.deepEqual(task.selection, { harness: "zcode" });
+    store.close();
+    store = new TaskStore(path);
+    assert.deepEqual(store.get(task.id)?.executionStages, [
+      { model: "glm-main", objective: "Implement UTF-8 rejection" }, { objective: "Verify boundary cases" }, {},
+    ]);
+    assert.deepEqual(store.getSequence(sequence.id)?.steps[0]?.task.executionStages, [
+      { model: "glm-main", objective: "Implement UTF-8 rejection" }, { objective: "Verify boundary cases" }, {},
+    ]);
+    assert.equal(store.getSequence(sequence.id)?.steps[1]?.task.executionStages, undefined);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("stage objective validation rejects invalid direct submissions atomically and accepts the normalized length boundary", () => {
+  const store = new TaskStore();
+  const base = { repoPath: ".", baseRef: "main", prompt: "Validate stage goals" };
+  try {
+    for (const objective of ["", " \r\n\t ", " untrimmed", "untrimmed ", 42, null, {}, "x".repeat(4001)]) {
+      const invalid = { ...base, executionStages: [{ objective }] } as unknown as TaskSubmission;
+      assert.throws(() => store.submit(invalid), /objective/, `must reject ${JSON.stringify(objective)}`);
+      assert.throws(() => store.createSequence([base, invalid]), /objective/);
+      assert.equal(store.list().length, 0);
+      assert.equal(store.listSequences().length, 0);
+    }
+    const task = store.submit({ ...base, executionStages: [{ objective: "x".repeat(4000) }] } as TaskSubmission);
+    assert.equal((store.get(task.id)?.executionStages?.[0] as { objective?: string }).objective?.length, 4000);
+  } finally { store.close(); }
+});
+
 test("attempt completion persists the final reviewer Harness, model, effort, and artifacts", () => {
   const store = new TaskStore();
   try {

@@ -510,6 +510,12 @@ function validateExecutionStages(submission: TaskSubmission): void {
   for (const [index, stage] of submission.executionStages.entries()) {
     if (!stage || typeof stage !== "object" || Array.isArray(stage)) throw new Error(`executionStages[${index}] must be an object`);
     for (const [field, value] of Object.entries(stage)) {
+      if (field === "objective") {
+        if (typeof value !== "string" || !value.trim() || value !== value.trim() || value.length > 4000) {
+          throw new Error(`executionStages[${index}].objective must be a normalized 1 to 4000 character string`);
+        }
+        continue;
+      }
       if (!["harness", "model", "reasoningEffort"].includes(field) || typeof value !== "string" || !value.trim() || value !== value.trim()) {
         throw new Error(`executionStages[${index}].${field} must be a non-empty supported selection field`);
       }

@@ -56,12 +56,14 @@ export type Task = {
   route?: RouteInfo;
   attempts?: Attempt[];
   tests?: TestResult[];
+  historicalTests?: TestResult[];
+  checkEvidence?: { state: 'current' | 'historical' | 'unattributed'; runId?: string; stageId?: string; attemptId?: string; status?: string };
   review?: ReviewResult;
   logs?: string | string[];
   report?: string;
   error?: string;
   maxRevisions?: number;
-  executionStages?: ExecutionSelection[];
+  executionStages?: ExecutionStageDefinition[];
   stages?: ExecutionStage[];
   handoffs?: Handoff[];
 };
@@ -76,6 +78,7 @@ export type Handoff = {
   source: { attemptId: string; harness: string; model: string };
   workspace: { baseCommit?: string; headCommit?: string; fingerprint?: string; state: string; changedFiles?: string[] };
   completed: string[]; currentState: string;
+  executorSummary?: string;
   decisions: Array<{ decision: string; rationale: string }>;
   keyFiles: Array<{ path: string; reason: string }>;
   checks: Array<{ id: string; status: string; evidence?: string }>;
@@ -116,3 +119,4 @@ export type Config = {
   };
 };
 export type ExecutionSelection = { harnessId?: string | null; modelId?: string | null; reasoningEffort?: string | null };
+export type ExecutionStageDefinition = ExecutionSelection & { objective?: string };

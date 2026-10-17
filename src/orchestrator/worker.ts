@@ -29,7 +29,7 @@ import { materializeReportProjection } from "../core/report-projection.js";
 import { inspectReviewRecovery } from "./review-recovery-inspector.js";
 import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
-import { HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
+import { boundExecutorSummary, HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
 
 type ResumeStage = "route" | "execute" | "review";
 interface ReviewReworkRunContext {
@@ -794,6 +794,8 @@ export class TaskWorker {
           cwd: worktree.path,
           prompt: [
             executionBrief,
+            this.#executionStageBrief(task, executionStageIndex),
+            "In your final reply, summarize the changes, decisions and their rationale, unfinished work, risks, and what a following agent should inspect or do next. Zero retains this as your unverified account; Git observations, configured checks and independent review determine task completion.",
             ...(isFirstRecoveredStage && revision === 0 && executionStageIndex === 0
               ? ["The checkout may contain incomplete edits from an interrupted earlier writer. Inspect the current changes, preserve correct work, and finish the task from this state. The earlier attempt did not complete or pass review."] : []),
             ...(isFirstReworkRecoveryWriter
@@ -817,7 +819,8 @@ export class TaskWorker {
           stderrPath: runResult.stderrPath,
           resultPath: runResult.eventsPath,
           error: runResult.error,
-          metadata: { actualModel: runResult.actualModel, durationMs: runResult.durationMs, sessionId: runResult.sessionId },
+          metadata: { actualModel: runResult.actualModel, durationMs: runResult.durationMs, sessionId: runResult.sessionId,
+            executorSummary: boundExecutorSummary(runResult.final) },
         }, { owner, processStartId });
         activeAttempt = undefined;
         active.adapter = undefined;
@@ -1754,8 +1757,15 @@ export class TaskWorker {
   #taskForExecutionStage(task: TaskRecord, index: number): TaskRecord {
     const stageSelection = task.executionStages?.[index];
     if (!stageSelection) return task;
-    const selection = { ...task.selection, ...stageSelection };
-    return { ...task, selection };
+    const { objective, ...executionSelection } = stageSelection;
+    const selection = { ...task.selection, ...executionSelection };
+    return { ...task, selection, ...(objective ? { prompt: `${task.prompt}\n\n${this.#executionStageBrief(task, index)}` } : {}) };
+  }
+
+  #executionStageBrief(task: TaskRecord, index: number): string {
+    const objective = task.executionStages?.[index]?.objective;
+    if (!objective) return "";
+    return `Execution stage ${index + 1} of ${task.executionStages!.length} objective:\n${objective}\nThis stage scope supplements the overall task. Preserve the original task and acceptance criteria, and address all reviewer-requested changes during revisions. Later stages receive this same worktree; describe unfinished work in your final reply.`;
   }
 
   #assertAllowedPaths(task: TaskRecord, paths: string[]): void {
@@ -1873,6 +1883,11 @@ export class TaskWorker {
     const finalStatus = input.status === "succeeded" && snapshotFailed ? "failed" : input.status;
     this.#options.store.finishStage(stage.id, owner, stage.processStartId, finalStatus, fingerprint);
     if (attempt) {
+      // The in-memory Attempt predates finishAttempt. Read the durable final so
+      // all finalization/recovery paths carry the same bounded executor claim.
+      const savedAttempt = this.#options.store.attempts(task.id).find(item => item.id === attempt.id && item.stageId === stage.id);
+      const executorSummary = typeof savedAttempt?.metadata?.executorSummary === "string"
+        ? boundExecutorSummary(savedAttempt.metadata.executorSummary) : undefined;
       const observedChecks = (task.checks ?? []).slice(0, 40).map(definition => {
         const result = checks.find(item => item.id === definition.id);
         return {
@@ -1914,6 +1929,7 @@ export class TaskWorker {
           : { baseCommit: worktree.baseCommit, fingerprint: fingerprint!, state: workspaceState, changedFiles: changed },
         completed,
         currentState: summary,
+        ...(executorSummary ? { executorSummary } : {}),
         decisions: [],
         rejectedOptions: [],
         keyFiles: changed.slice(0, 20).map(path => ({ path, reason: "Git reports this path changed from the task base." })),

@@ -357,23 +357,37 @@ async function parseSubmission(raw: unknown, options: ZeroServerOptions, capabil
   if (!Number.isInteger(maxRevisions) || maxRevisions < 0 || maxRevisions > 10) throw new HttpError(400, 'maxRevisions 必须在 0 到 10 之间');
   const checks = parseChecks(input.checkCommands);
   const capability = capabilitySnapshot ?? await capabilities(options);
+  // Match runtime precedence at the canonical repository root, but persist only
+  // user-authored locks so future routes still observe current project settings.
+  const defaults = (await options.config.read()).executionDefaults;
+  const inherited = { ...selectionFields(defaults?.global ?? null), ...selectionFields(defaults?.projects[repoPath] ?? null) };
   if (input.executionStages !== undefined) {
     const global = input.execution == null ? {} : parsePublicSelection(input.execution, 'execution');
-    const stages = validateExecutionStages(input.executionStages, global, capability);
+    const stages = validateExecutionStages(input.executionStages, { ...inherited, ...global }, capability);
     const selection = toExecutionSelection(global);
     return { repoPath, baseRef, prompt, acceptanceCriteria: criteria, maxRevisions, checks,
       ...(selection ? { selection } : {}), executionStages: stages };
   }
   const selection = input.execution == null ? undefined : validateSelection(input.execution, capability);
+  validateAvailableSelection({ ...inherited, ...selectionFields(selection ?? null) }, capability, 'execution effective selection');
   return { repoPath, baseRef, prompt, acceptanceCriteria: criteria, maxRevisions, checks, ...(selection ? { selection } : {}) };
 }
 
 function validateExecutionStages(rawStages: unknown, global: Record<string, string>, capability: Awaited<ReturnType<typeof capabilities>>): NonNullable<TaskSubmission['executionStages']> {
   if (!Array.isArray(rawStages) || rawStages.length < 1 || rawStages.length > 16) throw new HttpError(400, 'executionStages 必须包含 1 到 16 个阶段');
   return rawStages.map((rawStage, index) => {
-    const stage = parsePublicSelection(rawStage, `executionStages[${index}]`);
+    const label = `executionStages[${index}]`;
+    if (!rawStage || typeof rawStage !== 'object' || Array.isArray(rawStage)) throw new HttpError(400, `${label} 必须是对象`);
+    const { objective, ...selection } = rawStage as Record<string, unknown>;
+    const stage = parsePublicSelection(selection, label);
     const merged = { ...global, ...stage };
-    validateAvailableSelection(merged, capability, `executionStages[${index}]`);
+    validateAvailableSelection(merged, capability, label);
+    if (Object.hasOwn(rawStage, 'objective')) {
+      if (typeof objective !== 'string' || !objective.trim() || objective.trim().length > 4000) {
+        throw new HttpError(400, `${label}.objective 必须是 1 到 4000 个字符的非空文本`);
+      }
+      return { ...stage, objective: objective.trim() };
+    }
     return stage;
   });
 }
@@ -498,7 +512,8 @@ async function taskDetail(res: ServerResponse, id: string, options: ZeroServerOp
   const report = reportPath && (await access(reportPath).then(() => true).catch(() => false)) ? `/api/tasks/${encodeURIComponent(id)}/report` : undefined;
   json(res, 200, { ...mapTaskList(task), prompt: task.prompt, acceptanceCriteria: task.acceptanceCriteria?.join('\n'), baseRef: task.baseRef,
     maxRevisions: task.maxRevisions, route: route ? mapRoute(route) : undefined,
-    executionStages: (task.executionStages ?? []).map(publicExecutionSelection), stages: stages.map(mapStage), handoffs: handoffs.map(mapHandoff),
+    executionStages: (task.executionStages ?? []).map(stage => ({ ...publicExecutionSelection(stage), ...(stage.objective !== undefined ? { objective: stage.objective } : {}) })),
+    stages: stages.map(mapStage), handoffs: handoffs.map(mapHandoff),
     attempts: attemptDetails, tests: checkDetails, review: reviews.length ? mapReview(reviews.at(-1)!) : undefined,
     logs, report, error: task.failureReason, events: events.map(event => ({ type: event.type, at: event.at, payload: event.payload })) });
 }
@@ -546,7 +561,7 @@ function mapAttempt(value: Attempt) {
     number: value.sequence, status: value.status, startedAt: value.startedAt, endedAt: value.finishedAt,
     route: value.harness || value.model ? { harnessId: value.harness, modelId: value.model, reasoningEffort: value.reasoningEffort } : undefined,
     sessionId: typeof metadata.sessionId === 'string' ? metadata.sessionId : undefined,
-    summary: value.error ?? metadata.summary };
+    summary: typeof metadata.executorSummary === 'string' && metadata.executorSummary.trim() ? metadata.executorSummary : value.error ?? metadata.summary };
 }
 function mapStage(value: StageRecord) {
   return {
@@ -564,7 +579,7 @@ function mapHandoff(value: HandoffRecord) {
       baseCommit: value.workspace.baseCommit, headCommit: value.workspace.headCommit, fingerprint: value.workspace.fingerprint,
       state: value.workspace.state, changedFiles: value.workspace.changedFiles,
     },
-    completed: value.completed, currentState: value.currentState,
+    completed: value.completed, currentState: value.currentState, executorSummary: value.executorSummary,
     decisions: value.decisions.map(item => ({ decision: item.decision, rationale: item.rationale })),
     keyFiles: value.keyFiles.map(item => ({ path: item.path, reason: item.reason })),
     checks: value.checks.map(item => ({ id: item.id, status: item.status, evidence: item.evidence })),

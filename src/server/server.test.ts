@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { HarnessAdapter, HarnessCapabilities, RunRequest, RunResult, TaskSubmission } from '../domain/types.js';
+import type { HandoffRecord, HarnessAdapter, HarnessCapabilities, RunRequest, RunResult, TaskSubmission } from '../domain/types.js';
 import type { ModelBinding } from '../adapters/types.js';
 import { TaskStore } from '../core/task-store.js';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
@@ -390,6 +390,182 @@ test('POST /api/tasks persists ordered partial execution stages with global defa
       { model: 'glm-main' },
       { model: 'glm-main', reasoningEffort: 'low' },
     ]);
+  } finally { await f.close(); }
+});
+
+test('stage objectives roundtrip through public POST and GET without entering selection or defaults', async () => {
+  const f = await createFixture();
+  try {
+    const configBefore = await f.config.read();
+    const response = await fetch(`${f.url}/api/tasks`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repoPath: f.repoPath, baseRef: 'main', prompt: 'Implement and verify the parser with distinct goals.',
+        execution: { harnessId: 'zcode', reasoningEffort: 'high' },
+        executionStages: [{ modelId: 'glm-main', objective: '  Implement UTF-8 validation\n  ' }, { objective: 'Verify boundary cases' }, {}] }),
+    });
+    assert.equal(response.status, 201);
+    const created = await response.json() as { id: string };
+    const stored = f.store.get(created.id);
+    assert.deepEqual(stored?.selection, { harness: 'zcode', reasoningEffort: 'high' });
+    assert.deepEqual(stored?.executionStages, [
+      { model: 'glm-main', objective: 'Implement UTF-8 validation' }, { objective: 'Verify boundary cases' }, {},
+    ]);
+    const detailResponse = await fetch(`${f.url}/api/tasks/${created.id}`);
+    assert.equal(detailResponse.status, 200);
+    const detail = await detailResponse.json() as { executionStages: unknown[] };
+    assert.deepEqual(detail.executionStages, [
+      { modelId: 'glm-main', objective: 'Implement UTF-8 validation' }, { objective: 'Verify boundary cases' }, {},
+    ]);
+    assert.deepEqual(await f.config.read(), configBefore);
+  } finally { await f.close(); }
+});
+
+test('submission rejects incompatible inherited global selections for tasks, stages and sequence steps atomically', async () => {
+  const f = await createFixture(true, undefined, true);
+  try {
+    await f.config.write({ ...await f.config.read(), executionDefaults: {
+      global: { harness: 'codex', model: 'codex-main', reasoningEffort: 'high' }, projects: {},
+    } });
+    const base = { repoPath: f.repoPath, baseRef: 'main', prompt: 'Validate effective execution defaults before enqueueing.' };
+    const invalid = { ...base, execution: { harnessId: 'zcode' } };
+    for (const submission of [invalid, { ...invalid, executionStages: [{ objective: 'Implement the parser' }] }]) {
+      const response = await fetch(`${f.url}/api/tasks`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),
+      });
+      assert.equal(response.status, 400, 'zcode cannot inherit the codex-only model');
+      assert.match((await response.json() as { error: string }).error, /effective selection|可用 Harness 与模型组合/);
+      assert.equal(f.store.list().length, 0);
+    }
+    const sequence = await fetch(`${f.url}/api/sequences`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tasks: [{ ...base, execution: { harnessId: 'codex' } }, invalid] }),
+    });
+    assert.equal(sequence.status, 400);
+    assert.equal(f.store.listSequences().length, 0);
+    assert.equal(f.store.list().length, 0);
+
+    await f.config.write({ ...await f.config.read(), executionDefaults: {
+      global: { harness: 'zcode', model: 'glm-main', reasoningEffort: 'low' }, projects: {},
+    } });
+    const effort = await fetch(`${f.url}/api/tasks`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...base, execution: { harnessId: 'codex', modelId: 'codex-main' } }),
+    });
+    assert.equal(effort.status, 400, 'codex-main does not support the inherited low effort');
+    assert.equal(f.store.list().length, 0);
+  } finally { await f.close(); }
+});
+
+test('submission uses canonical project defaults with field precedence without persisting inherited locks', async () => {
+  const f = await createFixture(true, undefined, true);
+  try {
+    const nested = join(f.repoPath, 'src', 'nested');
+    await mkdir(nested, { recursive: true });
+    await f.config.write({ ...await f.config.read(), executionDefaults: {
+      global: { harness: 'codex', model: 'codex-main', reasoningEffort: 'high' },
+      projects: { [f.repoPath]: { harness: 'zcode', model: 'glm-main', reasoningEffort: 'low' } },
+    } });
+    const base = { repoPath: nested, baseRef: 'main', prompt: 'Resolve project defaults at the canonical repository root.' };
+    const invalid = await fetch(`${f.url}/api/tasks`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...base, execution: { harnessId: 'codex' } }),
+    });
+    assert.equal(invalid.status, 400, 'the project glm model must override the global codex model');
+    assert.equal(f.store.list().length, 0);
+    const response = await fetch(`${f.url}/api/tasks`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...base, execution: { reasoningEffort: 'high' },
+        executionStages: [{ objective: 'Implement parser' }, { harnessId: 'codex', modelId: 'codex-main', objective: 'Verify parser' }] }),
+    });
+    assert.equal(response.status, 201);
+    const created = await response.json() as { id: string };
+    assert.equal(f.store.get(created.id)?.repoPath, f.repoPath);
+    assert.deepEqual(f.store.get(created.id)?.selection, { reasoningEffort: 'high' });
+    assert.deepEqual(f.store.get(created.id)?.executionStages, [
+      { objective: 'Implement parser' }, { harness: 'codex', model: 'codex-main', objective: 'Verify parser' },
+    ]);
+    const inherited = await fetch(`${f.url}/api/tasks`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(base),
+    });
+    assert.equal(inherited.status, 201);
+    const inheritedTask = await inherited.json() as { id: string };
+    assert.equal(f.store.get(inheritedTask.id)?.selection, undefined);
+  } finally { await f.close(); }
+});
+
+test('stage objective API validation rejects whitespace, wrong types and excessive length before task creation', async () => {
+  const f = await createFixture();
+  const post = (objective: unknown) => fetch(`${f.url}/api/tasks`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ repoPath: f.repoPath, baseRef: 'main', prompt: 'Validate user-authored stage goals.', executionStages: [{ objective }] }),
+  });
+  try {
+    for (const objective of ['', ' \r\n\t ', 42, null, {}, 'x'.repeat(4001)]) {
+      const response = await post(objective);
+      assert.equal(response.status, 400);
+      assert.match((await response.json() as { error: string }).error, /objective/);
+      assert.equal(f.store.list().length, 0);
+    }
+    const accepted = await post(`  ${'x'.repeat(4000)}  `);
+    assert.equal(accepted.status, 201, 'the boundary applies to the normalized objective');
+    assert.equal((f.store.list()[0]?.executionStages?.[0] as { objective?: string }).objective?.length, 4000);
+    const incompatible = await fetch(`${f.url}/api/tasks`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repoPath: f.repoPath, baseRef: 'main', prompt: 'Still validate model locks alongside stage goals.',
+        executionStages: [{ objective: 'Verify parser', modelId: 'missing-model' }] }),
+    });
+    assert.equal(incompatible.status, 400);
+    assert.match((await incompatible.json() as { error: string }).error, /没有通过验证的可用 Harness 与模型组合/);
+    assert.equal(f.store.list().length, 1);
+  } finally { await f.close(); }
+});
+
+test('CLI stages-file preserves stage objectives through the real submission API', async () => {
+  const f = await createFixture();
+  try {
+    const stagesFile = join(f.root, 'stages.json');
+    await writeFile(stagesFile, JSON.stringify([{ harnessId: 'zcode', modelId: 'glm-main', objective: '  Implement parser  ' }, { objective: 'Verify parser' }]));
+    const result = await execFileAsync(process.execPath, [resolve('dist/cli.js'), 'submit', '--repo', f.repoPath,
+      '--prompt', 'Perform the two-stage parser change.', '--stages-file', stagesFile], {
+      env: { ...process.env, ZERO_URL: f.url }, windowsHide: true,
+    });
+    const created = JSON.parse(result.stdout) as { id: string };
+    assert.deepEqual(f.store.get(created.id)?.executionStages, [
+      { harness: 'zcode', model: 'glm-main', objective: 'Implement parser' }, { objective: 'Verify parser' },
+    ]);
+  } finally { await f.close(); }
+});
+
+test('task detail projects executor summaries as plain text and retains legacy attempt summaries', async () => {
+  const executorSummary = '<script>untrusted()</script> Implemented parser; verify boundaries next.';
+  const handoff: HandoffRecord & { executorSummary: string } = {
+    schemaVersion: 1, id: 'summary-handoff', byteLength: 100, taskId: 'api-executor-summary', stageId: 'source-stage',
+    createdAt: '2026-10-17T00:00:00.000Z', source: { attemptId: 'source-attempt', harness: 'zcode', model: 'glm-main' },
+    task: { objective: 'Parser task', acceptanceCriteria: [] }, workspace: { state: 'unknown' },
+    completed: [], currentState: 'Awaiting verification', decisions: [], rejectedOptions: [], keyFiles: [], checks: [], blockers: [], risks: [], nextSteps: [], executorSummary,
+  };
+  const f = await createFixture(true, undefined, false, store => new Proxy(store, {
+    get(target, property) {
+      if (property === 'handoffs') return () => [handoff];
+      const value: unknown = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }));
+  try {
+    const task = f.store.submit({ repoPath: f.repoPath, baseRef: 'main', prompt: 'Preserve real executor context as untrusted text.' }, 'api-executor-summary');
+    for (const metadata of [
+      { executorSummary, summary: 'Old summary' }, { summary: 'Legacy summary' },
+      { executorSummary: '', summary: 'Empty summary fallback' }, { executorSummary: 42, summary: 'Invalid type fallback' },
+    ]) {
+      const attempt = f.store.createAttempt(task.id, 'implement', { metadata });
+      f.store.finishAttempt(attempt.id, { status: 'succeeded' });
+    }
+    const response = await fetch(`${f.url}/api/tasks/${task.id}`);
+    assert.equal(response.status, 200);
+    const detail = await response.json() as { attempts: Array<{ summary?: string }>; handoffs: Array<{ executorSummary?: string; checks: unknown[] }> };
+    assert.deepEqual(detail.attempts.map(attempt => attempt.summary), [executorSummary, 'Legacy summary', 'Empty summary fallback', 'Invalid type fallback']);
+    assert.equal(detail.handoffs[0]?.executorSummary, executorSummary);
+    assert.deepEqual(detail.handoffs[0]?.checks, [], 'executor prose never becomes observed checks');
   } finally { await f.close(); }
 });
 
