@@ -9,6 +9,7 @@ import { GitWorktreeManager, type WorktreeInfo, type WorktreeReviewSnapshot } fr
 import { TaskStore } from "../core/task-store.js";
 import { TestRunner } from "../core/test-runner.js";
 import { TaskWorker } from "./worker.js";
+import { createZeroServer } from "../server/server.js";
 
 const exec = promisify(execFile);
 
@@ -66,6 +67,24 @@ async function runIntegrityScenario(scenario: "content" | "head" | "branch" | "i
           : { verdict: "pass", summary: "Approved", findings: [] } }; } },
       adapters: new Map([["fake", adapter]]), artifactRoot: join(root, "artifacts") });
     const result = await worker.runClaimed(task.id, owner);
+    const server = createZeroServer({ store, config: { async read() { throw new Error('Evidence reads must not probe models'); }, async write() {} } });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const response = await fetch(`http://127.0.0.1:${address.port}/api/tasks/${task.id}`);
+      assert.equal(response.status, 200);
+      const detail = await response.json() as { tests: Array<{ status: string }>; checkEvidence: { state: string } };
+      if (scenario === 'io') {
+        assert.equal(detail.checkEvidence.state, 'historical', 'snapshot failure before a fresh run must not reuse preceding checks');
+        assert.deepEqual(detail.tests, []);
+      } else {
+        assert.equal(detail.checkEvidence.state, 'current');
+      }
+      if (scenario === 'content') assert.ok(detail.tests.every(check => check.status === 'passed'));
+      else if (scenario === 'io') assert.match(result.failureReason!, /I\/O failure/);
+      else assert.ok(detail.tests.some(check => check.status === 'failed'), `${scenario}: passing commands cannot hide a failed validation gate`);
+    } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
     if (scenario !== "content") {
       assert.equal(result.status, "failed");
       assert.equal(result.revisionCount, 1, "uncertain or unsafe changes cannot consume an automatic retry");

@@ -560,10 +560,13 @@ test('task detail projects executor summaries as plain text and retains legacy a
       const attempt = f.store.createAttempt(task.id, 'implement', { metadata });
       f.store.finishAttempt(attempt.id, { status: 'succeeded' });
     }
+    const failed = f.store.createAttempt(task.id, 'implement', { metadata: { executorSummary: 'I completed the task.' } });
+    f.store.finishAttempt(failed.id, { status: 'failed', error: 'Harness reported a different model' });
     const response = await fetch(`${f.url}/api/tasks/${task.id}`);
     assert.equal(response.status, 200);
-    const detail = await response.json() as { attempts: Array<{ summary?: string }>; handoffs: Array<{ executorSummary?: string; checks: unknown[] }> };
-    assert.deepEqual(detail.attempts.map(attempt => attempt.summary), [executorSummary, 'Legacy summary', 'Empty summary fallback', 'Invalid type fallback']);
+    const detail = await response.json() as { attempts: Array<{ summary?: string; executorSummary?: string }>; handoffs: Array<{ executorSummary?: string; checks: unknown[] }> };
+    assert.deepEqual(detail.attempts.map(attempt => attempt.summary), [executorSummary, 'Legacy summary', 'Empty summary fallback', 'Invalid type fallback', 'Harness reported a different model']);
+    assert.equal(detail.attempts.at(-1)?.executorSummary, 'I completed the task.', 'executor claims must not overwrite the observed attempt error');
     assert.equal(detail.handoffs[0]?.executorSummary, executorSummary);
     assert.deepEqual(detail.handoffs[0]?.checks, [], 'executor prose never becomes observed checks');
   } finally { await f.close(); }

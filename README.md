@@ -8,6 +8,8 @@ Zero is an application made of one Node.js service, a local React web UI, and a 
 
 ## What works today
 
+Ordered agents can now receive separate stage `objective` values. Each executor's bounded final summary is retained in the attempt, handoff and report, and passed to the next agent as untrusted context alongside verified workspace provenance. The web editor supports stage goals and ordering. Task details separate current validation from superseded results; creation requests use durable idempotency keys so a lost response can be retried safely. See the [second audit](docs/2026-10-17-semantic-relay-audit.md) for verified behavior and limits.
+
 - An agent workspace with list/board views and search, status, repository, and Harness filters. Task details show actual execution stages, handoff summaries, workspace fingerprints, validation output, and independent review. Failed refreshes retain evidence with a stale-data notice; mobile navigation keeps tasks and settings reachable. Web submissions require validation commands. See [web documentation](web/README.md) and the [current project audit](docs/2026-10-17-project-audit.md).
 - A SQLite-backed task queue and local HTTP API, with `pending`, `running`, `reviewing`, `revision`, `waiting`, `recovery_required`, `done`, and `failed` task states.
 - A configurable master coordinator: choose the Codex subscription or an OpenAI-compatible HTTPS API model to route and oversee tasks. The coordinator only chooses among verified Harness/model bindings; it does not implement tasks. A separate read-only Codex session reviews the result. You can manually pin any subset of the execution Harness, model, and reasoning effort.
@@ -92,16 +94,16 @@ Each task entry uses the same fields as `submit`: `repoPath`, `baseRef`, `prompt
 
 Replace the repository and binding placeholders with real values. Every manually selected Harness/model/effort combination must be currently available and verified. Steps are kept in the submitted order. For steps in the same repository, later work starts from the earlier step's verified result commit. When goal metadata is present, Zero runs an aggregate Codex review after all steps finish and includes its current state and result in the sequence API and UI. A `PASS` yields `completed`; `changes_requested` may start an automatic aggregate-goal remediation task, bounded by `maxGoalRevisions`, while `blocked` keeps the sequence blocked and quota pauses it in `waiting`. `maxGoalRevisions` is separate from each task's `maxRevisions`.
 
-To submit ordered execution stage selections inside one task, pass a JSON array with `--stages-file`. Each stage may set any subset of `harnessId`, `modelId`, and `reasoningEffort`; stage values override the task-wide selections set by `--harness`, `--model`, and `--effort`. Remaining unset fields follow the task → project → global → configured coordinator priority. Every effective stage selection must match a currently available, locally verified binding.
+To submit ordered execution stages inside one task, pass a JSON array with `--stages-file`. Each stage may set `harnessId`, `modelId`, `reasoningEffort`, and a separate `objective` of 1–4000 characters. Stage selections override task-wide selections; remaining fields follow the task → project → global → configured coordinator priority. Every effective stage selection must match a currently available, locally verified binding. Stage goals supplement the overall objective and acceptance criteria.
 
 ```json
 [
-  { "harnessId": "<first-harness-id>", "modelId": "<first-model-id>" },
-  { "harnessId": "<second-harness-id>", "modelId": "<second-model-id>", "reasoningEffort": "high" }
+  { "harnessId": "<first-harness-id>", "modelId": "<first-model-id>", "objective": "Implement the storage layer and preserve its public contract." },
+  { "harnessId": "<second-harness-id>", "modelId": "<second-model-id>", "reasoningEffort": "high", "objective": "Integrate the consumer and verify empty-input behavior." }
 ]
 ```
 
-Replace the example IDs with verified binding IDs, save this as `stages.json`, then run `node dist/cli.js submit --repo 'C:\path\to\repo' --prompt 'Implement the change' --stages-file stages.json`. The API checks each effective stage against currently available verified bindings and stores the order as submitted.
+Replace the example IDs with verified binding IDs, save this as `stages.json`, then run `node dist/cli.js submit --repo 'C:\path\to\repo' --prompt 'Implement the storage layer and consumer integration' --check 'npm test' --stages-file stages.json`. Use a check command that actually validates your repository; Zero requires configured checks before a task can complete. The API checks effective bindings and stores the order as submitted.
 
 The CLI also provides `node dist/cli.js cancel <task-id>`. Run `node dist/cli.js` without arguments for all options. The UI and CLI use the same local service and queue.
 

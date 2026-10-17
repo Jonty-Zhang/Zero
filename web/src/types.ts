@@ -34,6 +34,7 @@ export type Attempt = {
   sessionId?: string;
   route?: RouteInfo;
   summary?: string;
+  executorSummary?: string;
   tests?: TestResult[];
   review?: ReviewResult;
   logs?: string | string[];

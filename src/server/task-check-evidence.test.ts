@@ -47,3 +47,18 @@ test('partial checks and independent integrity failures cannot appear as a compl
   assert.deepEqual(evidence.tests.map(item => item.status), ['passed', 'failed']);
   assert.equal(evidence.tests[1]!.id, '__zero_worktree_integrity__');
 });
+
+test('unsafe Git failures retain the current synthetic gate even without an attestable integrity record', () => {
+  const gate: CheckResult = { id: '__zero_worktree_integrity__', argv: [], status: 'failed', exitCode: null, durationMs: 0,
+    error: 'Task branch moved during validation; snapshot cannot be attested' };
+  for (const persistedGate of [true, false]) {
+    const failedRun = { ...run('run', 'a1', 's1', 'failed'), terminalReason: 'Unsafe Git state after validation' };
+    const evidence = selectTaskCheckEvidence({ task: { ...task, status: 'failed' }, attempts: [writer('a1', 's1')],
+      events: [event(1, 'check_run.started', { checkRunId: 'run' }), event(2, 'check.finished', { attemptId: 'a1', result: result('passed') }),
+        ...(persistedGate ? [event(3, 'check.finished', { attemptId: 'a1', result: gate })] : [])],
+      checks: [result('passed'), ...(persistedGate ? [gate] : [])], runs: [failedRun], results: () => [result('passed')], integrityFailure: () => undefined });
+    assert.ok(evidence.tests.some(check => check.status === 'failed'), 'a failed run must not render only green commands');
+    assert.match(evidence.tests.find(check => check.status === 'failed')!.error!, persistedGate ? /branch moved/ : /Unsafe Git state/);
+    assert.deepEqual(evidence.historicalTests, []);
+  }
+});

@@ -30,12 +30,22 @@ export function selectTaskCheckEvidence(input: TaskCheckEvidenceInput): TaskChec
     && latestRun.executionAttemptId === writer?.id && latestRun.executionStageId === writer?.stageId
     && latestStart!.id > recoveryBoundary ? latestRun : undefined;
   if (current) {
-    const tests = input.results!(current.id);
+    const tests = [...input.results!(current.id)];
+    const checkEvents = orderedEvents.filter(event => event.type === 'check.finished');
+    const currentEvents = checkEvents.filter(event => event.id > latestStart!.id && event.payload?.attemptId === current.executionAttemptId);
     const integrityError = input.integrityFailure?.(current.id);
     if (integrityError) tests.push({ id: '__zero_worktree_integrity__', argv: [], status: 'failed', exitCode: null, durationMs: 0, error: integrityError });
-    const checkEvents = orderedEvents.filter(event => event.type === 'check.finished');
+    // Branch moves and unreadable snapshots cannot produce an attested integrity
+    // record. Their machine-observed gate failure still belongs to this run.
+    const legacyGate = currentEvents.map(event => event.payload?.result as CheckResult).find(result => result
+      && result.id === '__zero_worktree_integrity__' && result.status !== 'passed');
+    if (legacyGate && !tests.some(result => result.id === legacyGate.id && result.status !== 'passed')) tests.push(legacyGate);
+    if (current.status === 'failed' && tests.every(result => result.status === 'passed')) {
+      tests.push({ id: '__zero_check_run__', argv: [], status: 'failed', exitCode: null, durationMs: 0,
+        error: current.terminalReason || 'Validation run failed; passing command exits do not establish a valid final checkout.' });
+    }
     const historicalTests = checkEvents.length
-      ? checkEvents.filter(event => event.payload?.attemptId !== current.executionAttemptId)
+      ? checkEvents.filter(event => event.payload?.attemptId !== current.executionAttemptId || event.id < latestStart!.id)
         .map(event => event.payload?.result as CheckResult).filter(result => result && typeof result.id === 'string')
       : checks.filter(check => !tests.some(currentCheck => JSON.stringify(check) === JSON.stringify(currentCheck)));
     return { tests, historicalTests, checkEvidence: { state: 'current', runId: current.id,

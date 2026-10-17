@@ -24,6 +24,15 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 describe('task workspace', () => {
+  it('shows the observed attempt error alongside a separately labelled executor claim', async () => {
+    vi.mocked(api.task).mockResolvedValue({ ...tasks[0]!, attempts: [{ id: 'failed-attempt', status: 'failed',
+      summary: 'Harness reported a different model', executorSummary: 'I completed the task.' }] } as Task);
+    render(<App />);
+    fireEvent.click(await screen.findByText('修复登录回调'));
+    expect(await screen.findByText('Harness reported a different model')).toBeTruthy();
+    expect(await screen.findByText('I completed the task.')).toBeTruthy();
+    expect(screen.getByText('执行者自述，需结合检查与审查确认')).toBeTruthy();
+  });
   it('keeps stage goals with their execution routes when reordered and removed before submission', async () => {
     vi.mocked(api.capabilities).mockResolvedValue({ ...capability, bindings: [{ harnessId: 'codex', modelId: 'model-a', available: true, reasoningEfforts: [] }] });
     vi.mocked(api.createTask).mockResolvedValue({ ...tasks[0]!, id: 'created-relay' });

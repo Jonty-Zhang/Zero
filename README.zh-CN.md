@@ -92,16 +92,18 @@ node dist/cli.js sequence <sequence-id>
 
 请将仓库路径和绑定占位符替换为实际值。手动指定的 Harness、模型和思考强度组合必须当前可用并已验证；步骤按文件中的顺序保存。同一仓库中的后续步骤从前一步的已验证结果提交开始。提供整体目标信息时，所有步骤完成后 Zero 会运行汇总 Codex 验收，并在序列 API 和界面中展示当前状态与结果。验收 `PASS` 后状态为 `completed`；`changes_requested` 可触发自动追加的整体目标返工任务，最多为 `maxGoalRevisions` 次（默认 `2`，允许范围 `0`–`5`），`goalRevisionCount` 展示已使用次数。返工上限用尽仍未通过时，序列保持阻塞并显示原因；`blocked` 也会使序列保持阻塞，额度等待会显示为 `waiting`。`maxGoalRevisions` 与每个任务的 `maxRevisions` 相互独立。自动目标返工已有自动化覆盖；第三轮已安装版 Goal E2E 于 2026-09-27 返回 `PASS`，详见[真实任务验证记录](docs/live-validation.md)。
 
-如需在单个任务内提交有序执行阶段，可通过 `--stages-file` 指定 JSON 数组。每个阶段可按需设置 `harnessId`、`modelId` 和 `reasoningEffort`；阶段值会覆盖 `--harness`、`--model` 和 `--effort` 设置的任务级选择，剩余未指定字段按任务 → 项目 → 全局 → 当前分配器的顺序补全。每个阶段的最终选择都必须匹配当前可用且已在本机验证的绑定。
+如需在单个任务内提交有序执行阶段，可通过 `--stages-file` 指定 JSON 数组。每个阶段可按需设置 `harnessId`、`modelId`、`reasoningEffort`，以及 1–4000 字符的独立 `objective`。阶段选择覆盖任务级选择，剩余未指定字段按任务 → 项目 → 全局 → 当前分配器补全；提交时会校验继承后的有效组合。阶段目标补充整体任务，返工时仍必须遵守原始验收与具体审查意见。
+
+执行者的最终答复会保存为有界 `executorSummary`，进入尝试、交接与报告，并以不可信资料传给下一位 agent。它不能替代 Zero 采集的 Git 与检查证据。网页支持目标编辑与排序、执行者自述，以及当前/历史检查分区；提交请求超时或断线后使用持久幂等身份重试，避免重复创建任务。详见[第二轮深入审查记录](docs/2026-10-17-semantic-relay-audit.md)。
 
 ```json
 [
-  { "harnessId": "<first-harness-id>", "modelId": "<first-model-id>" },
-  { "harnessId": "<second-harness-id>", "modelId": "<second-model-id>", "reasoningEffort": "high" }
+  { "harnessId": "<first-harness-id>", "modelId": "<first-model-id>", "objective": "实现存储层，保持现有公开接口。" },
+  { "harnessId": "<second-harness-id>", "modelId": "<second-model-id>", "reasoningEffort": "high", "objective": "接入消费者，并验证空输入行为。" }
 ]
 ```
 
-请将示例 ID 替换为已验证绑定的 ID，将内容保存为 `stages.json`，然后运行 `node dist/cli.js submit --repo 'C:\path\to\repo' --prompt '实现此改动' --stages-file stages.json`。API 会根据当前可用且已验证的绑定检查每个阶段的最终选择，并按提交顺序保存。
+请将示例 ID 替换为已验证绑定的 ID，将内容保存为 `stages.json`，然后运行 `node dist/cli.js submit --repo 'C:\path\to\repo' --prompt '实现存储层并完成消费者接入' --check 'npm test' --stages-file stages.json`。检查命令应换成该仓库实际使用的验证命令，Zero 必须通过已配置检查才能完成任务。API 会校验每个最终组合，并按提交顺序保存。
 
 CLI 还提供 `node dist/cli.js cancel <task-id>`。不带参数运行 `node dist/cli.js` 可查看全部选项。Web 界面和 CLI 共用本地服务与任务队列。
 

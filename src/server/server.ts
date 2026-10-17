@@ -606,11 +606,12 @@ function mapSequenceGoalReview(review: SequenceGoalReview) {
 function mapRoute(route: Record<string, unknown> | RouteDecision) { const value = route as Record<string, unknown>; return { harnessId: value.harness, modelId: value.model, reasoningEffort: value.effectiveReasoningEffort ?? value.reasoningEffort, selectionSource: value.selectionSource, reason: value.reason }; }
 function mapAttempt(value: Attempt) {
   const metadata = value.metadata ?? {};
+  const executorSummary = typeof metadata.executorSummary === 'string' && metadata.executorSummary.trim() ? metadata.executorSummary : undefined;
   return { id: value.id, stageId: value.stageId, role: value.role, exitCode: value.exitCode,
     number: value.sequence, status: value.status, startedAt: value.startedAt, endedAt: value.finishedAt,
     route: value.harness || value.model ? { harnessId: value.harness, modelId: value.model, reasoningEffort: value.reasoningEffort } : undefined,
     sessionId: typeof metadata.sessionId === 'string' ? metadata.sessionId : undefined,
-    summary: typeof metadata.executorSummary === 'string' && metadata.executorSummary.trim() ? metadata.executorSummary : value.error ?? metadata.summary };
+    summary: value.error ?? executorSummary ?? metadata.summary, executorSummary };
 }
 function mapStage(value: StageRecord) {
   return {

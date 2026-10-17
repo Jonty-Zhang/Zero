@@ -29,30 +29,40 @@
 
 Files: src/domain/types.ts, src/core/task-store.ts and tests, src/server/server.ts and tests, CLI tests.
 
-- [ ] Add failing store/API tests for objective roundtrip, persistence, whitespace/type/length rejection and legacy compatibility.
-- [ ] Add `ExecutionStageDefinition extends ExecutionSelection { objective?: string }`, validate direct store input and public API, and project the goal back in task detail without affecting execution defaults.
-- [ ] Run targeted store/server/CLI tests; commit and push the independently compatible contract.
+- [x] Add failing store/API tests for objective roundtrip, persistence, whitespace/type/length rejection and legacy compatibility.
+- [x] Add `ExecutionStageDefinition extends ExecutionSelection { objective?: string }`, validate direct store input and public API, and project the goal back in task detail without affecting execution defaults.
+- [x] Run targeted store/server/CLI tests; commit and push the independently compatible contract.
 
 ### Task 2: Bounded executor summaries
 
 Files: src/domain/handoff.ts and tests. Controller owns worker.ts, server projection and report integration.
 
-- [ ] Add failing normalization/parser/context tests for absent, Unicode-heavy and malicious final prose; keep existing context byte/character bounds.
-- [ ] Add optional HandoffV1.executorSummary plus reusable `boundExecutorSummary(value: string | undefined): string | undefined`; validate persisted field and include it as untrusted bounded JSON data.
-- [ ] Capture executor final in attempt metadata; retrieve it by source attempt when finalizing stages; expose it through API/reports. Prompt final replies for useful relay context.
-- [ ] Prove real two-stage worker relay, stage-specific prompts, narrow route selection and intact final review using Git-backed tests; commit and push.
+- [x] Add failing normalization/parser/context tests for absent, Unicode-heavy and malicious final prose; keep existing context byte/character bounds.
+- [x] Add optional HandoffV1.executorSummary plus reusable `boundExecutorSummary(value: string | undefined): string | undefined`; validate persisted field and include it as untrusted bounded JSON data.
+- [x] Capture executor final in attempt metadata; retrieve it by source attempt when finalizing stages; expose it through API/reports. Prompt final replies for useful relay context.
+- [x] Prove real two-stage worker relay, stage-specific prompts, narrow route selection and intact final review using Git-backed tests; commit and push.
 
 ### Task 3: Stage authoring and evidence UI
 
 Files: web/src/App.tsx, web/src/types.ts, web/src/styles.css and frontend tests.
 
-- [ ] Add failing interaction tests for stage goal editing/reordering/submission and untrusted summary display.
-- [ ] Implement editable goals, planned-goal display and readable executor summaries, preserving empty-history compatibility.
-- [ ] Fix separately reproduced UI/API lifecycle issues found by the audit, with behavioral regressions.
-- [ ] Run frontend/API tests, build and desktop/mobile Edge checks; commit and push.
+- [x] Add failing interaction tests for stage goal editing/reordering/submission and untrusted summary display.
+- [x] Implement editable goals, planned-goal display and readable executor summaries, preserving empty-history compatibility.
+- [x] Fix separately reproduced UI/API lifecycle issues found by the audit, with behavioral regressions.
+- [x] Run frontend/API tests, build and desktop/mobile Edge checks; commit and push.
 
 ### Task 4: Review and regressions
 
-- [ ] Obtain independent review of the complete second-round changes; fix substantive findings with regressions.
-- [ ] Run the full canonical core suite, frontend tests, API tests, public-tree checks and Windows/Linux CI on the pushed head.
-- [ ] Update audit/README/PR with actual behavior, evidence and remaining limitations; preserve the existing unmerged PR.
+- [x] Obtain independent review of the complete second-round changes; fix substantive findings with regressions.
+- [x] Run the full canonical core suite, frontend tests, API tests, public-tree checks and Windows/Linux CI on the pushed implementation head. `b607512`: local core 390/390 and both CI platforms succeeded; the last evidence-projection fixes add targeted 35/35 and 11/11, frontend 18/18, with their precise-head CI tracked on the existing PR.
+- [x] Update audit/README/PR with actual behavior, evidence and remaining limitations; preserve the existing unmerged PR.
+
+## Additional repairs justified by reproduced failures
+
+- [x] Reject incompatible project/global inherited selection before creating a task or sequence.
+- [x] Persist idempotency identities atomically with task/sequence inserts; prove concurrency, restart replay and response-abort retry. Preserve uncertain identities in the web client without storing prompt text.
+- [x] Select current check runs by writer, stage and recovery boundary, retaining old results separately and exposing independent integrity failures.
+- [x] Stream structured executor finals beyond bounded logs, reject conflicting model evidence, redact split secrets and distinguish provider errors from quoted quota text.
+- [x] Preserve package/verdict-bound reviewer findings through failed-check rework retries and guardian recovery; verify six-writer relay and interrupted boundaries.
+
+Evidence and remaining limitations are recorded in [the second audit](../../2026-10-17-semantic-relay-audit.md). All implementation commits are incrementally pushed to the existing branch; no merge is authorized or performed.
