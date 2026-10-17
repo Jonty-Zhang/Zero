@@ -316,7 +316,7 @@ async function updatePublicConfig(options: ZeroServerOptions, raw: unknown) {
     ? { kind, modelId: null, reasoningEffort: null, api: api! }
     : { ...pick('allocator'), kind, ...(api ? { api } : {}) };
   config.reviewer = pick('reviewer');
-  if (input.executionDefaults !== undefined) config.executionDefaults = await parseExecutionDefaults(input.executionDefaults, active);
+  if (input.executionDefaults !== undefined) config.executionDefaults = await parseExecutionDefaults(input.executionDefaults, active, config.executionDefaults);
   await options.config.write(config);
   return { allocator: { ...config.allocator, ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) }, reviewer: config.reviewer,
     executionDefaults: { global: publicExecutionSelection(config.executionDefaults?.global ?? null), projects: Object.entries(config.executionDefaults?.projects ?? {}).map(([repoPath, execution]) => ({ repoPath, execution: publicExecutionSelection(execution)! })) } };
@@ -327,19 +327,19 @@ function publicExecutionSelection(selection: ExecutionSelection | null): { harne
   return { ...(selection.harness ? { harnessId: selection.harness } : {}), ...(selection.model ? { modelId: selection.model } : {}), ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}) };
 }
 
-async function parseExecutionDefaults(raw: unknown, capability: Awaited<ReturnType<typeof capabilities>>): Promise<NonNullable<LocalZeroConfig['executionDefaults']>> {
+async function parseExecutionDefaults(raw: unknown, capability: Awaited<ReturnType<typeof capabilities>>, previous: LocalZeroConfig['executionDefaults']): Promise<NonNullable<LocalZeroConfig['executionDefaults']>> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, 'executionDefaults 必须是对象');
   const input = raw as Record<string, unknown>;
   for (const key of Object.keys(input)) if (key !== 'global' && key !== 'projects') throw new HttpError(400, `executionDefaults.${key} 不是支持的配置项`);
-  const parse = (value: unknown, label: string): ExecutionSelection | null => {
+  const parse = (value: unknown, label: string, saved?: ExecutionSelection | null): ExecutionSelection | null => {
     if (value == null) return null;
     const parsed = parsePublicSelection(value, label);
-    validateAvailableSelection(parsed, capability, label);
     const selection = toExecutionSelection(parsed);
     if (!selection) throw new HttpError(400, `${label} 至少需要一个执行选项`);
+    if (!sameExecutionSelection(selection, saved)) validateAvailableSelection(parsed, capability, label);
     return selection;
   };
-  const global = parse(input.global ?? null, 'executionDefaults.global');
+  const global = parse(input.global ?? null, 'executionDefaults.global', previous?.global);
   if (!Array.isArray(input.projects) || input.projects.length > 500) throw new HttpError(400, 'executionDefaults.projects 必须是项目配置数组');
   const projects: Record<string, ExecutionSelection> = {};
   for (const [index, rawProject] of input.projects.entries()) {
@@ -349,12 +349,22 @@ async function parseExecutionDefaults(raw: unknown, capability: Awaited<ReturnTy
     const rawPath = stringField(project.repoPath, `executionDefaults.projects[${index}].repoPath`, 1, 4096);
     const repoPath = await canonicalRepositoryPath(rawPath, `executionDefaults.projects[${index}].repoPath`);
     if (projects[repoPath]) throw new HttpError(400, `项目仓库重复：${repoPath}`);
-    const execution = parse(project.execution, `executionDefaults.projects[${index}].execution`);
+    const savedProject = previous?.projects[repoPath];
+    const execution = parse(project.execution, `executionDefaults.projects[${index}].execution`, savedProject);
     if (!execution) throw new HttpError(400, `executionDefaults.projects[${index}].execution 至少需要一个执行选项`);
-    validateAvailableSelection({ ...selectionFields(global), ...selectionFields(execution) }, capability, `executionDefaults.projects[${index}] effective selection`);
+    const effective = { ...selectionFields(global), ...selectionFields(execution) };
+    const savedEffective = { ...selectionFields(previous?.global ?? null), ...selectionFields(savedProject ?? null) };
+    // Keeping a project row cannot grandfather a changed inherited selection.
+    if (!savedProject || !sameExecutionSelection(effective, savedEffective)) {
+      validateAvailableSelection(effective, capability, `executionDefaults.projects[${index}] effective selection`);
+    }
     projects[repoPath] = execution;
   }
   return { global, projects };
+}
+
+function sameExecutionSelection(left: ExecutionSelection | null | undefined, right: ExecutionSelection | null | undefined): boolean {
+  return left?.harness === right?.harness && left?.model === right?.model && left?.reasoningEffort === right?.reasoningEffort;
 }
 
 function selectionFields(selection: ExecutionSelection | null): Record<string, string> {

@@ -28,7 +28,8 @@
 
 ## Next investigations
 
-- Configuration execution defaults during transient CLI/model unavailability.
+- [x] Preserve unchanged execution defaults during transient CLI/model unavailability; revalidate any changed inherited project selection.
+- [ ] Add an explicit persisted retry path for a blocked aggregate review without deleting verdict history, bypassing evidence gates, or automatically looping provider calls.
 - Sequence goal evidence after ordinary revision, interrupted attempts and review changes.
 - User-visible lifecycle errors, repeated submissions and settings changes while capabilities refresh.
 - Plaintext Harness error chronology, without broadening trusted error sources.

@@ -47,7 +47,7 @@ function getWithHost(url: string, host: string): Promise<{ status: number; body:
 
 class ProbeOnlyAdapter implements HarnessAdapter {
   probeCalls = 0;
-  constructor(readonly id: string, private readonly cap: HarnessCapabilities) {}
+  constructor(readonly id: string, readonly cap: HarnessCapabilities) {}
   probe(): Promise<HarnessCapabilities> { this.probeCalls++; return Promise.resolve(this.cap); }
   async run(_request: RunRequest): Promise<RunResult> {
     throw new Error('API integration tests must not execute a Harness');
@@ -920,6 +920,68 @@ test('PUT and GET /api/config persist an API coordinator reference without any k
     }) });
     assert.equal(invalid.status, 400);
     assert.match((await invalid.json() as { error: string }).error, /HTTPS/);
+  } finally { await f.close(); }
+});
+
+test('settings preserve unavailable existing execution defaults without accepting changes or new projects', async () => {
+  const f = await createFixture();
+  try {
+    const defaults = { global: { model: 'glm-main', reasoningEffort: 'low' },
+      projects: { [f.repoPath]: { harness: 'zcode', reasoningEffort: 'high' } } };
+    await f.config.write({ ...await f.config.read(), executionDefaults: defaults });
+    f.adapter.cap.available = false;
+    const read = await (await fetch(`${f.url}/api/config`)).json() as {
+      allocator: unknown; reviewer: unknown; executionDefaults: { global: unknown; projects: Array<{ repoPath: string; execution: unknown }> } };
+    const edited = { ...read, allocator: { kind: 'api', modelId: null, reasoningEffort: null,
+      api: { baseUrl: 'https://provider.example/v1', model: 'router', keyEnv: 'ZERO_ROUTER_KEY' } } };
+    const put = (body: unknown) => fetch(`${f.url}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const saved = await put(edited);
+    assert.equal(saved.status, 200, await saved.text());
+    assert.deepEqual((await f.config.read()).executionDefaults, defaults);
+    const anotherRepo = join(f.root, 'another-repo');
+    await mkdir(anotherRepo);
+    await execFileAsync('git', ['init', '--initial-branch=main'], { cwd: anotherRepo, windowsHide: true });
+    for (const executionDefaults of [
+      { ...read.executionDefaults, global: { modelId: 'glm-main', reasoningEffort: 'high' } },
+      { ...read.executionDefaults, global: null },
+      { ...read.executionDefaults, global: { modelId: 'glm-main', reasoningEffort: 'low', extra: 'invalid' } },
+      { ...read.executionDefaults, projects: [{ repoPath: f.repoPath, execution: { harnessId: 'zcode', reasoningEffort: 'low' } }] },
+      { ...read.executionDefaults, projects: [{ repoPath: anotherRepo, execution: read.executionDefaults.projects[0]!.execution }] },
+      { ...read.executionDefaults, projects: [{ ...read.executionDefaults.projects[0]!, extra: 'invalid' }] },
+    ]) {
+      const before = await readFile(f.config.path, 'utf8');
+      const rejected = await put({ ...edited, executionDefaults });
+      assert.equal(rejected.status, 400, await rejected.text());
+      assert.equal(await readFile(f.config.path, 'utf8'), before);
+    }
+    const removed = await put({ ...edited, executionDefaults: { ...read.executionDefaults, projects: [] } });
+    assert.equal(removed.status, 200, await removed.text());
+    const cleared = await put({ ...edited, executionDefaults: { global: null, projects: [] } });
+    assert.equal(cleared.status, 200, await cleared.text());
+    assert.deepEqual((await f.config.read()).executionDefaults, { global: null, projects: {} });
+    const projectOnly = { global: null, projects: { [f.repoPath]: { model: 'glm-main', reasoningEffort: 'high' } } };
+    await f.config.write({ ...await f.config.read(), executionDefaults: projectOnly });
+    const projectRead = await (await fetch(`${f.url}/api/config`)).json();
+    const projectSaved = await put(projectRead);
+    assert.equal(projectSaved.status, 200, await projectSaved.text());
+    assert.deepEqual((await f.config.read()).executionDefaults, projectOnly);
+  } finally { await f.close(); }
+});
+
+test('changing a global preset revalidates an unchanged project inherited selection', async () => {
+  const f = await createFixture(true, undefined, true);
+  try {
+    await f.config.write({ ...await f.config.read(), executionDefaults: {
+      global: { model: 'glm-main' }, projects: { [f.repoPath]: { harness: 'zcode' } },
+    } });
+    const read = await (await fetch(`${f.url}/api/config`)).json() as { executionDefaults: { global: unknown; projects: unknown[] } };
+    const before = await readFile(f.config.path, 'utf8');
+    const response = await fetch(`${f.url}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      ...read, executionDefaults: { ...read.executionDefaults, global: { modelId: 'codex-main' } },
+    }) });
+    assert.equal(response.status, 400);
+    assert.match((await response.json() as { error: string }).error, /effective selection/);
+    assert.equal(await readFile(f.config.path, 'utf8'), before);
   } finally { await f.close(); }
 });
 
