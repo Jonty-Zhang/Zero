@@ -4,8 +4,10 @@ import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
-import { TaskStore } from '../core/task-store.js';
+import { TaskStore, type CheckRunRecord, type CheckRunIntegrityFailureRecord } from '../core/task-store.js';
+import { selectTaskCheckEvidence } from './task-check-evidence.js';
 import { CodexAdapter } from '../adapters/codex.js';
+import { IdempotencyConflictError, submissionRequestHash, validateSubmissionKey } from '../core/submission-idempotency.js';
 import type { AdapterConfig } from '../adapters/base.js';
 import { DshAdapter } from '../adapters/dsh.js';
 import { ZCodeCompositeAdapter } from '../adapters/zcode-composite.js';
@@ -17,6 +19,9 @@ export type AdapterMap = Partial<Record<HarnessName, HarnessAdapter>>;
 export interface TaskStorePort {
   submit(submission: TaskSubmission): TaskRecord;
   createSequence(submissions: TaskSubmission[], id?: string, metadata?: TaskSequenceMetadata): TaskSequenceRecord;
+  lookupSubmissionRequest?(key: string, kind: 'task' | 'sequence', requestHash: string): { resourceId: string } | undefined;
+  submitIdempotent?(submission: TaskSubmission, request: { key: string; requestHash: string }): { record: TaskRecord; replayed: boolean };
+  createSequenceIdempotent?(submissions: TaskSubmission[], metadata: TaskSequenceMetadata, request: { key: string; requestHash: string }): { record: TaskSequenceRecord; replayed: boolean };
   getSequence(id: string): (TaskSequenceRecord & { goalReview?: SequenceGoalReview }) | undefined;
   listSequences(): Array<TaskSequenceRecord & { goalReview?: SequenceGoalReview }>;
   get(id: string): TaskRecord | undefined;
@@ -27,6 +32,9 @@ export interface TaskStorePort {
   handoffs?(taskId: string): HandoffRecord[];
   getRoute(taskId: string): RouteDecision | undefined;
   checks(taskId: string): CheckResult[];
+  checkRuns?(taskId: string): CheckRunRecord[];
+  checkRunResults?(runId: string): CheckResult[];
+  checkRunIntegrityFailure?(runId: string): CheckRunIntegrityFailureRecord | undefined;
   reviews(taskId: string): ReviewResult[];
   events(taskId: string): TaskEvent[];
 }
@@ -102,9 +110,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
       if (url.pathname === '/api/config' && req.method === 'PUT') return json(res, 200, await updatePublicConfig(options, await bodyJson(req, options.maxBodyBytes)));
       if (url.pathname === '/api/sequences' && req.method === 'GET') return json(res, 200, options.store.listSequences().map(mapSequence));
       if (url.pathname === '/api/sequences' && req.method === 'POST') {
-        const { submissions, metadata } = await parseSequence(await bodyJson(req, options.maxBodyBytes), options);
-        const sequence = options.store.createSequence(submissions, undefined, metadata);
-        if (options.enqueue) {
+        const raw = await bodyJson(req, options.maxBodyBytes);
+        const identity = submissionIdentity(req, raw, 'sequence', options.store);
+        const previous = identity && options.store.lookupSubmissionRequest!(identity.key, 'sequence', identity.requestHash);
+        if (previous) {
+          const sequence = options.store.getSequence(previous.resourceId);
+          if (!sequence) throw new HttpError(500, 'Persisted idempotency request refers to a missing sequence');
+          return json(res, 201, mapSequence(sequence));
+        }
+        const { submissions, metadata } = await parseSequence(raw, options);
+        const { record: sequence, replayed } = identity
+          ? options.store.createSequenceIdempotent!(submissions, metadata, identity)
+          : { record: options.store.createSequence(submissions, undefined, metadata), replayed: false };
+        if (options.enqueue && !replayed) {
           for (const step of sequence.steps) void Promise.resolve().then(() => options.enqueue!(step.task.id)).catch((error: unknown) => {
             try { options.store.fail(step.task.id, 'pending', `Scheduler enqueue failed: ${message(error)}`); } catch { /* A worker may have claimed it already. */ }
           });
@@ -120,9 +138,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
       }
       if (url.pathname === '/api/tasks' && req.method === 'GET') return json(res, 200, options.store.list().map(mapTaskList));
       if (url.pathname === '/api/tasks' && req.method === 'POST') {
-        const submission = await parseSubmission(await bodyJson(req, options.maxBodyBytes), options);
-        const task = options.store.submit(submission);
-        if (options.enqueue) void Promise.resolve(options.enqueue(task.id)).catch((error: unknown) => {
+        const raw = await bodyJson(req, options.maxBodyBytes);
+        const identity = submissionIdentity(req, raw, 'task', options.store);
+        const previous = identity && options.store.lookupSubmissionRequest!(identity.key, 'task', identity.requestHash);
+        if (previous) {
+          const task = options.store.get(previous.resourceId);
+          if (!task) throw new HttpError(500, 'Persisted idempotency request refers to a missing task');
+          return json(res, 201, mapTaskList(task));
+        }
+        const submission = await parseSubmission(raw, options);
+        const { record: task, replayed } = identity
+          ? options.store.submitIdempotent!(submission, identity)
+          : { record: options.store.submit(submission), replayed: false };
+        if (options.enqueue && !replayed) void Promise.resolve(options.enqueue(task.id)).catch((error: unknown) => {
           try { options.store.fail(task.id, 'pending', `Scheduler enqueue failed: ${message(error)}`); } catch { /* A worker may have claimed it already. */ }
         });
         return json(res, 201, mapTaskList(task));
@@ -138,9 +166,22 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     }
     await staticFile(res, url.pathname, options.staticDir);
   } catch (error) {
-    const code = error instanceof HttpError ? error.status : 500;
+    const code = error instanceof HttpError ? error.status : error instanceof IdempotencyConflictError ? 409 : 500;
     json(res, code, { error: message(error) });
   }
+}
+
+function submissionIdentity(req: IncomingMessage, raw: unknown, kind: 'task' | 'sequence', store: TaskStorePort): { key: string; requestHash: string } | undefined {
+  const header = req.headers['x-idempotency-key'];
+  if (header === undefined) return undefined;
+  let key: string;
+  try { key = validateSubmissionKey(header); }
+  catch (error) { throw new HttpError(400, message(error)); }
+  if (!store.lookupSubmissionRequest || !(kind === 'task' ? store.submitIdempotent : store.createSequenceIdempotent)) {
+    throw new HttpError(501, 'Durable submission idempotency is not supported by this task store');
+  }
+  try { return { key, requestHash: submissionRequestHash(raw) }; }
+  catch (error) { throw new HttpError(400, message(error)); }
 }
 
 async function parseSequence(raw: unknown, options: ZeroServerOptions): Promise<{ submissions: TaskSubmission[]; metadata: TaskSequenceMetadata }> {
@@ -495,6 +536,10 @@ async function taskDetail(res: ServerResponse, id: string, options: ZeroServerOp
   const route = options.store.getRoute(id);
   const stages = options.store.stages?.(id) ?? [];
   const handoffs = options.store.handoffs?.(id) ?? [];
+  const evidence = selectTaskCheckEvidence({ task, attempts, events, checks,
+    runs: options.store.checkRuns?.(id), results: options.store.checkRunResults?.bind(options.store),
+    integrityFailure: runId => options.store.checkRunIntegrityFailure?.(runId)
+      ? 'Worktree changed during validation; passing command exits do not validate the final checkout.' : undefined });
   const attemptDetails = await Promise.all(attempts.map(async attempt => {
     const stdout = await readArtifactText(attempt.stdoutPath, options.artifactRoot);
     const stderr = await readArtifactText(attempt.stderrPath, options.artifactRoot);
@@ -502,19 +547,23 @@ async function taskDetail(res: ServerResponse, id: string, options: ZeroServerOp
     return { ...mapAttempt(attempt), ...(text ? { logs: text } : {}) };
   }));
   const logs = attemptDetails.map((attempt, index) => attempt.logs ? `Attempt ${index + 1}\n${attempt.logs}` : '').filter(Boolean).join('\n\n');
-  const checkDetails = await Promise.all(checks.map(async check => {
+  const readCheck = async (check: CheckResult) => {
     const stdout = await readArtifactText(check.stdoutPath, options.artifactRoot);
     const stderr = await readArtifactText(check.stderrPath, options.artifactRoot);
     const output = [check.error, stdout ? `--- stdout ---\n${stdout}` : '', stderr ? `--- stderr ---\n${stderr}` : ''].filter(Boolean).join('\n');
     return { ...mapCheck(check), output: output || undefined };
-  }));
+  };
+  const [checkDetails, historicalTests] = await Promise.all([
+    Promise.all(evidence.tests.map(readCheck)), Promise.all(evidence.historicalTests.map(readCheck)),
+  ]);
   const reportPath = options.artifactRoot && /^[a-zA-Z0-9_-]{1,128}$/.test(id) ? join(resolve(options.artifactRoot), id, 'report.json') : undefined;
   const report = reportPath && (await access(reportPath).then(() => true).catch(() => false)) ? `/api/tasks/${encodeURIComponent(id)}/report` : undefined;
   json(res, 200, { ...mapTaskList(task), prompt: task.prompt, acceptanceCriteria: task.acceptanceCriteria?.join('\n'), baseRef: task.baseRef,
     maxRevisions: task.maxRevisions, route: route ? mapRoute(route) : undefined,
     executionStages: (task.executionStages ?? []).map(stage => ({ ...publicExecutionSelection(stage), ...(stage.objective !== undefined ? { objective: stage.objective } : {}) })),
     stages: stages.map(mapStage), handoffs: handoffs.map(mapHandoff),
-    attempts: attemptDetails, tests: checkDetails, review: reviews.length ? mapReview(reviews.at(-1)!) : undefined,
+    attempts: attemptDetails, tests: checkDetails, historicalTests, checkEvidence: evidence.checkEvidence,
+    review: reviews.length ? mapReview(reviews.at(-1)!) : undefined,
     logs, report, error: task.failureReason, events: events.map(event => ({ type: event.type, at: event.at, payload: event.payload })) });
 }
 

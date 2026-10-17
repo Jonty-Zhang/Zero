@@ -52,3 +52,46 @@ test('caller cancellation remains an AbortError during an error response body', 
   t.mock.method(globalThis, 'fetch', (_path, init) => nativeFetch(`http://127.0.0.1:${server.address().port}`, init));
   await assert.rejects(api.tasks({ signal: controller.signal }), { name: 'AbortError' });
 });
+
+for (const kind of ['createTask', 'createSequence']) {
+  test(`${kind} reuses submission identity after an uncertain failure and renews it after success`, async (t) => {
+    const keys = [];
+    let fail = true;
+    t.mock.method(globalThis, 'fetch', async (_path, init) => {
+      keys.push(init.headers['X-Idempotency-Key']);
+      if (fail) { fail = false; throw new TypeError('connection closed after request was sent'); }
+      return new Response(JSON.stringify({ id: 'saved-resource' }));
+    });
+    const payload = { prompt: `idempotent-${kind}`, repoPath: '/repo', checkCommands: ['test'] };
+    await assert.rejects(api[kind](payload), /connection closed/);
+    await api[kind]({ checkCommands: ['test'], repoPath: '/repo', prompt: `idempotent-${kind}` });
+    assert.match(keys[0], /^[A-Za-z0-9_-]{16,128}$/);
+    assert.equal(keys[1], keys[0], 'retrying the same JSON payload must not launch another agent');
+    await api[kind](payload);
+    assert.notEqual(keys[2], keys[1], 'a successful form can intentionally submit a new identical task');
+  });
+}
+
+test('changed submission payloads and endpoints receive independent identities', async (t) => {
+  const keys = [];
+  t.mock.method(globalThis, 'fetch', async (_path, init) => { keys.push(init.headers['X-Idempotency-Key']); throw new TypeError('offline'); });
+  await assert.rejects(api.createTask({ prompt: 'original' }));
+  await assert.rejects(api.createTask({ prompt: 'changed' }));
+  await assert.rejects(api.createSequence({ prompt: 'original' }));
+  assert.equal(new Set(keys).size, 3);
+});
+
+test('uncertain submission identity survives reloading the client module in the same tab', async (t) => {
+  const values = new Map();
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+  Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, value: { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, 'sessionStorage', previous); else delete globalThis.sessionStorage; });
+  const keys = [];
+  t.mock.method(globalThis, 'fetch', async (_path, init) => { keys.push(init.headers['X-Idempotency-Key']); throw new TypeError('connection lost'); });
+  await assert.rejects(api.createTask({ prompt: 'survive-reload' }));
+  const reloaded = await import(`../src/api.ts?reload=${Date.now()}`);
+  await assert.rejects(reloaded.api.createTask({ prompt: 'survive-reload' }));
+  assert.equal(keys[1], keys[0]);
+  assert.equal(values.size, 1);
+  assert.ok(![...values.keys()].some(key => key.includes('survive-reload')), 'storage keys must not retain the prompt text');
+});

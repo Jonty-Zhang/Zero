@@ -20,6 +20,7 @@ import type {
   TaskSubmission,
 } from "../domain/types.js";
 import { HANDOFF_V1_MAX_BYTES, parseHandoffV1 } from "../domain/handoff.js";
+import { IdempotencyConflictError, validateSubmissionKey } from "./submission-idempotency.js";
 
 type Json = string | null;
 type TaskRow = {
@@ -543,6 +544,10 @@ export class TaskStore {
       CREATE TABLE IF NOT EXISTS task_sequences (
         id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, objective TEXT, acceptance_criteria TEXT,
         max_goal_revisions INTEGER NOT NULL DEFAULT 2 CHECK(max_goal_revisions BETWEEN 0 AND 5)
+      );
+      CREATE TABLE IF NOT EXISTS submission_requests (
+        key TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('task','sequence')),
+        request_hash TEXT NOT NULL CHECK(length(request_hash)=64), resource_id TEXT NOT NULL, created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS task_sequence_steps (
         sequence_id TEXT NOT NULL REFERENCES task_sequences(id), task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
@@ -1243,33 +1248,74 @@ export class TaskStore {
   }
 
   submit(submission: TaskSubmission, id: string = randomUUID()): TaskRecord {
-    validateExecutionStages(submission);
-    const now = new Date().toISOString();
-    this.#transaction(() => {
+    return this.#submit(submission, id).record;
+  }
+
+  lookupSubmissionRequest(key: string, kind: "task" | "sequence", requestHash: string): { resourceId: string } | undefined {
+    validateSubmissionKey(key);
+    if (!/^[a-f0-9]{64}$/.test(requestHash)) throw new Error("Invalid submission request hash");
+    if (kind !== "task" && kind !== "sequence") throw new Error("Invalid submission request kind");
+    const previous = this.#db.prepare("SELECT kind,request_hash,resource_id FROM submission_requests WHERE key=?").get(key) as
+      { kind: "task" | "sequence"; request_hash: string; resource_id: string } | undefined;
+    if (!previous) return undefined;
+    if (previous.kind !== kind || previous.request_hash !== requestHash) throw new IdempotencyConflictError();
+    return { resourceId: previous.resource_id };
+  }
+
+  submitIdempotent(submission: TaskSubmission, request: { key: string; requestHash: string }): { record: TaskRecord; replayed: boolean } {
+    return this.#submit(submission, randomUUID(), request);
+  }
+
+  #submit(submission: TaskSubmission, id: string, request?: { key: string; requestHash: string }): { record: TaskRecord; replayed: boolean } {
+    return this.#transaction(() => {
+      const previous = request && this.lookupSubmissionRequest(request.key, "task", request.requestHash);
+      if (previous) {
+        const record = this.get(previous.resourceId);
+        if (!record) throw new Error("Persisted submission request refers to a missing task");
+        return { record, replayed: true };
+      }
+      validateExecutionStages(submission);
+      const now = new Date().toISOString();
       this.#db.prepare(`INSERT INTO tasks(id,status,created_at,updated_at,payload) VALUES(?, 'pending', ?, ?, ?)`)
         .run(id, now, now, JSON.stringify(submission));
       this.#event(id, "task.submitted", { submission }, now);
+      if (request) this.#db.prepare("INSERT INTO submission_requests(key,kind,request_hash,resource_id,created_at) VALUES(?,'task',?,?,?)")
+        .run(request.key, request.requestHash, id, now);
+      return { record: this.get(id)!, replayed: false };
     });
-    return this.get(id)!;
   }
 
   /** Atomically persists a user supplied sequence and all its tasks. The order is exactly the supplied order. */
   createSequence(submissions: TaskSubmission[], id: string = randomUUID(), metadata: TaskSequenceMetadata = {}): TaskSequenceRecord {
-    if (!Array.isArray(submissions) || submissions.length < 2) throw new Error("A task sequence must contain at least 2 steps");
-    if (metadata.objective !== undefined && (typeof metadata.objective !== "string" || !metadata.objective.trim())) {
-      throw new Error("sequence objective must be a non-empty string when provided");
-    }
-    if (metadata.acceptanceCriteria !== undefined && (!Array.isArray(metadata.acceptanceCriteria) ||
-      metadata.acceptanceCriteria.length === 0 || metadata.acceptanceCriteria.some(item => typeof item !== "string" || !item.trim()))) {
-      throw new Error("sequence acceptanceCriteria must contain non-empty strings when provided");
-    }
-    if (metadata.maxGoalRevisions !== undefined && (!Number.isInteger(metadata.maxGoalRevisions) || metadata.maxGoalRevisions < 0 || metadata.maxGoalRevisions > 5)) {
-      throw new Error("sequence maxGoalRevisions must be an integer from 0 to 5");
-    }
-    const acceptanceCriteria = metadata.acceptanceCriteria === undefined ? undefined : JSON.stringify(metadata.acceptanceCriteria);
-    const at = new Date().toISOString();
-    const taskIds = submissions.map(() => randomUUID());
-    this.#transaction(() => {
+    return this.#createSequence(submissions, id, metadata).record;
+  }
+
+  createSequenceIdempotent(submissions: TaskSubmission[], metadata: TaskSequenceMetadata, request: { key: string; requestHash: string }): { record: TaskSequenceRecord; replayed: boolean } {
+    return this.#createSequence(submissions, randomUUID(), metadata, request);
+  }
+
+  #createSequence(submissions: TaskSubmission[], id: string, metadata: TaskSequenceMetadata, request?: { key: string; requestHash: string }): { record: TaskSequenceRecord; replayed: boolean } {
+    return this.#transaction(() => {
+      const previous = request && this.lookupSubmissionRequest(request.key, "sequence", request.requestHash);
+      if (previous) {
+        const record = this.getSequence(previous.resourceId);
+        if (!record) throw new Error("Persisted submission request refers to a missing sequence");
+        return { record, replayed: true };
+      }
+      if (!Array.isArray(submissions) || submissions.length < 2) throw new Error("A task sequence must contain at least 2 steps");
+      if (metadata.objective !== undefined && (typeof metadata.objective !== "string" || !metadata.objective.trim())) {
+        throw new Error("sequence objective must be a non-empty string when provided");
+      }
+      if (metadata.acceptanceCriteria !== undefined && (!Array.isArray(metadata.acceptanceCriteria) ||
+        metadata.acceptanceCriteria.length === 0 || metadata.acceptanceCriteria.some(item => typeof item !== "string" || !item.trim()))) {
+        throw new Error("sequence acceptanceCriteria must contain non-empty strings when provided");
+      }
+      if (metadata.maxGoalRevisions !== undefined && (!Number.isInteger(metadata.maxGoalRevisions) || metadata.maxGoalRevisions < 0 || metadata.maxGoalRevisions > 5)) {
+        throw new Error("sequence maxGoalRevisions must be an integer from 0 to 5");
+      }
+      const acceptanceCriteria = metadata.acceptanceCriteria === undefined ? undefined : JSON.stringify(metadata.acceptanceCriteria);
+      const at = new Date().toISOString();
+      const taskIds = submissions.map(() => randomUUID());
       this.#db.prepare("INSERT INTO task_sequences(id,created_at,updated_at,objective,acceptance_criteria,max_goal_revisions) VALUES(?,?,?,?,?,?)")
         .run(id, at, at, metadata.objective ?? null, acceptanceCriteria ?? null, metadata.maxGoalRevisions ?? 2);
       const insertTask = this.#db.prepare("INSERT INTO tasks(id,status,created_at,updated_at,payload) VALUES(?, 'pending', ?, ?, ?)");
@@ -1282,8 +1328,10 @@ export class TaskStore {
         this.#event(taskId, "task.submitted", { submission, sequenceId: id, sequencePosition: position }, at);
       }
       this.#event(taskIds[0]!, "task_sequence.created", { sequenceId: id, taskIds, ...metadata }, at);
+      if (request) this.#db.prepare("INSERT INTO submission_requests(key,kind,request_hash,resource_id,created_at) VALUES(?,'sequence',?,?,?)")
+        .run(request.key, request.requestHash, id, at);
+      return { record: this.getSequence(id)!, replayed: false };
     });
-    return this.getSequence(id)!;
   }
 
   getSequence(id: string): ReviewedTaskSequenceRecord | undefined {
