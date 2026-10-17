@@ -27,6 +27,10 @@ export function selectTaskCheckEvidence(input: TaskCheckEvidenceInput): TaskChec
   const writer = attempts.filter(attempt => attempt.role === 'implement' || attempt.role === 'revise').at(-1);
   const current = task.status !== 'recovery_required' && latestRun && input.results
     && latestRun.taskId === task.id && latestRun.status !== 'abandoned'
+    // A workflow that failed after successful validation has no endorsed final
+    // checkout. Preserve those command results as history, including when a
+    // reviewer or a later commit boundary observed a changed snapshot.
+    && !(task.status === 'failed' && latestRun.status === 'completed')
     && latestRun.executionAttemptId === writer?.id && latestRun.executionStageId === writer?.stageId
     && latestStart!.id > recoveryBoundary ? latestRun : undefined;
   if (current) {

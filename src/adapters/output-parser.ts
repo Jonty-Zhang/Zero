@@ -1,4 +1,5 @@
 import type { ParsedOutput } from './types.js';
+import { OMITTED_PROTOCOL_STRING, ProtocolLineProjection } from './protocol-line-projection.js';
 
 const MAX_PROTOCOL_LINE_BYTES = 256 * 1024;
 const MAX_PROVIDER_ERRORS = 16;
@@ -11,7 +12,9 @@ export class StreamingOutputParser {
   private parts: Buffer[] = [];
   private bytes = 0;
   private discarding = false;
+  private projection?: ProtocolLineProjection;
   private skippedLine = false;
+  private providerFailureAfterSkippedLine = false;
   private finalText?: string;
   private actualModel?: string;
   private sessionId?: string;
@@ -31,24 +34,36 @@ export class StreamingOutputParser {
       const part = bytes.subarray(offset, end);
       if (!this.discarding) {
         if (this.bytes + part.length > MAX_PROTOCOL_LINE_BYTES) {
+          this.projection = new ProtocolLineProjection();
+          for (const buffered of this.parts) this.projection.consume(buffered);
+          this.projection.consume(part);
           this.parts = []; this.bytes = 0; this.discarding = true;
           this.skippedLine = true;
+          this.providerFailureAfterSkippedLine = false;
           // We cannot establish whether an oversized event supersedes an earlier
           // final. A subsequent valid final must establish the relay again.
           this.finalText = undefined;
         } else if (part.length) { this.parts.push(part); this.bytes += part.length; }
-      }
+      } else this.projection?.consume(part);
       if (newline < 0) return;
       if (!this.discarding) this.parseLine();
+      else this.parseProjection();
       this.parts = []; this.bytes = 0; this.discarding = false;
+      this.projection = undefined;
       offset = newline + 1;
     }
   }
 
-  finish(): Omit<ParsedOutput, 'events'> {
+  finish(options: { failedProcess?: boolean } = {}): Omit<ParsedOutput, 'events'> {
     if (!this.discarding && this.bytes) this.parseLine();
+    else if (this.discarding) this.parseProjection();
     this.parts = []; this.bytes = 0;
-    const outputError = this.parseFailure ?? (this.skippedLine && this.finalText === undefined
+    this.projection = undefined;
+    // Only a failed process and a provider error at/after the last skipped
+    // event establish a failure terminal. An earlier recoverable error cannot
+    // conceal a later unreadable final, even if the process exits successfully.
+    const providerFailure = options.failedProcess && this.providerFailureAfterSkippedLine;
+    const outputError = this.parseFailure ?? (this.skippedLine && this.finalText === undefined && !providerFailure
       ? 'Protocol output line exceeded the bounded parsing limit; no subsequent complete final message was available'
       : undefined);
     return {
@@ -62,11 +77,25 @@ export class StreamingOutputParser {
 
   private parseLine(): void {
     const line = Buffer.concat(this.parts, this.bytes).toString('utf8');
+    this.observe(line, false);
+  }
+
+  private parseProjection(): void {
+    try { this.observe(this.projection!.finish(), true); }
+    catch { this.parseFailure = 'Oversized protocol output could not establish complete identity and error evidence'; }
+  }
+
+  private observe(line: string, metadataOnly: boolean): void {
     if (!line.trim()) return;
     let parsed: ParsedOutput;
     try { parsed = this.parse(line, ''); }
     catch { this.parseFailure = 'Harness protocol output could not be parsed'; return; }
-    if (parsed.finalText !== undefined) this.finalText = redactText(parsed.finalText, this.secrets);
+    if (metadataOnly && [parsed.actualModel, parsed.sessionId, ...(parsed.providerErrors ?? []), ...parsed.events.map(event => event.type)]
+      .some(value => value?.includes(OMITTED_PROTOCOL_STRING))) {
+      this.parseFailure = 'Oversized protocol identity or error metadata exceeded the bounded parsing limit';
+      return;
+    }
+    if (!metadataOnly && parsed.finalText !== undefined) this.finalText = redactText(parsed.finalText, this.secrets);
     if (parsed.actualModel) {
       if (this.actualModel && this.actualModel !== parsed.actualModel) this.modelConflict = true;
       this.actualModel ??= redactText(parsed.actualModel, this.secrets);
@@ -74,6 +103,7 @@ export class StreamingOutputParser {
     this.modelConflict ||= Boolean(parsed.modelConflict);
     this.sessionId ??= parsed.sessionId ? redactText(parsed.sessionId, this.secrets) : undefined;
     this.structured ||= Boolean(parsed.hasStructuredOutput);
+    if (parsed.providerErrors?.length) this.providerFailureAfterSkippedLine = true;
     for (const error of parsed.providerErrors ?? []) {
       if (this.providerErrors.length >= MAX_PROVIDER_ERRORS) break;
       this.providerErrors.push(redactText(error, this.secrets).slice(0, MAX_ERROR_CHARACTERS));

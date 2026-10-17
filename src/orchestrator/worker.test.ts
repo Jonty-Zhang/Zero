@@ -12,8 +12,28 @@ import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError } from "../core/quota.js";
 import { HANDOFF_CONTEXT_MAX_BYTES, HANDOFF_CONTEXT_MAX_CHARS, HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
 import { TaskWorker, type TaskReviewer, type TaskRouter } from "./worker.js";
+import { createZeroServer } from "../server/server.js";
 
 const exec = promisify(execFile);
+
+async function assertFailedCheckSnapshotIsHistorical(store: TaskStore, task: TaskRecord): Promise<void> {
+  const server = createZeroServer({ store, config: { async read() { throw new Error("No provider configuration in this fixture"); }, async write() {} } });
+  try {
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/tasks/${task.id}`);
+    assert.equal(response.status, 200);
+    const detail = await response.json() as { error?: string; tests: unknown[]; historicalTests: { status: string }[]; checkEvidence: { state: string } };
+    assert.equal(detail.error, task.failureReason);
+    assert.equal(detail.checkEvidence.state, "historical");
+    assert.deepEqual(detail.tests, []);
+    assert.deepEqual(detail.historicalTests.map(check => check.status), ["passed"]);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+}
 
 async function initRepo(repo: string): Promise<void> {
   await mkdir(repo);
@@ -1256,6 +1276,7 @@ test("review snapshot mutation and failed reviewer process never persist a passi
       assert.equal(store.packageReviewVerdicts(task.id).length, 0);
       assert.equal(store.reviews(task.id).length, 0);
       assert.equal(store.attempts(task.id).find(item => item.role === "review")?.status, "failed");
+      await assertFailedCheckSnapshotIsHistorical(store, result);
     } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
   }
 });
@@ -1346,6 +1367,7 @@ test("worker refuses a late allowed-path edit injected after review checks and b
     const failed = await worker.runClaimed(task.id, owner);
     assert.equal(failed.status, "failed");
     assert.match(failed.failureReason ?? "", /Worktree has unstaged tracked changes|no longer matches the reviewed snapshot before candidate creation/);
+    await assertFailedCheckSnapshotIsHistorical(store, failed);
     const worktreePath = join(worktreeRoot, task.id);
     const { stdout: headOutput } = await exec("git", ["rev-parse", "HEAD"], { cwd: worktreePath });
     assert.equal(headOutput.trim(), baseCommit);

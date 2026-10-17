@@ -39,6 +39,15 @@ test('legacy evidence remains visible without claiming a verified current-run as
   assert.equal(evidence.checkEvidence.state, 'unattributed');
 });
 
+test('a failed workflow cannot endorse its earlier successful check snapshot as current', () => {
+  const evidence = selectTaskCheckEvidence({ task: { ...task, status: 'failed' }, attempts: [writer('a1', 's1')],
+    events: [event(1, 'check_run.started', { checkRunId: 'run' }), event(2, 'check.finished', { attemptId: 'a1', result: result('passed') })],
+    checks: [result('passed')], runs: [run('run', 'a1', 's1')], results: () => [result('passed')] });
+  assert.deepEqual(evidence.tests, []);
+  assert.deepEqual(evidence.historicalTests, [result('passed')]);
+  assert.equal(evidence.checkEvidence.state, 'historical');
+});
+
 test('partial checks and independent integrity failures cannot appear as a completed passing run', () => {
   const evidence = selectTaskCheckEvidence({ task, attempts: [writer('a1', 's1')], events: [event(1, 'check_run.started', { checkRunId: 'run' })],
     checks: [result('passed')], runs: [run('run', 'a1', 's1', 'failed')], results: () => [result('passed')],

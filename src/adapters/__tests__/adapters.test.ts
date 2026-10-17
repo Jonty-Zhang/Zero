@@ -115,6 +115,70 @@ test('a later matching model cannot erase an earlier mismatched model identity',
   assert.match(result.error ?? '', /model/i);
 });
 
+test('streaming cannot erase a model mismatch observed in a complete oversized diagnostic event', async () => {
+  for (const prefix of ['', `console.log(JSON.stringify({type:'thread.started',model:'gpt-5-codex'}));`]) {
+    const result = await new OutputFixtureAdapter(`${prefix}
+      console.log(JSON.stringify({type:'thread.started',model:'different-model',thread_id:'oversized-session',metadata:'x'.repeat(270000)}));
+      console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'actual final'}}));`).run(fixtureRequest());
+    assert.equal(result.status, 'failed', 'a later final cannot conceal an observed mismatch');
+    assert.match(result.error ?? '', /model/i);
+    assert.equal(result.final, 'actual final');
+    assert.equal(result.sessionId, 'oversized-session');
+    assert.equal(result.metadata?.modelVerification, 'event_confirmed');
+  }
+});
+
+test('model identities after oversized tool values remain observable beyond the entire diagnostic cap', async () => {
+  for (const event of [
+    `{type:'thread.started',model:'different-model',metadata:'x'.repeat(3*1024*1024)}`,
+    `{type:'item.completed',item:{type:'command_execution',aggregated_output:'x'.repeat(3*1024*1024)},model:'different-model'}`,
+  ]) {
+    const result = await new OutputFixtureAdapter(`console.log(JSON.stringify(${event}));
+      console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'actual final'}}));`).run(fixtureRequest());
+    assert.equal(result.status, 'failed');
+    assert.equal(result.actualModel, 'different-model');
+    assert.match(result.error ?? '', /model/i);
+  }
+});
+
+test('structured billing error codes remain ordinary failures instead of entering quota wait', async () => {
+  for (const event of [
+    { type: 'turn.failed', error: { code: 'insufficient_quota', message: 'Quota exceeded' } },
+    { type: 'error', code: 'billing_hard_limit_reached', message: 'Quota exceeded' },
+    { type: 'response.failed', error: { type: 'credit_balance_exhausted', message: 'Usage limit reached' } },
+  ]) {
+    const result = await new OutputFixtureAdapter(`console.log(${JSON.stringify(JSON.stringify(event))});process.exitCode=1;`).run(fixtureRequest());
+    assert.equal(result.status, 'failed');
+    assert.equal(result.quota, undefined, 'account action cannot be resolved by quota sleep/retry');
+  }
+});
+
+test('unverifiable oversized provider metadata cannot trigger automatic quota recovery', async () => {
+  const result = await new OutputFixtureAdapter(`console.log(JSON.stringify({type:'turn.failed',metadata:'x'.repeat(270000),
+    error:{code:'x'.repeat(5000),message:'Quota exceeded'}}));
+    console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'untrusted final'}}));process.exitCode=1;`).run(fixtureRequest());
+  assert.equal(result.status, 'failed');
+  assert.match(result.error ?? '', /metadata|protocol/i);
+  assert.equal(result.quota, undefined, 'incomplete provider evidence must not authorize a retry checkpoint');
+});
+
+test('an earlier recoverable provider error cannot hide a later oversized final', async () => {
+  const result = await new OutputFixtureAdapter(`console.log(JSON.stringify({type:'error',message:'Transient connection failed; reconnecting'}));
+    console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'x'.repeat(3*1024*1024)}}));`).run(fixtureRequest());
+  assert.equal(result.status, 'failed');
+  assert.equal(result.final, undefined);
+  assert.match(result.error ?? '', /output|final|limit/i);
+  assert.equal(result.quota, undefined);
+});
+
+test('a quota message before an unreadable later final does not authorize automatic recovery', async () => {
+  const result = await new OutputFixtureAdapter(`console.log(JSON.stringify({type:'error',message:'Quota exceeded; Retry-After: 60'}));
+    console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'x'.repeat(3*1024*1024)}}));process.exitCode=1;`).run(fixtureRequest());
+  assert.equal(result.status, 'failed');
+  assert.match(result.error ?? '', /output|final|limit/i);
+  assert.equal(result.quota, undefined);
+});
+
 test('oversized final fails explicitly instead of relaying an earlier reasoning message', async () => {
   const result = await new OutputFixtureAdapter(`console.log(JSON.stringify({type:'item.completed',item:{type:'reasoning',text:'stale thought'}}));
     console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'x'.repeat(3*1024*1024)}}));`).run(fixtureRequest());

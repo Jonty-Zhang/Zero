@@ -99,7 +99,20 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
           ...(streamedOutput ? { onStdoutChunk: (chunk: Buffer | string) => streamedOutput.consume(chunk) } : {}),
         });
       } finally { this.active.delete(activeKey); }
-      const parsed = { ...invocation.parseOutput(outcome.stdout, outcome.stderr), ...streamedOutput?.finish() };
+      const diagnostic = invocation.parseOutput(outcome.stdout, outcome.stderr);
+      const streamed = streamedOutput?.finish({ failedProcess: outcome.status === 'failed' && outcome.exitCode !== 0 });
+      // The stream owns the final message (the log may end before it), but a
+      // discarded large line cannot erase identity or error evidence that the
+      // diagnostic prefix was still able to parse completely.
+      const parsed: ParsedOutput = streamed ? {
+        ...diagnostic, ...streamed,
+        actualModel: streamed.actualModel ?? diagnostic.actualModel,
+        sessionId: streamed.sessionId ?? diagnostic.sessionId,
+        modelConflict: Boolean(diagnostic.modelConflict || streamed.modelConflict
+          || diagnostic.actualModel && streamed.actualModel && diagnostic.actualModel !== streamed.actualModel),
+        hasStructuredOutput: Boolean(diagnostic.hasStructuredOutput || streamed.hasStructuredOutput),
+        providerErrors: [...new Set([...(diagnostic.providerErrors ?? []), ...(streamed.providerErrors ?? [])])],
+      } : diagnostic;
       const modelMismatch = Boolean(parsed.modelConflict || parsed.actualModel && parsed.actualModel !== binding.model.modelId);
       const status = modelMismatch || parsed.outputError ? 'failed' : outcome.status === 'completed' && outcome.exitCode !== 0 ? 'failed' : outcome.status;
       const runError = parsed.modelConflict ? 'Harness reported conflicting model identities'
@@ -124,7 +137,7 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
         sessionId: parsed.sessionId,
         error: runError,
       };
-      const quota = outcome.status === 'failed' && outcome.exitCode !== 0 && !modelMismatch
+      const quota = outcome.status === 'failed' && outcome.exitCode !== 0 && !modelMismatch && !parsed.outputError
         ? classifyQuota(parsed.hasStructuredOutput ? (parsed.providerErrors ?? []).join('\n') : plaintextProviderError(outcome.stderr))
         : undefined;
       return {
@@ -284,9 +297,13 @@ function providerError(type: string, item: Record<string, unknown>): string | un
   const failedResult = type === 'result' && (item.is_error === true || item.isError === true || item.success === false || item.status === 'failed' || item.status === 'error');
   if (!['error', 'turn.failed', 'response.failed'].includes(type) && !failedResult) return undefined;
   const error = item.error;
-  if (typeof error === 'string') return error;
-  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message;
-  return typeof item.message === 'string' ? item.message : failedResult && typeof item.response === 'string' ? item.response : extractText(item);
+  const detail = error && typeof error === 'object' ? error as Record<string, unknown> : undefined;
+  const codes = [item.code, detail?.code, detail?.type].filter((value): value is string => typeof value === 'string');
+  const message = typeof error === 'string' ? error : typeof detail?.message === 'string' ? detail.message
+    : typeof item.message === 'string' ? item.message : failedResult && typeof item.response === 'string' ? item.response : extractText(item);
+  // Preserve account/billing codes even when the human message merely says
+  // "quota exceeded"; those failures require action rather than a timed retry.
+  return [...codes, message].filter(Boolean).join('\n') || undefined;
 }
 
 function extractText(item: Record<string, unknown>): string | undefined {
