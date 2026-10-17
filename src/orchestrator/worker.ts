@@ -560,6 +560,7 @@ export class TaskWorker {
           && !revisionSteps.some(step => step.failedCheckRunId === latestCheckRun.id)) {
           const retry = this.#options.store.beginReviewReworkCheckRetry(taskId, reworkResume.continuation.id, {
             checkRunId: latestCheckRun.id, owner, generationId: task.claimGenerationId!,
+            fingerprint: reopened.fingerprint,
           });
           if (retry.kind === "revision_limit") return retry.task;
           task = retry.task;
@@ -575,6 +576,13 @@ export class TaskWorker {
         }
         if (latestFailedStep) {
           const failedChecks = this.#options.store.checkRunResults(latestFailedStep.failedCheckRunId);
+          if (latestFailedStep.integrityFailureHash) {
+            const integrity = this.#options.store.checkRunIntegrityFailure(latestFailedStep.failedCheckRunId);
+            if (!integrity || hash(JSON.stringify(integrity)) !== latestFailedStep.integrityFailureHash) {
+              throw new Error("Review rework revision step has no matching persisted integrity failure evidence");
+            }
+            failedChecks.push(this.#integrityFailureCheck());
+          }
           if (!failedChecks.length || failedChecks.every(check => check.status === "passed")) {
             throw new Error("Review rework revision step has no persisted failed check results");
           }
@@ -895,14 +903,34 @@ export class TaskWorker {
         }
         if (checkTreeError || !checksAfter || !sameReviewSnapshot(checksSnapshot, checksAfter)
           || branchAfterChecks?.ref !== branchHead.ref || branchAfterChecks?.head !== branchHead.head) {
-          const integrityCheck: CheckResult = {
-            id: "__zero_worktree_integrity__", argv: [], status: "failed", exitCode: null, durationMs: 0,
-            error: `Worktree or task branch changed while validation checks ran${checkTreeError ? `: ${checkTreeError}` : "; their results do not apply to the final tree"}`,
-          };
+          const integrityCheck = this.#integrityFailureCheck(checkTreeError);
           checks.push(integrityCheck);
+          finalChecks = checks;
+          executionChecks = checks;
           this.#options.store.saveCheck(taskId, integrityCheck, attempt.id);
-          this.#options.store.finishCheckRun(checkRun.id, { owner, generationId }, "failed", integrityCheck.error ?? "Worktree integrity check failed");
-          activeCheckRunId = undefined;
+          try {
+            // These two errors mean a known unstaged change. Other capture
+            // failures remain uncertain even if a later Git read happens to work.
+            if (checkTreeError && !["Worktree has unstaged tracked changes", "Worktree has unstaged untracked files"].includes(checkTreeError)) {
+              throw new Error(`Validation integrity inspection failed: ${checkTreeError}`);
+            }
+            const creation = this.#options.store.getWorktreeCreation(taskId);
+            if (!creation || creation.status !== "created" || !creation.plan || !creation.observed) {
+              throw new Error("Validation integrity inspection has no registered worktree");
+            }
+            const reopened = await this.#options.worktrees.reopenFromEvidence(
+              creation.plan as WorktreeCreationPlan, creation.observed as WorktreeCreationEvidence);
+            const inspection = await this.#inspectReviewReworkGit(task, reopened);
+            if (inspection.gitState.branchRef !== branchHead.ref || inspection.gitState.head !== branchHead.head) {
+              throw new Error("Task branch or HEAD moved during validation; automatic rework is unsafe");
+            }
+            this.#options.store.failCheckRunForIntegrity(checkRun.id, { owner, generationId }, inspection);
+            activeCheckRunId = undefined;
+          } catch (error) {
+            this.#options.store.finishCheckRun(checkRun.id, { owner, generationId }, "failed", integrityCheck.error!);
+            activeCheckRunId = undefined;
+            throw error;
+          }
         }
         finalChecks = checks;
         executionChecks = checks;
@@ -913,13 +941,18 @@ export class TaskWorker {
               `Validation checks failed: ${failedChecks.map(check => check.id).join(", ")}`);
             activeCheckRunId = undefined;
           }
-          await this.#finishExecutionStage({
+          const failedOutputFingerprint = await this.#finishExecutionStage({
             task, worktree, stage: executionStage, attempt: executionAttempt, route, owner,
             status: "failed", checks, summary: "Zero observed one or more failed validation checks.",
           });
+          const integrityFailure = this.#options.store.checkRunIntegrityFailure(checkRun.id);
+          if (integrityFailure && failedOutputFingerprint !== integrityFailure.gitState.snapshot.fingerprint) {
+            throw new Error("Worktree changed or became unreadable after the integrity failure inspection; automatic rework is unsafe");
+          }
           if (reviewReworkContinuationId) {
             const retry = this.#options.store.beginReviewReworkCheckRetry(taskId, reviewReworkContinuationId, {
               checkRunId: checkRun.id, owner, generationId,
+              fingerprint: failedOutputFingerprint,
             });
             if (retry.kind === "revision_limit") return retry.task;
             task = retry.task;
@@ -1741,6 +1774,11 @@ export class TaskWorker {
     if (review) chunks.push(`Reviewer verdict: ${review.verdict}\n${review.summary}\n${review.findings.map(item => `- ${item.severity}${item.file ? ` ${item.file}${item.line ? `:${item.line}` : ""}` : ""}: ${item.evidence} Required change: ${item.requestedChange}`).join("\n")}`);
     if (task.acceptanceCriteria?.length) chunks.push(`Acceptance criteria:\n${task.acceptanceCriteria.map(item => `- ${item}`).join("\n")}`);
     return chunks.join("\n");
+  }
+
+  #integrityFailureCheck(detail?: string): CheckResult {
+    return { id: "__zero_worktree_integrity__", argv: [], status: "failed", exitCode: null, durationMs: 0,
+      error: `Worktree or task branch changed while validation checks ran${detail ? `: ${detail}` : "; their results do not apply to the final tree"}` };
   }
 
   #initialExecutionBrief(task: TaskRecord, brief: string): string {

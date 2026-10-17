@@ -339,6 +339,8 @@ export interface ReviewReworkRevisionStepRecord {
   failedCheckIds: string[];
   resultsHash: string;
   snapshotHash: string;
+  /** Absent for legacy retries backed only by submitted command failures. */
+  integrityFailureHash?: string;
   createdAt: string;
 }
 
@@ -346,7 +348,21 @@ export interface BeginReviewReworkCheckRetryInput {
   checkRunId: string;
   owner: string;
   generationId: string;
+  /** Freshly observed output identity; mandatory for Zero integrity failures. */
+  fingerprint?: string;
   now?: Date;
+}
+
+/** A Zero-owned gate result, separate from the submitted command/check ID set. */
+export interface CheckRunIntegrityFailureRecord {
+  runId: string;
+  taskId: string;
+  owner: string;
+  generationId: string;
+  beforeSnapshotHash: string;
+  identity: ClaimReviewRecoveryInput["identity"];
+  gitState: ReviewReworkGitInspection;
+  createdAt: string;
 }
 
 export type BeginReviewReworkCheckRetryResult =
@@ -600,6 +616,15 @@ export class TaskStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES check_runs(id),
         check_id TEXT NOT NULL, at TEXT NOT NULL, result TEXT NOT NULL, UNIQUE(run_id, check_id)
       );
+      CREATE TABLE IF NOT EXISTS check_run_integrity_failures (
+        run_id TEXT PRIMARY KEY REFERENCES check_runs(id), task_id TEXT NOT NULL REFERENCES tasks(id),
+        generation_id TEXT NOT NULL REFERENCES startup_generations(id), owner TEXT NOT NULL,
+        payload TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TRIGGER IF NOT EXISTS check_run_integrity_failures_no_update BEFORE UPDATE ON check_run_integrity_failures
+        BEGIN SELECT RAISE(ABORT,'check run integrity failures are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS check_run_integrity_failures_no_delete BEFORE DELETE ON check_run_integrity_failures
+        BEGIN SELECT RAISE(ABORT,'check run integrity failures are immutable'); END;
       CREATE TABLE IF NOT EXISTS review_packages (
         id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), check_run_id TEXT NOT NULL UNIQUE REFERENCES check_runs(id),
         execution_attempt_id TEXT NOT NULL REFERENCES attempts(id), execution_stage_id TEXT NOT NULL REFERENCES stages(id),
@@ -3297,13 +3322,15 @@ export class TaskStore {
       let checkResults: CheckResult[];
       try { checkResults = checkRows.map(row => JSON.parse(row.result) as CheckResult); }
       catch { throw new Error("Failed rework check run has malformed result evidence"); }
+      const integrityFailure = this.checkRunIntegrityFailure(input.checkRunId);
       if (!Array.isArray(expectedCheckIds) || expectedCheckIds.length !== requiredChecks.length ||
           !sameStringSet(expectedCheckIds, requiredChecks.map(check => check.id)) ||
           run.check_definition_hash !== currentCheckDefinitionHash ||
           checkRows.length !== expectedCheckIds.length || !sameStringSet(checkRows.map(row => row.check_id), expectedCheckIds) ||
           checkResults.some((check, index) => check.id !== checkRows[index]?.check_id ||
             !["passed", "failed", "timed_out", "spawn_error"].includes(check.status) ||
-            (check.status === "passed" && check.exitCode !== 0)) || !checkResults.some(check => check.status !== "passed") ||
+            (check.status === "passed" && check.exitCode !== 0)) ||
+          (!checkResults.some(check => check.status !== "passed") && !integrityFailure) ||
           !storedSnapshot || !SHA256_PATTERN.test(storedSnapshot.diffHash) ||
           createHash("sha256").update(storedSnapshot.diff, "utf8").digest("hex") !== storedSnapshot.diffHash) {
         throw new Error("Failed rework check run must have the current complete check set, matching definition hash, and a real failure");
@@ -3320,14 +3347,26 @@ export class TaskStore {
           run.execution_stage_id !== stage.id || run.execution_attempt_id !== attempt.id) {
         throw new Error("Failed check run is not bound to the latest completed writer attempt and failed rework stage");
       }
+      if (integrityFailure && (stage.output_fingerprint !== integrityFailure.gitState.snapshot.fingerprint ||
+          input.fingerprint !== integrityFailure.gitState.snapshot.fingerprint)) {
+        throw new Error("Integrity retry requires matching persisted failure, completed-stage output, and fresh worktree fingerprints");
+      }
 
+      const failedCheckIds = [...new Set([
+        ...checkResults.filter(check => check.status !== "passed").map(check => check.id),
+        ...(integrityFailure ? ["__zero_worktree_integrity__"] : []),
+      ])];
+      const integrityFailureHash = integrityFailure
+        ? sha256Bytes(Buffer.from(JSON.stringify(integrityFailure), "utf8")) : undefined;
       const highWater = this.#reviewReworkRevisionHighWater(continuation);
       if (highWater === undefined || task.revision_count !== highWater) throw new Error("Rework revision chain or task revision count is inconsistent");
       const existingRow = this.#db.prepare("SELECT payload FROM rework_revision_steps WHERE continuation_id=? AND failed_check_run_id=?")
         .get(continuation.id, input.checkRunId) as { payload: string } | undefined;
       if (existingRow) {
         const step = JSON.parse(existingRow.payload) as ReviewReworkRevisionStepRecord;
-        if (step.revisionAfter !== highWater || task.revision_count !== step.revisionAfter) {
+        if (step.revisionAfter !== highWater || task.revision_count !== step.revisionAfter ||
+          step.integrityFailureHash !== integrityFailureHash ||
+          step.resultsHash !== sha256Bytes(Buffer.from(JSON.stringify(checkResults), "utf8"))) {
           throw new Error("Existing failed-check revision step is no longer the current revision high-water");
         }
         result = { kind: "started", step, task: this.get(taskId)!, alreadyApplied: true };
@@ -3337,8 +3376,7 @@ export class TaskStore {
       const revisionLimit = submission.maxRevisions ?? 0;
       if (!Number.isSafeInteger(revisionLimit) || revisionLimit < 0) throw new Error("Task maxRevisions must be a non-negative integer");
       if (task.revision_count >= revisionLimit) {
-        const failedIds = checkResults.filter(check => check.status !== "passed").map(check => check.id);
-        const reason = `Validation failed after ${task.revision_count} content revisions: ${failedIds.join(", ")}`;
+        const reason = `Validation failed after ${task.revision_count} content revisions: ${failedCheckIds.join(", ")}`;
         const changed = this.#db.prepare(`UPDATE tasks SET status='failed',updated_at=?,failure_reason=?,lease_owner=NULL,
           lease_expires_at=NULL,heartbeat_at=NULL,active_attempt_id=NULL WHERE id=? AND status='running' AND lease_owner=?
           AND claim_generation_id=? AND revision_count=?`).run(at, reason, taskId, input.owner, input.generationId, task.revision_count);
@@ -3347,19 +3385,19 @@ export class TaskStore {
         this.#disableExecutionRecoveryCheckpoint(taskId, at, "terminal:failed");
         this.#event(taskId, "task.transition", { from: "running", to: "failed", reason, failedCheckRunId: input.checkRunId }, at);
         this.#event(taskId, "task.review_rework_revision_limit", { continuationId, checkRunId: input.checkRunId,
-          revision: task.revision_count, failedCheckIds: failedIds, reason }, at);
+          revision: task.revision_count, failedCheckIds, reason }, at);
         result = { kind: "revision_limit", reason, task: this.get(taskId)! };
         return;
       }
 
-      const failedCheckIds = checkResults.filter(check => check.status !== "passed").map(check => check.id);
       const step: ReviewReworkRevisionStepRecord = { id: randomUUID(), taskId, continuationId,
         failedCheckRunId: input.checkRunId, revisionBefore: task.revision_count, revisionAfter: task.revision_count + 1,
         checkRunGenerationId: String(run.generation_id), owner: input.owner, generationId: input.generationId,
         executionStageId: String(stage.id), executionAttemptId: String(attempt.id),
         checkDefinitionHash: String(run.check_definition_hash), expectedCheckIds,
         failedCheckIds, resultsHash: createHash("sha256").update(JSON.stringify(checkResults), "utf8").digest("hex"),
-        snapshotHash: createHash("sha256").update(JSON.stringify(storedSnapshot), "utf8").digest("hex"), createdAt: at };
+        snapshotHash: createHash("sha256").update(JSON.stringify(storedSnapshot), "utf8").digest("hex"),
+        ...(integrityFailureHash ? { integrityFailureHash } : {}), createdAt: at };
       const payload = JSON.stringify(step);
       if (Buffer.byteLength(payload, "utf8") > 65_536) throw new Error("Rework revision step exceeds 64 KiB");
       const inserted = this.#db.prepare(`INSERT INTO rework_revision_steps(id,task_id,continuation_id,failed_check_run_id,
@@ -4222,6 +4260,87 @@ export class TaskStore {
       }
       this.#event(run.task_id, "check_run.result", { checkRunId: runId, result }, at);
     });
+  }
+
+  /** Atomically records a Zero gate failure without changing the submitted check set.
+   * The caller must independently inspect Git and allowedPaths; Store binds that
+   * attestation to the registered checkout and this exact live run generation. */
+  failCheckRunForIntegrity(runId: string, guard: CheckRunGuard, input: {
+    identity: ClaimReviewRecoveryInput["identity"]; gitState: ReviewReworkGitInspection;
+  }): CheckRunIntegrityFailureRecord {
+    const now = new Date();
+    this.#assertFreshRecoveryCheck(input.identity.checkedAt, now);
+    this.#assertFreshRecoveryCheck(input.gitState.checkedAt, now);
+    let record!: CheckRunIntegrityFailureRecord;
+    this.#transaction(() => {
+      const run = this.#db.prepare("SELECT * FROM check_runs WHERE id=?").get(runId) as Record<string, unknown> | undefined;
+      if (!run || run.status !== "running" || run.owner !== guard.owner || run.generation_id !== guard.generationId) {
+        throw new Error("Integrity failure requires its running check run owner and generation");
+      }
+      const task = this.#commitTask(String(run.task_id));
+      this.#assertReviewLease(task, guard.owner, guard.generationId);
+      const latest = this.#db.prepare("SELECT id FROM check_runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
+        .get(String(run.task_id)) as { id: string } | undefined;
+      const stage = this.getStage(String(run.execution_stage_id));
+      if (latest?.id !== runId || !stage || stage.status !== "running" || stage.taskId !== run.task_id || stage.generationId !== guard.generationId) {
+        throw new Error("Integrity failure requires the latest check run and its current running stage");
+      }
+      this.#validateIntegrityFailureInspection(run, input);
+      record = { runId, taskId: String(run.task_id), owner: guard.owner, generationId: guard.generationId,
+        beforeSnapshotHash: sha256Bytes(Buffer.from(String(run.snapshot), "utf8")),
+        identity: input.identity, gitState: input.gitState, createdAt: now.toISOString() };
+      const payload = JSON.stringify(record);
+      if (Buffer.byteLength(payload, "utf8") > MAX_REVIEW_DIFF_BYTES + 131_072) throw new Error("Integrity failure evidence exceeds its size limit");
+      this.#db.prepare("INSERT INTO check_run_integrity_failures(run_id,task_id,generation_id,owner,payload,created_at) VALUES(?,?,?,?,?,?)")
+        .run(runId, record.taskId, guard.generationId, guard.owner, payload, record.createdAt);
+      this.#db.prepare("UPDATE check_runs SET status='failed',terminal_reason=? WHERE id=? AND status='running'")
+        .run("Zero observed allowed-path content changes while validation checks ran", runId);
+      this.#event(record.taskId, "check_run.integrity_failed", { checkRunId: runId, generationId: guard.generationId,
+        evidenceHash: sha256Bytes(Buffer.from(payload, "utf8")) }, record.createdAt);
+    });
+    return record;
+  }
+
+  checkRunIntegrityFailure(runId: string): CheckRunIntegrityFailureRecord | undefined {
+    const run = this.#db.prepare("SELECT * FROM check_runs WHERE id=?").get(runId) as Record<string, unknown> | undefined;
+    const row = this.#db.prepare("SELECT * FROM check_run_integrity_failures WHERE run_id=?").get(runId) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    const value = JSON.parse(String(row.payload)) as CheckRunIntegrityFailureRecord;
+    if (!run || value.runId !== runId || row.task_id !== run.task_id || value.taskId !== run.task_id ||
+      row.generation_id !== run.generation_id || value.generationId !== run.generation_id ||
+      row.owner !== run.owner || value.owner !== run.owner || value.createdAt !== row.created_at ||
+      value.beforeSnapshotHash !== sha256Bytes(Buffer.from(String(run.snapshot), "utf8"))) {
+      throw new Error("Integrity failure evidence does not match its exact check run");
+    }
+    this.#validateIntegrityFailureInspection(run, value);
+    return value;
+  }
+
+  #validateIntegrityFailureInspection(run: Record<string, unknown>, input: {
+    identity: ClaimReviewRecoveryInput["identity"]; gitState: ReviewReworkGitInspection;
+  }): void {
+    const before = JSON.parse(String(run.snapshot)) as CheckRunSnapshot;
+    const after = input.gitState?.snapshot;
+    const observed = input.identity?.observed as { info?: Record<string, unknown>; commonGitDir?: string; head?: string; fingerprint?: string } | undefined;
+    const creation = this.getWorktreeCreation(String(run.task_id));
+    const plan = creation?.plan as Record<string, unknown> | undefined;
+    const saved = creation?.observed as typeof observed;
+    if (!creation || creation.status !== "created" || !plan || !saved?.info || !observed?.info ||
+      !["taskId", "repoPath", "path", "branch", "baseCommit"].every(key => plan[key] === saved.info![key] && saved.info![key] === observed.info![key]) ||
+      plan.taskId !== run.task_id || plan.baseCommit !== before.baseCommit || plan.branch !== `zero/${String(run.task_id)}` ||
+      saved.head !== plan.baseCommit || plan.commonGitDir !== saved.commonGitDir || saved.commonGitDir !== observed.commonGitDir ||
+      observed.head !== before.preHead || observed.fingerprint !== input.identity.fingerprint ||
+      !after || after.baseCommit !== before.baseCommit || after.preHead !== before.preHead ||
+      input.gitState.branchRef !== run.branch_ref || input.gitState.head !== before.preHead ||
+      input.gitState.branchRef !== `refs/heads/zero/${String(run.task_id)}` ||
+      input.gitState.allowedPathsVerified !== true || !Array.isArray(input.gitState.changedPaths) ||
+      input.gitState.changedPaths.some(path => typeof path !== "string" || !path || path.includes("\0")) ||
+      !SHA256_PATTERN.test(input.identity.fingerprint) || after.fingerprint !== input.identity.fingerprint ||
+      after.fingerprint === before.fingerprint || after.treeId === before.treeId) {
+      throw new Error("Integrity failure requires registered same-HEAD Git identity and verified allowed-path content changes");
+    }
+    this.#validateReviewEvidence(after, JSON.parse(String(run.route)) as RouteDecision,
+      JSON.parse(String(run.expected_check_ids)) as string[], String(run.check_definition_hash));
   }
 
   /** Closes an unsuccessful or superseded run while retaining all individual result rows. */
