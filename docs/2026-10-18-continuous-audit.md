@@ -7,6 +7,10 @@
 | 早期额度错误遮住当前认证/账单失败；错误超过 16 条后新的额度信息又被丢掉 | 真实 Node 子进程复现错误等待与漏等待。新增独立的有界 `lastProviderError`，只用最新真实 provider 错误分类当前非零失败，保留原始历史供诊断；模型冲突、不可验证协议和强制进程失败仍优先。最新失败诊断进入机器错误，便于用户处理账户问题。3 项回归先失败后通过，适配器与 quota 共 126 项通过；独立复审未发现阻止合入的问题 |
 | 暂时不可用的已保存模型在设置 GET 中变成 null，原样保存后永久丢失 | GET 保留已保存选择；PUT 仅允许原样保留同角色的完整 model/effort 二元组，新选择仍需验证。网页显示“当前不可用”并保留该值。真实 HTTP 与组件测试先失败后通过，服务端 32/32、前端 19/19、类型检查和生产构建通过，Edge 375px 实际 HTTP 保存无溢出/页面异常；root 又独立重跑设置 HTTP 与浏览器回归，独立复审未发现阻止合入的问题 |
 | 最终目标返工继承全部历史阶段检查 | 创建 first.txt、随后迁移成 second.txt 的正常计划会收到“first.txt 存在”和“不存在”两条矛盾命令，最终返工耗尽预算失败。返工现在只继承最后完成步骤的检查，历史检查保留在原任务及目标审查资料；没有移除最终约束。3 项真实 Git E2E 覆盖原流程、重命名后仅补 proof 即完成、破坏最终文件约束仍失败。sequence/revision/E2E 共 17/17 通过；独立 reviewer 重跑 goal 单元及 E2E 8/8 通过 |
-| 普通返工成功的步骤仍被历史失败检查阻止总目标验收 | 真实 Git/SQLite/TaskWorker 复现 checkRuns=[failed, completed] 且 task 已 DONE，目标 reviewer 却从未被调用；将按最终结果包选取权威检查，缺少真正最终证据仍拒绝验收 |
+| 普通返工成功的步骤仍被历史失败检查阻止总目标验收 | 真实 Git/SQLite/TaskWorker 复现 checkRuns=[failed, completed] 且 task 已 DONE，目标 reviewer 却从未被调用。现在沿 applied commit → sealed package → checkRun 选取权威证据，并校验报告、执行身份、快照、检查定义、完成事件及完整通过结果。真实回归覆盖成功返工、缺 package、错误 run、缺结果共 5/5；独立 reviewer 重跑新测试及 main 测试 20/20 通过，未发现阻止合入的问题 |
+
+## 后续一轮
+
+已确认执行预设也有离线保存阻塞：即使 global/project 没变，修改无关设置仍因 CLI 暂时不可用被拒绝。另确认目标 reviewer 一次临时断线生成的 blocked 会跨重启永久缓存；现界面没有重新验收入口。二者继续按独立复现、最小修复和复审推进。
 
 所有新复现使用隔离 Git 工作区、SQLite 和本地 fake adapters，没有消耗真实模型额度或改写生产配置。执行进度见[持续审查计划](superpowers/plans/2026-10-18-continuous-audit.md)。
