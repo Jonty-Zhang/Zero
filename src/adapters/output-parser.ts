@@ -21,6 +21,7 @@ export class StreamingOutputParser {
   private modelConflict = false;
   private structured = false;
   private readonly providerErrors: string[] = [];
+  private lastProviderError?: string;
   private parseFailure?: string;
 
   constructor(private readonly parse: (stdout: string, stderr: string) => ParsedOutput, private readonly secrets: string[]) {}
@@ -71,6 +72,7 @@ export class StreamingOutputParser {
       ...(this.modelConflict ? { modelConflict: true } : {}),
       ...(this.structured ? { hasStructuredOutput: true } : {}),
       ...(this.providerErrors.length ? { providerErrors: [...this.providerErrors] } : {}),
+      ...(this.lastProviderError ? { lastProviderError: this.lastProviderError } : {}),
       ...(outputError ? { outputError } : {}),
     };
   }
@@ -104,6 +106,8 @@ export class StreamingOutputParser {
     this.sessionId ??= parsed.sessionId ? redactText(parsed.sessionId, this.secrets) : undefined;
     this.structured ||= Boolean(parsed.hasStructuredOutput);
     if (parsed.providerErrors?.length) this.providerFailureAfterSkippedLine = true;
+    const latestError = parsed.lastProviderError ?? parsed.providerErrors?.at(-1);
+    if (latestError) this.lastProviderError = redactText(latestError, this.secrets).slice(0, MAX_ERROR_CHARACTERS);
     for (const error of parsed.providerErrors ?? []) {
       if (this.providerErrors.length >= MAX_PROVIDER_ERRORS) break;
       this.providerErrors.push(redactText(error, this.secrets).slice(0, MAX_ERROR_CHARACTERS));

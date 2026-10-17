@@ -126,6 +126,8 @@ export interface ParsedOutput {
   modelConflict?: boolean;
   /** Explicit provider error event messages, never agent or tool prose. */
   providerErrors?: string[];
+  /** Latest observed provider error, independent of the bounded diagnostic history. */
+  lastProviderError?: string;
   hasStructuredOutput?: boolean;
   outputError?: string;
 }

@@ -787,22 +787,35 @@ async function captureSequenceGoalEvidence(store: TaskStore, worktrees: GitWorkt
     }
     finalCommit = commit.candidateSha!;
     const allEvents = store.events(task.id);
-    const checkRuns = store.checkRuns(task.id);
-    const checkEvidence = checkRuns.map(run => {
-      const completedEvent = allEvents.find(event => event.type === 'check_run.completed' &&
-        (event.payload as { checkRunId?: unknown } | undefined)?.checkRunId === run.id);
-      const rawResults = (completedEvent?.payload as { results?: unknown } | undefined)?.results;
-      const results = Array.isArray(rawResults) ? rawResults.map(item => {
-        const result = item as { id?: unknown; status?: unknown; exitCode?: unknown; durationMs?: unknown };
-        return { id: result.id, status: result.status, exitCode: result.exitCode, durationMs: result.durationMs };
-      }) : [];
-      if (run.status !== 'completed' || results.length !== run.expectedCheckIds.length) {
-        throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because persisted check evidence is incomplete.');
-      }
-      return { runId: run.id, status: run.status, expectedCheckIds: run.expectedCheckIds,
+    // Ordinary content revisions leave failed historical runs. Completion is
+    // justified by the exact package sealed into the applied commit/report,
+    // never by every historical run or an arbitrary later passing attempt.
+    const pkg = store.getReviewPackage(commit.packageId);
+    const run = pkg && store.getCheckRun(pkg.checkRunId);
+    if (!pkg || !run || pkg.taskId !== task.id || run.taskId !== task.id || run.id !== pkg.checkRunId
+      || run.status !== 'completed' || report.packageId !== pkg.id || report.verdictId !== commit.verdictId
+      || pkg.executionAttemptId !== run.executionAttemptId || pkg.executionStageId !== run.executionStageId
+      || pkg.routeAttemptId !== run.routeAttemptId || pkg.checkDefinitionHash !== run.checkDefinitionHash
+      || JSON.stringify(pkg.expectedCheckIds) !== JSON.stringify(run.expectedCheckIds)
+      || pkg.branchRef !== commit.branchRef || pkg.snapshot.preHead !== commit.preHead
+      || pkg.snapshot.treeId !== commit.treeId || pkg.snapshot.diffHash !== commit.diffHash
+      || JSON.stringify(pkg.snapshot) !== JSON.stringify(run.snapshot)) {
+      throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the completed result lacks its linked current check package.');
+    }
+    const completedEvent = allEvents.find(event => event.type === 'check_run.completed' &&
+      event.payload?.checkRunId === run.id && event.payload?.reviewPackageId === pkg.id);
+    const rawResults = completedEvent?.payload?.results;
+    const results = store.checkRunResults(run.id);
+    const ids = new Set(results.map(result => result.id));
+    if (!Array.isArray(rawResults) || JSON.stringify(rawResults) !== JSON.stringify(results)
+      || results.length !== run.expectedCheckIds.length || ids.size !== run.expectedCheckIds.length
+      || run.expectedCheckIds.some(id => !ids.has(id)) || results.some(result => result.status !== 'passed')) {
+      throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because persisted current check evidence is incomplete.');
+    }
+    const checkEvidence = [{ runId: run.id, status: run.status, expectedCheckIds: run.expectedCheckIds,
         checkDefinitionHash: run.checkDefinitionHash, snapshot: { baseCommit: run.snapshot.baseCommit, preHead: run.snapshot.preHead,
-          treeId: run.snapshot.treeId, fingerprint: run.snapshot.fingerprint, diffHash: run.snapshot.diffHash }, results };
-    });
+          treeId: run.snapshot.treeId, fingerprint: run.snapshot.fingerprint, diffHash: run.snapshot.diffHash },
+        results: results.map(({ id, status, exitCode, durationMs }) => ({ id, status, exitCode, durationMs })) }];
     stepEvidence.push({ position: step.position, taskId: task.id, prompt: task.prompt,
       acceptanceCriteria: task.acceptanceCriteria ?? [], baseRef: task.baseRef,
       effectiveBaseCommit: step.effectiveBaseCommit, resultCommit: commit.candidateSha,

@@ -12,13 +12,18 @@ function fixture(options: { checkCount?: number; missingAllowedPaths?: boolean; 
       allowedPaths: ['src/a.ts', 'tests/a.test.ts'],
       checks: [
         { id: 'one', argv: ['npm', 'test'] },
-        ...Array.from({ length: Math.max(0, checkCount - 1) }, (_, index) => ({ id: `first-${index}`, argv: ['check', String(index)] })),
+        { id: 'intermediate-only', argv: ['check-intermediate-output'] },
       ],
     },
     {
       repoPath: 'C:/project', baseRef: 'main', prompt: 'Final step',
       ...(options.missingAllowedPaths ? {} : { allowedPaths: ['src/b.ts', 'src/a.ts'] }),
-      checks: [{ id: 'duplicate-test', argv: ['npm', 'test'] }, { id: 'last', argv: ['lint'] }],
+      checks: [
+        { id: 'final-test', argv: ['npm', 'test'] },
+        { id: 'duplicate-test', argv: ['npm', 'test'] },
+        ...Array.from({ length: Math.max(0, checkCount - 1) }, (_, index) => ({ id: `final-${index}`, argv: ['check', String(index)] })),
+        { id: 'last', argv: ['lint'] },
+      ],
     },
   ];
   const sequence = {
@@ -39,7 +44,7 @@ function fixture(options: { checkCount?: number; missingAllowedPaths?: boolean; 
   return { sequence, review };
 }
 
-test('builds a goal remediation submission with deduplicated checks and bounded scope', () => {
+test('builds goal remediation with only deduplicated final-step checks and bounded scope', () => {
   const { sequence, review } = fixture();
   const submission = buildGoalRevisionSubmission(sequence, review);
 

@@ -153,6 +153,32 @@ test('structured billing error codes remain ordinary failures instead of enterin
   }
 });
 
+test('the latest structured authentication failure supersedes an earlier quota retry message', async () => {
+  const result = await new OutputFixtureAdapter(`console.log(JSON.stringify({type:'error',message:'Quota exceeded; Retry-After: 60'}));
+    console.log(JSON.stringify({type:'turn.failed',error:{code:'invalid_api_key',message:'Authentication failed'}}));process.exitCode=1;`).run(fixtureRequest());
+  assert.equal(result.status, 'failed');
+  assert.equal(result.quota, undefined);
+  assert.match(result.error ?? '', /invalid_api_key|Authentication failed/);
+});
+
+test('the current billing error survives a full error history and truncated diagnostic logs', async () => {
+  const result = await new OutputFixtureAdapter(`for(let i=0;i<16;i++)console.log(JSON.stringify({type:'error',message:i===0?'Quota exceeded; Retry-After: 60':'Transient network error'}));
+    console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',text:'x'.repeat(3*1024*1024)}}));
+    console.log(JSON.stringify({type:'turn.failed',error:{code:'insufficient_quota',message:'Quota exceeded'}}));process.exitCode=1;`).run(fixtureRequest());
+  assert.equal(result.status, 'failed');
+  assert.equal(result.quota, undefined);
+  assert.match(result.error ?? '', /insufficient_quota/);
+});
+
+test('a current provider quota after a full history retains recovery and its actual diagnostic', async () => {
+  const result = await new OutputFixtureAdapter(`for(let i=0;i<16;i++)console.log(JSON.stringify({type:'error',message:'Transient network error'}));
+    console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',text:'x'.repeat(3*1024*1024)}}));
+    console.log(JSON.stringify({type:'turn.failed',error:{message:'Quota exceeded; Retry-After: 60'}}));process.exitCode=1;`).run(fixtureRequest());
+  assert.equal(result.status, 'failed');
+  assert.equal(result.quota?.source, 'retry_after');
+  assert.match(result.error ?? '', /Quota exceeded/);
+});
+
 test('unverifiable oversized provider metadata cannot trigger automatic quota recovery', async () => {
   const result = await new OutputFixtureAdapter(`console.log(JSON.stringify({type:'turn.failed',metadata:'x'.repeat(270000),
     error:{code:'x'.repeat(5000),message:'Quota exceeded'}}));

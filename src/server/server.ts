@@ -256,16 +256,13 @@ async function capabilities(options: ZeroServerOptions) {
 
 async function readPublicConfig(options: ZeroServerOptions) {
   const config = await options.config.read();
-  const active = await capabilities(options);
-  const modelIds = new Set(active.allocator.models.map((choice: { id: string }) => choice.id));
-  const efforts = new Set(active.allocator.reasoningEfforts.map((choice: { id: string }) => choice.id));
   return {
     allocator: { kind: config.allocator.kind ?? 'codex',
-      modelId: config.allocator.modelId && modelIds.has(config.allocator.modelId) ? config.allocator.modelId : null,
-      reasoningEffort: config.allocator.reasoningEffort && efforts.has(config.allocator.reasoningEffort) ? config.allocator.reasoningEffort : null,
+      modelId: config.allocator.modelId,
+      reasoningEffort: config.allocator.reasoningEffort,
       ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) },
-    reviewer: { modelId: config.reviewer.modelId && modelIds.has(config.reviewer.modelId) ? config.reviewer.modelId : null,
-      reasoningEffort: config.reviewer.reasoningEffort && efforts.has(config.reviewer.reasoningEffort) ? config.reviewer.reasoningEffort : null },
+    reviewer: { modelId: config.reviewer.modelId,
+      reasoningEffort: config.reviewer.reasoningEffort },
     executionDefaults: {
       global: publicExecutionSelection(config.executionDefaults?.global ?? null),
       projects: Object.entries(config.executionDefaults?.projects ?? {}).map(([repoPath, execution]) => ({ repoPath, execution: publicExecutionSelection(execution)! })),
@@ -279,18 +276,23 @@ async function updatePublicConfig(options: ZeroServerOptions, raw: unknown) {
   const active = await capabilities(options);
   const models = new Set(active.allocator.models.map((choice: { id: string }) => choice.id));
   const efforts = new Set(active.allocator.reasoningEfforts.map((choice: { id: string }) => choice.id));
+  const config = await options.config.read();
   const pick = (role: 'allocator' | 'reviewer') => {
     const value = input[role];
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HttpError(400, `${role} 必须是对象`);
     const v = value as Record<string, unknown>;
     const modelId = nullableString(v.modelId, `${role}.modelId`);
     const reasoningEffort = nullableString(v.reasoningEffort, `${role}.reasoningEffort`);
+    // Availability is transient; saving other settings must not erase an existing
+    // choice. Only the exact saved pair may bypass current-candidate validation.
+    if (modelId === config[role].modelId && reasoningEffort === config[role].reasoningEffort) {
+      return { modelId, reasoningEffort: reasoningEffort as LocalZeroConfig['allocator']['reasoningEffort'] };
+    }
     if (modelId && !models.has(modelId)) throw new HttpError(400, `${role} 模型不是当前已验证的 Codex 候选`);
     if (reasoningEffort && !efforts.has(reasoningEffort)) throw new HttpError(400, `${role} 思考强度不是当前已验证的 Codex 候选`);
     if (modelId && reasoningEffort && !active.bindings.some((binding: { harnessId: string; modelId: string; available: boolean; reasoningEfforts: Array<{ id: string }> }) => binding.harnessId === 'codex' && binding.modelId === modelId && binding.available && binding.reasoningEfforts.some(item => item.id === reasoningEffort))) throw new HttpError(400, `${role} 思考强度未在所选 Codex 模型上验证`);
     return { modelId, reasoningEffort: reasoningEffort as LocalZeroConfig['allocator']['reasoningEffort'] };
   };
-  const config = await options.config.read();
   const allocatorRaw = input.allocator;
   if (!allocatorRaw || typeof allocatorRaw !== 'object' || Array.isArray(allocatorRaw)) throw new HttpError(400, 'allocator 必须是对象');
   const allocatorInput = allocatorRaw as Record<string, unknown>;
@@ -314,7 +316,7 @@ async function updatePublicConfig(options: ZeroServerOptions, raw: unknown) {
     ? { kind, modelId: null, reasoningEffort: null, api: api! }
     : { ...pick('allocator'), kind, ...(api ? { api } : {}) };
   config.reviewer = pick('reviewer');
-  if (input.executionDefaults !== undefined) config.executionDefaults = await parseExecutionDefaults(input.executionDefaults, active);
+  if (input.executionDefaults !== undefined) config.executionDefaults = await parseExecutionDefaults(input.executionDefaults, active, config.executionDefaults);
   await options.config.write(config);
   return { allocator: { ...config.allocator, ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) }, reviewer: config.reviewer,
     executionDefaults: { global: publicExecutionSelection(config.executionDefaults?.global ?? null), projects: Object.entries(config.executionDefaults?.projects ?? {}).map(([repoPath, execution]) => ({ repoPath, execution: publicExecutionSelection(execution)! })) } };
@@ -325,19 +327,19 @@ function publicExecutionSelection(selection: ExecutionSelection | null): { harne
   return { ...(selection.harness ? { harnessId: selection.harness } : {}), ...(selection.model ? { modelId: selection.model } : {}), ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}) };
 }
 
-async function parseExecutionDefaults(raw: unknown, capability: Awaited<ReturnType<typeof capabilities>>): Promise<NonNullable<LocalZeroConfig['executionDefaults']>> {
+async function parseExecutionDefaults(raw: unknown, capability: Awaited<ReturnType<typeof capabilities>>, previous: LocalZeroConfig['executionDefaults']): Promise<NonNullable<LocalZeroConfig['executionDefaults']>> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, 'executionDefaults 必须是对象');
   const input = raw as Record<string, unknown>;
   for (const key of Object.keys(input)) if (key !== 'global' && key !== 'projects') throw new HttpError(400, `executionDefaults.${key} 不是支持的配置项`);
-  const parse = (value: unknown, label: string): ExecutionSelection | null => {
+  const parse = (value: unknown, label: string, saved?: ExecutionSelection | null): ExecutionSelection | null => {
     if (value == null) return null;
     const parsed = parsePublicSelection(value, label);
-    validateAvailableSelection(parsed, capability, label);
     const selection = toExecutionSelection(parsed);
     if (!selection) throw new HttpError(400, `${label} 至少需要一个执行选项`);
+    if (!sameExecutionSelection(selection, saved)) validateAvailableSelection(parsed, capability, label);
     return selection;
   };
-  const global = parse(input.global ?? null, 'executionDefaults.global');
+  const global = parse(input.global ?? null, 'executionDefaults.global', previous?.global);
   if (!Array.isArray(input.projects) || input.projects.length > 500) throw new HttpError(400, 'executionDefaults.projects 必须是项目配置数组');
   const projects: Record<string, ExecutionSelection> = {};
   for (const [index, rawProject] of input.projects.entries()) {
@@ -347,12 +349,22 @@ async function parseExecutionDefaults(raw: unknown, capability: Awaited<ReturnTy
     const rawPath = stringField(project.repoPath, `executionDefaults.projects[${index}].repoPath`, 1, 4096);
     const repoPath = await canonicalRepositoryPath(rawPath, `executionDefaults.projects[${index}].repoPath`);
     if (projects[repoPath]) throw new HttpError(400, `项目仓库重复：${repoPath}`);
-    const execution = parse(project.execution, `executionDefaults.projects[${index}].execution`);
+    const savedProject = previous?.projects[repoPath];
+    const execution = parse(project.execution, `executionDefaults.projects[${index}].execution`, savedProject);
     if (!execution) throw new HttpError(400, `executionDefaults.projects[${index}].execution 至少需要一个执行选项`);
-    validateAvailableSelection({ ...selectionFields(global), ...selectionFields(execution) }, capability, `executionDefaults.projects[${index}] effective selection`);
+    const effective = { ...selectionFields(global), ...selectionFields(execution) };
+    const savedEffective = { ...selectionFields(previous?.global ?? null), ...selectionFields(savedProject ?? null) };
+    // Keeping a project row cannot grandfather a changed inherited selection.
+    if (!savedProject || !sameExecutionSelection(effective, savedEffective)) {
+      validateAvailableSelection(effective, capability, `executionDefaults.projects[${index}] effective selection`);
+    }
     projects[repoPath] = execution;
   }
   return { global, projects };
+}
+
+function sameExecutionSelection(left: ExecutionSelection | null | undefined, right: ExecutionSelection | null | undefined): boolean {
+  return left?.harness === right?.harness && left?.model === right?.model && left?.reasoningEffort === right?.reasoningEffort;
 }
 
 function selectionFields(selection: ExecutionSelection | null): Record<string, string> {

@@ -47,7 +47,7 @@ function getWithHost(url: string, host: string): Promise<{ status: number; body:
 
 class ProbeOnlyAdapter implements HarnessAdapter {
   probeCalls = 0;
-  constructor(readonly id: string, private readonly cap: HarnessCapabilities) {}
+  constructor(readonly id: string, readonly cap: HarnessCapabilities) {}
   probe(): Promise<HarnessCapabilities> { this.probeCalls++; return Promise.resolve(this.cap); }
   async run(_request: RunRequest): Promise<RunResult> {
     throw new Error('API integration tests must not execute a Harness');
@@ -853,6 +853,49 @@ test('capabilities do not call a help-only model binding live verified', async (
   } finally { await f.close(); }
 });
 
+test('configuration round trips preserve unavailable saved role choices and reject new unavailable choices', async () => {
+  for (const selection of [{ modelId: 'codex-main', reasoningEffort: 'high' as const }, { modelId: null, reasoningEffort: 'high' as const }]) {
+    let config: LocalZeroConfig = { ...testConfig(true, true), allocator: { kind: 'codex', ...selection }, reviewer: { ...selection } };
+    let available = false;
+    const store = new TaskStore();
+    const server = createZeroServer({ store, config: { read: async () => structuredClone(config), write: async value => { config = structuredClone(value); } },
+      adapters: { codex: { id: 'codex', probe: async () => ({ harness: 'codex', available, models: available ? ['codex-main'] : [], reasoningEfforts: ['high'], roles: ['implement', 'revise'] }),
+        run: async () => { throw new Error('No real Harness execution is allowed'); } } } });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const url = `http://127.0.0.1:${address.port}/api/config`;
+    const put = (body: unknown) => fetch(url, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    try {
+      const read = await (await fetch(url)).json() as { allocator: LocalZeroConfig['allocator']; reviewer: LocalZeroConfig['reviewer'] };
+      assert.deepEqual(read.allocator, { kind: 'codex', ...selection });
+      assert.deepEqual(read.reviewer, selection);
+      const saved = await put(read);
+      assert.equal(saved.status, 200, await saved.text());
+      assert.deepEqual(config.reviewer, selection);
+      for (const role of ['allocator', 'reviewer'] as const) {
+        for (const changed of [{ ...selection, modelId: 'new-unverified-model' }, { ...selection, reasoningEffort: 'xhigh' },
+          selection.modelId ? { ...selection, reasoningEffort: null } : { ...selection, modelId: 'codex-main' }]) {
+          const before = structuredClone(config);
+          const rejected = await put({ ...read, [role]: { ...read[role], ...changed } });
+          assert.equal(rejected.status, 400, await rejected.text());
+          assert.deepEqual(config, before);
+        }
+      }
+      const unrelatedEdit = await put({ ...read, allocator: { kind: 'api', modelId: null, reasoningEffort: null,
+        api: { baseUrl: 'https://provider.example/v1', model: 'router', keyEnv: 'ZERO_ROUTER_KEY' } } });
+      assert.equal(unrelatedEdit.status, 200, await unrelatedEdit.text());
+      assert.deepEqual(config.reviewer, selection);
+      available = true;
+      assert.deepEqual((await (await fetch(url)).json() as typeof read).reviewer, selection);
+      available = false;
+      const cleared = await put({ ...read, allocator: { kind: 'codex', modelId: null, reasoningEffort: null }, reviewer: { modelId: null, reasoningEffort: null } });
+      assert.equal(cleared.status, 200, await cleared.text());
+      assert.deepEqual(config.reviewer, { modelId: null, reasoningEffort: null });
+    } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); store.close(); }
+  }
+});
+
 test('PUT and GET /api/config persist an API coordinator reference without any key value', async () => {
   const f = await createFixture();
   try {
@@ -877,6 +920,68 @@ test('PUT and GET /api/config persist an API coordinator reference without any k
     }) });
     assert.equal(invalid.status, 400);
     assert.match((await invalid.json() as { error: string }).error, /HTTPS/);
+  } finally { await f.close(); }
+});
+
+test('settings preserve unavailable existing execution defaults without accepting changes or new projects', async () => {
+  const f = await createFixture();
+  try {
+    const defaults = { global: { model: 'glm-main', reasoningEffort: 'low' },
+      projects: { [f.repoPath]: { harness: 'zcode', reasoningEffort: 'high' } } };
+    await f.config.write({ ...await f.config.read(), executionDefaults: defaults });
+    f.adapter.cap.available = false;
+    const read = await (await fetch(`${f.url}/api/config`)).json() as {
+      allocator: unknown; reviewer: unknown; executionDefaults: { global: unknown; projects: Array<{ repoPath: string; execution: unknown }> } };
+    const edited = { ...read, allocator: { kind: 'api', modelId: null, reasoningEffort: null,
+      api: { baseUrl: 'https://provider.example/v1', model: 'router', keyEnv: 'ZERO_ROUTER_KEY' } } };
+    const put = (body: unknown) => fetch(`${f.url}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const saved = await put(edited);
+    assert.equal(saved.status, 200, await saved.text());
+    assert.deepEqual((await f.config.read()).executionDefaults, defaults);
+    const anotherRepo = join(f.root, 'another-repo');
+    await mkdir(anotherRepo);
+    await execFileAsync('git', ['init', '--initial-branch=main'], { cwd: anotherRepo, windowsHide: true });
+    for (const executionDefaults of [
+      { ...read.executionDefaults, global: { modelId: 'glm-main', reasoningEffort: 'high' } },
+      { ...read.executionDefaults, global: null },
+      { ...read.executionDefaults, global: { modelId: 'glm-main', reasoningEffort: 'low', extra: 'invalid' } },
+      { ...read.executionDefaults, projects: [{ repoPath: f.repoPath, execution: { harnessId: 'zcode', reasoningEffort: 'low' } }] },
+      { ...read.executionDefaults, projects: [{ repoPath: anotherRepo, execution: read.executionDefaults.projects[0]!.execution }] },
+      { ...read.executionDefaults, projects: [{ ...read.executionDefaults.projects[0]!, extra: 'invalid' }] },
+    ]) {
+      const before = await readFile(f.config.path, 'utf8');
+      const rejected = await put({ ...edited, executionDefaults });
+      assert.equal(rejected.status, 400, await rejected.text());
+      assert.equal(await readFile(f.config.path, 'utf8'), before);
+    }
+    const removed = await put({ ...edited, executionDefaults: { ...read.executionDefaults, projects: [] } });
+    assert.equal(removed.status, 200, await removed.text());
+    const cleared = await put({ ...edited, executionDefaults: { global: null, projects: [] } });
+    assert.equal(cleared.status, 200, await cleared.text());
+    assert.deepEqual((await f.config.read()).executionDefaults, { global: null, projects: {} });
+    const projectOnly = { global: null, projects: { [f.repoPath]: { model: 'glm-main', reasoningEffort: 'high' } } };
+    await f.config.write({ ...await f.config.read(), executionDefaults: projectOnly });
+    const projectRead = await (await fetch(`${f.url}/api/config`)).json();
+    const projectSaved = await put(projectRead);
+    assert.equal(projectSaved.status, 200, await projectSaved.text());
+    assert.deepEqual((await f.config.read()).executionDefaults, projectOnly);
+  } finally { await f.close(); }
+});
+
+test('changing a global preset revalidates an unchanged project inherited selection', async () => {
+  const f = await createFixture(true, undefined, true);
+  try {
+    await f.config.write({ ...await f.config.read(), executionDefaults: {
+      global: { model: 'glm-main' }, projects: { [f.repoPath]: { harness: 'zcode' } },
+    } });
+    const read = await (await fetch(`${f.url}/api/config`)).json() as { executionDefaults: { global: unknown; projects: unknown[] } };
+    const before = await readFile(f.config.path, 'utf8');
+    const response = await fetch(`${f.url}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      ...read, executionDefaults: { ...read.executionDefaults, global: { modelId: 'codex-main' } },
+    }) });
+    assert.equal(response.status, 400);
+    assert.match((await response.json() as { error: string }).error, /effective selection/);
+    assert.equal(await readFile(f.config.path, 'utf8'), before);
   } finally { await f.close(); }
 });
 

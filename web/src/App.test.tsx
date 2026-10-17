@@ -173,6 +173,28 @@ describe('task workspace', () => {
     unmount();
     expect(signal?.aborted).toBe(true);
   });
+  it('shows unavailable saved role choices and preserves them while saving an unrelated edit', async () => {
+    const stored = { allocator: { kind: 'codex' as const, modelId: 'saved-router', reasoningEffort: 'high' },
+      reviewer: { modelId: 'saved-reviewer', reasoningEffort: 'xhigh' } };
+    vi.mocked(api.config).mockResolvedValue(stored);
+    vi.mocked(api.saveConfig).mockImplementation(async value => value);
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    fireEvent.click(screen.getByRole('button', { name: '路由设置' }));
+    const router = await screen.findByLabelText('默认模型');
+    const reviewer = screen.getByLabelText('审核模型');
+    expect((router as HTMLSelectElement).value).toBe('saved-router');
+    expect((reviewer as HTMLSelectElement).value).toBe('saved-reviewer');
+    expect(within(router).getByRole('option', { name: 'saved-router（当前不可用）' })).toBeTruthy();
+    expect((screen.getByLabelText('审核思考强度') as HTMLSelectElement).value).toBe('xhigh');
+    fireEvent.change(screen.getByLabelText('分配器来源'), { target: { value: 'api' } });
+    fireEvent.change(screen.getByLabelText(/^API HTTPS 地址/), { target: { value: 'https://provider.example/v1' } });
+    fireEvent.change(screen.getByLabelText('API 模型'), { target: { value: 'router' } });
+    fireEvent.change(screen.getByLabelText(/^密钥环境变量名/), { target: { value: 'ZERO_ROUTER_KEY' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+    await screen.findByRole('status');
+    expect(api.saveConfig).toHaveBeenCalledWith(expect.objectContaining({ reviewer: stored.reviewer }));
+  });
   it('disables every settings field while saving the edited configuration', async () => {
     vi.mocked(api.saveConfig).mockReturnValue(new Promise(() => {}));
     render(<App />);

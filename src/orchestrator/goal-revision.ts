@@ -22,13 +22,13 @@ export function buildGoalRevisionSubmission(
 
   const finalTask = sequence.steps[sequence.steps.length - 1]!.task;
   const checksByArgv = new Map<string, string[]>();
-  for (const step of sequence.steps) {
-    for (const check of step.task.checks ?? []) {
-      const argvKey = JSON.stringify(check.argv);
-      if (!checksByArgv.has(argvKey)) checksByArgv.set(argvKey, [...check.argv]);
-      if (checksByArgv.size > MAX_GOAL_REVISION_CHECKS) {
-        throw new Error(`Goal revision exceeds the ${MAX_GOAL_REVISION_CHECKS} distinct-check limit`);
-      }
+  // Earlier checks may describe intermediate files intentionally replaced by
+  // later steps. Their results remain historical evidence for the goal review.
+  for (const check of finalTask.checks ?? []) {
+    const argvKey = JSON.stringify(check.argv);
+    if (!checksByArgv.has(argvKey)) checksByArgv.set(argvKey, [...check.argv]);
+    if (checksByArgv.size > MAX_GOAL_REVISION_CHECKS) {
+      throw new Error(`Goal revision exceeds the ${MAX_GOAL_REVISION_CHECKS} distinct-check limit`);
     }
   }
   const checks: CheckDefinition[] = [...checksByArgv.values()].map((argv, index) => ({
