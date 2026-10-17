@@ -28,7 +28,8 @@
 - 真 Edge 桌面 1440px 与移动 375px 验证：阶段目标编辑/重排/提交、执行自述纯文本、检查历史折叠、失去提交响应后使用同 key 重试、无横向溢出、无 pageerror。使用真实静态服务与 CSP，数据为隔离 fixture，不代表生产模型任务。
 - `b607512` 的本机完整核心 **390/390** 通过（约 12 分钟）；[精确提交 CI](https://github.com/Jonty-Zhang/Zero/actions/runs/39028494727) 的 Linux 与 Windows 全部成功，包括 guardian、打包、安装/卸载 smoke。Linux 日志确认 core 390、frontend 17、API 10 无失败。
 - 最后两项展示问题均经过 RED→GREEN：35 项服务端/证据测试、11 项真实 Git 与证据测试、前端全套 **18/18**、API **10/10**、类型检查及生产构建通过。独立复审确认无遗留 Important/Critical；最终新增回归使核心测试总数增加至 391。新增提交的精确 CI 结果以 [PR 检查](https://github.com/Jonty-Zhang/Zero/pull/1/checks) 为准，不把此前提交结果冒充后续提交结果。
-- 后续默认流程审查真实复现 npm 启动阻塞，4 项新测试覆盖配套/PATH Node 选择、缺 Node、命令扩展名、坏 shim、空格与 shell 字符参数、未知 wrapper 失败，以及真实安装 npm 执行隔离项目的 `npm test`；连同原 TestRunner 回归 **5/5** 通过。真实 `npm --version`、`npx --version` 从失败变为通过；没有安装包或请求模型。独立审查提出的 Node 版本和不存在显式路径问题均以 RED→GREEN 修正并复审通过。核心总数现为 395，两个实际 Windows 执行用例只在 Windows 运行。
+- 后续默认流程审查真实复现 npm 启动阻塞，4 项新测试覆盖配套/PATH Node 选择、缺 Node、命令扩展名、坏 shim、空格与 shell 字符参数、未知 wrapper 失败，以及真实安装 npm 执行隔离项目的 `npm test`；连同原 TestRunner 回归 **5/5** 通过。真实 `npm --version`、`npx --version` 从失败变为通过；没有安装包或请求模型。独立审查提出的 Node 版本和不存在显式路径问题均以 RED→GREEN 修正并复审通过。
+- 同一链路还复现 API 错拒 `npm test -- --runInBand`：移除对标准 `--` 字面分隔符的误拦截，保留命令分词与 shell 控制字符限制；新增真实 HTTP 用例证明 npm/node 参数原样持久。服务端、调用解析及执行器共 **36/36** 通过，独立审查通过。核心测试总数现为 396，两个实际 Windows 执行用例只在 Windows 运行。
 
 ## 保留的边界
 

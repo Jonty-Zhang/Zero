@@ -14,6 +14,18 @@ import { createCodexAdapter, createZeroServer, type TaskStorePort } from './serv
 
 const execFileAsync = promisify(execFile);
 
+test('check commands preserve the standard end-of-options separator for npm and node', async () => {
+  const f = await createFixture();
+  try {
+    const response = await fetch(`${f.url}/api/tasks`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repoPath: f.repoPath, prompt: 'Run the repository checks with explicit test arguments.',
+        checkCommands: ['npm test -- --runInBand', 'node --test -- tests/example.test.cjs'] }) });
+    assert.equal(response.status, 201, await response.text());
+    const task = f.store.list()[0]!;
+    assert.deepEqual(task.checks?.map(check => check.argv), [['npm', 'test', '--', '--runInBand'], ['node', '--test', '--', 'tests/example.test.cjs']]);
+  } finally { await f.close(); }
+});
+
 function getWithHost(url: string, host: string): Promise<{ status: number; body: string }> {
   const target = new URL(url);
   return new Promise((resolveResponse, reject) => {

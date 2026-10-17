@@ -481,7 +481,7 @@ function parseChecks(value: unknown): CheckDefinition[] {
     if (line.length > 2000 || /[\0\r\n]/.test(line) || /[;&|<>`$]/.test(line)) throw new HttpError(400, `第 ${index + 1} 条检查命令包含不支持的 shell 控制字符`);
     const argv = tokenize(line);
     if (!argv.length) throw new HttpError(400, `第 ${index + 1} 条检查命令为空`);
-    if (argv.some(arg => arg.startsWith('@(') || arg.startsWith('$(') || arg.startsWith('-') && arg === '--')) throw new HttpError(400, `第 ${index + 1} 条检查命令参数无效`);
+    if (argv.some(arg => arg.startsWith('@(') || arg.startsWith('$('))) throw new HttpError(400, `第 ${index + 1} 条检查命令参数无效`);
     return { id: `check-${index + 1}`, argv };
   });
 }
