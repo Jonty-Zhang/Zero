@@ -569,11 +569,7 @@ export class TaskWorker {
         }
         revision = revisionSteps.at(-1)?.revisionAfter ?? reworkResume.continuation.revisionAfter;
         if (task.revisionCount !== revision) throw new Error("Review rework revision count differs from its append-only revision high-water");
-        const reviewVerdict = this.#options.store.getPackageReviewVerdict(reworkResume.continuation.verdictId);
-        if (!reviewVerdict || reviewVerdict.packageId !== reworkResume.continuation.packageId
-          || reviewVerdict.result.verdict !== "changes_requested") {
-          throw new Error("Review rework continuation verdict binding is missing or no longer requests changes");
-        }
+        const reviewRequirements = this.#reviewReworkRequirements(taskId, reworkResume.continuation.id);
         if (latestFailedStep) {
           const failedChecks = this.#options.store.checkRunResults(latestFailedStep.failedCheckRunId);
           if (latestFailedStep.integrityFailureHash) {
@@ -586,9 +582,9 @@ export class TaskWorker {
           if (!failedChecks.length || failedChecks.every(check => check.status === "passed")) {
             throw new Error("Review rework revision step has no persisted failed check results");
           }
-          revisionBrief = this.#revisionBrief(task, failedChecks, undefined, revision);
+          revisionBrief = this.#revisionBrief(task, failedChecks, reviewRequirements, revision);
         } else {
-          revisionBrief = this.#revisionBrief(task, [], reviewVerdict.result, revision);
+          revisionBrief = this.#revisionBrief(task, [], reviewRequirements, revision);
         }
         finalRoute = undefined;
         finalChecks = [];
@@ -960,7 +956,7 @@ export class TaskWorker {
             if (retry.kind === "revision_limit") return retry.task;
             task = retry.task;
             revision = retry.step.revisionAfter;
-            revisionBrief = this.#revisionBrief(task, failedChecks, undefined, revision);
+            revisionBrief = this.#revisionBrief(task, failedChecks, this.#reviewReworkRequirements(taskId, reviewReworkContinuationId), revision);
             executionStage = undefined;
             executionAttempt = undefined;
             finalRoute = undefined;
@@ -1776,6 +1772,17 @@ export class TaskWorker {
     const regexes = allowed.map(globRegex);
     const denied = paths.filter(path => !regexes.some(regex => regex.test(path)));
     if (denied.length) throw new Error(`Changed files outside allowedPaths: ${denied.join(", ")}`);
+  }
+
+  #reviewReworkRequirements(taskId: string, continuationId: string): ReviewResult {
+    const continuation = this.#options.store.getReviewReworkContinuation(taskId, continuationId);
+    const verdict = continuation && this.#options.store.getPackageReviewVerdict(continuation.verdictId);
+    if (!continuation || continuation.id !== this.#options.store.getReviewReworkContinuation(taskId)?.id
+      || !verdict || verdict.taskId !== taskId || verdict.packageId !== continuation.packageId
+      || verdict.result.verdict !== "changes_requested") {
+      throw new Error("Review rework continuation verdict binding is missing or no longer requests changes");
+    }
+    return verdict.result;
   }
 
   #revisionBrief(task: TaskRecord, failed: CheckResult[], review: ReviewResult | undefined, revision: number): string {

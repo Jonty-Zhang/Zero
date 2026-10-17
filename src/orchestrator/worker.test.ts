@@ -693,7 +693,8 @@ test("guardian review rework recovery restarts route and validation from the reg
           writerCalls++;
           assert.equal(request.cwd, plan.path);
           if (failedCheckBoundary) assert.match(request.prompt, /Failed checks:/);
-          else assert.match(request.prompt, /Reviewer verdict: changes_requested/);
+          assert.match(request.prompt, /Reviewer verdict: changes_requested/);
+          assert.match(request.prompt, /Rewrite result.txt with the approved marker\./);
           if (["mid-writer", "post-writer", "failed-check-before-retry", "failed-check-after-retry"].includes(boundary)) {
             assert.match(request.prompt, /partial edits from the interrupted reviewer-requested revision/);
           }
