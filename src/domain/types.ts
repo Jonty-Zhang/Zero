@@ -77,9 +77,12 @@ export interface TaskSequenceRecord {
 
 /** Publicly useful aggregate goal-review state retained with a sequence. */
 export interface SequenceGoalReview {
+  attemptId?: string;
   state: "running" | "quota" | "verdict";
   result?: ReviewResult;
   retryAt?: string;
+  /** A user-requested retry is queued for this exact blocked attempt. */
+  retryRequestedAt?: string;
   createdAt: string;
   completedAt?: string;
 }

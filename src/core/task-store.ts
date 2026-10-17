@@ -215,6 +215,17 @@ export interface SequenceGoalReviewRecord {
   retryAt?: string;
   createdAt: string;
   completedAt?: string;
+  retryRequestedAt?: string;
+}
+
+export interface SequenceGoalReviewRetryRequest {
+  sequenceId: string;
+  sourceAttemptId: string;
+  requestedAt: string;
+}
+
+export class GoalReviewRetryConflictError extends Error {
+  constructor(message: string) { super(message); this.name = "GoalReviewRetryConflictError"; }
 }
 
 export type ReviewedTaskSequenceRecord = TaskSequenceRecord & {
@@ -1351,6 +1362,8 @@ export class TaskStore {
     const handoffError = firstUnfinished ? this.#sequenceHandoffError(firstUnfinished.task.id) : undefined;
     let status: TaskSequenceStatus;
     const goalReview = this.sequenceGoalReview(id);
+    const retryRequest = goalReview?.result?.verdict === "blocked" ? this.pendingSequenceGoalReviewRetry(id) : undefined;
+    if (goalReview && retryRequest?.sourceAttemptId === goalReview.attemptId) goalReview.retryRequestedAt = retryRequest.requestedAt;
     if (steps.length > 0 && steps.every(step => step.task.status === "done")) {
       if (sequence.objective === null && sequence.acceptance_criteria === null) status = "completed";
       else if (goalReview?.state === "verdict" && goalReview.result?.verdict === "pass") status = "completed";
@@ -1396,29 +1409,79 @@ export class TaskStore {
     return row ? this.#sequenceGoalReview(row) : undefined;
   }
 
-  startSequenceGoalReview(sequenceId: string, evidenceFingerprint: string, attemptId: string = randomUUID(), now = new Date()): SequenceGoalReviewRecord {
+  requestSequenceGoalReviewRetry(sequenceId: string, expectedAttemptId: string, now = new Date()): SequenceGoalReviewRetryRequest {
+    return this.#transaction(() => {
+      const latest = this.sequenceGoalReview(sequenceId);
+      if (!this.#completedSequenceHasGoal(sequenceId) || latest?.attemptId !== expectedAttemptId ||
+          latest.state !== "verdict" || latest.result?.verdict !== "blocked") {
+        throw new GoalReviewRetryConflictError("Only the latest blocked goal review of a completed sequence can be retried");
+      }
+      const existing = this.#goalReviewRetryRequest(sequenceId, expectedAttemptId);
+      if (existing) return existing;
+      const requestedAt = now.toISOString();
+      this.#event(this.#goalReviewEventTask(sequenceId), "task_sequence.goal_review_retry_requested",
+        { sequenceId, sourceAttemptId: expectedAttemptId }, requestedAt);
+      return { sequenceId, sourceAttemptId: expectedAttemptId, requestedAt };
+    });
+  }
+
+  pendingSequenceGoalReviewRetry(sequenceId: string): SequenceGoalReviewRetryRequest | undefined {
+    if (!this.#completedSequenceHasGoal(sequenceId)) return undefined;
+    const latest = this.sequenceGoalReview(sequenceId);
+    if (latest?.state !== "verdict" || latest.result?.verdict !== "blocked") return undefined;
+    return this.#goalReviewRetryRequest(sequenceId, latest.attemptId);
+  }
+
+  #completedSequenceHasGoal(sequenceId: string): boolean {
+    const sequence = this.#db.prepare("SELECT objective,acceptance_criteria FROM task_sequences WHERE id=?").get(sequenceId) as
+      { objective: string | null; acceptance_criteria: string | null } | undefined;
+    if (!sequence || (sequence.objective === null && sequence.acceptance_criteria === null)) return false;
+    const count = this.#db.prepare(`SELECT COUNT(*) AS n,SUM(CASE WHEN t.status='done' THEN 1 ELSE 0 END) AS done
+      FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id WHERE s.sequence_id=?`).get(sequenceId) as { n: number; done: number | null };
+    return count.n >= 2 && Number(count.done) === Number(count.n);
+  }
+
+  #goalReviewRetryRequest(sequenceId: string, sourceAttemptId: string): SequenceGoalReviewRetryRequest | undefined {
+    const rows = this.#db.prepare("SELECT at,payload FROM events WHERE task_id=? AND type='task_sequence.goal_review_retry_requested' ORDER BY id")
+      .all(this.#goalReviewEventTask(sequenceId)) as Array<{ at: string; payload: string | null }>;
+    for (const row of rows) {
+      const payload = decode(row.payload) as Record<string, unknown> | undefined;
+      if (payload?.sequenceId === sequenceId && payload.sourceAttemptId === sourceAttemptId) {
+        return { sequenceId, sourceAttemptId, requestedAt: row.at };
+      }
+    }
+    return undefined;
+  }
+
+  startSequenceGoalReview(sequenceId: string, evidenceFingerprint: string, attemptId: string = randomUUID(), now = new Date(),
+    retryOfAttemptId?: string, expectedPreviousAttemptId?: string | null): SequenceGoalReviewRecord {
     if (!/^[a-f0-9]{64}$/.test(evidenceFingerprint)) throw new Error("Aggregate goal evidence fingerprint must be a SHA-256 digest");
-    const createdAt = now.toISOString();
     this.#transaction(() => {
-      const sequence = this.#db.prepare("SELECT objective,acceptance_criteria FROM task_sequences WHERE id=?").get(sequenceId) as
-        { objective: string | null; acceptance_criteria: string | null } | undefined;
-      const count = this.#db.prepare("SELECT COUNT(*) AS n, SUM(CASE WHEN t.status='done' THEN 1 ELSE 0 END) AS done FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id WHERE s.sequence_id=?")
-        .get(sequenceId) as { n: number; done: number | null } | undefined;
-      if (!sequence || (sequence.objective === null && sequence.acceptance_criteria === null) || !count || count.n < 2 || Number(count.done) !== Number(count.n)) {
+      const latest = this.sequenceGoalReview(sequenceId);
+      if (expectedPreviousAttemptId !== undefined && (latest?.attemptId ?? null) !== expectedPreviousAttemptId) {
+        throw new GoalReviewRetryConflictError("The aggregate goal review changed before this attempt could start");
+      }
+      if (retryOfAttemptId !== undefined) {
+        const pending = this.pendingSequenceGoalReviewRetry(sequenceId);
+        if (!pending || pending.sourceAttemptId !== retryOfAttemptId) {
+          throw new GoalReviewRetryConflictError("The requested goal review retry is missing, stale or no longer eligible");
+        }
+      }
+      if (!this.#completedSequenceHasGoal(sequenceId)) {
         throw new Error("Aggregate goal review requires goal metadata and every sequence step authoritatively DONE");
       }
-      const latest = this.#db.prepare("SELECT state,generation_id,created_at,retry_at FROM task_sequence_goal_reviews WHERE sequence_id=? ORDER BY created_at DESC,attempt_id DESC LIMIT 1")
-        .get(sequenceId) as { state: string; generation_id: string; created_at: string; retry_at: string | null } | undefined;
-      if (latest?.state === "running" && latest.generation_id === this.#startupGeneration.id && Date.parse(latest.created_at) + 15 * 60_000 > now.getTime()) {
+      if (latest?.state === "running" && latest.generationId === this.#startupGeneration.id && Date.parse(latest.createdAt) + 15 * 60_000 > now.getTime()) {
         throw new Error("An aggregate goal review attempt is already active for this sequence");
       }
-      if (latest?.state === "quota" && latest.retry_at && Date.parse(latest.retry_at) > now.getTime()) {
+      if (latest?.state === "quota" && latest.retryAt && Date.parse(latest.retryAt) > now.getTime()) {
         throw new Error("An aggregate goal review attempt is waiting for quota");
       }
+      const createdAt = new Date(Math.max(now.getTime(), latest ? Date.parse(latest.createdAt) + 1 : -Infinity)).toISOString();
       this.#db.prepare("INSERT INTO task_sequence_goal_reviews(attempt_id,sequence_id,generation_id,evidence_fingerprint,state,created_at) VALUES(?,?,?,?,'running',?)")
         .run(attemptId, sequenceId, this.#startupGeneration.id, evidenceFingerprint, createdAt);
       this.#event((this.#db.prepare("SELECT task_id FROM task_sequence_steps WHERE sequence_id=? ORDER BY position LIMIT 1").get(sequenceId) as { task_id: string }).task_id,
-        "task_sequence.goal_review_started", { sequenceId, attemptId, evidenceFingerprint }, createdAt);
+        "task_sequence.goal_review_started", { sequenceId, attemptId, evidenceFingerprint,
+          ...(retryOfAttemptId !== undefined ? { retryOfAttemptId } : {}) }, createdAt);
     });
     return this.sequenceGoalReviewByAttempt(attemptId)!;
   }
