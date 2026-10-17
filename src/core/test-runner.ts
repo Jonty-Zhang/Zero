@@ -4,6 +4,7 @@ import { createWriteStream } from "node:fs";
 import { basename, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { CheckDefinition, CheckResult } from "../domain/types.js";
+import { resolveCheckInvocation } from "./check-invocation.js";
 
 export interface TestRunnerOptions {
   timeoutMs?: number;
@@ -39,6 +40,11 @@ export class TestRunner {
       throw new Error("Check requires an id and a non-empty argv array");
     }
     const started = Date.now();
+    const environment = this.#safeEnvironment();
+    let invocation;
+    try { invocation = await resolveCheckInvocation(check.argv, cwd, environment); }
+    catch (error) { return { id: check.id, argv: [...check.argv], status: 'spawn_error', exitCode: null,
+      durationMs: Date.now() - started, error: error instanceof Error ? error.message : String(error) }; }
     const logName = `${basename(check.id).replace(/[^a-zA-Z0-9_-]/g, "_")}-${randomUUID()}`;
     let stdoutPath: string | undefined;
     let stderrPath: string | undefined;
@@ -56,14 +62,20 @@ export class TestRunner {
     let timedOut = false;
     let logTruncated = false;
     let spawnError: string | undefined;
-    const child = spawn(check.argv[0], check.argv.slice(1), {
+    const finishLogs = () => Promise.all([new Promise<void>(r => stdoutFile?.end(r) ?? r()), new Promise<void>(r => stderrFile?.end(r) ?? r())]);
+    let child: ReturnType<typeof spawn>;
+    try { child = spawn(invocation.executable, invocation.args, {
       cwd,
       shell: false,
       windowsHide: true,
       detached: process.platform !== "win32",
-      env: this.#safeEnvironment(),
+      env: environment,
       stdio: ["ignore", "pipe", "pipe"],
-    });
+    }); } catch (error) {
+      await finishLogs();
+      return { id: check.id, argv: [...check.argv], status: 'spawn_error', exitCode: null, durationMs: Date.now() - started,
+        stdoutPath, stderrPath, error: error instanceof Error ? error.message : String(error) };
+    }
     const tee = (stream: NodeJS.ReadableStream, file: ReturnType<typeof createWriteStream> | undefined, size: () => number, setSize: (n: number) => void) => {
       stream.on("data", (chunk: Buffer) => {
         const next = size() + chunk.length;
@@ -114,7 +126,7 @@ export class TestRunner {
       child.once("error", error => { spawnError = error.message; finish(null); });
       child.once("close", code => finish(code));
     });
-    await Promise.all([new Promise<void>(r => stdoutFile?.end(r) ?? r()), new Promise<void>(r => stderrFile?.end(r) ?? r())]);
+    await finishLogs();
     if (logTruncated) {
       await Promise.all([
         stdoutPath ? new Promise<void>(r => { const file = createWriteStream(stdoutPath!, { flags: "a" }); file.end("\n[Zero truncated log at configured byte limit]\n", r); }) : Promise.resolve(),

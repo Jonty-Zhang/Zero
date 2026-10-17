@@ -64,5 +64,6 @@ Files: web/src/App.tsx, web/src/types.ts, web/src/styles.css and frontend tests.
 - [x] Select current check runs by writer, stage and recovery boundary, retaining old results separately and exposing independent integrity failures.
 - [x] Stream structured executor finals beyond bounded logs, reject conflicting model evidence, redact split secrets and distinguish provider errors from quoted quota text.
 - [x] Preserve package/verdict-bound reviewer findings through failed-check rework retries and guardian recovery; verify six-writer relay and interrupted boundaries.
+- [x] Fix reproduced Windows `npm test`/`npx` spawn failures with direct Node-entry invocation, preserving companion/PATH Node choice, exact command existence, argument boundaries, and failure recording. Verify a real isolated npm package without network installation.
 
 Evidence and remaining limitations are recorded in [the second audit](../../2026-10-17-semantic-relay-audit.md). All implementation commits are incrementally pushed to the existing branch; no merge is authorized or performed.

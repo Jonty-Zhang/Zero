@@ -16,6 +16,7 @@
 | 返工检查再失败后丢失原审查要求 | 重建 revision brief 时传入 `review=undefined`；guardian 恢复同样遗漏 | 活跃 continuation 绑定原 package/verdict，后续检查重试与恢复都携带具体审查要求。六次写入、两轮审查、一次中间检查失败的真实 Git 回归验证；不扩大 revision 次数或完成门禁 |
 | 不可证明的 Git 失败在网页只剩绿色命令 | HEAD/分支移动或未知 I/O 无法建立完整 integrity record，但该批次仍已失败 | 独立复审复现后，按准确 attempt 与事件边界补回已保存的失败 gate；完全缺少 gate 时显示 failed-run 原因。6 项真实 Git 流程通过 HTTP 复验；检查批次建立前的 I/O 失败只保留历史检查，不复用旧绿色结果 |
 | 执行者自述遮住实际错误 | attempt.summary 优先采用模型 final，即使机器报告模型身份不符 | 机器错误优先，另以 executorSummary 显示有来源的非可信自述；API 与网页回归覆盖“自述完成但实际失败” |
+| Windows 上默认 npm 检查根本无法启动 | TestRunner 用 shell:false 直接 spawn npm；Windows npm/npx 通常为 .cmd，实际复现 spawn npm ENOENT | 按 PATH 及准确命令文件找到已安装 npm/npx 的 JS 入口，直接由同目录 Node 或 PATH Node 执行；保持 argv 边界、原始检查定义和既有环境限制，不自动启用 shell。不存在的显式路径和未知脚本不冒充成功，启动同步异常保存为 spawn_error |
 
 ## 证据与记录
 
@@ -27,6 +28,7 @@
 - 真 Edge 桌面 1440px 与移动 375px 验证：阶段目标编辑/重排/提交、执行自述纯文本、检查历史折叠、失去提交响应后使用同 key 重试、无横向溢出、无 pageerror。使用真实静态服务与 CSP，数据为隔离 fixture，不代表生产模型任务。
 - `b607512` 的本机完整核心 **390/390** 通过（约 12 分钟）；[精确提交 CI](https://github.com/Jonty-Zhang/Zero/actions/runs/39028494727) 的 Linux 与 Windows 全部成功，包括 guardian、打包、安装/卸载 smoke。Linux 日志确认 core 390、frontend 17、API 10 无失败。
 - 最后两项展示问题均经过 RED→GREEN：35 项服务端/证据测试、11 项真实 Git 与证据测试、前端全套 **18/18**、API **10/10**、类型检查及生产构建通过。独立复审确认无遗留 Important/Critical；最终新增回归使核心测试总数增加至 391。新增提交的精确 CI 结果以 [PR 检查](https://github.com/Jonty-Zhang/Zero/pull/1/checks) 为准，不把此前提交结果冒充后续提交结果。
+- 后续默认流程审查真实复现 npm 启动阻塞，4 项新测试覆盖配套/PATH Node 选择、缺 Node、命令扩展名、坏 shim、空格与 shell 字符参数、未知 wrapper 失败，以及真实安装 npm 执行隔离项目的 `npm test`；连同原 TestRunner 回归 **5/5** 通过。真实 `npm --version`、`npx --version` 从失败变为通过；没有安装包或请求模型。独立审查提出的 Node 版本和不存在显式路径问题均以 RED→GREEN 修正并复审通过。核心总数现为 395，两个实际 Windows 执行用例只在 Windows 运行。
 
 ## 保留的边界
 
