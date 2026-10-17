@@ -76,15 +76,24 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - name: Build runtime assets for release staging
+      - name: Install Windows core dependencies
         shell: pwsh
-        run: |
-          npm ci
-          npm test
-          npm --prefix web ci
-          npm --prefix web test
-          node --test web/tests/api.test.mjs
-          npm --prefix web run build
+        run: npm ci
+      - name: Build and test Windows core
+        shell: pwsh
+        run: npm test
+      - name: Install Windows web dependencies
+        shell: pwsh
+        run: npm --prefix web ci
+      - name: Test Windows web interactions
+        shell: pwsh
+        run: npm --prefix web test
+      - name: Test Windows web request lifecycle
+        shell: pwsh
+        run: node --test web/tests/api.test.mjs
+      - name: Build Windows web application
+        shell: pwsh
+        run: npm --prefix web run build
       - name: Verify Windows release staging
         shell: pwsh
         run: |
@@ -92,6 +101,7 @@ jobs:
           $nodeLicense = Join-Path (Split-Path -Parent $nodeExe) 'LICENSE'
           if (-not (Test-Path -LiteralPath $nodeLicense -PathType Leaf)) { throw 'Node distribution LICENSE was not found beside node.exe' }
           node --test scripts/tests/stage-windows-release.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release staging tests failed' }
           $releaseDir = Join-Path (Get-Location) 'release-stage'
           node scripts/stage-windows-release.mjs --node-exe $nodeExe --node-license $nodeLicense --guardian-exe (Resolve-Path .\guardian.exe).Path --output-dir $releaseDir
           if ($LASTEXITCODE -ne 0) { throw 'Windows release staging failed' }
