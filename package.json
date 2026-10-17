@@ -9,7 +9,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
-    "test": "npm run build && node --test \"dist/**/*.test.js\""
+    "test": "npm run build && node --import ./scripts/test-environment.mjs --test \"dist/**/*.test.js\""
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

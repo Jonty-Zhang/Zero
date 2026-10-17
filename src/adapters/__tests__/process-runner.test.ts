@@ -102,7 +102,8 @@ test('runner terminates a process that exceeds its time budget', async () => {
     cwd: process.cwd(), env: {}, timeoutMs: 100,
   });
   assert.equal(result.status, 'timed_out');
-  assert.equal(result.exitCode, null);
+  // POSIX signals commonly yield null; Windows taskkill may yield a nonzero code.
+  assert.notEqual(result.exitCode, 0);
   assert.match(result.error ?? '', /exceeded 100 ms/);
 });
 
