@@ -29,7 +29,7 @@ function routeFor(taskId: string): RouteDecision {
     fieldSources: { harness: 'codex', model: 'codex', reasoningEffort: 'codex' }, reason: 'E2E fixture route', decidedAt: new Date().toISOString() };
 }
 
-test('two ordered tasks persist reports, aggregate changes_requested appends remediation, and final PASS completes the goal', async () => {
+async function runGoalRemediationScenario(options: { rename?: boolean; breakFinalCheck?: boolean } = {}): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'zero-goal-e2e-'));
   const repo = join(root, 'repo');
   const dbPath = join(root, 'tasks.sqlite');
@@ -41,10 +41,13 @@ test('two ordered tasks persist reports, aggregate changes_requested appends rem
     const sequence = store.createSequence([
       { repoPath: repo, baseRef: 'main', prompt: 'Create first.txt', maxRevisions: 0,
         checks: [{ id: 'first-file-exists', argv: [process.execPath, '-e', "require('node:fs').accessSync('first.txt')"] }] },
-      { repoPath: repo, baseRef: 'main', prompt: 'Create second.txt and keep first.txt', maxRevisions: 0,
-        checks: [{ id: 'both-files-exist', argv: [process.execPath, '-e', "const fs=require('node:fs'); fs.accessSync('first.txt'); fs.accessSync('second.txt')"] }] },
-    ], 'goal-e2e-sequence', { objective: 'Create both files and document the aggregate result',
-      acceptanceCriteria: ['first.txt and second.txt exist', 'goal-proof.txt records the aggregate review remediation'], maxGoalRevisions: 2 });
+      { repoPath: repo, baseRef: 'main', prompt: options.rename ? 'Rename first.txt to second.txt and remove the old name' : 'Create second.txt and keep first.txt', maxRevisions: 0,
+        checks: [{ id: 'final-files', argv: [process.execPath, '-e', options.rename
+          ? "const fs=require('node:fs'); if(fs.existsSync('first.txt'))process.exit(1); fs.accessSync('second.txt')"
+          : "const fs=require('node:fs'); fs.accessSync('first.txt'); fs.accessSync('second.txt')"] }] },
+    ], 'goal-e2e-sequence', { objective: options.rename ? 'Create first.txt, rename it to second.txt, and document the aggregate result' : 'Create both files and document the aggregate result',
+      acceptanceCriteria: [options.rename ? 'second.txt exists and first.txt is removed' : 'first.txt and second.txt exist',
+        'goal-proof.txt records the aggregate review remediation'], maxGoalRevisions: 2 });
     const stepIds = sequence.steps.map(step => step.task.id);
     const aggregateVerdicts: ReviewResult[] = [
       { verdict: 'changes_requested', summary: 'The aggregate result needs a proof file.', findings: [
@@ -71,6 +74,10 @@ test('two ordered tasks persist reports, aggregate changes_requested appends rem
       async run(request) {
         const file = request.taskId === stepIds[0] ? 'first.txt' : request.taskId === stepIds[1] ? 'second.txt' : 'goal-proof.txt';
         await writeFile(join(request.cwd, file), `${file} approved\n`);
+        if (options.rename && request.taskId === stepIds[1]) await rm(join(request.cwd, 'first.txt'));
+        if (options.breakFinalCheck && !stepIds.includes(request.taskId)) {
+          await writeFile(join(request.cwd, 'first.txt'), 'The obsolete name must remain absent.\n');
+        }
         return { status: 'completed', exitCode: 0, requestedModel: request.model, actualModel: request.model, durationMs: 1 };
       },
     };
@@ -125,6 +132,8 @@ test('two ordered tasks persist reports, aggregate changes_requested appends rem
     assert.match(aggregateRequests[0]?.prompt ?? '', /second\.txt/);
     assert.match(aggregateRequests[0]?.prompt ?? '', /reportSha256/);
     assert.match(aggregateRequests[0]?.prompt ?? '', /cumulativeDiff/);
+    assert.match(aggregateRequests[0]?.prompt ?? '', /first-file-exists/);
+    assert.match(aggregateRequests[0]?.prompt ?? '', /final-files/);
     const firstAttemptId = changesRequested.goalReview?.attemptId;
     store.close();
 
@@ -138,10 +147,24 @@ test('two ordered tasks persist reports, aggregate changes_requested appends rem
     assert.equal(afterAppend.steps.length, 3);
     const remediation = afterAppend.steps[2]!.task;
     assert.match(remediation.prompt, /Create goal-proof\.txt/);
+    assert.equal(store.checks(stepIds[0]!).length, 1, 'the intermediate check remains in its original task history');
     const remediationClaim = store.claimNext('goal-remediation-worker');
     assert.equal(remediationClaim?.id, remediation.id);
     assert.equal(remediationClaim?.sequenceBaseCommit, secondReport?.resultCommit);
-    assert.equal((await worker().runClaimed(remediation.id, 'goal-remediation-worker')).status, 'done');
+    const remediationResult = await worker().runClaimed(remediation.id, 'goal-remediation-worker');
+    if (options.breakFinalCheck) {
+      assert.equal(remediationResult.status, 'failed');
+      assert.match(remediationResult.failureReason ?? '', /Validation failed after 2 content revisions/);
+      assert.equal(store.getSequence(sequence.id)?.status, 'blocked');
+      assert.deepEqual(remediation.checks?.map(check => check.argv), [afterAppend.steps[1]!.task.checks![0]!.argv]);
+      const failedChecks = store.checks(remediation.id);
+      assert.equal(failedChecks.length, 3, 'the final check runs initially and after each bounded content revision');
+      assert.ok(failedChecks.every(check => check.status === 'failed'));
+      assert.equal(aggregateRequests.length, 1, 'a broken final-step invariant prevents another aggregate PASS');
+      return;
+    }
+    assert.equal(remediationResult.status, 'done', remediationResult.failureReason);
+    assert.deepEqual(remediation.checks?.map(check => check.argv), [afterAppend.steps[1]!.task.checks![0]!.argv]);
     const remediationReport = await worker().readReport(remediation.id);
     assert.equal(remediationReport?.finalStatus, 'done');
     assert.ok(remediationReport?.resultCommit);
@@ -168,4 +191,16 @@ test('two ordered tasks persist reports, aggregate changes_requested appends rem
     store.close();
     await rm(root, { recursive: true, force: true });
   }
+}
+
+test('two ordered tasks persist reports, aggregate changes_requested appends remediation, and final PASS completes the goal', async () => {
+  await runGoalRemediationScenario();
+});
+
+test('goal remediation after a rename uses final checks and completes without restoring the intermediate file', async () => {
+  await runGoalRemediationScenario({ rename: true });
+});
+
+test('goal remediation still fails when it violates the final-step file constraint', async () => {
+  await runGoalRemediationScenario({ rename: true, breakFinalCheck: true });
 });
