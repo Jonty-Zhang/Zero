@@ -112,12 +112,13 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
           || diagnostic.actualModel && streamed.actualModel && diagnostic.actualModel !== streamed.actualModel),
         hasStructuredOutput: Boolean(diagnostic.hasStructuredOutput || streamed.hasStructuredOutput),
         providerErrors: [...new Set([...(diagnostic.providerErrors ?? []), ...(streamed.providerErrors ?? [])])],
+        lastProviderError: streamed.lastProviderError ?? diagnostic.lastProviderError ?? diagnostic.providerErrors?.at(-1),
       } : diagnostic;
       const modelMismatch = Boolean(parsed.modelConflict || parsed.actualModel && parsed.actualModel !== binding.model.modelId);
       const status = modelMismatch || parsed.outputError ? 'failed' : outcome.status === 'completed' && outcome.exitCode !== 0 ? 'failed' : outcome.status;
       const runError = parsed.modelConflict ? 'Harness reported conflicting model identities'
         : modelMismatch ? `Harness reported model ${parsed.actualModel}, expected ${binding.model.modelId}`
-          : parsed.outputError ?? outcome.error;
+          : parsed.outputError ?? outcome.error ?? (outcome.status === 'failed' && outcome.exitCode !== 0 ? parsed.lastProviderError : undefined);
       const artifactPaths = request.artifactDir
         ? await this.persistArtifacts(request.artifactDir, request.taskId, request.attemptId, outcome.stdout, outcome.stderr, parsed)
         : {};
@@ -138,7 +139,7 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
         error: runError,
       };
       const quota = outcome.status === 'failed' && outcome.exitCode !== 0 && !modelMismatch && !parsed.outputError
-        ? classifyQuota(parsed.hasStructuredOutput ? (parsed.providerErrors ?? []).join('\n') : plaintextProviderError(outcome.stderr))
+        ? classifyQuota(parsed.hasStructuredOutput ? parsed.lastProviderError ?? '' : plaintextProviderError(outcome.stderr))
         : undefined;
       return {
         status: result.status,
@@ -281,6 +282,7 @@ export function parseJsonLines(stdout: string, stderr = ''): ParsedOutput {
   return { events, finalText, actualModel, sessionId,
     ...(modelConflict ? { modelConflict: true } : {}),
     ...(hasStructuredOutput ? { hasStructuredOutput: true } : {}),
+    ...(providerErrors.length ? { lastProviderError: providerErrors.at(-1) } : {}),
     ...(providerErrors.length ? { providerErrors } : {}),
   };
 }
