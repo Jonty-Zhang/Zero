@@ -1,6 +1,6 @@
 # Agent Workspace Improvement Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Make cross-agent handoffs observable and the Zero web workspace readable, reliable, and testable.
 
@@ -51,10 +51,10 @@
 
 **Interfaces:** Client stage/handoff types match Task 2 exactly. Task detail binds displayed ID to selected ID. Independent validation section consumes `task.tests` regardless of attempts.
 
-- [ ] Reproduce checks hidden when attempts exist and stale task details during a delayed switch, using browser or component tests.
-- [ ] Fix task identity, request ordering, accessible dialog close behavior and human-readable API errors.
-- [ ] Render ordered stages, handoff summaries, routing and validation evidence with safe empty states.
-- [ ] Verify old records, failed requests, delayed responses and cancel target; build, review, commit and push.
+- [x] Reproduce checks hidden when attempts exist and stale task details during a delayed switch, using browser or component tests.
+- [x] Fix task identity, request ordering, accessible dialog close behavior and human-readable API errors.
+- [x] Render ordered stages, handoff summaries, routing and validation evidence with safe empty states.
+- [x] Verify old records, failed requests, delayed responses and cancel target; build, review, commit and push.
 
 ### Task 4: Workspace layout and task discovery
 
@@ -64,16 +64,16 @@
 
 **Ruling (2026-10-17 integration review):** The list API deliberately omits full prompts. Search uses fields actually present in list records; copy and fixtures must not promise full description search. Returning every historical 100,000-character prompt on each poll is outside this change. A future full-text search should be implemented server-side with its own contract.
 
-- [ ] Add meaningful tests for search/filter combinations, empty results and state counts.
-- [ ] Implement workspace navigation, summary, list/board switch and responsive visual design, using existing components and icons.
-- [ ] Keep mobile navigation visible; communicate actual connection and request errors.
-- [ ] Verify 1440px and 375px layouts, keyboard navigation and submit/sequence/settings flows; build, review, commit and push.
+- [x] Add meaningful tests for search/filter combinations, empty results and state counts.
+- [x] Implement workspace navigation, summary, list/board switch and responsive visual design, using existing components and icons.
+- [x] Keep mobile navigation visible; communicate actual connection and request errors.
+- [x] Verify 1440px and 375px layouts, keyboard navigation and submit/sequence/settings flows; build, review, commit and push.
 
 ### Task 5: Verified core bugs and final integration
 
 **Files:** Only root-cause-identified core/adaptor files and their regression tests, plus audit/docs/CI as appropriate.
 
-- [ ] Convert independently confirmed core findings into a failing regression before changing production code.
-- [ ] Apply narrow fixes without broad recovery/permission refactors; run targeted tests and full suite.
-- [ ] Review the complete branch independently, address actionable findings and run final checks.
-- [ ] Record exact test results, screenshots and remaining limitations; push final commits and verify remote head/CI.
+- [x] Convert independently confirmed core findings into a failing regression before changing production code.
+- [x] Apply narrow fixes without broad recovery/permission refactors; run targeted tests and full suite.
+- [x] Review the complete branch independently, address actionable findings and run final checks.
+- [x] Record exact test results, screenshots and remaining limitations; push final commits and verify remote head/CI.
