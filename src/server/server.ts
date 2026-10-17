@@ -256,16 +256,13 @@ async function capabilities(options: ZeroServerOptions) {
 
 async function readPublicConfig(options: ZeroServerOptions) {
   const config = await options.config.read();
-  const active = await capabilities(options);
-  const modelIds = new Set(active.allocator.models.map((choice: { id: string }) => choice.id));
-  const efforts = new Set(active.allocator.reasoningEfforts.map((choice: { id: string }) => choice.id));
   return {
     allocator: { kind: config.allocator.kind ?? 'codex',
-      modelId: config.allocator.modelId && modelIds.has(config.allocator.modelId) ? config.allocator.modelId : null,
-      reasoningEffort: config.allocator.reasoningEffort && efforts.has(config.allocator.reasoningEffort) ? config.allocator.reasoningEffort : null,
+      modelId: config.allocator.modelId,
+      reasoningEffort: config.allocator.reasoningEffort,
       ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) },
-    reviewer: { modelId: config.reviewer.modelId && modelIds.has(config.reviewer.modelId) ? config.reviewer.modelId : null,
-      reasoningEffort: config.reviewer.reasoningEffort && efforts.has(config.reviewer.reasoningEffort) ? config.reviewer.reasoningEffort : null },
+    reviewer: { modelId: config.reviewer.modelId,
+      reasoningEffort: config.reviewer.reasoningEffort },
     executionDefaults: {
       global: publicExecutionSelection(config.executionDefaults?.global ?? null),
       projects: Object.entries(config.executionDefaults?.projects ?? {}).map(([repoPath, execution]) => ({ repoPath, execution: publicExecutionSelection(execution)! })),
@@ -279,18 +276,23 @@ async function updatePublicConfig(options: ZeroServerOptions, raw: unknown) {
   const active = await capabilities(options);
   const models = new Set(active.allocator.models.map((choice: { id: string }) => choice.id));
   const efforts = new Set(active.allocator.reasoningEfforts.map((choice: { id: string }) => choice.id));
+  const config = await options.config.read();
   const pick = (role: 'allocator' | 'reviewer') => {
     const value = input[role];
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HttpError(400, `${role} 必须是对象`);
     const v = value as Record<string, unknown>;
     const modelId = nullableString(v.modelId, `${role}.modelId`);
     const reasoningEffort = nullableString(v.reasoningEffort, `${role}.reasoningEffort`);
+    // Availability is transient; saving other settings must not erase an existing
+    // choice. Only the exact saved pair may bypass current-candidate validation.
+    if (modelId === config[role].modelId && reasoningEffort === config[role].reasoningEffort) {
+      return { modelId, reasoningEffort: reasoningEffort as LocalZeroConfig['allocator']['reasoningEffort'] };
+    }
     if (modelId && !models.has(modelId)) throw new HttpError(400, `${role} 模型不是当前已验证的 Codex 候选`);
     if (reasoningEffort && !efforts.has(reasoningEffort)) throw new HttpError(400, `${role} 思考强度不是当前已验证的 Codex 候选`);
     if (modelId && reasoningEffort && !active.bindings.some((binding: { harnessId: string; modelId: string; available: boolean; reasoningEfforts: Array<{ id: string }> }) => binding.harnessId === 'codex' && binding.modelId === modelId && binding.available && binding.reasoningEfforts.some(item => item.id === reasoningEffort))) throw new HttpError(400, `${role} 思考强度未在所选 Codex 模型上验证`);
     return { modelId, reasoningEffort: reasoningEffort as LocalZeroConfig['allocator']['reasoningEffort'] };
   };
-  const config = await options.config.read();
   const allocatorRaw = input.allocator;
   if (!allocatorRaw || typeof allocatorRaw !== 'object' || Array.isArray(allocatorRaw)) throw new HttpError(400, 'allocator 必须是对象');
   const allocatorInput = allocatorRaw as Record<string, unknown>;

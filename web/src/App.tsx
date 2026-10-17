@@ -41,7 +41,7 @@ function Field({ label, hint, children, className = '' }: { label: string; hint?
   return <label className={`field ${className}`}><span className="field-label">{label}</span>{children}{hint && <span className="field-hint">{hint}</span>}</label>;
 }
 function Select({ value, onChange, choices, placeholder, disabled }: { value: string; onChange: (v: string) => void; choices: Choice[]; placeholder: string; disabled?: boolean }) {
-  return <div className="select-wrap"><select value={value} disabled={disabled} onChange={e => onChange(e.target.value)}><option value="">{placeholder}</option>{choices.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}</select><ChevronDown size={15} /></div>;
+  return <div className="select-wrap"><select value={value} disabled={disabled} onChange={e => onChange(e.target.value)}><option value="">{placeholder}</option>{value && !choices.some(choice => choice.id === value) && <option value={value} disabled>{value}（当前不可用）</option>}{choices.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}</select><ChevronDown size={15} /></div>;
 }
 function Button({ children, onClick, variant = 'secondary', disabled, type = 'button' }: { children: ReactNode; onClick?: () => void; variant?: 'primary' | 'secondary' | 'quiet' | 'danger'; disabled?: boolean; type?: 'button' | 'submit' }) {
   return <button className={`button ${variant}`} type={type} onClick={onClick} disabled={disabled}>{children}</button>;

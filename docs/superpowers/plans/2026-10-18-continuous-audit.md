@@ -21,7 +21,7 @@
 
 - [x] Reproduce early quota diagnostics masking later authentication/billing errors and the first-16-errors truncation boundary.
 - [x] Save the latest provider error independently of bounded history; classify the current failure from that evidence and expose its diagnostic. Run adapter/quota regressions and independent review.
-- [ ] Preserve unavailable saved allocator/reviewer choices across configuration GET/PUT. Show unavailable values in the web editor while rejecting new unverified choices. Verify real HTTP and UI regressions.
+- [x] Preserve unavailable saved allocator/reviewer choices across configuration GET/PUT. Show unavailable values in the web editor while rejecting new unverified choices. Verify real HTTP and UI regressions.
 - [ ] In goal remediation, inherit final-step checks rather than all historical intermediate checks. Verify rename/migration and retained-final-check failures with real Git workflows.
 - [ ] For aggregate goal verification, select the completed check run sealed into the applied result package; historical failed attempts must not block a successfully revised task. Keep missing or mismatched final evidence blocked.
 - [ ] Run whole-project checks for the integrated round, inspect the precise CI result, record evidence, and continue a second independent investigation round.

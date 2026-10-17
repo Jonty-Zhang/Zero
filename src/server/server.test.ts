@@ -853,6 +853,49 @@ test('capabilities do not call a help-only model binding live verified', async (
   } finally { await f.close(); }
 });
 
+test('configuration round trips preserve unavailable saved role choices and reject new unavailable choices', async () => {
+  for (const selection of [{ modelId: 'codex-main', reasoningEffort: 'high' as const }, { modelId: null, reasoningEffort: 'high' as const }]) {
+    let config: LocalZeroConfig = { ...testConfig(true, true), allocator: { kind: 'codex', ...selection }, reviewer: { ...selection } };
+    let available = false;
+    const store = new TaskStore();
+    const server = createZeroServer({ store, config: { read: async () => structuredClone(config), write: async value => { config = structuredClone(value); } },
+      adapters: { codex: { id: 'codex', probe: async () => ({ harness: 'codex', available, models: available ? ['codex-main'] : [], reasoningEfforts: ['high'], roles: ['implement', 'revise'] }),
+        run: async () => { throw new Error('No real Harness execution is allowed'); } } } });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const url = `http://127.0.0.1:${address.port}/api/config`;
+    const put = (body: unknown) => fetch(url, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    try {
+      const read = await (await fetch(url)).json() as { allocator: LocalZeroConfig['allocator']; reviewer: LocalZeroConfig['reviewer'] };
+      assert.deepEqual(read.allocator, { kind: 'codex', ...selection });
+      assert.deepEqual(read.reviewer, selection);
+      const saved = await put(read);
+      assert.equal(saved.status, 200, await saved.text());
+      assert.deepEqual(config.reviewer, selection);
+      for (const role of ['allocator', 'reviewer'] as const) {
+        for (const changed of [{ ...selection, modelId: 'new-unverified-model' }, { ...selection, reasoningEffort: 'xhigh' },
+          selection.modelId ? { ...selection, reasoningEffort: null } : { ...selection, modelId: 'codex-main' }]) {
+          const before = structuredClone(config);
+          const rejected = await put({ ...read, [role]: { ...read[role], ...changed } });
+          assert.equal(rejected.status, 400, await rejected.text());
+          assert.deepEqual(config, before);
+        }
+      }
+      const unrelatedEdit = await put({ ...read, allocator: { kind: 'api', modelId: null, reasoningEffort: null,
+        api: { baseUrl: 'https://provider.example/v1', model: 'router', keyEnv: 'ZERO_ROUTER_KEY' } } });
+      assert.equal(unrelatedEdit.status, 200, await unrelatedEdit.text());
+      assert.deepEqual(config.reviewer, selection);
+      available = true;
+      assert.deepEqual((await (await fetch(url)).json() as typeof read).reviewer, selection);
+      available = false;
+      const cleared = await put({ ...read, allocator: { kind: 'codex', modelId: null, reasoningEffort: null }, reviewer: { modelId: null, reasoningEffort: null } });
+      assert.equal(cleared.status, 200, await cleared.text());
+      assert.deepEqual(config.reviewer, { modelId: null, reasoningEffort: null });
+    } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); store.close(); }
+  }
+});
+
 test('PUT and GET /api/config persist an API coordinator reference without any key value', async () => {
   const f = await createFixture();
   try {
