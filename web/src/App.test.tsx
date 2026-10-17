@@ -7,7 +7,7 @@ import type { Task } from './types';
 
 vi.mock('./api', () => ({ api: { tasks: vi.fn(), task: vi.fn(), capabilities: vi.fn(), sequences: vi.fn(), config: vi.fn(), cancelTask: vi.fn(), createTask: vi.fn(), createSequence: vi.fn(), saveConfig: vi.fn() } }));
 const tasks: Task[] = [
-  { id: 'alpha', title: '修复登录回调', prompt: 'OAuth cookie regression', status: 'running', repoPath: 'C:/repo/zero', route: { harnessId: 'codex', modelId: 'model-a' } },
+  { id: 'alpha', title: '修复登录回调', status: 'running', repoPath: 'C:/repo/zero', route: { harnessId: 'codex', modelId: 'model-a' } },
   { id: 'beta', title: '更新文档', status: 'done', repoPath: 'C:/repo/docs', route: { harnessId: 'dsh' } },
   { id: 'gamma', title: '恢复登录测试', status: 'failed', repoPath: 'C:/repo/zero', route: { harnessId: 'codex' } },
 ];
@@ -24,11 +24,11 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 describe('task workspace', () => {
-  it('combines prompt search, status, repository and Harness filters in the default table', async () => {
+  it('combines list-title search, status, repository and Harness filters in the default table', async () => {
     render(<App />);
     await screen.findByText('修复登录回调');
     expect(screen.getByRole('table')).toBeTruthy();
-    fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'cookie' } });
+    fireEvent.change(screen.getByRole('searchbox'), { target: { value: '登录' } });
     expect(screen.queryByText('更新文档')).toBeNull();
     fireEvent.change(screen.getByLabelText('仓库筛选'), { target: { value: 'C:/repo/zero' } });
     fireEvent.change(screen.getByLabelText('Harness 筛选'), { target: { value: 'codex' } });

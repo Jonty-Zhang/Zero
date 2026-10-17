@@ -60,7 +60,9 @@
 
 **Files:** `web/src/App.tsx`, `web/src/styles.css`, focused workspace components.
 
-**Interfaces:** Search task title/prompt, repository and IDs; filter by actual task status and repository. Counts come from loaded tasks. Default list view and optional board use the same filtered dataset.
+**Interfaces:** Search task titles, repository paths, model IDs and task IDs; filter by actual task status, repository and Harness. Counts come from loaded tasks. Default list view and optional board use the same filtered dataset.
+
+**Ruling (2026-10-17 integration review):** The list API deliberately omits full prompts. Search uses fields actually present in list records; copy and fixtures must not promise full description search. Returning every historical 100,000-character prompt on each poll is outside this change. A future full-text search should be implemented server-side with its own contract.
 
 - [ ] Add meaningful tests for search/filter combinations, empty results and state counts.
 - [ ] Implement workspace navigation, summary, list/board switch and responsive visual design, using existing components and icons.
