@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import type { TaskSequenceRecord } from '../domain/types.js';
+import type { GoalReviewResult, TaskSequenceRecord } from '../domain/types.js';
 import type { SequenceGoalReviewRecord } from '../core/task-store.js';
 import { buildGoalRevisionSubmission } from './goal-revision.js';
 
@@ -40,7 +40,7 @@ function fixture(options: { checkCount?: number; missingAllowedPaths?: boolean; 
         { file: 'src/a.ts', line: 12, severity: 'high', evidence: 'The output is not produced.', requestedChange: 'Produce the expected output and cover it with a test.' },
       ],
     },
-  } as SequenceGoalReviewRecord;
+  } as SequenceGoalReviewRecord & { result: GoalReviewResult };
   return { sequence, review };
 }
 
@@ -91,4 +91,40 @@ test('rejects verdicts other than changes_requested and rejects empty findings',
 test('rejects oversized prompts rather than omitting review evidence', () => {
   const { sequence, review } = fixture({ summary: 'x'.repeat(24_000) });
   assert.throws(() => buildGoalRevisionSubmission(sequence, review), /24000-character limit/);
+});
+
+test('targets an earlier repository tip with its own checks, permissions and local criteria', () => {
+  const { sequence, review } = fixture();
+  sequence.steps[0]!.task.acceptanceCriteria = ['A remains locally valid'];
+  sequence.steps[1]!.task.repoPath = 'C:/other-project';
+  delete sequence.steps[1]!.task.allowedPaths;
+  review.result!.targetTaskId = sequence.steps[0]!.task.id;
+  const submission = buildGoalRevisionSubmission(sequence, review);
+  assert.equal(submission.repoPath, 'C:/project');
+  assert.deepEqual(submission.allowedPaths, ['src/a.ts', 'tests/a.test.ts']);
+  assert.deepEqual(submission.checks?.map(check => check.argv), [['npm', 'test'], ['check-intermediate-output']]);
+  assert.deepEqual(submission.acceptanceCriteria, ['A remains locally valid']);
+  assert.match(submission.prompt, /Regression tests cover it/);
+});
+
+test('unions only target-root permissions and inherits the latest target-root checks', () => {
+  const { sequence, review } = fixture();
+  const finalA = sequence.steps[1]!;
+  sequence.steps.splice(1, 0, { position: 1, task: { ...finalA.task, id: 'task-B', repoPath: 'C:/other-project', allowedPaths: undefined } });
+  review.result!.targetTaskId = finalA.task.id;
+  const submission = buildGoalRevisionSubmission(sequence, review);
+  assert.deepEqual(submission.allowedPaths, ['src/a.ts', 'tests/a.test.ts', 'src/b.ts']);
+  assert.deepEqual(submission.checks?.map(check => check.argv), [['npm', 'test'], ['check', '0'], ['lint']]);
+  assert.ok(submission.acceptanceCriteria?.every(criterion => !sequence.acceptanceCriteria!.includes(criterion)));
+});
+
+test('rejects foreign and earlier targets and missing targets in mixed-root sequences', () => {
+  const { sequence, review } = fixture();
+  review.result!.targetTaskId = 'foreign';
+  assert.throws(() => buildGoalRevisionSubmission(sequence, review), /target/i);
+  review.result!.targetTaskId = sequence.steps[0]!.task.id;
+  assert.throws(() => buildGoalRevisionSubmission(sequence, review), /latest|tip/i);
+  delete review.result!.targetTaskId;
+  sequence.steps[0]!.task.repoPath = 'C:/other-project';
+  assert.throws(() => buildGoalRevisionSubmission(sequence, review), /target/i);
 });

@@ -117,7 +117,7 @@ test("goal revisions are bounded, idempotent, and claim from the latest authorit
   const path = join(root, "tasks.sqlite");
   let store = new TaskStore(path);
   try {
-    const sequence = store.createSequence([{ ...submission("first"), repoPath: "./earlier-repo" }, submission("second")], "revision-append",
+    const sequence = store.createSequence([submission("first"), submission("second")], "revision-append",
       { objective: "Deliver the goal", maxGoalRevisions: 2 });
     const resultCommit = "c".repeat(40);
     seedAuthoritativeDone(path, sequence.steps[0]!.task.id, "b".repeat(40));

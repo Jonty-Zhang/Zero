@@ -52,11 +52,11 @@
 
 **Consumes:** `GoalReviewResult.targetTaskId?`; existing aggregate attempt/request and authoritative task evidence.
 
-- [ ] RED: latest A tip can be targeted while global-last is B; append uses A result base and one budget unit; duplicate/reopened/competing requests append once.
-- [ ] RED: foreign/earlier/ambiguous/missing-identity target, mismatched repository submission and exhausted budget refuse writes; no-target legacy single-root remains usable.
-- [ ] RED: target-local checks, permissions and acceptance criteria; unrestricted B does not broaden restricted A.
-- [ ] Implement transaction-local persisted group authorization and target-aware revision builder, retaining current claim-time handoff guards.
-- [ ] GREEN: store/sequence/goal revision tests and isolated typecheck; independent review; root commits/pushes verified unit.
+- [x] RED: latest A tip can be targeted while global-last is B; append uses A result base and one budget unit; duplicate/reopened/competing requests append once.
+- [x] RED: foreign/earlier/ambiguous/missing-identity target, mismatched repository submission and exhausted budget refuse writes; no-target legacy single-root remains usable.
+- [x] RED: target-local checks, permissions and acceptance criteria; unrestricted B does not broaden restricted A.
+- [x] Implement transaction-local persisted group authorization and target-aware revision builder, retaining current claim-time handoff guards.
+- [x] GREEN: store/sequence/goal revision tests and isolated typecheck; independent review; root commits/pushes verified unit. Implementer 144/144; independent reviewer 58/58.
 
 ## Task 4: Full evidence capture and independent reviewer (root)
 
@@ -87,3 +87,4 @@
 - Keep snapshot fingerprints distinct from an explicit full inputFingerprint; clone the bounded input before any asynchronous provider work.
 - Extract aggregate evidence capture into a focused server module and reuse the existing isolated Git environment.
 - Snapshot independent review reproduced Windows EBUSY on unmerged-index refusal. Metadata batches now drain every child process before propagating failure. Overlap refusal also precedes artifact directory creation; both corrections have RED/GREEN regressions.
+- Store independent review added exact package/run execution/stage/route and completed-event result associations. Root review also required canonical planned-path composition. All seven additions failed before correction and passed afterward.
