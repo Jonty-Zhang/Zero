@@ -20,14 +20,14 @@ import { TestRunner } from '../core/test-runner.js';
 import { TaskRouter } from '../orchestrator/router.js';
 import { OpenAICompatibleCoordinator } from '../orchestrator/openai-compatible-coordinator.js';
 import { TaskReviewer } from '../orchestrator/reviewer.js';
-import { GoalReviewer } from '../orchestrator/goal-reviewer.js';
+import { GoalReviewer, goalReviewInputFingerprint } from '../orchestrator/goal-reviewer.js';
 import { buildGoalRevisionSubmission } from '../orchestrator/goal-revision.js';
-import { createTrustedCodexCwd } from '../orchestrator/trusted-codex-cwd.js';
+import { captureSequenceGoalEvidence } from './sequence-goal-evidence.js';
 import { QuotaLimitError } from '../core/quota.js';
 import { TaskWorker } from '../orchestrator/worker.js';
 import { ConfigStore } from './config-store.js';
 import { createCodexAdapter, createDefaultAdapters, createZeroServer } from './server.js';
-import type { ExecutionSelection, HarnessAdapter, TaskSequenceRecord, TaskStatus } from '../domain/types.js';
+import type { ExecutionSelection, HarnessAdapter, TaskStatus } from '../domain/types.js';
 import { DshAdapter } from '../adapters/dsh.js';
 import { ZCodeAdapter } from '../adapters/zcode.js';
 
@@ -689,11 +689,13 @@ export function createSequenceGoalReviewScheduler(options: {
         const cfg = await options.readReviewerConfig();
         const goalReviewer = new GoalReviewer({ codex, model: cfg.modelId ?? undefined, reasoningEffort: cfg.reasoningEffort ?? undefined });
         const execution = await goalReviewer.review({ sequenceId: sequence.id, objective: sequence.objective,
-          acceptanceCriteria: sequence.acceptanceCriteria, stepEvidence: before.stepEvidence, workspacePath: before.workspacePath,
+          acceptanceCriteria: sequence.acceptanceCriteria, stepEvidence: before.stepEvidence, workspacePath: before.workspacePath, repositories: before.repositories,
           artifactRoot: reviewRoot, attemptId: attempt.attemptId, model: cfg.modelId ?? undefined,
           reasoningEffort: cfg.reasoningEffort ?? undefined });
         const after = await captureSequenceGoalEvidence(store, worktrees, sequence, reviewRoot);
-        const verifiedFingerprint = execution.evidenceFingerprint === before.snapshotFingerprint &&
+        const verifiedFingerprint = execution.inputFingerprint === goalReviewInputFingerprint({ objective: sequence.objective,
+          acceptanceCriteria: sequence.acceptanceCriteria, stepEvidence: before.stepEvidence, repositories: before.repositories }) &&
+          execution.evidenceFingerprint === before.snapshotFingerprint &&
           execution.verifiedSnapshotFingerprint === after.snapshotFingerprint ? after.fingerprint : '';
         store.finishSequenceGoalReview({ attemptId: attempt.attemptId, result: execution.result, verifiedEvidenceFingerprint: verifiedFingerprint });
         return;
@@ -751,129 +753,6 @@ export async function runZCodeDesktopModelCatalog(options: ZCodeDesktopModelCata
       catch { throw new Error('Temporary ZCode catalog workspace cleanup could not be confirmed.'); }
     }
   }
-}
-
-const MAX_SEQUENCE_GOAL_EVIDENCE_BYTES = 512 * 1024;
-const MAX_SEQUENCE_GOAL_DIFF_BYTES = 192 * 1024;
-
-async function captureSequenceGoalEvidence(store: TaskStore, worktrees: GitWorktreeManager,
-  sequence: TaskSequenceRecord, artifactRoot: string): Promise<{
-    stepEvidence: unknown; workspacePath: string; fingerprint: string; snapshotFingerprint: string;
-  }> {
-  const steps = sequence.steps;
-  if (steps.length < 2 || steps.some(step => step.task.status !== 'done')) throw new Error('GOAL_BLOCK:Aggregate goal verification requires every step to be authoritatively DONE.');
-  const commonDirs = steps.map(({ task }) => {
-    const result = spawnSync('git', ['-C', task.repoPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'], {
-      encoding: 'utf8', windowsHide: true, timeout: 5_000,
-    });
-    if (result.error || result.status !== 0 || !result.stdout.trim()) throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because repository identity could not be established.');
-    return resolve(result.stdout.trim());
-  });
-  if (commonDirs.some(directory => directory.toLowerCase() !== commonDirs[0]!.toLowerCase())) {
-    throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the sequence spans multiple repositories.');
-  }
-
-  const stepEvidence = [] as Array<Record<string, unknown>>;
-  let finalCommit = '';
-  for (const [index, step] of steps.entries()) {
-    const task = step.task;
-    const reports = store.reportOperations(task.id);
-    const commits = store.commitOperations(task.id).filter(commit => commit.status === 'applied');
-    if (reports.length !== 1 || reports[0]!.status !== 'complete' || commits.length !== 1 ||
-      reports[0]!.commitOperationId !== commits[0]!.id || !commits[0]!.candidateSha) {
-      throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because a completed step lacks authoritative report and commit evidence.');
-    }
-    const report = reports[0]!;
-    const commit = commits[0]!;
-    if (index > 0 && step.effectiveBaseCommit?.toLowerCase() !== finalCommit.toLowerCase()) {
-      throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because chained step commits do not match their persisted handoff bases.');
-    }
-    finalCommit = commit.candidateSha!;
-    const allEvents = store.events(task.id);
-    // Ordinary content revisions leave failed historical runs. Completion is
-    // justified by the exact package sealed into the applied commit/report,
-    // never by every historical run or an arbitrary later passing attempt.
-    const pkg = store.getReviewPackage(commit.packageId);
-    const run = pkg && store.getCheckRun(pkg.checkRunId);
-    if (!pkg || !run || pkg.taskId !== task.id || run.taskId !== task.id || run.id !== pkg.checkRunId
-      || run.status !== 'completed' || report.packageId !== pkg.id || report.verdictId !== commit.verdictId
-      || pkg.executionAttemptId !== run.executionAttemptId || pkg.executionStageId !== run.executionStageId
-      || pkg.routeAttemptId !== run.routeAttemptId || pkg.checkDefinitionHash !== run.checkDefinitionHash
-      || JSON.stringify(pkg.expectedCheckIds) !== JSON.stringify(run.expectedCheckIds)
-      || pkg.branchRef !== commit.branchRef || pkg.snapshot.preHead !== commit.preHead
-      || pkg.snapshot.treeId !== commit.treeId || pkg.snapshot.diffHash !== commit.diffHash
-      || JSON.stringify(pkg.snapshot) !== JSON.stringify(run.snapshot)) {
-      throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the completed result lacks its linked current check package.');
-    }
-    const completedEvent = allEvents.find(event => event.type === 'check_run.completed' &&
-      event.payload?.checkRunId === run.id && event.payload?.reviewPackageId === pkg.id);
-    const rawResults = completedEvent?.payload?.results;
-    const results = store.checkRunResults(run.id);
-    const ids = new Set(results.map(result => result.id));
-    if (!Array.isArray(rawResults) || JSON.stringify(rawResults) !== JSON.stringify(results)
-      || results.length !== run.expectedCheckIds.length || ids.size !== run.expectedCheckIds.length
-      || run.expectedCheckIds.some(id => !ids.has(id)) || results.some(result => result.status !== 'passed')) {
-      throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because persisted current check evidence is incomplete.');
-    }
-    const checkEvidence = [{ runId: run.id, status: run.status, expectedCheckIds: run.expectedCheckIds,
-        checkDefinitionHash: run.checkDefinitionHash, snapshot: { baseCommit: run.snapshot.baseCommit, preHead: run.snapshot.preHead,
-          treeId: run.snapshot.treeId, fingerprint: run.snapshot.fingerprint, diffHash: run.snapshot.diffHash },
-        results: results.map(({ id, status, exitCode, durationMs }) => ({ id, status, exitCode, durationMs })) }];
-    stepEvidence.push({ position: step.position, taskId: task.id, prompt: task.prompt,
-      acceptanceCriteria: task.acceptanceCriteria ?? [], baseRef: task.baseRef,
-      effectiveBaseCommit: step.effectiveBaseCommit, resultCommit: commit.candidateSha,
-      report: { reportSha256: report.reportSha256, reportSize: report.reportSize, diffSha256: report.diffSha256, diffSize: report.diffSize },
-      checks: checkEvidence });
-  }
-  const last = steps.at(-1)!;
-  if (!last.task.sequenceBaseCommit) throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the final chained worktree base commit is missing.');
-  let workspace;
-  try { workspace = await worktrees.reopen(last.task.id, last.task.repoPath, last.task.sequenceBaseCommit); }
-  catch { throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the final reviewed worktree cannot be safely reopened.'); }
-  let head;
-  try { head = await worktrees.readTaskBranchHead(workspace); }
-  catch { throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the final worktree HEAD cannot be verified.'); }
-  if (head.head.toLowerCase() !== finalCommit.toLowerCase()) {
-    throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the final worktree HEAD changed after its task was marked DONE.');
-  }
-  let status: string;
-  try { status = await worktrees.status(workspace); }
-  catch { throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because final worktree contents cannot be verified.'); }
-  if (status.trim()) throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the final worktree has changes after its task was marked DONE.');
-
-  const baseCommit = store.commitOperations(steps[0]!.task.id).find(commit => commit.status === 'applied')?.preHead;
-  if (!baseCommit) throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the first step base commit is missing.');
-  const cumulativeDiffResult = spawnSync('git', ['diff', '--no-ext-diff', '--binary', baseCommit, finalCommit, '--'], {
-    cwd: workspace.path, encoding: 'buffer', windowsHide: true, timeout: 15_000, maxBuffer: MAX_SEQUENCE_GOAL_DIFF_BYTES + 1,
-  });
-  if (cumulativeDiffResult.error || cumulativeDiffResult.status !== 0 || !Buffer.isBuffer(cumulativeDiffResult.stdout)) {
-    throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the cumulative base-to-result diff could not be safely read.');
-  }
-  if (cumulativeDiffResult.stdout.byteLength > MAX_SEQUENCE_GOAL_DIFF_BYTES) {
-    throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the cumulative base-to-result diff exceeds the bounded review limit.');
-  }
-  const cumulativeDiff = cumulativeDiffResult.stdout.toString('utf8');
-  if (!Buffer.from(cumulativeDiff, 'utf8').equals(cumulativeDiffResult.stdout)) {
-    throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because the cumulative diff is not valid UTF-8 evidence.');
-  }
-
-  let snapshotFingerprint: string;
-  let snapshotMetadata: Record<string, unknown>;
-  const trusted = await createTrustedCodexCwd({ artifactRoot, purpose: 'review', taskWorkspace: workspace.path, includeProjectSnapshot: true });
-  try {
-    if (!trusted.projectSnapshot) throw new Error('GOAL_BLOCK:Aggregate goal verification could not create a final project snapshot.');
-    snapshotFingerprint = trusted.projectSnapshot.manifest.contentSha256;
-    snapshotMetadata = { headCommit: trusted.projectSnapshot.manifest.headCommit, indexTree: trusted.projectSnapshot.manifest.indexTree,
-      contentSha256: snapshotFingerprint, fileCount: trusted.projectSnapshot.manifest.fileCount, totalBytes: trusted.projectSnapshot.manifest.totalBytes,
-      excluded: trusted.projectSnapshot.manifest.excluded, transformed: trusted.projectSnapshot.manifest.transformed };
-  } finally { await trusted.dispose(); }
-  const evidence = { objective: sequence.objective ?? '', acceptanceCriteria: sequence.acceptanceCriteria ?? [], steps: stepEvidence,
-    baseCommit, finalResultCommit: finalCommit, cumulativeDiff: { sha256: createHash('sha256').update(cumulativeDiff, 'utf8').digest('hex'), text: cumulativeDiff },
-    finalWorktreeHead: head.head, projectSnapshot: snapshotMetadata };
-  const evidenceBytes = Buffer.byteLength(JSON.stringify(evidence), 'utf8');
-  if (evidenceBytes > MAX_SEQUENCE_GOAL_EVIDENCE_BYTES) throw new Error('GOAL_BLOCK:Aggregate goal verification is blocked because its persisted evidence exceeds the bounded review limit.');
-  return { stepEvidence: evidence, workspacePath: workspace.path, fingerprint: createHash('sha256').update(JSON.stringify(evidence), 'utf8').digest('hex'),
-    snapshotFingerprint };
 }
 
 function safeGoalBlockReason(error: unknown): string {

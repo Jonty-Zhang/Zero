@@ -64,20 +64,20 @@
 
 **Consumes:** Task 2 bundle interfaces and Task 3 aggregate target behavior.
 
-- [ ] RED: A->B and A->B->A produce verified grouped evidence including singleton bases; missing authoritative evidence or divergent common-dir chains remain blocked.
-- [ ] RED: one read-only session sees all bounded snapshots; dedicated multi schema rejects missing/unsafe targets while ordinary/single-source behavior stays unchanged.
-- [ ] Implement live/persisted group identity and complete before/provider/after fingerprint equality. Return source mappings for the reviewer.
-- [ ] Parse aggregate target only for the goal protocol and normalize malformed/unsafe output to blocked before remediation.
-- [ ] GREEN: goal reviewer/main/evidence tests, mutation of non-target and persisted input mismatch regressions; independent review and commit/push.
+- [x] RED: A->B and A->B->A produce verified grouped evidence including singleton bases; missing authoritative evidence or divergent common-dir chains remain blocked.
+- [x] RED: one read-only session sees all bounded snapshots; dedicated multi schema rejects missing/unsafe targets while ordinary/single-source behavior stays unchanged.
+- [x] Implement live/persisted group identity and complete before/provider/after fingerprint equality. Return source mappings for the reviewer.
+- [x] Parse aggregate target only for the goal protocol and normalize malformed/unsafe output to blocked before remediation.
+- [x] GREEN: goal reviewer/main/evidence tests, mutation of non-target and persisted input mismatch regressions; independent review and commit/push. Root integration 12/12; independent focused integration 25/25, plus isolated-read corrections 36/36.
 
 ## Task 5: End-to-end workflow and dashboard (root, after boundaries settle)
 
 **Files:** `src/server/server.ts`, `web/src/types.ts`, `web/src/App.tsx`, tests; new real-Git multi-repository goal E2E; README/audit.
 
-- [ ] RED: real A->B PASS and A->B->A; changes_requested targets A, only A writes/checks, B is unchanged, then whole-goal PASS.
-- [ ] RED: invalid/foreign/stale/missing multi target persists blocked and explicit retry recovers; quota/reboot/revision limits and competing scheduler gates remain.
-- [ ] Project targetTaskId in HTTP and show its repository in goal findings; maintain old DTO/keyboard/retry behavior.
-- [ ] Verify actual Edge desktop/narrow viewport against local fixtures and API; update user-facing workflow and honest remaining limits.
+- [x] RED: real A->B PASS and A->B->A; changes_requested targets A, only A writes/checks, B is unchanged, then whole-goal PASS.
+- [x] RED: invalid/foreign/stale/missing multi target persists blocked and explicit retry recovers; quota/reboot/revision limits and competing scheduler gates remain.
+- [x] Project targetTaskId in HTTP and show its repository in goal findings; maintain old DTO/keyboard/retry behavior.
+- [x] Verify actual Edge desktop/narrow viewport against local fixtures and API; update user-facing workflow and honest remaining limits. Real HTTP/SQLite Edge at 1440 and 375 px, correct target navigation, no horizontal overflow or page errors; web 33/33 and production build passed.
 - [ ] Independent final review, canonical full core, web/client/type/build/public-tree on a frozen commit; exact-head Linux/Windows CI, push/PR and main tree verification.
 - [ ] Record verified outcomes and continue the next audit unless the user requests pausing.
 
@@ -88,3 +88,5 @@
 - Extract aggregate evidence capture into a focused server module and reuse the existing isolated Git environment.
 - Snapshot independent review reproduced Windows EBUSY on unmerged-index refusal. Metadata batches now drain every child process before propagating failure. Overlap refusal also precedes artifact directory creation; both corrections have RED/GREEN regressions.
 - Store independent review added exact package/run execution/stage/route and completed-event result associations. Root review also required canonical planned-path composition. All seven additions failed before correction and passed afterward.
+- Integration review found that isolated Git reads must also reach registered-worktree reopening/fingerprinting, and must ignore replacement refs. Optional read environments preserve writer defaults; three failure-first regressions cover fsmonitor, ambient repository overrides and original-object diffs. Existing concurrency retry hook follows reopenFromEvidence; 11/11 retry tests pass.
+- Astra high whole-branch review was interrupted by account usage limits before a conclusion. A separate available reviewer is being attempted; no uncompleted review is counted as approval.

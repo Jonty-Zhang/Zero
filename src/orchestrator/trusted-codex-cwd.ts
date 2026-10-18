@@ -626,6 +626,7 @@ export function safeGitEnvironment(globalConfigPath: string): NodeJS.ProcessEnv 
     GIT_CONFIG_VALUE_1: 'false',
     GIT_OPTIONAL_LOCKS: '0',
     GIT_TERMINAL_PROMPT: '0',
+    GIT_NO_REPLACE_OBJECTS: '1',
   };
   for (const key of ['PATH', 'Path', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'HOME']) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
