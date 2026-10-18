@@ -170,8 +170,8 @@ test('a stale normal scheduler cannot start again after another connection finis
     await writeFile(fixture.finalFile, 'approved');
     let arrived!: () => void; const waiting = new Promise<void>(resolve => { arrived = resolve; });
     const gate = new Promise<void>(resolve => { release = resolve; });
-    const original = c.worktrees.reopen.bind(c.worktrees); let blocked = false;
-    c.worktrees.reopen = async (...args) => { const info = await original(...args); if (!blocked) { blocked = true; arrived(); await gate; } return info; };
+    const original = c.worktrees.reopenFromEvidence.bind(c.worktrees); let blocked = false;
+    c.worktrees.reopenFromEvidence = async (...args) => { const info = await original(...args); if (!blocked) { blocked = true; arrived(); await gate; } return info; };
     c.mode = 'pass'; const stale = c.scheduler()();
     await waiting;
     c.store.requestSequenceGoalReviewRetry(fixture.sequenceId, source.attemptId);

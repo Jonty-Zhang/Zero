@@ -732,6 +732,14 @@ test('sequence GET exposes aggregate review identity without private fingerprint
     assert.deepEqual(listItem.goalReview, expectedReview);
     assert.equal(Object.hasOwn(listItem.goalReview, 'evidenceFingerprint'), false);
     assert.equal(Object.hasOwn(listItem.goalReview, 'generationId'), false);
+    const targetAttempt = f.store.startSequenceGoalReview(sequence.id, 'f'.repeat(64));
+    f.store.finishSequenceGoalReview({ attemptId: targetAttempt.attemptId, verifiedEvidenceFingerprint: 'f'.repeat(64),
+      result: { verdict: 'changes_requested', summary: 'Fix the first repository', targetTaskId: sequence.steps[0]!.task.id,
+        findings: [{ severity: 'high', evidence: 'Missing contract validation', requestedChange: 'Add validation' }] } });
+    const targeted = await (await fetch(`${f.url}/api/sequences/${sequence.id}`)).json() as { goalReview: { result: { targetTaskId?: string } } };
+    assert.equal(targeted.goalReview.result.targetTaskId, sequence.steps[0]!.task.id);
+    const targetedList = await (await fetch(`${f.url}/api/sequences`)).json() as Array<{ id: string; goalReview?: { result: { targetTaskId?: string } } }>;
+    assert.equal(targetedList.find(item => item.id === sequence.id)?.goalReview?.result.targetTaskId, sequence.steps[0]!.task.id);
   } finally { await f.close(); }
 });
 

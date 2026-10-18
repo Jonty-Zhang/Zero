@@ -4,6 +4,7 @@ import path from "node:path";
 import type {
   Attempt,
   CheckResult,
+  GoalReviewResult,
   HandoffRecord,
   HandoffV1,
   ReviewResult,
@@ -211,7 +212,7 @@ export interface SequenceGoalReviewRecord {
   generationId: string;
   evidenceFingerprint: string;
   state: "running" | "quota" | "verdict";
-  result?: ReviewResult;
+  result?: GoalReviewResult;
   retryAt?: string;
   createdAt: string;
   completedAt?: string;
@@ -1490,7 +1491,7 @@ export class TaskStore {
     return this.sequenceGoalReviewByAttempt(attemptId)!;
   }
 
-  finishSequenceGoalReview(input: { attemptId: string; result?: ReviewResult; retryAt?: string; verifiedEvidenceFingerprint?: string; now?: Date }): SequenceGoalReviewRecord {
+  finishSequenceGoalReview(input: { attemptId: string; result?: GoalReviewResult; retryAt?: string; verifiedEvidenceFingerprint?: string; now?: Date }): SequenceGoalReviewRecord {
     const now = input.now ?? new Date();
     const completedAt = now.toISOString();
     const row = this.#db.prepare("SELECT * FROM task_sequence_goal_reviews WHERE attempt_id=?").get(input.attemptId) as Record<string, unknown> | undefined;
@@ -1507,7 +1508,7 @@ export class TaskStore {
       });
       return this.sequenceGoalReviewByAttempt(input.attemptId)!;
     }
-    if (!input.result || !isValidReviewResult(input.result)) throw new Error("Aggregate goal review must contain a valid reviewer verdict");
+    if (!input.result || !isValidGoalReviewResult(input.result)) throw new Error("Aggregate goal review must contain a valid reviewer verdict and target");
     let result = input.result;
     if (input.verifiedEvidenceFingerprint !== row.evidence_fingerprint) {
       result = { verdict: "blocked", summary: "Aggregate evidence changed during review; a fresh review is required.", findings: [
@@ -1550,7 +1551,8 @@ export class TaskStore {
       const latest = this.#db.prepare("SELECT attempt_id FROM task_sequence_goal_reviews WHERE sequence_id=? ORDER BY created_at DESC,attempt_id DESC LIMIT 1")
         .get(sequenceId) as { attempt_id: string } | undefined;
       if (!sequence || !review || review.sequence_id !== sequenceId || latest?.attempt_id !== reviewAttemptId || review.state !== "verdict" ||
-          !review.result || (JSON.parse(review.result) as ReviewResult).verdict !== "changes_requested") {
+          !review.result || !isValidGoalReviewResult(JSON.parse(review.result) as GoalReviewResult) ||
+          (JSON.parse(review.result) as GoalReviewResult).verdict !== "changes_requested") {
         throw new Error("Goal revision requires the latest aggregate changes_requested verdict for this sequence");
       }
       if (sequence.objective === null && sequence.acceptance_criteria === null) throw new Error("Goal revision requires aggregate goal metadata");
@@ -1561,12 +1563,44 @@ export class TaskStore {
       }
       const revisionCount = Number((this.#db.prepare("SELECT COUNT(*) AS n FROM task_sequence_goal_revisions WHERE sequence_id=?").get(sequenceId) as { n: number }).n);
       if (revisionCount >= Number(sequence.max_goal_revisions)) throw new Error("Goal revision limit reached");
-      const finalStep = this.#db.prepare(`SELECT t.id,t.payload FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id
-        WHERE s.sequence_id=? ORDER BY s.position DESC LIMIT 1`).get(sequenceId) as { id: string; payload: string } | undefined;
-      if (!finalStep || (JSON.parse(finalStep.payload) as TaskSubmission).repoPath !== submission.repoPath) {
-        throw new Error("Goal revision must target the final sequence step's repository");
+      const steps = (this.#db.prepare(`SELECT t.id,t.payload,s.effective_base_commit FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id
+        WHERE s.sequence_id=? ORDER BY s.position`).all(sequenceId) as Array<{ id: string; payload: string; effective_base_commit: string | null }>)
+        .map(row => ({ ...row, submission: JSON.parse(row.payload) as TaskSubmission }));
+      const result = JSON.parse(review.result!) as GoalReviewResult;
+      const multipleRoots = new Set(steps.map(step => step.submission.repoPath)).size > 1;
+      if (result.targetTaskId === undefined && multipleRoots) throw new Error("Mixed-root goal revision requires an explicit target task");
+      const target = result.targetTaskId === undefined ? steps.at(-1)! : steps.find(step => step.id === result.targetTaskId);
+      if (!target) throw new Error("Goal revision target does not belong to this sequence");
+      if (submission.repoPath !== target.submission.repoPath) throw new Error("Goal revision must target the final sequence step's repository or the explicit target's exact repository root");
+
+      let effectiveBaseCommit: string;
+      let targetCommonGitDir: string | undefined;
+      // Previously persisted single-root reviews may predate creation records. Keep
+      // that legacy path only when no registered identity exists anywhere in the sequence.
+      const legacy = result.targetTaskId === undefined && steps.every(step => !this.getWorktreeCreation(step.id));
+      if (legacy) {
+        effectiveBaseCommit = this.#authoritativeResultCommit(target.id);
+      } else {
+        const identities = steps.map(step => ({ step, identity: this.#goalRevisionIdentity(step.id, step.submission) }));
+        const targetIdentity = identities.find(entry => entry.step.id === target.id)!.identity;
+        if (submission.repoPath !== targetIdentity.repoPath) throw new Error("Goal revision target submission must use its registered canonical repository root");
+        const group = identities.filter(entry => repositoryIdentityKey(entry.identity.commonGitDir) === repositoryIdentityKey(targetIdentity.commonGitDir));
+        if (group.at(-1)!.step.id !== target.id) throw new Error("Goal revision target must be the latest tip of its repository group");
+        let previousResult: string | undefined;
+        for (const { step, identity } of group) {
+          if ((previousResult === undefined ? step.effective_base_commit !== null : step.effective_base_commit !== previousResult) ||
+              (previousResult !== undefined && identity.baseCommit !== previousResult)) {
+            throw new Error("Goal revision target group has a divergent persisted creation/handoff lineage");
+          }
+          previousResult = this.#goalRevisionResultCommit(step.id, step.submission, identity.baseCommit);
+        }
+        // Claim-time predecessor lookup deliberately uses the exact submitted root.
+        // Never persist a base that that same lookup would later replace or reject.
+        const exactRootTip = steps.filter(step => step.submission.repoPath === submission.repoPath).at(-1)!;
+        if (exactRootTip.id !== target.id) throw new Error("Goal revision target disagrees with the exact-root sequence predecessor");
+        effectiveBaseCommit = previousResult!;
+        targetCommonGitDir = targetIdentity.commonGitDir;
       }
-      const effectiveBaseCommit = this.#authoritativeResultCommit(finalStep.id);
       const position = Number((this.#db.prepare("SELECT COALESCE(MAX(position),-1)+1 AS position FROM task_sequence_steps WHERE sequence_id=?").get(sequenceId) as { position: number }).position);
       this.#db.prepare("INSERT INTO tasks(id,status,created_at,updated_at,payload) VALUES(?, 'pending', ?, ?, ?)")
         .run(taskId, at, at, JSON.stringify(submission));
@@ -1575,9 +1609,76 @@ export class TaskStore {
       this.#db.prepare("INSERT INTO task_sequence_goal_revisions(sequence_id,review_attempt_id,task_id,created_at) VALUES(?,?,?,?)")
         .run(sequenceId, reviewAttemptId, taskId, at);
       this.#event(taskId, "task.submitted", { submission, sequenceId, sequencePosition: position, goalReviewAttemptId: reviewAttemptId }, at);
-      this.#event(taskId, "task_sequence.goal_revision_appended", { sequenceId, reviewAttemptId, taskId, position, effectiveBaseCommit }, at);
+      this.#event(taskId, "task_sequence.goal_revision_appended", { sequenceId, reviewAttemptId, taskId, position, effectiveBaseCommit,
+        targetTaskId: target.id, targetRepoPath: submission.repoPath, ...(targetCommonGitDir ? { targetCommonGitDir } : {}) }, at);
       return this.get(taskId)!;
     });
+  }
+
+  #goalRevisionIdentity(taskId: string, submission: TaskSubmission): { repoPath: string; commonGitDir: string; baseCommit: string } {
+    const creation = this.getWorktreeCreation(taskId);
+    const plan = creation?.plan as Record<string, unknown> | undefined;
+    const observed = creation?.observed as { info?: Record<string, unknown>; commonGitDir?: string; head?: string; fingerprint?: string } | undefined;
+    if (!creation || creation.status !== "created" || !plan || !observed?.info ||
+        !["taskId", "repoPath", "path", "branch", "baseCommit"].every(key => typeof plan[key] === "string" && plan[key] === observed.info![key]) ||
+        plan.taskId !== taskId || plan.branch !== `zero/${taskId}` ||
+        ![plan.repoPath, plan.path, plan.worktreeRoot, plan.commonGitDir].every(value => typeof value === "string" && path.isAbsolute(value) && path.resolve(value) === value) ||
+        plan.path !== path.resolve(String(plan.worktreeRoot), taskId) ||
+        repositoryIdentityKey(String(plan.repoPath)) !== repositoryIdentityKey(path.resolve(submission.repoPath)) ||
+        !/^[a-f0-9]{40,64}$/i.test(String(plan.baseCommit)) || observed.head !== plan.baseCommit ||
+        plan.commonGitDir !== observed.commonGitDir || !SHA256_PATTERN.test(creation.fingerprint ?? "") ||
+        creation.fingerprint !== observed.fingerprint) {
+      throw new Error(`Goal revision requires matching registered creation identity for task ${taskId}`);
+    }
+    return { repoPath: String(plan.repoPath), commonGitDir: String(plan.commonGitDir), baseCommit: String(plan.baseCommit).toLowerCase() };
+  }
+
+  #goalRevisionResultCommit(taskId: string, submission: TaskSubmission, creationBase: string): string {
+    const sha = this.#authoritativeResultCommit(taskId);
+    const commit = this.commitOperations(taskId).find(operation => operation.status === "applied" && operation.candidateSha?.toLowerCase() === sha)!;
+    const pkg = this.getReviewPackage(commit.packageId);
+    const run = pkg && this.getCheckRun(pkg.checkRunId);
+    const verdict = this.getPackageReviewVerdict(commit.verdictId);
+    const report = this.reportOperations(taskId).find(operation => operation.status === "complete" && operation.commitOperationId === commit.id);
+    const snapshot = pkg?.snapshot;
+    const checks = submission.checks ?? [];
+    const expectedIds = checks.map(check => check.id);
+    const results = run ? this.checkRunResults(run.id) : [];
+    const completedEvent = run && pkg && this.events(taskId).find(event => event.type === "check_run.completed" &&
+      event.payload?.checkRunId === run.id && event.payload?.reviewPackageId === pkg.id);
+    const latestVerdict = this.#db.prepare("SELECT id FROM review_verdicts WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
+      .get(taskId) as { id: string } | undefined;
+    const attempt = verdict && this.#db.prepare("SELECT status,role,harness,metadata FROM attempts WHERE id=? AND task_id=?")
+      .get(verdict.attemptId, taskId) as { status: string; role: string; harness: string; metadata: string | null } | undefined;
+    const metadata = attempt?.metadata ? JSON.parse(attempt.metadata) as Record<string, unknown> : {};
+    if (!pkg || pkg.taskId !== taskId || this.reviewPackages(taskId).at(-1)?.id !== pkg.id || !snapshot ||
+        snapshot.baseCommit.toLowerCase() !== creationBase || snapshot.preHead.toLowerCase() !== commit.preHead ||
+        snapshot.treeId.toLowerCase() !== commit.treeId || snapshot.diffHash !== commit.diffHash ||
+        pkg.branchRef !== `refs/heads/zero/${taskId}` || commit.branchRef !== pkg.branchRef ||
+        !commit.appliedEvidence || commit.appliedEvidence.treeId.toLowerCase() !== commit.treeId || commit.appliedEvidence.diffHash !== commit.diffHash ||
+        commit.appliedEvidence.candidateObjectVerified !== true || commit.appliedEvidence.indexMatchesReviewedTree !== true || commit.appliedEvidence.worktreeClean !== true ||
+        !run || run.taskId !== taskId || run.status !== "completed" || run.branchRef !== pkg.branchRef ||
+        run.executionAttemptId !== pkg.executionAttemptId || run.executionStageId !== pkg.executionStageId || run.routeAttemptId !== pkg.routeAttemptId ||
+        !sameReviewRecoverySnapshot(run.snapshot, snapshot) ||
+        run.checkDefinitionHash !== pkg.checkDefinitionHash || !sameStringSet(run.expectedCheckIds, pkg.expectedCheckIds) ||
+        pkg.checkDefinitionHash !== sha256Bytes(Buffer.from(JSON.stringify(checks), "utf8")) || !sameStringSet(pkg.expectedCheckIds, expectedIds) ||
+        !Array.isArray(completedEvent?.payload?.results) || JSON.stringify(completedEvent.payload.results) !== JSON.stringify(results) ||
+        results.length !== expectedIds.length || !sameStringSet(results.map(result => result.id), expectedIds) ||
+        results.some(result => result.status !== "passed" || result.exitCode !== 0) ||
+        !verdict || verdict.taskId !== taskId || verdict.packageId !== pkg.id || latestVerdict?.id !== verdict.id ||
+        !isValidReviewResult(verdict.result) || verdict.result.verdict !== "pass" || !sameReviewRecoverySnapshot(verdict.snapshot, snapshot) ||
+        !attempt || attempt.status !== "succeeded" || attempt.role !== "review" || attempt.harness !== "codex" ||
+        metadata.packageId !== pkg.id || metadata.generationId !== verdict.generationId ||
+        !report || report.packageId !== pkg.id || report.verdictId !== verdict.id ||
+        report.reportSize !== report.reportBytes.byteLength || sha256Bytes(report.reportBytes) !== report.reportSha256 ||
+        report.diffSize !== report.diffBytes.byteLength || sha256Bytes(report.diffBytes) !== report.diffSha256 || report.diffSha256 !== snapshot.diffHash) {
+      throw new Error(`Goal revision target lineage requires authoritative package, checks, verdict, applied commit and report for task ${taskId}`);
+    }
+    const reportObject = JSON.parse(report.reportBytes.toString("utf8")) as Record<string, unknown>;
+    if (reportObject.baseCommit !== creationBase || reportObject.taskId !== taskId || reportObject.finalStatus !== "done" || reportObject.resultCommit !== sha) {
+      throw new Error(`Goal revision target lineage report does not match its creation base and authoritative result for task ${taskId}`);
+    }
+    return sha;
   }
 
   sequenceGoalReviewByAttempt(attemptId: string): SequenceGoalReviewRecord | undefined {
@@ -1590,8 +1691,10 @@ export class TaskStore {
   }
 
   #sequenceGoalReview(row: Record<string, unknown>): SequenceGoalReviewRecord {
+    const result = row.result ? JSON.parse(String(row.result)) as GoalReviewResult : undefined;
+    if (result && !isValidGoalReviewResult(result)) throw new Error("Persisted aggregate goal review contains an invalid verdict or target");
     return { sequenceId: String(row.sequence_id), attemptId: String(row.attempt_id), generationId: String(row.generation_id), evidenceFingerprint: String(row.evidence_fingerprint),
-      state: row.state as SequenceGoalReviewRecord["state"], ...(row.result ? { result: JSON.parse(String(row.result)) as ReviewResult } : {}),
+      state: row.state as SequenceGoalReviewRecord["state"], ...(result ? { result } : {}),
       ...(row.retry_at ? { retryAt: String(row.retry_at) } : {}), createdAt: String(row.created_at),
       ...(row.completed_at ? { completedAt: String(row.completed_at) } : {}) };
   }
@@ -4766,6 +4869,16 @@ export class TaskStore {
     }
     return { ...handoff, id: row.id, byteLength: row.payload_bytes };
   }
+}
+
+function repositoryIdentityKey(value: string): string {
+  const normalized = path.normalize(value);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function isValidGoalReviewResult(value: GoalReviewResult): boolean {
+  return isValidReviewResult(value) && (value.targetTaskId === undefined ||
+    (value.verdict === "changes_requested" && typeof value.targetTaskId === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value.targetTaskId)));
 }
 
 function isValidReviewResult(value: ReviewResult): boolean {

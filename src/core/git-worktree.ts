@@ -11,6 +11,15 @@ export const WORKTREE_FINGERPRINT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
 const WORKTREE_FINGERPRINT_MAX_PATHS = 100_000;
 const GIT_METADATA_MAX_BYTES = 16 * 1024 * 1024;
 
+/** Drain all concurrent reads before reporting a failure and releasing their paths. */
+async function settleReadCommands<T extends readonly unknown[]>(commands: { [K in keyof T]: Promise<T[K]> }): Promise<T> {
+  const results = await Promise.allSettled(commands);
+  return results.map(result => {
+    if (result.status === 'rejected') throw result.reason;
+    return result.value;
+  }) as unknown as T;
+}
+
 export interface WorktreeInfo {
   taskId: string;
   repoPath: string;
@@ -163,8 +172,9 @@ export class GitWorktreeManager {
    * Reopens a task worktree from its persisted creation plan and observed evidence.
    * The original fingerprint is validated as evidence metadata, then a fresh one
    * is computed after Git identity and ancestry have been checked.
+   * An explicit Git environment applies to every read, including fingerprinting.
    */
-  async reopenFromEvidence(plan: WorktreeCreationPlan, evidence: WorktreeCreationEvidence): Promise<WorktreeCreationEvidence> {
+  async reopenFromEvidence(plan: WorktreeCreationPlan, evidence: WorktreeCreationEvidence, gitEnvironment?: NodeJS.ProcessEnv): Promise<WorktreeCreationEvidence> {
     this.#assertTaskId(plan.taskId);
     if (!evidence || !evidence.info || !/^[a-f0-9]{64}$/.test(evidence.fingerprint)
       || !/^[a-fA-F0-9]{40,64}$/.test(evidence.head)) {
@@ -195,18 +205,18 @@ export class GitWorktreeManager {
 
     const repo = await realpath(plan.repoPath);
     if (repo !== plan.repoPath) throw new Error("Repository path changed since creation");
-    const { stdout: repoTop } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: repo, windowsHide: true });
+    const { stdout: repoTop } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: repo, windowsHide: true, env: gitEnvironment });
     if (await realpath(repoTop.trim()) !== plan.repoPath) throw new Error("Repository identity changed since creation");
-    const { stdout: commonOutput } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo, windowsHide: true });
+    const { stdout: commonOutput } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo, windowsHide: true, env: gitEnvironment });
     const commonGitDir = await realpath(commonOutput.trim());
     if (commonGitDir !== plan.commonGitDir) throw new Error("Repository Git common directory changed since creation");
 
-    const [worktreeTop, worktreeCommon, headResult, baseResult, registeredResult] = await Promise.all([
-      execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: path, windowsHide: true }),
-      execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: path, windowsHide: true }),
-      execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: path, windowsHide: true }),
-      execFileAsync("git", ["rev-parse", "--verify", `${plan.baseCommit}^{commit}`], { cwd: repo, windowsHide: true }),
-      execFileAsync("git", ["worktree", "list", "--porcelain", "-z"], { cwd: repo, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }),
+    const [worktreeTop, worktreeCommon, headResult, baseResult, registeredResult] = await settleReadCommands([
+      execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: path, windowsHide: true, env: gitEnvironment }),
+      execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: path, windowsHide: true, env: gitEnvironment }),
+      execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: path, windowsHide: true, env: gitEnvironment }),
+      execFileAsync("git", ["rev-parse", "--verify", `${plan.baseCommit}^{commit}`], { cwd: repo, windowsHide: true, env: gitEnvironment }),
+      execFileAsync("git", ["worktree", "list", "--porcelain", "-z"], { cwd: repo, windowsHide: true, maxBuffer: 4 * 1024 * 1024, env: gitEnvironment }),
     ]);
     if (await realpath(worktreeTop.stdout.trim()) !== plan.path) throw new Error("Checkpoint path is not the planned task worktree");
     if (await realpath(worktreeCommon.stdout.trim()) !== plan.commonGitDir) throw new Error("Checkpoint worktree belongs to a different Git common directory");
@@ -224,13 +234,13 @@ export class GitWorktreeManager {
     if (registered.head?.toLowerCase() !== head.toLowerCase() || registered.detached || registered.bare || registered.prunable) {
       throw new Error("Git worktree registration does not match the task worktree HEAD and branch");
     }
-    await execFileAsync("git", ["merge-base", "--is-ancestor", plan.baseCommit, head], { cwd: path, windowsHide: true });
+    await execFileAsync("git", ["merge-base", "--is-ancestor", plan.baseCommit, head], { cwd: path, windowsHide: true, env: gitEnvironment });
 
     const info: WorktreeInfo = {
       taskId: plan.taskId, repoPath: plan.repoPath, path: plan.path, branch: plan.branch, baseCommit: plan.baseCommit,
     };
-    const fingerprint = await this.fingerprint(info);
-    const { stdout: finalHead } = await execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: path, windowsHide: true });
+    const fingerprint = await this.fingerprint(info, gitEnvironment);
+    const { stdout: finalHead } = await execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: path, windowsHide: true, env: gitEnvironment });
     if (finalHead.trim().toLowerCase() !== head.toLowerCase()) {
       throw new Error("Task worktree HEAD changed while reopening from persisted evidence");
     }
@@ -331,18 +341,19 @@ export class GitWorktreeManager {
   /**
    * Fingerprints Git identity/index state plus content of every changed tracked
    * and non-ignored untracked file. Resource or path-boundary violations fail closed.
+   * Callers may supply an isolated Git environment without changing writer defaults.
    */
-  async fingerprint(info: WorktreeInfo): Promise<string> {
+  async fingerprint(info: WorktreeInfo, gitEnvironment?: NodeJS.ProcessEnv): Promise<string> {
     await this.#validateInfo(info);
-    await this.#ensureTaskBranch(info);
+    await this.#ensureTaskBranch(info, gitEnvironment);
     const readMetadata = async () => {
-      const [headResult, indexResult, statusResult, changedResult, untrackedResult, flagResult] = await Promise.all([
-        execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: info.path, windowsHide: true }),
-        execFileAsync("git", ["ls-files", "--stage", "-z"], { cwd: info.path, windowsHide: true, maxBuffer: GIT_METADATA_MAX_BYTES }),
-        execFileAsync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: info.path, windowsHide: true, maxBuffer: GIT_METADATA_MAX_BYTES }),
-        execFileAsync("git", ["diff", "--no-renames", "--name-only", "-z", info.baseCommit, "--"], { cwd: info.path, windowsHide: true, maxBuffer: GIT_METADATA_MAX_BYTES }),
-        execFileAsync("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: info.path, windowsHide: true, maxBuffer: GIT_METADATA_MAX_BYTES }),
-        execFileAsync("git", ["ls-files", "-v", "-z"], { cwd: info.path, windowsHide: true, maxBuffer: GIT_METADATA_MAX_BYTES }),
+      const [headResult, indexResult, statusResult, changedResult, untrackedResult, flagResult] = await settleReadCommands([
+        execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: info.path, windowsHide: true, env: gitEnvironment }),
+        execFileAsync("git", ["ls-files", "--stage", "-z"], { cwd: info.path, windowsHide: true, maxBuffer: GIT_METADATA_MAX_BYTES, env: gitEnvironment }),
+        execFileAsync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: info.path, windowsHide: true, maxBuffer: GIT_METADATA_MAX_BYTES, env: gitEnvironment }),
+        execFileAsync("git", ["diff", "--no-renames", "--name-only", "-z", info.baseCommit, "--"], { cwd: info.path, windowsHide: true, maxBuffer: GIT_METADATA_MAX_BYTES, env: gitEnvironment }),
+        execFileAsync("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: info.path, windowsHide: true, maxBuffer: GIT_METADATA_MAX_BYTES, env: gitEnvironment }),
+        execFileAsync("git", ["ls-files", "-v", "-z"], { cwd: info.path, windowsHide: true, maxBuffer: GIT_METADATA_MAX_BYTES, env: gitEnvironment }),
       ]);
       for (const entry of flagResult.stdout.split("\0").filter(Boolean)) {
         const tag = entry[0];
@@ -816,8 +827,8 @@ export class GitWorktreeManager {
     return target;
   }
 
-  async #ensureTaskBranch(info: WorktreeInfo): Promise<void> {
-    const { stdout } = await execFileAsync("git", ["branch", "--show-current"], { cwd: info.path, windowsHide: true });
+  async #ensureTaskBranch(info: WorktreeInfo, gitEnvironment?: NodeJS.ProcessEnv): Promise<void> {
+    const { stdout } = await execFileAsync("git", ["branch", "--show-current"], { cwd: info.path, windowsHide: true, env: gitEnvironment });
     if (stdout.trim() !== info.branch) throw new Error(`Refusing to inspect or commit a worktree checked out on unexpected branch ${stdout.trim()}`);
   }
 

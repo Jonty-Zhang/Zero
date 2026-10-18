@@ -90,7 +90,7 @@ export type SequenceGoalReview = {
   state: 'running' | 'quota' | 'verdict';
   attemptId?: string;
   retryRequestedAt?: string;
-  result?: ReviewResult;
+  result?: ReviewResult & { targetTaskId?: string };
   retryAt?: string;
   createdAt: string;
   completedAt?: string;

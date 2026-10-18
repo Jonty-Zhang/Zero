@@ -36,6 +36,20 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 describe('task workspace', () => {
+  it('shows the selected remediation repository and opens that earlier task', async () => {
+    const sequence = blockedSequence();
+    sequence.steps[0]!.task = { ...sequence.steps[0]!.task, repoPath: 'C:/projects/server' };
+    sequence.steps[1]!.task = { ...sequence.steps[1]!.task, repoPath: 'C:/projects/client' };
+    sequence.goalReview!.result = { verdict: 'changes_requested', summary: '服务端需要补充校验', targetTaskId: 'step-one', findings: [{ message: '检查接口契约' }] };
+    vi.mocked(api.task).mockResolvedValue(sequence.steps[0]!.task);
+    const dialog = await openSequence(sequence);
+    const target = within(dialog).getByRole('region', { name: '本轮返工目标' });
+    expect(within(target).getByText('C:/projects/server')).toBeTruthy();
+    expect(within(target).queryByText('C:/projects/client')).toBeNull();
+    fireEvent.click(within(target).getByRole('button', { name: '查看目标步骤' }));
+    await screen.findByRole('dialog', { name: '任务详情' });
+    expect(vi.mocked(api.task).mock.calls[0]?.[0]).toBe('step-one');
+  });
   it('queues the exact blocked goal attempt once and keeps its findings during a delayed refresh', async () => {
     const sequence = blockedSequence();
     const dialog = await openSequence(sequence);
