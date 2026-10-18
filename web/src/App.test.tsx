@@ -339,4 +339,41 @@ describe('task workspace', () => {
     close.dispatchEvent(backwards);
     expect(document.activeElement).toBe(summary);
   });
+  it('keeps keyboard focus inside a submitting dialog after its controls become disabled', async () => {
+    vi.mocked(api.createTask).mockImplementation(() => new Promise(() => {}));
+    render(<App />);
+    const opener = await screen.findByRole('button', { name: '提交任务' });
+    opener.focus();
+    fireEvent.click(opener);
+    const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
+    fireEvent.change(within(dialog).getByLabelText(/仓库路径/), { target: { value: 'C:/repo/zero' } });
+    fireEvent.change(within(dialog).getByLabelText('任务描述 *'), { target: { value: '完成目标并检查结果' } });
+    fireEvent.change(within(dialog).getByLabelText(/检查命令/), { target: { value: 'npm test' } });
+    const submit = within(dialog).getByRole('button', { name: '加入任务队列' });
+    submit.focus();
+    fireEvent.click(submit);
+    expect(document.activeElement).toBe(dialog);
+    // Disabled controls can leave BODY focused in a native browser.
+    (document.activeElement as HTMLElement).blur();
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+    document.body.dispatchEvent(tab);
+    expect(tab.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(dialog);
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(screen.getAllByRole('dialog')).toHaveLength(1);
+  });
+  it('redirects background focus into the dialog and restores the opener after closing', async () => {
+    render(<App />);
+    const opener = await screen.findByRole('button', { name: '提交任务' });
+    opener.focus();
+    fireEvent.click(opener);
+    const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
+    screen.getByRole('button', { name: '路由设置' }).focus();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(opener);
+    screen.getByRole('button', { name: '路由设置' }).focus();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: '路由设置' }));
+  });
 });
