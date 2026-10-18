@@ -13,6 +13,18 @@ const tasks: Task[] = [
 ];
 const capability = { harnesses: [{ id: 'codex', name: 'Codex', available: true }], bindings: [], allocator: { models: [], reasoningEfforts: [] }, reviewer: { models: [], reasoningEfforts: [] } };
 const config = { allocator: { kind: 'codex', modelId: null, reasoningEffort: null }, reviewer: { modelId: null, reasoningEffort: null } };
+const sharedModelCapabilities = {
+  ...capability,
+  harnesses: [{ id: 'codex', name: 'Codex', available: true }, { id: 'dsh', name: 'DSH', available: true }, { id: 'offline', name: 'Offline', available: false }],
+  bindings: [
+    { harnessId: 'codex', modelId: 'shared-model', available: true, reasoningEfforts: [{ id: 'low', label: 'Low' }] },
+    { harnessId: 'dsh', modelId: 'shared-model', available: true, reasoningEfforts: [{ id: 'low', label: 'Low' }, { id: 'high', label: 'High' }] },
+    { harnessId: 'codex', modelId: 'other-model', available: true, reasoningEfforts: [{ id: 'medium', label: 'Medium' }] },
+    { harnessId: 'codex', modelId: 'shared-model', available: false, reasoningEfforts: [{ id: 'xhigh', label: 'Unavailable binding' }] },
+    { harnessId: 'offline', modelId: 'shared-model', available: true, reasoningEfforts: [{ id: 'max', label: 'Unavailable harness' }] },
+  ],
+};
+const optionValues = (select: HTMLElement) => Array.from((select as HTMLSelectElement).options).map(option => option.value);
 const blockedSequence = (): TaskSequence => ({ id: 'sequence-retry', objective: '可重试的整体目标', status: 'blocked', maxGoalRevisions: 2, goalRevisionCount: 0,
   createdAt: '', updatedAt: '', steps: [{ position: 0, task: { ...tasks[1]!, id: 'step-one' } }, { position: 1, task: { ...tasks[1]!, id: 'step-two' } }],
   goalReview: { state: 'verdict', attemptId: 'blocked-attempt', createdAt: '', result: { verdict: 'blocked', summary: '审核器连接失败', findings: [{ message: '保留上一轮失败发现' }] } } });
@@ -36,6 +48,115 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 describe('task workspace', () => {
+  it('keeps cached goal cards usable after a failed poll and replaces them on recovery', async () => {
+    vi.useFakeTimers();
+    const sequence = blockedSequence();
+    vi.mocked(api.sequences).mockResolvedValueOnce([sequence]).mockRejectedValueOnce(new Error('sequence endpoint 503')).mockResolvedValue([{ ...sequence, objective: '恢复后的目标' }]);
+    vi.mocked(api.sequence).mockResolvedValue(sequence);
+    render(<App />);
+    await act(async () => {});
+    expect(screen.getByRole('button', { name: /可重试的整体目标.*步骤已完成/ })).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(4500); });
+    const retainedCard = screen.getByRole('button', { name: /可重试的整体目标.*步骤已完成/ });
+    const warning = screen.getByRole('alert');
+    expect(warning.textContent).toContain('sequence endpoint 503');
+    expect(warning.textContent).toContain('上次同步');
+    fireEvent.click(retainedCard);
+    await act(async () => {});
+    const dialog = screen.getByRole('dialog', { name: '目标进度' });
+    expect(within(dialog).getByRole('heading', { name: '可重试的整体目标' })).toBeTruthy();
+    expect(within(dialog).getByText(/^有序步骤/)).toBeTruthy();
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    await act(async () => { await vi.advanceTimersByTimeAsync(4500); });
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('button', { name: /可重试的整体目标.*步骤已完成/ })).toBeNull();
+    expect(screen.getByRole('button', { name: /恢复后的目标.*步骤已完成/ })).toBeTruthy();
+  });
+  it('shows an initial goal-list error without cached cards and clears it after a successful refresh', async () => {
+    vi.mocked(api.sequences).mockRejectedValueOnce(new Error('initial sequence endpoint 503')).mockResolvedValue([blockedSequence()]);
+    const { container } = render(<App />);
+    expect(await screen.findByText('initial sequence endpoint 503')).toBeTruthy();
+    expect(container.querySelectorAll('.sequence-card')).toHaveLength(0);
+    expect(screen.queryByText(/上次同步的目标/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '刷新工作区' }));
+    expect(await screen.findByRole('button', { name: /可重试的整体目标.*步骤已完成/ })).toBeTruthy();
+    expect(screen.queryByText('initial sequence endpoint 503')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+  it('unions available shared-model efforts without a harness lock and submits the chosen effort', async () => {
+    vi.mocked(api.capabilities).mockResolvedValue(sharedModelCapabilities);
+    vi.mocked(api.createTask).mockResolvedValue(tasks[0]!);
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
+    const [harness, model, effort] = within(dialog).getAllByRole('combobox');
+    fireEvent.change(model!, { target: { value: 'shared-model' } });
+    expect(optionValues(effort!)).toEqual(['', 'low', 'high']);
+    fireEvent.change(effort!, { target: { value: 'high' } });
+    expect((harness as HTMLSelectElement).value).toBe('');
+    fireEvent.change(within(dialog).getByLabelText(/仓库路径/), { target: { value: 'C:/repo/zero' } });
+    fireEvent.change(within(dialog).getByLabelText('任务描述 *'), { target: { value: '共享模型可自动选择执行器' } });
+    fireEvent.change(within(dialog).getByLabelText(/检查命令/), { target: { value: 'npm test' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: '加入任务队列' }));
+    await screen.findByRole('dialog', { name: '任务详情' });
+    expect(api.createTask).toHaveBeenCalledWith(expect.objectContaining({ execution: { harnessId: null, modelId: 'shared-model', reasoningEffort: 'high' } }));
+  });
+  it('narrows shared-model efforts to an explicit harness and clears dependent choices when changed', async () => {
+    vi.mocked(api.capabilities).mockResolvedValue(sharedModelCapabilities);
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    const [harness, model, effort] = within(screen.getByRole('dialog')).getAllByRole('combobox');
+    fireEvent.change(harness!, { target: { value: 'dsh' } });
+    fireEvent.change(model!, { target: { value: 'shared-model' } });
+    expect(optionValues(effort!)).toEqual(['', 'low', 'high']);
+    fireEvent.change(effort!, { target: { value: 'high' } });
+    fireEvent.change(harness!, { target: { value: 'codex' } });
+    expect((model as HTMLSelectElement).value).toBe('');
+    expect((effort as HTMLSelectElement).value).toBe('');
+    fireEvent.change(model!, { target: { value: 'shared-model' } });
+    expect(optionValues(effort!)).toEqual(['', 'low']);
+    fireEvent.change(effort!, { target: { value: 'low' } });
+    fireEvent.change(model!, { target: { value: 'other-model' } });
+    expect((effort as HTMLSelectElement).value).toBe('');
+    expect(optionValues(effort!)).toEqual(['', 'medium']);
+  });
+  it('preserves shared-model effort selections while capabilities fail or temporarily lose available bindings', async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.capabilities).mockResolvedValueOnce(sharedModelCapabilities).mockRejectedValueOnce(new Error('capabilities 503')).mockResolvedValueOnce({ ...sharedModelCapabilities, bindings: [] }).mockResolvedValue(sharedModelCapabilities);
+    render(<App />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    const [harness, model, effort] = within(screen.getByRole('dialog')).getAllByRole('combobox');
+    fireEvent.change(model!, { target: { value: 'shared-model' } });
+    fireEvent.change(effort!, { target: { value: 'high' } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+    expect((harness as HTMLSelectElement).value).toBe('');
+    expect((model as HTMLSelectElement).value).toBe('shared-model');
+    expect((effort as HTMLSelectElement).value).toBe('high');
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+    expect((model as HTMLSelectElement).value).toBe('shared-model');
+    expect((effort as HTMLSelectElement).value).toBe('high');
+    expect((within(effort!).getByRole('option', { name: /high.*当前不可用/ }) as HTMLOptionElement).disabled).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+    expect((effort as HTMLSelectElement).value).toBe('high');
+    expect((within(effort!).getByRole('option', { name: 'High' }) as HTMLOptionElement).disabled).toBe(false);
+  });
+  it('keeps sequence-step shared-model efforts unioned and narrows them for an explicit harness', async () => {
+    vi.mocked(api.capabilities).mockResolvedValue(sharedModelCapabilities);
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    fireEvent.click(screen.getAllByRole('button', { name: '提交目标' })[0]!);
+    const dialog = screen.getByRole('dialog', { name: '提交有序任务序列' });
+    const step = within(dialog).getByLabelText('步骤 1 描述 *').closest('.sequence-step-editor')!;
+    const [harness, model, effort] = within(step as HTMLElement).getAllByRole('combobox');
+    fireEvent.change(model!, { target: { value: 'shared-model' } });
+    expect(optionValues(effort!)).toEqual(['', 'low', 'high']);
+    fireEvent.change(harness!, { target: { value: 'codex' } });
+    fireEvent.change(model!, { target: { value: 'shared-model' } });
+    expect(optionValues(effort!)).toEqual(['', 'low']);
+  });
   it('shows the selected remediation repository and opens that earlier task', async () => {
     const sequence = blockedSequence();
     sequence.steps[0]!.task = { ...sequence.steps[0]!.task, repoPath: 'C:/projects/server' };

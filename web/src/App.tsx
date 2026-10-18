@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } 
 import { Activity, Search, LayoutList, Columns3, Layers3, AlertCircle, ArrowDown, ArrowRight, ArrowUp, Check, CheckCircle2, ChevronDown, CircleHelp, Clock3, Code2, FileText, FolderGit2, ListOrdered, LoaderCircle, Plus, RefreshCw, Settings2, ShieldCheck, Target, TerminalSquare, X, XCircle } from 'lucide-react';
 import { api } from './api';
 import { usePolling } from './usePolling';
-import type { Binding, Capabilities, Choice, Config, ExecutionSelection, HarnessHealth, Status, Task, TaskSequence, TestResult } from './types';
+import type { Capabilities, Choice, Config, ExecutionSelection, HarnessHealth, Status, Task, TaskSequence, TestResult } from './types';
 
 const columns: { id: Status; label: string; tone: string }[] = [
   { id: 'pending', label: '待处理', tone: 'slate' }, { id: 'running', label: '执行中', tone: 'blue' },
@@ -175,7 +175,8 @@ function TaskCard({ task, onClick }: { task: Task; onClick: () => void }) {
 function SequenceProgressSection({ sequences, error, onOpen, onCreate }: { sequences: TaskSequence[]; error: string; onOpen: (id: string) => void; onCreate: () => void }) {
   if (!sequences.length && !error) return <section className="sequence-section"><div className="sequence-section-heading"><div><h2><Target size={16} />目标序列</h2><p>把一个目标拆成至少两个按顺序执行的任务。</p></div><Button onClick={onCreate}><ListOrdered size={14} />提交目标</Button></div></section>;
   return <section className="sequence-section"><div className="sequence-section-heading"><div><h2><Target size={16} />目标序列</h2><p>按顺序查看目标拆解任务的进度。</p></div><Button onClick={onCreate}><ListOrdered size={14} />提交目标</Button></div>
-    {error ? <div className="alert error compact"><AlertCircle size={15} />{error}</div> : <div className="sequence-list">{sequences.map(sequence => {
+    {error && <div className="alert error compact" role="alert"><AlertCircle size={15} /><div>{sequences.length > 0 && <b>刷新失败，显示上次同步的目标</b>}<span>{error}</span></div></div>}
+    {sequences.length > 0 && <div className="sequence-list">{sequences.map(sequence => {
       const completed = sequence.steps.filter(step => step.task.status === 'done').length;
       const activeGoalRevision = activeGoalRevisionTask(sequence);
       const allStepsDone = sequence.steps.length > 0 && completed === sequence.steps.length;
@@ -301,8 +302,7 @@ function SubmitModal({ capabilities, capabilityError, allocatorKind, onClose, on
   const filteredBindings = bindings.filter(b => !harnessId || b.harnessId === harnessId);
   const harnessChoices = [...new Map(bindings.map(b => [b.harnessId, b])).values()].map(b => ({ id: b.harnessId, label: capabilities?.harnesses.find(h => h.id === b.harnessId)?.name || b.harnessId }));
   const modelChoices = [...new Map(filteredBindings.map(b => [b.modelId, b])).values()].map(b => ({ id: b.modelId, label: b.modelName || b.modelId }));
-  const selectedBinding: Binding | undefined = bindings.find(b => b.modelId === modelId && (!harnessId || b.harnessId === harnessId));
-  const effortChoices = selectedBinding?.reasoningEfforts ?? (modelId ? [...new Map(bindings.filter(b => b.modelId === modelId).flatMap(b => b.reasoningEfforts ?? []).map(e => [e.id, e])).values()] : []);
+  const effortChoices = modelId ? [...new Map(filteredBindings.filter(b => b.modelId === modelId).flatMap(b => b.reasoningEfforts ?? []).map(e => [e.id, e])).values()] : [];
   const submit = async (event: FormEvent) => { event.preventDefault(); if (busy) return; if (!checks.trim()) { setError('请至少填写一条检查命令。'); return; } setError(''); setBusy(true); try { const created = await api.createTask({ repoPath: repoPath.trim(), baseRef: baseRef.trim() || null, prompt: prompt.trim(), acceptanceCriteria: criteria.trim(), maxRevisions, checkCommands: checks.split('\n').map(s => s.trim()).filter(Boolean), execution: { harnessId: harnessId || null, modelId: modelId || null, reasoningEffort: effort || null }, ...(stages.length ? { executionStages: stages.map(stage => ({ ...(stage.objective.trim() ? { objective: stage.objective.trim() } : {}), ...(stage.harnessId ? { harnessId: stage.harnessId } : {}), ...(stage.modelId ? { modelId: stage.modelId } : {}), ...(stage.reasoningEffort ? { reasoningEffort: stage.reasoningEffort } : {}) })) } : {}) }); onCreated(created); } catch (e) { setError(e instanceof Error ? e.message : '提交失败，请稍后重试'); } finally { setBusy(false); } };
   const allocatorName = allocatorKind === 'api' ? 'API 模型' : 'Codex';
   return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="提交执行任务" className="modal submit-modal"><div className="modal-heading"><div><div className="eyebrow">新建任务</div><h2>提交执行任务</h2><p>未指定的执行选项由 {allocatorName} 分配器根据可用能力补全。</p></div><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>

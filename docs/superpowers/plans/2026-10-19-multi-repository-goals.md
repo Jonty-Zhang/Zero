@@ -78,8 +78,8 @@
 - [x] RED: invalid/foreign/stale/missing multi target persists blocked and explicit retry recovers; quota/reboot/revision limits and competing scheduler gates remain.
 - [x] Project targetTaskId in HTTP and show its repository in goal findings; maintain old DTO/keyboard/retry behavior.
 - [x] Verify actual Edge desktop/narrow viewport against local fixtures and API; update user-facing workflow and honest remaining limits. Real HTTP/SQLite Edge at 1440 and 375 px, correct target navigation, no horizontal overflow or page errors; web 33/33 and production build passed.
-- [ ] Independent final review, canonical full core, web/client/type/build/public-tree on a frozen commit; exact-head Linux/Windows CI, push/PR and main tree verification.
-- [ ] Record verified outcomes and continue the next audit unless the user requests pausing.
+- [x] Independent final review, canonical full core, web/client/type/build/public-tree on frozen source 113566c; local and Windows core 558/558, Linux 554 passed + 4 platform skips, web 33/33, client 11/11, both CI runs and Windows installer/uninstaller succeeded. PR #6 merged as de4bc8f; remote/local main and the tested tree 18c9c5a verified equal.
+- [x] Record verified outcomes in PR #6 and continue the next web workflow audit as authorized.
 
 ## Implementation rulings
 
