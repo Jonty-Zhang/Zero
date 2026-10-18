@@ -53,9 +53,130 @@ export interface TrustedCodexCwd {
   dispose(): Promise<void>;
 }
 
+export interface GoalProjectSource {
+  repositoryId: string;
+  targetTaskId: string;
+  taskWorkspace: string;
+}
+
+export interface GoalProjectSnapshot {
+  source: GoalProjectSource;
+  snapshot: ProjectSnapshot;
+}
+
 const MAX_SNAPSHOT_FILES = 10_000;
 const MAX_SNAPSHOT_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_SNAPSHOT_TOTAL_BYTES = 64 * 1024 * 1024;
+
+/** Build one bounded review bundle; repository IDs, never source paths, name its namespaces. */
+export async function createTrustedGoalCwd(options: { artifactRoot: string; repositories: GoalProjectSource[] }): Promise<{
+  cwd: string;
+  projectSnapshots: GoalProjectSnapshot[];
+  manifestPath: string;
+  contentSha256: string;
+  dispose(): Promise<void>;
+}> {
+  if (!Array.isArray(options.repositories) || options.repositories.length < 1 || options.repositories.length > 20) {
+    throw new Error('Goal review snapshot requires between 1 and 20 repositories');
+  }
+  const repositoryIds = new Set<string>();
+  const targetTaskIds = new Set<string>();
+  // Capture caller-owned mappings before the first asynchronous operation.
+  const sources = options.repositories.map((source) => {
+    if (typeof source.repositoryId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(source.repositoryId)) throw new Error('Goal review snapshot has an invalid repository ID');
+    if (typeof source.targetTaskId !== 'string' || !source.targetTaskId.trim() || source.targetTaskId.length > 256 || /[\x00-\x1f\x7f]/.test(source.targetTaskId)) throw new Error('Goal review snapshot has an invalid target task ID');
+    const namespace = process.platform === 'win32' ? source.repositoryId.toLowerCase() : source.repositoryId;
+    if (repositoryIds.has(namespace) || targetTaskIds.has(source.targetTaskId)) throw new Error('Goal review snapshot has duplicate repository or target task IDs');
+    repositoryIds.add(namespace);
+    targetTaskIds.add(source.targetTaskId);
+    if (!isAbsolute(source.taskWorkspace)) throw new Error('Trusted Codex cwd paths must be absolute');
+    return { ...source };
+  });
+  if (!isAbsolute(options.artifactRoot)) throw new Error('Trusted Codex cwd paths must be absolute');
+  const sourceRoots = await Promise.all(sources.map(source => realpath(source.taskWorkspace)));
+  const plannedArtifactRoot = await resolveUncreatedPath(options.artifactRoot);
+  if (sourceRoots.some(root => isWithin(root, plannedArtifactRoot))) throw new Error('Trusted Codex cwd would overlap a task workspace');
+  await mkdir(options.artifactRoot, { recursive: true });
+  const artifactRoot = await realpath(options.artifactRoot);
+  const setupId = randomUUID();
+  const sandboxPath = join(artifactRoot, `.zero-codex-review-${setupId}`);
+  const gitConfigPath = join(artifactRoot, `.zero-codex-git-config-${setupId}`);
+  if (!isWithin(artifactRoot, sandboxPath) || sourceRoots.some(root => isWithin(root, sandboxPath) || isWithin(sandboxPath, root))) {
+    throw new Error('Trusted Codex cwd would overlap a task workspace or escape artifactRoot');
+  }
+  for (const sourceRoot of sourceRoots) await assertNoAgentInstructions(sandboxPath, sourceRoot);
+  let created = false;
+  let identity: Awaited<ReturnType<typeof lstat>> | undefined;
+  const dispose = async (): Promise<void> => {
+    const info = await lstat(sandboxPath).catch((error: unknown) => {
+      if (isNodeError(error) && error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (!info) return;
+    const current = await realpath(sandboxPath);
+    if (!identity || info.isSymbolicLink() || !info.isDirectory() || info.dev !== identity.dev || info.ino !== identity.ino || current !== sandboxPath || !isWithin(artifactRoot, current) || sourceRoots.some(root => isWithin(root, current) || isWithin(current, root))) {
+      throw new Error('Refusing to remove a Trusted Codex cwd whose resolved path or identity changed');
+    }
+    await rm(current, { recursive: true, force: false });
+  };
+  try {
+    await writeFile(gitConfigPath, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    await mkdir(sandboxPath, { recursive: false, mode: 0o700 });
+    created = true;
+    identity = await lstat(sandboxPath);
+    if (await realpath(sandboxPath) !== sandboxPath) throw new Error('Trusted Codex cwd resolved outside artifactRoot');
+    await execFileAsync('git', ['init', '--quiet', '--initial-branch=main', '--template='], {
+      cwd: sandboxPath, windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024, env: safeGitEnvironment(gitConfigPath),
+    });
+    const prepared: PreparedProjectSnapshot[] = [];
+    const budget = { files: 0, bytes: 0 };
+    // All repositories must pass metadata and size preflight before any blob is read.
+    for (const sourceRoot of sourceRoots) prepared.push(await prepareProjectSnapshot(sourceRoot, gitConfigPath, budget));
+    const projectSnapshots: GoalProjectSnapshot[] = [];
+    for (let index = 0; index < sources.length; index++) {
+      const source = sources[index]!;
+      const snapshot = await createProjectSnapshot(sourceRoots[index]!, sandboxPath, prepared[index]!, `review-context/projects/${source.repositoryId}`);
+      projectSnapshots.push({ source, snapshot });
+    }
+    // Recheck every source after the entire bundle is written, including earlier sources.
+    for (const project of prepared) await assertProjectSnapshotUnchanged(project);
+    for (const sourceRoot of sourceRoots) await assertNoAgentInstructions(sandboxPath, sourceRoot);
+    const repositories = projectSnapshots.map(({ source, snapshot }) => ({
+      repositoryId: source.repositoryId,
+      targetTaskId: source.targetTaskId,
+      projectRoot: `review-context/projects/${source.repositoryId}/project`,
+      manifestPath: `review-context/projects/${source.repositoryId}/manifest.json`,
+      headCommit: snapshot.manifest.headCommit,
+      indexTree: snapshot.manifest.indexTree,
+      contentSha256: snapshot.manifest.contentSha256,
+      fileCount: snapshot.manifest.fileCount,
+      totalBytes: snapshot.manifest.totalBytes,
+    }));
+    const contentSha256 = createHash('sha256').update(JSON.stringify(repositories)).digest('hex');
+    const manifestPath = join(sandboxPath, 'review-context', 'repositories.json');
+    await writeFile(manifestPath, `${JSON.stringify({ version: 1, repositories, contentSha256 }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    return { cwd: sandboxPath, projectSnapshots, manifestPath, contentSha256, dispose };
+  } catch (error) {
+    if (created) await dispose().catch(() => undefined);
+    throw error;
+  } finally {
+    await rm(gitConfigPath, { force: true }).catch(() => undefined);
+  }
+}
+
+/** Resolve existing ancestors without creating an artifact directory inside a source. */
+async function resolveUncreatedPath(path: string): Promise<string> {
+  let existing = resolve(path);
+  for (;;) {
+    try { return resolve(await realpath(existing), relative(existing, path)); }
+    catch (error) {
+      if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
+      const parent = dirname(existing);
+      if (parent === existing) throw error;
+      existing = parent;
+    }
+  }
+}
 
 /**
  * Creates a fresh Git repository below artifactRoot for a coordinator/reviewer Codex
@@ -123,17 +244,36 @@ export async function createTrustedCodexCwd(options: TrustedCodexCwdOptions): Pr
   }
 }
 
-async function createProjectSnapshot(taskWorkspace: string, sandbox: string): Promise<ProjectSnapshot> {
-  const gitConfigPath = join(sandbox, '.snapshot-git-config');
-  const gitOptions = {
-    cwd: taskWorkspace,
-    windowsHide: true,
-    timeout: 15_000,
-    maxBuffer: 16 * 1024 * 1024,
-    encoding: 'buffer',
-    env: safeGitEnvironment(gitConfigPath),
+interface PreparedProjectSnapshot {
+  taskWorkspace: string;
+  gitConfigPath: string;
+  headCommit: string;
+  indexTree: string;
+  stagedListing: Buffer;
+  untrackedListing: Buffer;
+  sourceEntries: GitIndexEntry[];
+  excluded: ProjectSnapshotManifest['excluded'];
+}
+
+function snapshotGitOptions(taskWorkspace: string, gitConfigPath: string) {
+  return {
+    cwd: taskWorkspace, windowsHide: true, timeout: 15_000, maxBuffer: 16 * 1024 * 1024,
+    encoding: 'buffer', env: safeGitEnvironment(gitConfigPath),
   } as const;
-  const [head, index, stagedListing, untrackedListing] = await Promise.all([
+}
+
+/** A failed command must not leave sibling Git processes holding source paths open. */
+async function settleGitCommands<T extends readonly unknown[]>(commands: { [K in keyof T]: Promise<T[K]> }): Promise<T> {
+  const results = await Promise.allSettled(commands);
+  return results.map(result => {
+    if (result.status === 'rejected') throw result.reason;
+    return result.value;
+  }) as unknown as T;
+}
+
+async function prepareProjectSnapshot(taskWorkspace: string, gitConfigPath: string, budget: { files: number; bytes: number }): Promise<PreparedProjectSnapshot> {
+  const gitOptions = snapshotGitOptions(taskWorkspace, gitConfigPath);
+  const [head, index, stagedListing, untrackedListing] = await settleGitCommands([
     execFileAsync('git', ['rev-parse', '--verify', 'HEAD^{commit}'], gitOptions),
     execFileAsync('git', ['write-tree'], gitOptions),
     execFileAsync('git', ['ls-files', '--stage', '-z'], gitOptions),
@@ -154,7 +294,8 @@ async function createProjectSnapshot(taskWorkspace: string, sandbox: string): Pr
     excluded.push({ path: entry.path, reason: 'Git metadata is excluded from the review snapshot' });
     return false;
   });
-  if (sourceEntries.length > MAX_SNAPSHOT_FILES) {
+  budget.files += sourceEntries.length;
+  if (budget.files > MAX_SNAPSHOT_FILES) {
     throw new Error(`Project review snapshot exceeds the ${MAX_SNAPSHOT_FILES} file limit`);
   }
   for (const entry of sourceEntries) {
@@ -164,10 +305,20 @@ async function createProjectSnapshot(taskWorkspace: string, sandbox: string): Pr
     if (entry.mode === '160000') throw new Error(`Project review snapshot refuses Git submodules: ${entry.path}`);
     if (entry.mode !== '100644' && entry.mode !== '100755') throw new Error(`Project review snapshot found an unsupported Git file mode: ${entry.path}`);
   }
+  for (const size of await readIndexBlobSizes(taskWorkspace, sourceEntries, gitConfigPath)) {
+    budget.bytes += size;
+    if (budget.bytes > MAX_SNAPSHOT_TOTAL_BYTES) throw new Error(`Project review snapshot exceeds the ${MAX_SNAPSHOT_TOTAL_BYTES} byte total limit`);
+  }
+  return { taskWorkspace, gitConfigPath, headCommit, indexTree, stagedListing: stagedListing.stdout, untrackedListing: untrackedListing.stdout, sourceEntries, excluded };
+}
+
+async function createProjectSnapshot(taskWorkspace: string, sandbox: string, prepared?: PreparedProjectSnapshot, namespace = 'review-context'): Promise<ProjectSnapshot> {
+  const project = prepared ?? await prepareProjectSnapshot(taskWorkspace, join(sandbox, '.snapshot-git-config'), { files: 0, bytes: 0 });
+  const { gitConfigPath, headCommit, indexTree, sourceEntries, excluded } = project;
   const blobContents = await readIndexBlobs(taskWorkspace, sourceEntries, gitConfigPath);
 
-  const root = join(sandbox, 'review-context', 'project');
-  const manifestPath = join(sandbox, 'review-context', 'manifest.json');
+  const root = join(sandbox, namespace, 'project');
+  const manifestPath = join(sandbox, namespace, 'manifest.json');
   await mkdir(root, { recursive: true, mode: 0o700 });
   const realRoot = await realpath(root);
   if (!isWithin(sandbox, realRoot)) throw new Error('Project review snapshot directory escaped the trusted Codex cwd');
@@ -202,14 +353,7 @@ async function createProjectSnapshot(taskWorkspace: string, sandbox: string): Pr
     });
   }
 
-  const [headAfter, indexAfter, stagedListingAfter] = await Promise.all([
-    execFileAsync('git', ['rev-parse', '--verify', 'HEAD^{commit}'], gitOptions),
-    execFileAsync('git', ['write-tree'], gitOptions),
-    execFileAsync('git', ['ls-files', '--stage', '-z'], gitOptions),
-  ]);
-  if (headAfter.stdout.toString('utf8').trim() !== headCommit || indexAfter.stdout.toString('utf8').trim() !== indexTree || !stagedListingAfter.stdout.equals(stagedListing.stdout)) {
-    throw new Error('Project Git HEAD or index changed while the review snapshot was being created');
-  }
+  await assertProjectSnapshotUnchanged(project);
 
   const contentHash = createHash('sha256');
   for (const file of files) contentHash.update(`${file.sourcePath}\0${file.indexBlob}\0${file.bytes}\0${file.sha256}\n`);
@@ -229,7 +373,7 @@ async function createProjectSnapshot(taskWorkspace: string, sandbox: string): Pr
   };
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
   const summary = [
-    `Snapshot: review-context/project (manifest: review-context/manifest.json)`,
+    `Snapshot: ${namespace}/project (manifest: ${namespace}/manifest.json)`,
     `Source state: HEAD ${headCommit}; index tree ${indexTree}.`,
     `Coverage: ${files.length} staged Git index blobs; ${totalBytes} bytes; SHA-256 ${manifest.contentSha256}.`,
     `Excluded: ${excluded.length} Git metadata path(s); non-ignored files outside the index cause a blocked review.`,
@@ -237,6 +381,19 @@ async function createProjectSnapshot(taskWorkspace: string, sandbox: string): Pr
     'The manifest lists every copied path, hash, exclusion, and transformed name. If required context is missing, return blocked.',
   ].join('\n');
   return { root, manifestPath, summary, manifest };
+}
+
+async function assertProjectSnapshotUnchanged(project: PreparedProjectSnapshot): Promise<void> {
+  const gitOptions = snapshotGitOptions(project.taskWorkspace, project.gitConfigPath);
+  const [headAfter, indexAfter, stagedListingAfter, untrackedAfter] = await settleGitCommands([
+    execFileAsync('git', ['rev-parse', '--verify', 'HEAD^{commit}'], gitOptions),
+    execFileAsync('git', ['write-tree'], gitOptions),
+    execFileAsync('git', ['ls-files', '--stage', '-z'], gitOptions),
+    execFileAsync('git', ['ls-files', '--others', '--exclude-standard', '-z'], gitOptions),
+  ]);
+  if (headAfter.stdout.toString('utf8').trim() !== project.headCommit || indexAfter.stdout.toString('utf8').trim() !== project.indexTree || !stagedListingAfter.stdout.equals(project.stagedListing) || !untrackedAfter.stdout.equals(project.untrackedListing)) {
+    throw new Error('Project Git HEAD or index changed while the review snapshot was being created');
+  }
 }
 
 function validateGitPath(sourcePath: string): string[] {
@@ -280,11 +437,29 @@ function decodeGitListing(value: Buffer): string {
 
 async function readIndexBlobs(taskWorkspace: string, entries: GitIndexEntry[], gitConfigPath: string): Promise<Buffer[]> {
   if (!entries.length) return [];
-  const maxOutputBytes = MAX_SNAPSHOT_TOTAL_BYTES + entries.length * 128 + 1024;
+  return parseBatchBlobs(await runGitBatch(taskWorkspace, entries, gitConfigPath, false), entries);
+}
+
+async function readIndexBlobSizes(taskWorkspace: string, entries: GitIndexEntry[], gitConfigPath: string): Promise<number[]> {
+  if (!entries.length) return [];
+  const output = await runGitBatch(taskWorkspace, entries, gitConfigPath, true);
+  const records = output.toString('ascii').split('\n');
+  if (records.pop() !== '' || records.length !== entries.length) throw new Error('Project review snapshot received an invalid Git blob size listing');
+  return records.map((record, index) => {
+    const [oid, type, sizeText] = record.split(' ');
+    const size = Number(sizeText);
+    if (oid !== entries[index]!.oid || type !== 'blob' || !Number.isSafeInteger(size) || size < 0) throw new Error('Project review snapshot received an unexpected Git blob size response');
+    if (size > MAX_SNAPSHOT_FILE_BYTES) throw new Error(`Project review snapshot file exceeds the ${MAX_SNAPSHOT_FILE_BYTES} byte limit: ${entries[index]!.path}`);
+    return size;
+  });
+}
+
+async function runGitBatch(taskWorkspace: string, entries: GitIndexEntry[], gitConfigPath: string, sizesOnly: boolean): Promise<Buffer> {
+  const maxOutputBytes = (sizesOnly ? 0 : MAX_SNAPSHOT_TOTAL_BYTES) + entries.length * 128 + 1024;
   const env = safeGitEnvironment(gitConfigPath);
   env.GIT_NO_REPLACE_OBJECTS = '1';
-  return await new Promise<Buffer[]>((resolvePromise, rejectPromise) => {
-    const child = spawn('git', ['cat-file', '--batch'], {
+  return await new Promise<Buffer>((resolvePromise, rejectPromise) => {
+    const child = spawn('git', ['cat-file', sizesOnly ? '--batch-check' : '--batch'], {
       cwd: taskWorkspace,
       windowsHide: true,
       env,
@@ -319,11 +494,7 @@ async function readIndexBlobs(taskWorkspace: string, entries: GitIndexEntry[], g
         rejectPromise(new Error('Project review snapshot could not read Git index blobs'));
         return;
       }
-      try {
-        resolvePromise(parseBatchBlobs(Buffer.concat(chunks, outputBytes), entries));
-      } catch (error) {
-        rejectPromise(error);
-      }
+      resolvePromise(Buffer.concat(chunks, outputBytes));
     });
     child.stdin.on('error', (error) => fail(new Error(`Project review snapshot could not request Git index blobs: ${error.message}`)));
     child.stdin.end(`${entries.map((entry) => entry.oid).join('\n')}\n`);
@@ -397,18 +568,20 @@ async function assertNoAgentInstructions(cwd: string, projectWorkspace?: string)
     current = parent;
   }
   if (projectWorkspace) {
-    const [topLevel, commonDirectory] = await Promise.all([
+    const [topLevel, commonDirectory] = await settleGitCommands([
       execFileAsync('git', ['rev-parse', '--show-toplevel'], {
         cwd: projectWorkspace,
         windowsHide: true,
         timeout: 10_000,
         maxBuffer: 64 * 1024,
+        env: safeGitEnvironment(join(cwd, '.snapshot-git-config')),
       }),
       execFileAsync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
         cwd: projectWorkspace,
         windowsHide: true,
         timeout: 10_000,
         maxBuffer: 64 * 1024,
+        env: safeGitEnvironment(join(cwd, '.snapshot-git-config')),
       }),
     ]);
     const projectRoot = await findProjectRepositoryRoot(topLevel.stdout.trim(), commonDirectory.stdout.trim());
@@ -442,7 +615,7 @@ async function findProjectRepositoryRoot(topLevelPath: string, commonDirectoryPa
   }
 }
 
-function safeGitEnvironment(globalConfigPath: string): NodeJS.ProcessEnv {
+export function safeGitEnvironment(globalConfigPath: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: globalConfigPath,

@@ -33,7 +33,7 @@
 - [x] Re-run the saved real two-repository reproduction against main 95b0766 in an ignored build and confirm goal blocks while no-goal completes.
 - [x] Independent builder review of design/interfaces; resolve project/minor decisions in the written spec.
 - [x] Add aggregate-only GoalReviewResult and sequence record typing, retaining ordinary ReviewResult.
-- [ ] Typecheck targeted contracts and commit/push design/contracts.
+- [x] Typecheck targeted contracts and commit/push design/contracts (`f804b15`).
 
 ## Task 2: Trusted multi-source snapshot bundle (snapshot agent)
 
@@ -41,10 +41,10 @@
 
 **Produces:** exported `GoalProjectSource { repositoryId: string; targetTaskId: string; taskWorkspace: string }`; `GoalProjectSnapshot { source: GoalProjectSource; snapshot: ProjectSnapshot }`; `createTrustedGoalCwd(options: { artifactRoot: string; repositories: GoalProjectSource[] }): Promise<{ cwd: string; projectSnapshots: GoalProjectSnapshot[]; manifestPath: string; contentSha256: string; dispose(): Promise<void> }>`.
 
-- [ ] RED: read two same-basename repositories through separate safe namespaces; stable combined hash changes when either source or target mapping changes.
-- [ ] RED: duplicate/unsafe IDs, overlap with any source, instructions/config in any inherited chain, symlink/submodule/unmerged/untracked source, changed Git index, global budgets and guarded disposal.
-- [ ] Implement shared budget-aware index snapshot writer and bundle without changing the existing API/layout. Export the existing safeGitEnvironment helper for server evidence capture.
-- [ ] GREEN: trusted cwd suite and isolated typecheck; independent review; root commits/pushes the verified unit.
+- [x] RED: read two same-basename repositories through separate safe namespaces; stable combined hash changes when either source or target mapping changes.
+- [x] RED: duplicate/unsafe IDs, overlap with any source, instructions/config in any inherited chain, symlink/submodule/unmerged/untracked source, changed Git index, global budgets and guarded disposal.
+- [x] Implement shared budget-aware index snapshot writer and bundle without changing the existing API/layout. Export the existing safeGitEnvironment helper for server evidence capture.
+- [x] GREEN: trusted cwd suite and isolated typecheck; independent review; root commits/pushes the verified unit. Implementer 33/33 compatibility; independent 15/15 bundle tests and 10/10 repeated failure-path cases.
 
 ## Task 3: Persistent target and local remediation (core agent)
 
@@ -86,3 +86,4 @@
 - Design review approved the corrected immutable creation-base contract. Transaction authorization must also prove target-group lineage; mixed-root no-target remediation is refused even where an old test expected it.
 - Keep snapshot fingerprints distinct from an explicit full inputFingerprint; clone the bounded input before any asynchronous provider work.
 - Extract aggregate evidence capture into a focused server module and reuse the existing isolated Git environment.
+- Snapshot independent review reproduced Windows EBUSY on unmerged-index refusal. Metadata batches now drain every child process before propagating failure. Overlap refusal also precedes artifact directory creation; both corrections have RED/GREEN regressions.
