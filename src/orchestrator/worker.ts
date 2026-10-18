@@ -415,6 +415,8 @@ export class TaskWorker {
         return payload?.continuationId === continuation.id && payload.packageId === continuation.packageId
           && payload.verdictId === continuation.verdictId && payload.revision === revisionHighWater
           && payload.owner === owner && payload.generationId === task.claimGenerationId
+          && payload.executionStageIndex === quotaClaim.executionStageIndex
+          && payload.continuingExecution === quotaClaim.continuingExecution
           && payload.claimId === quotaClaim.id;
       });
       if (quotaClaim.taskId !== task.id || quotaClaim.continuationId !== continuation.id
@@ -591,7 +593,8 @@ export class TaskWorker {
         checksSnapshot = undefined;
         reviewPackageId = undefined;
         stage = "route";
-        executionStageIndex = 0;
+        executionStageIndex = reworkResume.quotaResume?.executionStageIndex ?? 0;
+        continuingExecution = reworkResume.quotaResume?.continuingExecution ?? false;
         const priorReworkGeneration = reworkResume.claim?.priorClaimGenerationId ?? reworkResume.quotaResume?.priorClaimGenerationId;
         reworkFirstWriterRecovery = priorReworkGeneration !== undefined && this.#options.store.stages(taskId)
           .some(candidate => candidate.sequence > reworkResume.continuation.stageHighWater
@@ -688,7 +691,7 @@ export class TaskWorker {
           const routeAttempt = this.#options.store.createAttempt(taskId, "route", { owner, harness: "codex" });
           if (reviewReworkContinuationId) {
             this.#options.store.checkpointReviewRework(taskId, reviewReworkContinuationId, { owner, generationId: task.claimGenerationId! }, {
-              phase: "route_started", checkpoint: { attemptId: routeAttempt.id, revision },
+              phase: "route_started", checkpoint: { attemptId: routeAttempt.id, revision, executionStageIndex, continuingExecution },
             });
           }
           activeAttempt = routeAttempt;
@@ -1358,6 +1361,7 @@ export class TaskWorker {
           task = this.#options.store.pauseReviewReworkForQuota(taskId, owner, {
             continuationId: continuation.id,
             attemptId: latestAttempt.id,
+            executionStageIndex,
             retryAt,
             reason: errorMessage,
             identity: inspection.identity,

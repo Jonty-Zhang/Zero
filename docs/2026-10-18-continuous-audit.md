@@ -21,6 +21,12 @@
 
 核心存储 16 项、真实 HTTP 5 项、真实 Git/SQLite/TaskWorker E2E 6 项通过。E2E 覆盖重启恢复、并发点击、验收前后工作区变化、配置读取失败、额度与返工上限、旧调度器跨连接竞争。前端 30/30、客户端 11/11、类型与生产构建通过。Edge 1440/375px 的实际 HTTP/SQLite 联调确认队列跨刷新持久、单次请求事件、保留旧 findings 且无横向溢出。独立 reviewer 复跑各边界，未发现阻止合入的问题；本批全量及准确提交 CI 另行记录，定向结果不代替全量。
 
-下一轮已复现提交任务时焦点退到 BODY、Tab 逃出对话框并打开第二个模态的问题，继续处理。
+## 接力续跑及网页焦点
+
+提交任务时禁用全部控件会让 Edge 焦点退到 BODY，Tab 可进入背景并打开第二个模态。已用 document 键盘/焦点守卫和 busy 焦点回退修复；新增 2 项组件回归先失败后通过，前端共 32/32、类型检查和构建通过。独立 reviewer 与 root 都在 Edge 1440/375px 验证任务/序列提交、失败后恢复、Escape 门禁、焦点返回入口、详情折叠和抽屉替换。
+
+审核要求返工时，后一个 agent 额度暂停后曾从阶段 0 重跑，恢复已删除的 plan.json 并导致最终检查失败。现将 quota checkpoint 与相同 continuation/revision/generation/owner 的不可变 progress 交叉验证，恢复准确逻辑阶段及暂停 writer 的衔接；仍获取 fresh route，不增加 revision。可证明的旧 writer 记录可推导位置，歧义旧多阶段 route 继续等待。新真实 Git 回归 5/5，原存储及 quota 兼容回归共 82 项通过；root 独立重跑新 5/5，reviewer 再验证跨三代 guardian 的 writer quota → route quota 链路通过。Git、claim 和最终验收门禁保留。
+
+后续已确认配置读改写并发丢失：网页设置保存与 CLI 注册模型均成功，但后写入者擦掉对方更新。隔离真实 CLI + HTTP 已复现，继续修复完整读改写的互斥。
 
 所有新复现使用隔离 Git 工作区、SQLite 和本地 fake adapters，没有消耗真实模型额度或改写生产配置。执行进度见[持续审查计划](superpowers/plans/2026-10-18-continuous-audit.md)。

@@ -9,7 +9,7 @@
 - [x] Reproduce task submission disabling the focused control and allowing background keyboard navigation to open another modal.
 - [x] Add component regressions that fail before the fix; guard document keyboard/focus events and move focus to the dialog when busy.
 - [x] Verify existing and new component tests, TypeScript/build, actual Edge at 1440/375px, failure recovery, opener focus, details and drawer replacement.
-- [ ] Reproduce and repair rework quota resuming at stage zero after a later agent paused. Verify exact stage continuation, route failures, guardian reboot, missing/invalid checkpoints, and unchanged budgets.
+- [x] Reproduce and repair rework quota resuming at stage zero after a later agent paused. Verify exact stage continuation, route failures, guardian reboot, missing/invalid checkpoints, and unchanged budgets.
 - [ ] Independently review recovery changes, run full integration and exact-head CI, commit/push and merge verified work.
 - [ ] Continue the next functional audit; investigate plaintext provider diagnostic chronology using actual child processes before choosing a fix.
 

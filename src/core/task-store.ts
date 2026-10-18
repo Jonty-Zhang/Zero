@@ -432,6 +432,8 @@ export interface PauseReviewReworkForQuotaInput {
   reason: string;
   identity: ClaimReviewReworkContinuationInput["identity"];
   gitState: ReviewReworkGitInspection;
+  /** Logical execution stage within the current content revision. */
+  executionStageIndex?: number;
   now?: Date;
 }
 
@@ -449,6 +451,8 @@ export interface ReviewReworkQuotaResumeClaimRecord extends Omit<ReviewReworkCla
   verdictId: string;
   revision: number;
   recoveredGeneration: boolean;
+  executionStageIndex: number;
+  continuingExecution: boolean;
 }
 
 const ZERO_COMMIT_IDENTITY = {
@@ -2494,6 +2498,42 @@ export class TaskStore {
     return result;
   }
 
+  #reworkQuotaExecutionPosition(taskId: string, continuation: ReviewReworkContinuationRecord,
+    attempt: { id: string; role: string; stage_id: string | null }, revision: number, generationId: string, owner: string,
+    expectedIndex: unknown, fingerprint: string): { executionStageIndex: number; continuingExecution: boolean } | undefined {
+    const task = this.#db.prepare("SELECT payload FROM tasks WHERE id=?").get(taskId) as { payload: string } | undefined;
+    if (!task) return undefined;
+    const submission = JSON.parse(task.payload) as TaskSubmission;
+    const stageCount = submission.executionStages?.length ?? 1;
+    const progress = this.reviewReworkProgress(taskId, continuation.id);
+    const source = progress.filter(item => item.generationId === generationId && item.owner === owner
+      && item.checkpoint.revision === revision && (attempt.role === "route"
+        ? item.phase === "route_started" && item.checkpoint.attemptId === attempt.id
+        : item.phase === "writer_started" && item.stageId === attempt.stage_id));
+    const indices = source.map(item => item.checkpoint.executionStageIndex);
+    // A single-stage legacy continuation has only one possible position. In a
+    // multi-stage task, require the exact immutable route/writer progress.
+    const executionStageIndex = stageCount === 1 && (!indices.length || indices.every(index => index === undefined))
+      ? 0 : indices[0];
+    if (!Number.isSafeInteger(executionStageIndex) || Number(executionStageIndex) < 0 || Number(executionStageIndex) >= stageCount
+      || indices.some(index => index !== undefined && index !== executionStageIndex)
+      || (stageCount > 1 && (!indices.length || indices.some(index => index !== executionStageIndex)))
+      || (expectedIndex !== undefined && expectedIndex !== executionStageIndex)) return undefined;
+    const routeContinuations = source.map(item => item.checkpoint.continuingExecution);
+    if (routeContinuations.some(value => value !== undefined && typeof value !== "boolean")
+      || new Set(routeContinuations).size > 1) return undefined;
+    const continuingExecution = attempt.role !== "route" || routeContinuations[0] === true;
+    if (stageCount > 1 && continuingExecution) {
+      const writer = this.stages(taskId).filter(stage => ["implement", "revise"].includes(stage.role)
+        && stage.sequence > continuation.stageHighWater).at(-1);
+      const writerProgress = writer && progress.filter(item => item.phase === "writer_started" && item.stageId === writer.id
+        && item.checkpoint.revision === revision);
+      if (!writer || writer.status !== "interrupted" || writer.outputFingerprint !== fingerprint
+        || !writerProgress?.length || writerProgress.some(item => item.checkpoint.executionStageIndex !== executionStageIndex)) return undefined;
+    }
+    return { executionStageIndex: Number(executionStageIndex), continuingExecution };
+  }
+
   /** Persist a rework quota wait together with the exact post-process worktree inspection. */
   pauseReviewReworkForQuota(taskId: string, owner: string, input: PauseReviewReworkForQuotaInput): TaskRecord {
     const now = input.now ?? new Date();
@@ -2556,6 +2596,9 @@ export class TaskStore {
           (!routeQuota && !executionQuota) || runningWriter || (stage && (stage.started_at == null || stage.process_start_id == null))) {
         throw new Error("Rework quota pause requires the latest terminal quota attempt and no active rework writer");
       }
+      const position = this.#reworkQuotaExecutionPosition(taskId, continuation, attempt, task.revision_count,
+        this.#startupGeneration.id, owner, input.executionStageIndex, input.identity.fingerprint);
+      if (!position) throw new Error("Rework quota pause has no unambiguous logical execution stage");
 
       const worktree = this.#db.prepare("SELECT * FROM worktree_creations WHERE task_id=?").get(taskId) as {
         status: string; plan: string; observed: string | null; fingerprint: string | null;
@@ -2592,7 +2635,7 @@ export class TaskStore {
         .get(taskId) as { n: number }).n);
       const checkpoint = { kind: "rework_quota", continuationId: continuation.id, packageId: continuation.packageId,
         verdictId: continuation.verdictId, revision: task.revision_count, claimGenerationId: this.#startupGeneration.id,
-        owner, attemptId: attempt.id, stageId: stage?.id ? String(stage.id) : null, stageSequence,
+        owner, attemptId: attempt.id, stageId: stage?.id ? String(stage.id) : null, stageSequence, ...position,
         pauseIdentity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint },
         pauseGitState: input.gitState, retryAt: retryAt.toISOString() };
       const checkpointJson = JSON.stringify(checkpoint);
@@ -2690,6 +2733,9 @@ export class TaskStore {
         ["interrupted", "failed", "succeeded"].includes(String(stage.status)) && stage.finished_at != null;
       if (!attempt || latestAttempt?.id !== attempt.id || !["failed", "interrupted"].includes(attempt.status) ||
           (!routeQuota && !executionQuota) || runningWriter) return;
+      const position = this.#reworkQuotaExecutionPosition(taskId, continuation, attempt, task.revision_count,
+        priorGenerationId, String(checkpoint.owner), checkpoint.executionStageIndex, input.identity.fingerprint);
+      if (!position || (checkpoint.continuingExecution !== undefined && checkpoint.continuingExecution !== position.continuingExecution)) return;
 
       const savedIdentity = checkpoint.pauseIdentity as ClaimReviewReworkContinuationInput["identity"];
       const savedGit = checkpoint.pauseGitState as ReviewReworkGitInspection;
@@ -2723,7 +2769,7 @@ export class TaskStore {
         claimGenerationId: this.#startupGeneration.id, owner, leaseExpiresAt: expires,
         ...(previousClaim ? { priorClaimId: String(previousClaim.id) } : {}), ...(guardianLineage ? { guardianLineage } : {}),
         identity: { checkedAt: input.identity.checkedAt, observed: input.identity.observed, fingerprint: input.identity.fingerprint },
-        gitState: input.gitState, claimedAt: at, recoveredGeneration };
+        gitState: input.gitState, claimedAt: at, recoveredGeneration, ...position };
       const payload = JSON.stringify(claim);
       if (Buffer.byteLength(payload, "utf8") > 65_536) throw new Error("Rework quota recovery claim exceeds 64 KiB");
       const changed = this.#db.prepare(`UPDATE tasks SET status='running',updated_at=?,lease_owner=?,lease_expires_at=?,heartbeat_at=?,
@@ -2742,7 +2788,7 @@ export class TaskStore {
         generationId: this.#startupGeneration.id, recovery: recoveredGeneration ? "review_rework_quota" : "review_rework_quota_resume" }, at);
       this.#event(taskId, "task.review_rework_quota_resumed", { continuationId: continuation.id,
         packageId: continuation.packageId, verdictId: continuation.verdictId, revision: task.revision_count,
-        priorGenerationId, generationId: this.#startupGeneration.id, owner, recoveredGeneration, claimId: checkpointId }, at);
+        priorGenerationId, generationId: this.#startupGeneration.id, owner, recoveredGeneration, claimId: checkpointId, ...position }, at);
       result = claim;
     });
     return result;
