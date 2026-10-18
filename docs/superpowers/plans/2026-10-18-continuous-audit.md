@@ -24,12 +24,12 @@
 - [x] Preserve unavailable saved allocator/reviewer choices across configuration GET/PUT. Show unavailable values in the web editor while rejecting new unverified choices. Verify real HTTP and UI regressions.
 - [x] In goal remediation, inherit final-step checks rather than all historical intermediate checks. Verify rename/migration and retained-final-check failures with real Git workflows.
 - [x] For aggregate goal verification, select the completed check run sealed into the applied result package; historical failed attempts must not block a successfully revised task. Keep missing or mismatched final evidence blocked.
-- [ ] Run whole-project checks for the integrated round, inspect the precise CI result, record evidence, and continue a second independent investigation round.
+- [x] Run whole-project checks for the integrated round, inspect the precise CI result, record evidence, and continue a second independent investigation round.
 
 ## Next investigations
 
 - [x] Preserve unchanged execution defaults during transient CLI/model unavailability; revalidate any changed inherited project selection.
-- [ ] Add an explicit persisted retry path for a blocked aggregate review without deleting verdict history, bypassing evidence gates, or automatically looping provider calls.
+- [x] Add an explicit persisted retry path for a blocked aggregate review without deleting verdict history, bypassing evidence gates, or automatically looping provider calls.
 - Sequence goal evidence after ordinary revision, interrupted attempts and review changes.
 - User-visible lifecycle errors, repeated submissions and settings changes while capabilities refresh.
 - Plaintext Harness error chronology, without broadening trusted error sources.

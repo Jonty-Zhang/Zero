@@ -25,5 +25,5 @@
 - [x] Root: consume pending requests through both normal review and evidence-block paths. Real Git E2E must recover a transient failure across restart; unchanged blocked verdicts without a request must remain cached.
 - [x] UI: render eligibility and queue status, submit the exact source attempt, disable repeated clicks and refresh after conflicts. Preserve prior findings and test request boundaries.
 - [x] Negative gates: changed final checkout stays blocked, post-review evidence changes cannot PASS, quota and active review cannot be bypassed, changes_requested still respects the goal revision cap.
-- [ ] Run targeted and whole-project checks on a fixed build, verify desktop/mobile behavior, independently review, commit/push and inspect exact-head CI.
-- [ ] Continue the next audit round after recording outcomes and remaining limits.
+- [x] Run targeted and whole-project checks on a fixed build, verify desktop/mobile behavior, independently review, commit/push and inspect exact-head CI.
+- [x] Continue the next audit round after recording outcomes and remaining limits.
