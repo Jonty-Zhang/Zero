@@ -79,7 +79,7 @@ export interface TaskSequenceRecord {
 export interface SequenceGoalReview {
   attemptId?: string;
   state: "running" | "quota" | "verdict";
-  result?: ReviewResult;
+  result?: GoalReviewResult;
   retryAt?: string;
   /** A user-requested retry is queued for this exact blocked attempt. */
   retryRequestedAt?: string;
@@ -315,4 +315,9 @@ export interface ReviewResult {
   summary: string;
   findings: ReviewFinding[];
   rawPath?: string;
+}
+
+/** Aggregate review may select the current tip of one repository for remediation. */
+export interface GoalReviewResult extends ReviewResult {
+  targetTaskId?: string;
 }
