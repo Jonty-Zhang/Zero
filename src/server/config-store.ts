@@ -48,6 +48,18 @@ const EMPTY: LocalZeroConfig = {
 // A local queue prevents synchronous SQLite contention between operations that
 // need this same event loop to finish their asynchronous JSON replacement.
 const configUpdates = new Map<string, Promise<void>>();
+async function waitForConfigLock(lock: DatabaseSync, statement: 'BEGIN IMMEDIATE' | 'COMMIT'): Promise<void> {
+  const deadline = performance.now() + 10_000;
+  for (;;) {
+    try { lock.exec(statement); return; }
+    catch (error) {
+      const code = (error as { errcode?: number }).errcode;
+      if (typeof code !== 'number' || (code & 255) !== 5) throw error;
+      if (performance.now() >= deadline) throw new Error('Timed out waiting for Zero configuration update lock');
+      await delay(25);
+    }
+  }
+}
 async function withConfigUpdate<T>(path: string, change: (canonicalPath: string) => Promise<T>): Promise<T> {
   const absolute = resolve(path);
   await mkdir(dirname(absolute), { recursive: true });
@@ -62,18 +74,11 @@ async function withConfigUpdate<T>(path: string, change: (canonicalPath: string)
     let acquired = false;
     try {
       lock.exec('PRAGMA busy_timeout=0');
-      const deadline = performance.now() + 10_000;
-      for (;;) {
-        try { lock.exec('BEGIN IMMEDIATE'); acquired = true; break; }
-        catch (error) {
-          const code = (error as { errcode?: number }).errcode;
-          if (typeof code !== 'number' || (code & 255) !== 5) throw error;
-          if (performance.now() >= deadline) throw new Error('Timed out waiting for Zero configuration update lock');
-          await delay(25);
-        }
-      }
+      await waitForConfigLock(lock, 'BEGIN IMMEDIATE'); acquired = true;
       const result = await change(canonicalPath);
-      lock.exec('COMMIT'); acquired = false;
+      // COMMIT needs an EXCLUSIVE lock, which a concurrent reader can delay
+      // after BEGIN IMMEDIATE succeeded. Retry only COMMIT, never the mutation.
+      await waitForConfigLock(lock, 'COMMIT'); acquired = false;
       return result;
     } finally {
       if (acquired) { try { lock.exec('ROLLBACK'); } catch { /* Closing also releases the process lock. */ } }

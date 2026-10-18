@@ -5,7 +5,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import type { TaskSequenceRecord } from '../domain/types.js';
 import type { GitWorktreeManager, WorktreeCreationEvidence, WorktreeCreationPlan } from '../core/git-worktree.js';
 import type { TaskStore } from '../core/task-store.js';
-import { createTrustedCodexCwd, createTrustedGoalCwd, safeGitEnvironment,
+import { createTrustedCodexCwd, createTrustedGoalCwd, safeGitEnvironment, worktreeGitEnvironment,
   type GoalProjectSource, type ProjectSnapshot } from '../orchestrator/trusted-codex-cwd.js';
 
 const MAX_EVIDENCE_BYTES = 512 * 1024;
@@ -38,12 +38,12 @@ export async function captureSequenceGoalEvidence(store: TaskStore, worktrees: G
   try {
     await writeFile(configPath, '', { mode: 0o600, flag: 'wx' });
     const env = safeGitEnvironment(configPath);
-    const git = (cwd: string, args: string[], maxBuffer = 1024 * 1024) => {
-      const result = spawnSync('git', args, { cwd, env, windowsHide: true, timeout: 15_000, maxBuffer });
+    const git = (cwd: string, args: string[], maxBuffer = 1024 * 1024, readEnv = env) => {
+      const result = spawnSync('git', args, { cwd, env: readEnv, windowsHide: true, timeout: 15_000, maxBuffer });
       if (result.error || result.status !== 0 || !Buffer.isBuffer(result.stdout)) block('Git evidence could not be safely read');
       return result.stdout!;
     };
-    const gitText = (cwd: string, args: string[]) => git(cwd, args).toString('utf8').trim();
+    const gitText = (cwd: string, args: string[], readEnv = env) => git(cwd, args, 1024 * 1024, readEnv).toString('utf8').trim();
     const groups = new Map<string, RepositoryGroup>();
     const stepEvidence: Array<Record<string, unknown>> = [];
     for (const step of sequence.steps) {
@@ -116,21 +116,22 @@ export async function captureSequenceGoalEvidence(store: TaskStore, worktrees: G
     const repositoryEvidence: Array<Record<string, unknown>> = [];
     let diffBytes = 0;
     for (const group of groups.values()) {
+      const { env: readEnv, textNormalization } = await worktreeGitEnvironment(configPath, group.finalPlan.path);
       let workspace;
-      try { workspace = (await worktrees.reopenFromEvidence(group.finalPlan, group.finalObserved, env)).info; }
+      try { workspace = (await worktrees.reopenFromEvidence(group.finalPlan, group.finalObserved, readEnv)).info; }
       catch { block('the final reviewed worktree cannot be safely reopened'); }
-      const head = gitText(workspace.path, ['rev-parse', '--verify', 'HEAD^{commit}']);
-      const index = gitText(workspace.path, ['write-tree']);
+      const head = gitText(workspace.path, ['rev-parse', '--verify', 'HEAD^{commit}'], readEnv);
+      const index = gitText(workspace.path, ['write-tree'], readEnv);
       if (!sameCommit(head, group.finalCommit) || !sameCommit(index, group.finalTree)) block('a final worktree HEAD or index changed after its task was marked DONE');
-      if (git(workspace.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all']).byteLength) block('a final worktree has changes after its task was marked DONE');
-      const bytes = git(workspace.path, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', group.baseCommit, group.finalCommit, '--'], MAX_DIFF_BYTES - diffBytes + 1);
+      if (git(workspace.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], 1024 * 1024, readEnv).byteLength) block('a final worktree has changes after its task was marked DONE');
+      const bytes = git(workspace.path, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', group.baseCommit, group.finalCommit, '--'], MAX_DIFF_BYTES - diffBytes + 1, readEnv);
       diffBytes += bytes.byteLength;
       if (diffBytes > MAX_DIFF_BYTES) block('the combined cumulative diffs exceed the bounded review limit');
       const text = bytes.toString('utf8');
       if (!Buffer.from(text, 'utf8').equals(bytes)) block('a cumulative diff is not valid UTF-8 evidence');
       repositories.push({ repositoryId: group.repositoryId, targetTaskId: group.finalPlan.taskId, taskWorkspace: workspace.path });
       repositoryEvidence.push({ repositoryId: group.repositoryId, targetTaskId: group.finalPlan.taskId, taskIds: group.taskIds,
-        baseCommit: group.baseCommit, finalResultCommit: group.finalCommit, cumulativeDiff: { sha256: sha(text), text }, finalWorktreeHead: head });
+        baseCommit: group.baseCommit, finalResultCommit: group.finalCommit, cumulativeDiff: { sha256: sha(text), text }, finalWorktreeHead: head, gitTextNormalization: textNormalization });
     }
     let snapshotFingerprint: string;
     let evidence: Record<string, unknown>;

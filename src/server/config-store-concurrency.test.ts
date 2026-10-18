@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { DatabaseSync } from 'node:sqlite';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
 import { createZeroServer } from './server.js';
 import { TaskStore } from '../core/task-store.js';
@@ -110,9 +111,12 @@ function childProcess(args: string[], dataRoot: string) {
   });
   return { child, done };
 }
-async function pausedCli(root: string, id = enrolled.id) {
+async function pausedCli(root: string, id = enrolled.id, observeCommit = false) {
   const preload = join(root, `pause-${id}.mjs`);
-  await writeFile(preload, `import {ConfigStore} from ${JSON.stringify(new URL('./config-store.js', import.meta.url).href)};
+  await writeFile(preload, `${observeCommit ? `import {DatabaseSync} from 'node:sqlite';
+const exec=DatabaseSync.prototype.exec;
+DatabaseSync.prototype.exec=function(sql){if(sql==='COMMIT')process.send({kind:'commit'});return exec.call(this,sql);};` : ''}
+import {ConfigStore} from ${JSON.stringify(new URL('./config-store.js', import.meta.url).href)};
 const read=ConfigStore.prototype.read;let paused=false;
 ConfigStore.prototype.read=async function(){const snapshot=await read.call(this);if(!paused){paused=true;process.send({kind:'snapshot'});await new Promise(resolve=>process.once('message',resolve));}return snapshot;};`);
   const spawned = childProcess(['--import', pathToFileURL(preload).href, fileURLToPath(new URL('../cli.js', import.meta.url)),
@@ -154,6 +158,40 @@ test('two real CLI processes retain both enrollments', { timeout: 15_000 }, asyn
     assert.ok(results.every(result => result.code === 0), JSON.stringify(results));
     assert.deepEqual((await f.store.read()).models.map(item => item.id).sort(), ['base-model', 'new-model', 'other-model']);
   } finally { if (first) { await stop(first.child); await first.done; } await f.close(); }
+});
+
+test('a configuration writer waits for a concurrent SQLite reader before committing its lock', { timeout: 15_000 }, async () => {
+  const f = await fixture(); let writer: Awaited<ReturnType<typeof pausedCli>> | undefined;
+  let reader: DatabaseSync | undefined;
+  try {
+    writer = await pausedCli(f.root, enrolled.id, true);
+    reader = new DatabaseSync(`${f.path}.write-lock.sqlite`);
+    reader.exec('BEGIN');
+    reader.prepare('SELECT * FROM sqlite_master').all();
+    // This real read transaction prevents the writer's RESERVED lock from
+    // upgrading to EXCLUSIVE at COMMIT, even though BEGIN IMMEDIATE succeeded.
+    // Observe the second real COMMIT attempt instead of relying on process speed.
+    const retrying = new Promise<void>(resolveRetry => {
+      let attempts = 0;
+      writer!.child.on('message', message => {
+        if ((message as { kind?: string }).kind === 'commit' && ++attempts === 2) resolveRetry();
+      });
+    });
+    writer.child.send('resume');
+    await Promise.race([retrying, writer.done.then(result => {
+      assert.fail(`Writer exited before retrying COMMIT: ${JSON.stringify(result)}`);
+    })]);
+    reader.exec('ROLLBACK'); reader.close(); reader = undefined;
+    const result = await writer.done; assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /Registered new-model/);
+    mutations.enroll.check(await f.store.read());
+    await f.store.write(edit());
+    const config = await f.store.read(); mutations.enroll.check(config); assert.equal(config.allocator.kind, 'api');
+  } finally {
+    if (reader) { reader.exec('ROLLBACK'); reader.close(); }
+    if (writer) { await stop(writer.child); await writer.done; }
+    await f.close();
+  }
 });
 
 test('a killed writer releases its cross-process lock without blocking the event loop', { timeout: 15_000 }, async () => {

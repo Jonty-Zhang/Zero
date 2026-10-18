@@ -11,6 +11,7 @@ import { GitWorktreeManager } from '../core/git-worktree.js';
 import { TestRunner } from '../core/test-runner.js';
 import { TaskWorker } from '../orchestrator/worker.js';
 import { createSequenceGoalReviewScheduler } from './main.js';
+import { captureSequenceGoalEvidence } from './sequence-goal-evidence.js';
 
 const exec = promisify(execFile);
 async function git(cwd: string, ...args: string[]) { return (await exec('git', args, { cwd, windowsHide: true })).stdout.trim(); }
@@ -160,6 +161,19 @@ test('mixed repositories without a goal retain ordinary completion without aggre
   } finally { await f.dispose(); }
 });
 
+test('whole-goal evidence binds text normalization changes even when indexed snapshots stay identical', async () => {
+  const f = await fixture();
+  try {
+    const sequence = f.store.getSequence(f.sequence.id)!;
+    const before = await captureSequenceGoalEvidence(f.store, f.worktrees, sequence, f.artifacts);
+    const workspace = f.store.getWorktreeCreation(f.taskIds[1]!)!.plan as { path: string };
+    await git(workspace.path, 'config', 'core.autocrlf', 'input');
+    const after = await captureSequenceGoalEvidence(f.store, f.worktrees, sequence, f.artifacts);
+    assert.equal(after.snapshotFingerprint, before.snapshotFingerprint);
+    assert.notEqual(after.fingerprint, before.fingerprint);
+  } finally { await f.dispose(); }
+});
+
 test('invalid multi targets and non-target mutation block safely and explicit retry recovers', async t => {
   const f = await fixture(true);
   try {
@@ -204,7 +218,8 @@ test('invalid multi targets and non-target mutation block safely and explicit re
         recover = true;
         store.requestSequenceGoalReviewRetry(f.sequence.id, latest.attemptId);
         await schedule();
-        assert.equal(store.getSequence(f.sequence.id)?.status, 'completed');
+        assert.equal(store.getSequence(f.sequence.id)?.status, 'completed', JSON.stringify({ scenario, calls,
+          review: store.sequenceGoalReview(f.sequence.id), retry: store.pendingSequenceGoalReviewRetry(f.sequence.id) }));
         assert.equal(store.getSequence(f.sequence.id)?.goalRevisionCount, 0);
       } finally {
         store.close();

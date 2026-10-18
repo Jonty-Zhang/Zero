@@ -615,6 +615,43 @@ async function findProjectRepositoryRoot(topLevelPath: string, commonDirectoryPa
   }
 }
 
+export interface WorktreeTextNormalization {
+  autocrlf: 'true' | 'false' | 'input';
+  eol: 'native' | 'lf' | 'crlf';
+}
+
+/** Preserve only safe text-conversion scalars when inspecting a writer's worktree. */
+export async function worktreeGitEnvironment(globalConfigPath: string, taskWorkspace: string): Promise<{
+  env: NodeJS.ProcessEnv; textNormalization: WorktreeTextNormalization;
+}> {
+  const queryEnv: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1' };
+  // Pure config reads retain the writer's effective system/global settings, but
+  // neither repository redirects nor the legacy config-only override may retarget them.
+  for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_CONFIG']) delete queryEnv[key];
+  const read = async (key: string, boolean: boolean, fallback: string): Promise<string> => {
+    try {
+      const { stdout } = await execFileAsync('git', ['config', '--null', ...(boolean ? ['--type=bool-or-str'] : []), '--get', key],
+        { cwd: taskWorkspace, env: queryEnv, windowsHide: true, timeout: 10_000, maxBuffer: 4096 });
+      if (!stdout.endsWith('\0')) throw new Error('Invalid source Git text configuration');
+      return stdout.slice(0, -1).toLowerCase();
+    } catch (error) {
+      if ((error as { code?: unknown }).code === 1) return fallback;
+      throw new Error('Source Git text configuration could not be read safely');
+    }
+  };
+  const [autocrlf, eol] = await settleGitCommands([
+    read('core.autocrlf', true, 'false'), read('core.eol', false, 'native'),
+  ]);
+  if (!['true', 'false', 'input'].includes(autocrlf) || !['native', 'lf', 'crlf'].includes(eol)) {
+    throw new Error('Source Git text configuration is unsupported');
+  }
+  const env = safeGitEnvironment(globalConfigPath);
+  env.GIT_CONFIG_COUNT = '4';
+  env.GIT_CONFIG_KEY_2 = 'core.autocrlf'; env.GIT_CONFIG_VALUE_2 = autocrlf;
+  env.GIT_CONFIG_KEY_3 = 'core.eol'; env.GIT_CONFIG_VALUE_3 = eol;
+  return { env, textNormalization: { autocrlf: autocrlf as WorktreeTextNormalization['autocrlf'], eol: eol as WorktreeTextNormalization['eol'] } };
+}
+
 export function safeGitEnvironment(globalConfigPath: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     GIT_CONFIG_NOSYSTEM: '1',

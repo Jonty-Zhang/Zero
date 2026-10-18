@@ -31,9 +31,20 @@ All new executions use real local Git worktrees/SQLite and deterministic fake pr
 - Real Git multi-repository workflow 12/12; independent focused reviewer/integration/evidence suite 25/25; HTTP/retry suite 11/11. Isolated read environment/manager/snapshot regressions 36/36, including original Git objects under replacement refs.
 - Web interaction suite: 33/33 passed; web TypeScript and production build passed. Target HTTP projection regression passed.
 - Edge at 1440 px and 375 px against a local HTTP server and real SQLite: selected earlier target and both repository paths visible, target navigation correct, no horizontal overflow or page errors.
-- Full feature integration, final independent review and exact-commit Linux/Windows verification are pending; this document will record their outcomes before merge.
+- The merge gate requires a canonical full run and exact-head Linux/Windows CI after any corrections. Final commit-specific results and the merge receipt are recorded with [PR #6](https://github.com/Jonty-Zhang/Zero/pull/6), separately from the focused runs above.
 
 The requested Astra high final reviewer hit an account usage limit before returning a conclusion. That attempt is not recorded as an approved review; the completed boundary reviews above remain separately documented.
+
+The retried configured Astra high reviewer subsequently approved source `e8941b9`, with an independent isolated compile and 13/13 protocol/read regressions. A separate available reviewer also approved its static audit. These reviews did not replace full-suite verification.
+
+## Full-suite findings and corrections
+
+The first canonical local run on `e8941b9` reported 555 tests: 552 passed, 3 failed. The failures represented two underlying conditions (one parent/child failure pair). Linux CI passed 551 with four platform skips, while Windows CI reproduced the goal-recovery failure (553 passed, 2 failed). The branch stayed draft.
+
+1. A configuration writer could acquire `BEGIN IMMEDIATE`, replace JSON once, then fail `COMMIT` when an overlapping SQLite reader delayed its exclusive lock. A deterministic held-reader CLI regression reproduced the raw `database is locked` exit in 137 ms. The correction retries only lock acquisition or COMMIT asynchronously within the existing bound; it retains ownership and never repeats the configuration mutation. Both config suites passed 31/31.
+2. Disabling system/global Git config during worktree inspection also removed Windows `core.autocrlf=true`. A normal restore wrote CRLF; ordinary Git correctly reported clean, while the isolated environment reported a modification. Existing index stat caches sometimes masked the mismatch, explaining the earlier focused passes. The correction reads and pins only effective `core.autocrlf`/`core.eol` scalars and binds them into whole-goal evidence. A real-Git failure-first regression checks global CRLF, local overrides, safe defaults, bool aliases, redirected config rejection, retained fsmonitor isolation and detection of actual content changes. Indexed snapshots remain canonical blob bytes.
+
+The reviewer independently approved both narrow corrections and reran their two focused regressions successfully. The corrected source requires a new frozen full-suite/CI run before merge; its exact results are retained in the PR's checks and validation record.
 
 ## Remaining boundaries
 
