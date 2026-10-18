@@ -92,6 +92,7 @@ export async function runProcess(options: ProcessRunnerOptions): Promise<Process
     exitCode: exit.code,
     stdout: out,
     stderr: err,
+    ...(stderrBytes > maxBytes ? { stderrTruncated: true } : {}),
     ...(forcedError ? { error: forcedError } : {}),
   };
 }

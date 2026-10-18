@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { buildChildEnv, runProcess } from './process-runner.js';
 import type { AdapterRunResult, HarnessId, Invocation, ModelBinding, ParsedOutput, ReasoningEffort, RunContext } from './types.js';
 import { classifyQuota } from '../core/quota.js';
-import { plaintextProviderError, StreamingOutputParser } from './output-parser.js';
+import { dshProviderError, plaintextProviderError, StreamingOutputParser } from './output-parser.js';
 
 export interface AdapterConfig {
   executable?: string;
@@ -116,9 +116,10 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
       } : diagnostic;
       const modelMismatch = Boolean(parsed.modelConflict || parsed.actualModel && parsed.actualModel !== binding.model.modelId);
       const status = modelMismatch || parsed.outputError ? 'failed' : outcome.status === 'completed' && outcome.exitCode !== 0 ? 'failed' : outcome.status;
+      const dshError = this.id === 'dsh' && outputFormat === 'text' ? dshProviderError(outcome.stderr, outcome.stderrTruncated) : undefined;
       const runError = parsed.modelConflict ? 'Harness reported conflicting model identities'
         : modelMismatch ? `Harness reported model ${parsed.actualModel}, expected ${binding.model.modelId}`
-          : parsed.outputError ?? outcome.error ?? (outcome.status === 'failed' && outcome.exitCode !== 0 ? parsed.lastProviderError : undefined);
+          : parsed.outputError ?? outcome.error ?? (outcome.status === 'failed' && outcome.exitCode !== 0 ? parsed.lastProviderError ?? (dshError?.slice(0, 4_096) || undefined) : undefined);
       const artifactPaths = request.artifactDir
         ? await this.persistArtifacts(request.artifactDir, request.taskId, request.attemptId, outcome.stdout, outcome.stderr, parsed)
         : {};
@@ -139,7 +140,7 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
         error: runError,
       };
       const quota = outcome.status === 'failed' && outcome.exitCode !== 0 && !modelMismatch && !parsed.outputError
-        ? classifyQuota(parsed.hasStructuredOutput ? parsed.lastProviderError ?? '' : plaintextProviderError(outcome.stderr))
+        ? classifyQuota(parsed.hasStructuredOutput ? parsed.lastProviderError ?? '' : dshError ?? plaintextProviderError(outcome.stderr))
         : undefined;
       return {
         status: result.status,

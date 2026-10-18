@@ -75,13 +75,25 @@ function useDialog(onClose: () => void, busy = false) {
       if (event.key === 'Tab') {
         const items = controls(); const first = items[0]; const last = items.at(-1);
         if (!first) { event.preventDefault(); element.focus(); }
-        else if (event.shiftKey && (document.activeElement === first || document.activeElement === element)) { event.preventDefault(); last?.focus(); }
-        else if (!event.shiftKey && (document.activeElement === last || document.activeElement === element)) { event.preventDefault(); first.focus(); }
+        else if (event.shiftKey && (document.activeElement === first || document.activeElement === element || !element.contains(document.activeElement))) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && (document.activeElement === last || document.activeElement === element || !element.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
       }
     };
-    element.addEventListener('keydown', onKey);
-    return () => { element.removeEventListener('keydown', onKey); previous?.focus(); };
+    const containFocus = (event: FocusEvent) => {
+      if (event.target instanceof Node && !element.contains(event.target)) (controls()[0] ?? element).focus();
+    };
+    document.addEventListener('keydown', onKey, true);
+    document.addEventListener('focusin', containFocus);
+    return () => {
+      document.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('focusin', containFocus);
+      if (previous?.isConnected) previous.focus();
+    };
   }, []);
+  useEffect(() => {
+    // Disabling the focused submit control can move native browser focus to BODY.
+    if (busy) ref.current?.focus();
+  }, [busy]);
   return ref;
 }
 
