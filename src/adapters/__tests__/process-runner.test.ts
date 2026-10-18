@@ -95,6 +95,20 @@ test('runner bounds log size and reports truncation', async () => {
   assert.match(result.stdout, /^abcd\n\[Zero: output truncated/);
 });
 
+test('runner distinguishes actual stderr truncation from stdout truncation or a literal marker', async () => {
+  for (const stderr of ['abcdefghij', '[Zero: output truncated]']) {
+    const result = await runProcess({ executable: process.execPath,
+      args: ['-e', `process.stdout.write('x'.repeat(100));process.stderr.write(${JSON.stringify(stderr)})`],
+      cwd: process.cwd(), env: {}, timeoutMs: 5_000, maxLogBytes: 32 });
+    assert.match(result.stdout, /output truncated/);
+    assert.notEqual(result.stderrTruncated, true);
+  }
+  const result = await runProcess({ executable: process.execPath,
+    args: ['-e', "process.stderr.write('x'.repeat(100))"],
+    cwd: process.cwd(), env: {}, timeoutMs: 5_000, maxLogBytes: 32 });
+  assert.equal(result.stderrTruncated, true);
+});
+
 test('runner terminates a process that exceeds its time budget', async () => {
   const result = await runProcess({
     executable: process.execPath,

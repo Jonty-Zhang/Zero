@@ -29,4 +29,10 @@
 
 后续已确认配置读改写并发丢失：网页设置保存与 CLI 注册模型均成功，但后写入者擦掉对方更新。隔离真实 CLI + HTTP 已复现，继续修复完整读改写的互斥。
 
+## DSH 当前诊断
+
+DSH 将原样推理写到 stderr，旧提取器会把其中引用的 quota 与 Retry-After 当成当前错误，又丢掉最后的认证诊断。现在仅对 DSH text 使用最后一条 CLI 诊断及其续行，保留错误 code，避免旧推理影响当前认证、账单或重试时间；对外错误保留脱敏和 4096 字符上限。机器记录的 stderr 截断单独判断，真正截断时不据前缀授权额度恢复；stdout 单独截断、模型打印的截断标记不误伤正常额度诊断。
+
+已从[官方 registry](https://registry.npmjs.org/@deepseek-ai/dsh-headless/0.1.5-rc.2)读取支持版本的[源码包](https://registry.npmjs.org/@deepseek-ai/dsh-headless/-/dsh-headless-0.1.5-rc.2.tgz)，sha512 与发布 integrity 一致，确认 `package/lib/index.js` 先写 `dsh: reasoning:`，终态为 `dsh: <code>: <message>` 或 driver 的 `dsh: <message>`。没有安装/执行包或调用模型；包元数据没有 gitHead，不声称对应某个 Git commit。完整适配器 134/134；root 独立重跑 DSH/截断相关 20/20。未带 framing 的旧 fallback 仍保留原有局限，Codex/ZCode 的终态顺序本轮不改；本机 DSH 入口未定位，不能据此宣称 live 验证。
+
 所有新复现使用隔离 Git 工作区、SQLite 和本地 fake adapters，没有消耗真实模型额度或改写生产配置。执行进度见[持续审查计划](superpowers/plans/2026-10-18-continuous-audit.md)。

@@ -45,6 +45,89 @@ class OutputFixtureAdapter extends BaseHarnessAdapter {
 }
 const fixtureRequest = () => ({ taskId: 'offline-output', attemptId: 'fixture-1', role: 'implement' as const,
   harness: 'codex' as const, model: 'gpt-main', cwd: process.cwd(), prompt: 'offline deterministic fixture' });
+const plainFixtureOutput = (stdout: string, stderr: string): ParsedOutput => ({ finalText: stdout.trim() || undefined,
+  events: [{ type: 'output', message: stdout }, { type: 'stderr', message: stderr }] });
+const runDshFixture = (script: string, config: AdapterConfig = {}) => new OutputFixtureAdapter(script, plainFixtureOutput, config, 'dsh')
+  .run({ ...fixtureRequest(), harness: 'dsh', model: 'deepseek-main' });
+
+test('DSH terminal authentication diagnostics supersede quota quoted in streamed reasoning', async () => {
+  const result = await runDshFixture(`process.stderr.write('dsh: reasoning:\\nQuota exceeded; Retry-After: 86400\\nInspecting a previous report.\\ndsh: invalid_api_key: Authentication failed\\n');process.exitCode=1;`);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.quota, undefined);
+  assert.match(result.error ?? '', /invalid_api_key: Authentication failed/);
+});
+
+test('DSH quota uses the terminal diagnostic and its own retry time instead of earlier reasoning', async () => {
+  const before = Date.now();
+  const result = await runDshFixture(`process.stderr.write('dsh: reasoning:\\nQuota exceeded; Retry-After: 86400\\ndsh: llm_error: Quota exceeded\\nRetry-After: 60\\n');process.exitCode=1;`);
+  assert.equal(result.quota?.source, 'retry_after');
+  assert.ok(Date.parse(result.quota!.retryAt!) >= before + 59_000);
+  assert.ok(Date.parse(result.quota!.retryAt!) <= Date.now() + 61_000);
+  assert.match(result.error ?? '', /llm_error: Quota exceeded/);
+  assert.ok(!result.error?.includes('86400'));
+});
+
+test('DSH coded quota diagnostics remain recoverable and retain account error exclusions', async () => {
+  const quota = await runDshFixture(`console.error('dsh: llm_error: Quota exceeded; Retry-After: 60');process.exitCode=1;`);
+  assert.equal(quota.quota?.source, 'retry_after');
+  assert.match(quota.error ?? '', /llm_error/);
+  for (const code of ['insufficient_quota', 'billing_hard_limit_reached', 'credit_balance_exhausted']) {
+    const result = await runDshFixture(`console.error(${JSON.stringify(`dsh: ${code}: Quota exceeded`)});process.exitCode=1;`);
+    assert.equal(result.quota, undefined);
+    assert.match(result.error ?? '', new RegExp(code));
+  }
+});
+
+test('DSH reasoning without a later terminal diagnostic cannot authorize a quota retry', async () => {
+  const result = await runDshFixture(`process.stderr.write('dsh: reasoning:\\nError: Quota exceeded; Retry-After: 60\\n');process.exitCode=1;`);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.quota, undefined);
+});
+
+test('DSH chooses its latest diagnostic instead of retaining an earlier quota failure', async () => {
+  const result = await runDshFixture(`console.error('dsh: Quota exceeded; Retry-After: 60');console.error('dsh: Session flush failed: EACCES');process.exitCode=1;`);
+  assert.equal(result.quota, undefined);
+  assert.match(result.error ?? '', /Session flush failed: EACCES/);
+});
+
+test('DSH preserves legacy anchored quota diagnostics when there is no reasoning stream', async () => {
+  const result = await runDshFixture(`console.error('Error: Quota exceeded; Retry-After: 60');process.exitCode=1;`);
+  assert.equal(result.quota?.source, 'retry_after');
+});
+
+test('DSH cannot authorize quota recovery from a truncated stderr prefix', async () => {
+  const result = await runDshFixture(`process.stderr.write('Error: Quota exceeded; Retry-After: 60\\n'+'x'.repeat(1000)+'\\ndsh: invalid_api_key: Authentication failed\\n');process.exitCode=1;`, { maxLogBytes: 128 });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.quota, undefined);
+  assert.equal(result.error, undefined, 'a discarded terminal diagnostic cannot be asserted as the current error');
+});
+
+test('DSH quota survives stdout-only truncation and a literal truncation marker in its full stderr', async () => {
+  const result = await runDshFixture(`process.stdout.write('x'.repeat(1000));console.error('dsh: llm_error: Quota exceeded; Retry-After: 60\\n[Zero: output truncated at configured byte limit]');process.exitCode=1;`, { maxLogBytes: 256 });
+  assert.equal(result.quota?.source, 'retry_after');
+});
+
+test('DSH failure diagnostics remain redacted and bounded when exposed as run errors', async () => {
+  const secret = 'offline-dsh-secret';
+  const result = await runDshFixture(`console.error('dsh: insufficient_quota: Quota exceeded offline-dsh-secret '+ 'x'.repeat(6000));process.exitCode=1;`, {
+    secretRefs: { FIXTURE_TOKEN: 'offline-token' }, resolveSecret: () => secret,
+  });
+  assert.equal(result.quota, undefined);
+  assert.match(result.error ?? '', /insufficient_quota.*\[REDACTED\]/);
+  assert.ok(result.error!.length <= 4096);
+  assert.ok(!JSON.stringify(result).includes(secret));
+});
+
+test('DSH quota diagnostics do not replace successful exits or forced timeout errors', async () => {
+  const success = await runDshFixture(`console.error('dsh: llm_error: Quota exceeded; Retry-After: 60');`);
+  assert.equal(success.status, 'completed');
+  assert.equal(success.error, undefined);
+  assert.equal(success.quota, undefined);
+  const timedOut = await runDshFixture(`console.error('dsh: llm_error: Quota exceeded; Retry-After: 60');setInterval(()=>{},1000);`, { timeoutMs: 150 });
+  assert.equal(timedOut.status, 'timed_out');
+  assert.match(timedOut.error ?? '', /exceeded 150 ms timeout/);
+  assert.equal(timedOut.quota, undefined);
+});
 
 test('streaming protocol retains the actual final beyond the log cap and an oversized tool line', async () => {
   const script = `console.log(JSON.stringify({type:'thread.started',thread_id:'session-original',model:'gpt-5-codex'}));

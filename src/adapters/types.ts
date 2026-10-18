@@ -136,6 +136,8 @@ export interface ProcessOutcome {
   exitCode: number | null;
   stdout: string;
   stderr: string;
+  /** Raw stderr exceeded the capture limit, independently of stdout or printed marker text. */
+  stderrTruncated?: boolean;
   status: RunStatus;
   error?: string;
 }

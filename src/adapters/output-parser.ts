@@ -127,3 +127,25 @@ export function plaintextProviderError(stderr: string): string {
   const provider = /^(?:(?:error|codex|dsh|zcode)(?:\s+error)?\s*:\s*)?(?:you(?:'ve| have) hit your usage limit\b|usage limit (?:has been )?(?:reached|exceeded)\b|quota (?:has been )?(?:exceeded|reached)\b)/i;
   return lines.filter(line => provider.test(line.trim()) || /^\s*(?:retry-after|resets?(?:\s+at)?|try again(?:\s+at|\s+in)?)\s*[:=]?\s*(?:\d|\d{4}-)/i.test(line)).join('\n');
 }
+
+/** DSH streams untrusted reasoning on stderr, then writes its terminal failure
+ * as `dsh: <code>: <message>` (or `dsh: <message>` for driver failures).
+ * Only the latest diagnostic and its continuation belong to that failure. */
+export function dshProviderError(stderr: string, truncated = false): string {
+  // A captured prefix cannot establish which diagnostic ended the process.
+  if (truncated) return '';
+  const lines = stderr.split(/\r?\n/);
+  let diagnostic = -1;
+  let framed = false;
+  for (const [index, line] of lines.entries()) {
+    const match = /^\s*dsh:\s*(.*)$/i.exec(line);
+    if (!match) continue;
+    framed = true;
+    const message = match[1]!.trim();
+    diagnostic = message && !/^(?:reasoning|warning|info|debug|trace):/i.test(message) ? index : -1;
+  }
+  if (diagnostic >= 0) return lines.slice(diagnostic).join('\n').trim();
+  // Once DSH framing is present, bare lines may be model reasoning. Keep the
+  // legacy anchored fallback only for output without that framing.
+  return framed ? '' : plaintextProviderError(stderr);
+}
