@@ -1,6 +1,8 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute } from 'node:path';
+import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { ModelBinding, ModelConfig, ReasoningEffort } from '../adapters/types.js';
 import type { ExecutionSelection } from '../domain/types.js';
 
@@ -43,6 +45,47 @@ const EMPTY: LocalZeroConfig = {
   verifications: {},
 };
 
+// A local queue prevents synchronous SQLite contention between operations that
+// need this same event loop to finish their asynchronous JSON replacement.
+const configUpdates = new Map<string, Promise<void>>();
+async function withConfigUpdate<T>(path: string, change: (canonicalPath: string) => Promise<T>): Promise<T> {
+  const absolute = resolve(path);
+  await mkdir(dirname(absolute), { recursive: true });
+  const canonicalPath = await realpath(absolute).catch(async error => {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    return join(await realpath(dirname(absolute)), basename(absolute));
+  });
+  const key = process.platform === 'win32' ? canonicalPath.toLowerCase() : canonicalPath;
+  const previous = configUpdates.get(key) ?? Promise.resolve();
+  const update = previous.then(async () => {
+    const lock = new DatabaseSync(`${canonicalPath}.write-lock.sqlite`);
+    let acquired = false;
+    try {
+      lock.exec('PRAGMA busy_timeout=0');
+      const deadline = performance.now() + 10_000;
+      for (;;) {
+        try { lock.exec('BEGIN IMMEDIATE'); acquired = true; break; }
+        catch (error) {
+          const code = (error as { errcode?: number }).errcode;
+          if (typeof code !== 'number' || (code & 255) !== 5) throw error;
+          if (performance.now() >= deadline) throw new Error('Timed out waiting for Zero configuration update lock');
+          await delay(25);
+        }
+      }
+      const result = await change(canonicalPath);
+      lock.exec('COMMIT'); acquired = false;
+      return result;
+    } finally {
+      if (acquired) { try { lock.exec('ROLLBACK'); } catch { /* Closing also releases the process lock. */ } }
+      lock.close();
+    }
+  });
+  const settled = update.then(() => {}, () => {});
+  configUpdates.set(key, settled);
+  try { return await update; }
+  finally { if (configUpdates.get(key) === settled) configUpdates.delete(key); }
+}
+
 export class ConfigStore {
   constructor(readonly path: string) {}
 
@@ -67,90 +110,118 @@ export class ConfigStore {
   }
 
   async write(value: LocalZeroConfig): Promise<void> {
-    await mkdir(dirname(this.path), { recursive: true });
-    const previous = await this.read();
-    const next: LocalZeroConfig = {
-      ...previous,
-      allocator: value.allocator,
-      reviewer: value.reviewer,
-      ...(value.executionDefaults !== undefined ? { executionDefaults: value.executionDefaults } : {}),
-    };
-    await this.persist(next);
+    return this.update(async (previous, path) => {
+      const next: LocalZeroConfig = {
+        ...previous,
+        allocator: value.allocator,
+        reviewer: value.reviewer,
+        ...(value.executionDefaults !== undefined ? { executionDefaults: value.executionDefaults } : {}),
+      };
+      await this.persist(next, path);
+    });
   }
 
   /** Adds a user-selected ZCode desktop tuple to Zero's model registry only. */
   async registerZCodeDesktopModel(model: ModelConfig): Promise<'registered' | 'already_registered'> {
     if (!isValidLocalModel(model)) throw new Error('ZCode desktop model requires a safe local ID and exact provider/model IDs');
-    const config = await this.read();
-    const sameId = config.models.filter(item => item.id === model.id);
-    if (sameId.length) {
-      if (sameId.length === 1 && sameId[0]!.provider === model.provider && sameId[0]!.modelId === model.modelId) {
-        return 'already_registered';
+    return this.update(async (config, path) => {
+      const sameId = config.models.filter(item => item.id === model.id);
+      if (sameId.length) {
+        if (sameId.length === 1 && sameId[0]!.provider === model.provider && sameId[0]!.modelId === model.modelId) {
+          return 'already_registered';
+        }
+        throw new Error(`Local model ID ${model.id} is already registered with a different tuple`);
       }
-      throw new Error(`Local model ID ${model.id} is already registered with a different tuple`);
-    }
-    if (config.models.some(item => item.provider === model.provider && item.modelId === model.modelId)) {
-      throw new Error('This exact provider/model tuple is already registered under another local model ID');
-    }
+      if (config.models.some(item => item.provider === model.provider && item.modelId === model.modelId)) {
+        throw new Error('This exact provider/model tuple is already registered under another local model ID');
+      }
 
-    // This command only adds a model selector. It does not create or change a
-    // binding, verification record, allocator choice, or reviewer choice.
-    config.models = [...config.models, { ...model }];
-    await this.persist(config);
-    return 'registered';
+      // This command only adds a model selector. It does not create or change a
+      // binding, verification record, allocator choice, or reviewer choice.
+      config.models = [...config.models, { ...model }];
+      await this.persist(config, path);
+      return 'registered' as const;
+    });
   }
 
-  async markVerified(harness: 'codex', modelId: string, evidence: Omit<LocalZeroConfig['verifications'][string], 'reasoningEfforts'> & { reasoningEfforts?: ReasoningEffort[] }): Promise<void> {
-    const config = await this.read();
-    const model = config.models.find(item => item.id === modelId || item.modelId === modelId);
-    if (!model) throw new Error(`Unknown model ID: ${modelId}`);
-    const key = `${harness}:${model.id}`;
-    const reasoningEfforts = evidence.reasoningEfforts ?? config.bindings.find(item => item.harness === harness && item.model.id === model.id)?.reasoningEfforts ?? [];
-    const binding: ModelBinding = { harness, model, selector: 'cli_argument', verified: true, verificationSource: 'smoke_test', verifiedCliVersion: evidence.cliVersion, reasoningEfforts };
-    config.bindings = [...config.bindings.filter(item => !(item.harness === harness && item.model.id === model.id)), binding];
-    config.verifications[key] = { ...evidence, reasoningEfforts };
-    await this.persist(config);
+  async markVerified(harness: 'codex', modelId: string, evidence: Omit<LocalZeroConfig['verifications'][string], 'reasoningEfforts'> & { reasoningEfforts?: ReasoningEffort[] }, expectedModel?: ModelConfig): Promise<void> {
+    return this.update(async (config, path) => {
+      const model = config.models.find(item => item.id === modelId || item.modelId === modelId);
+      if (!model) throw new Error(`Unknown model ID: ${modelId}`);
+      if (expectedModel && !sameModelTuple(model, expectedModel)) {
+        throw new Error(`Local model ${modelId} changed during Codex verification; run verification again`);
+      }
+      const key = `${harness}:${model.id}`;
+      const previousBinding = config.bindings.find(item => item.harness === harness && item.model.id === model.id);
+      const previousProof = config.verifications[key];
+      // Independent effort proofs accumulate only for the same exact model and
+      // CLI in both fresh records; a changed identity starts a new proof set.
+      const sameVerification = previousBinding?.verified && sameModelTuple(previousBinding.model, model)
+        && isPinnedCliVersion(evidence.cliVersion) && previousBinding.verifiedCliVersion === evidence.cliVersion
+        && previousProof?.cliVersion === evidence.cliVersion && previousProof.exitCode === 0
+        && previousProof.requestedModel === model.modelId && evidence.requestedModel === model.modelId
+        && (!previousProof.actualModel || previousProof.actualModel === model.modelId)
+        && (!evidence.actualModel || evidence.actualModel === model.modelId);
+      const retainedEfforts = sameVerification
+        ? (previousBinding.reasoningEfforts ?? []).filter(effort => (previousProof.reasoningEfforts ?? []).includes(effort)) : [];
+      const incomingEfforts = evidence.reasoningEfforts ?? [];
+      const reasoningEfforts = [...new Set([...retainedEfforts, ...incomingEfforts])];
+      const retainedProofs = sameVerification ? Object.fromEntries(Object.entries(previousProof.effortEvidence ?? {})
+        .filter(([effort, proof]) => retainedEfforts.includes(effort as ReasoningEffort)
+          && proof.cliVersion === evidence.cliVersion && proof.exitCode === 0 && isValidTimestamp(proof.verifiedAt))) : {};
+      const { effortEvidence: providedProofs, ...verificationEvidence } = evidence;
+      const incomingProofs = Object.fromEntries(Object.entries(providedProofs ?? {})
+        .filter(([effort, proof]) => incomingEfforts.includes(effort as ReasoningEffort)
+          && proof.cliVersion === evidence.cliVersion && proof.exitCode === 0 && isValidTimestamp(proof.verifiedAt)));
+      const effortEvidence = { ...retainedProofs, ...incomingProofs };
+      const binding: ModelBinding = { harness, model, selector: 'cli_argument', verified: true, verificationSource: 'smoke_test', verifiedCliVersion: evidence.cliVersion, reasoningEfforts };
+      config.bindings = [...config.bindings.filter(item => !(item.harness === harness && item.model.id === model.id)), binding];
+      config.verifications[key] = { ...verificationEvidence, reasoningEfforts, ...(Object.keys(effortEvidence).length ? { effortEvidence } : {}) };
+      await this.persist(config, path);
+    });
   }
 
   async markDshVerified(modelId: string, expectedModel: ModelConfig, profile: string, evidence: Omit<LocalZeroConfig['verifications'][string], 'reasoningEfforts' | 'profile'>): Promise<void> {
     if (!isSafeDshProfile(profile)) throw new Error('DSH profile must be a safe profile name');
     if (!evidence.cliVersion.trim() || evidence.cliVersion === 'unknown') throw new Error('DSH CLI version is required to pin a verified binding');
-    const config = await this.read();
-    const matches = config.models.filter(item => item.id === modelId);
-    if (matches.length !== 1) throw new Error(`Expected exactly one local model ID: ${modelId}`);
-    const model = matches[0]!;
-    if (model.provider !== expectedModel.provider || model.modelId !== expectedModel.modelId) {
-      throw new Error(`Local model ${modelId} changed during DSH verification; run verification again`);
-    }
-    const key = `dsh:${model.id}`;
-    const binding: ModelBinding = {
-      harness: 'dsh', model, selector: 'profile', profile, verified: true,
-      verificationSource: 'smoke_test', verifiedCliVersion: evidence.cliVersion, reasoningEfforts: [],
-    };
-    config.bindings = [...config.bindings.filter(item => !(item.harness === 'dsh' && item.model.id === model.id)), binding];
-    config.verifications[key] = { ...evidence, profile, reasoningEfforts: [] };
-    await this.persist(config);
+    return this.update(async (config, path) => {
+      const matches = config.models.filter(item => item.id === modelId);
+      if (matches.length !== 1) throw new Error(`Expected exactly one local model ID: ${modelId}`);
+      const model = matches[0]!;
+      if (model.provider !== expectedModel.provider || model.modelId !== expectedModel.modelId) {
+        throw new Error(`Local model ${modelId} changed during DSH verification; run verification again`);
+      }
+      const key = `dsh:${model.id}`;
+      const binding: ModelBinding = {
+        harness: 'dsh', model, selector: 'profile', profile, verified: true,
+        verificationSource: 'smoke_test', verifiedCliVersion: evidence.cliVersion, reasoningEfforts: [],
+      };
+      config.bindings = [...config.bindings.filter(item => !(item.harness === 'dsh' && item.model.id === model.id)), binding];
+      config.verifications[key] = { ...evidence, profile, reasoningEfforts: [] };
+      await this.persist(config, path);
+    });
   }
 
   async markZCodeVerified(modelId: string, expectedModel: ModelConfig, configDir: string, mode: string, evidence: Omit<LocalZeroConfig['verifications'][string], 'reasoningEfforts' | 'configDir' | 'mode'>): Promise<void> {
     if (!isAbsoluteConfigDir(configDir)) throw new Error('ZCode config directory must be an absolute path');
     if (!isSupportedZCodeMode(mode)) throw new Error('ZCode mode must be build or yolo');
     if (!evidence.cliVersion.trim() || evidence.cliVersion === 'unknown') throw new Error('ZCode CLI version is required to pin a verified binding');
-    const config = await this.read();
-    const matches = config.models.filter(item => item.id === modelId);
-    if (matches.length !== 1) throw new Error(`Expected exactly one local model ID: ${modelId}`);
-    const model = matches[0]!;
-    if (model.provider !== expectedModel.provider || model.modelId !== expectedModel.modelId) {
-      throw new Error(`Local model ${modelId} changed during ZCode verification; run verification again`);
-    }
-    const key = `zcode:${model.id}`;
-    const binding: ModelBinding = {
-      harness: 'zcode', model, selector: 'isolated_config', configDir, mode, verified: true,
-      verificationSource: 'smoke_test', verifiedCliVersion: evidence.cliVersion, reasoningEfforts: [],
-    };
-    config.bindings = [...config.bindings.filter(item => !(item.harness === 'zcode' && item.model.id === model.id)), binding];
-    config.verifications[key] = { ...evidence, configDir, mode, reasoningEfforts: [] };
-    await this.persist(config);
+    return this.update(async (config, path) => {
+      const matches = config.models.filter(item => item.id === modelId);
+      if (matches.length !== 1) throw new Error(`Expected exactly one local model ID: ${modelId}`);
+      const model = matches[0]!;
+      if (model.provider !== expectedModel.provider || model.modelId !== expectedModel.modelId) {
+        throw new Error(`Local model ${modelId} changed during ZCode verification; run verification again`);
+      }
+      const key = `zcode:${model.id}`;
+      const binding: ModelBinding = {
+        harness: 'zcode', model, selector: 'isolated_config', configDir, mode, verified: true,
+        verificationSource: 'smoke_test', verifiedCliVersion: evidence.cliVersion, reasoningEfforts: [],
+      };
+      config.bindings = [...config.bindings.filter(item => !(item.harness === 'zcode' && item.model.id === model.id)), binding];
+      config.verifications[key] = { ...evidence, configDir, mode, reasoningEfforts: [] };
+      await this.persist(config, path);
+    });
   }
 
   async markZCodeAppServerVerified(
@@ -176,77 +247,83 @@ export class ConfigStore {
     }
 
     // All checks run before persistence. A rejected proof leaves the existing config bytes untouched.
-    const config = await this.read();
-    const matches = config.models.filter(item => item.id === modelId);
-    if (matches.length !== 1) throw new Error(`Expected exactly one local model ID: ${modelId}`);
-    const model = matches[0]!;
-    if (model.provider !== expectedModel.provider || model.modelId !== expectedModel.modelId) {
-      throw new Error(`Local model ${modelId} changed during ZCode app-server verification; run verification again`);
-    }
-    const key = `zcode:${model.id}`;
-    const binding: Extract<ModelBinding, { selector: 'app_server_existing_desktop' }> = {
-      harness: 'zcode',
-      model,
-      selector: 'app_server_existing_desktop',
-      verified: true,
-      verificationSource: 'smoke_test',
-      verifiedCliVersion: evidence.cliVersion,
-      verificationEvidence: {
-        kind: 'selector_only',
+    return this.update(async (config, path) => {
+      const matches = config.models.filter(item => item.id === modelId);
+      if (matches.length !== 1) throw new Error(`Expected exactly one local model ID: ${modelId}`);
+      const model = matches[0]!;
+      if (model.provider !== expectedModel.provider || model.modelId !== expectedModel.modelId) {
+        throw new Error(`Local model ${modelId} changed during ZCode app-server verification; run verification again`);
+      }
+      const key = `zcode:${model.id}`;
+      const binding: Extract<ModelBinding, { selector: 'app_server_existing_desktop' }> = {
+        harness: 'zcode',
+        model,
+        selector: 'app_server_existing_desktop',
+        verified: true,
+        verificationSource: 'smoke_test',
+        verifiedCliVersion: evidence.cliVersion,
+        verificationEvidence: {
+          kind: 'selector_only',
+          verifiedAt: evidence.verifiedAt,
+          providerId: evidence.providerId,
+          modelId: evidence.modelId,
+          cliVersion: evidence.cliVersion,
+          reasoningEffort: evidence.reasoningEffort,
+        },
+        reasoningEfforts: [evidence.reasoningEffort],
+      };
+      config.bindings = [...config.bindings.filter(item => !(item.harness === 'zcode' && item.model.id === model.id)), binding];
+      config.verifications[key] = {
         verifiedAt: evidence.verifiedAt,
-        providerId: evidence.providerId,
-        modelId: evidence.modelId,
         cliVersion: evidence.cliVersion,
-        reasoningEffort: evidence.reasoningEffort,
-      },
-      reasoningEfforts: [evidence.reasoningEffort],
-    };
-    config.bindings = [...config.bindings.filter(item => !(item.harness === 'zcode' && item.model.id === model.id)), binding];
-    config.verifications[key] = {
-      verifiedAt: evidence.verifiedAt,
-      cliVersion: evidence.cliVersion,
-      requestedModel: model.modelId,
-      exitCode: 0,
-      level: 'selector_only',
-      reasoningEfforts: [evidence.reasoningEffort],
-      effortEvidence: {
-        [evidence.reasoningEffort]: { verifiedAt: evidence.verifiedAt, cliVersion: evidence.cliVersion, exitCode: 0 },
-      },
-    };
-    await this.persist(config);
+        requestedModel: model.modelId,
+        exitCode: 0,
+        level: 'selector_only',
+        reasoningEfforts: [evidence.reasoningEffort],
+        effortEvidence: {
+          [evidence.reasoningEffort]: { verifiedAt: evidence.verifiedAt, cliVersion: evidence.cliVersion, exitCode: 0 },
+        },
+      };
+      await this.persist(config, path);
+    });
   }
 
   async markReasoningEffortVerified(harness: 'codex', modelId: string, effort: ReasoningEffort, cliVersion: string): Promise<void> {
-    const config = await this.read();
-    const model = config.models.find(item => item.id === modelId || item.modelId === modelId);
-    const binding = config.bindings.find(item => item.harness === harness && item.model.id === model?.id && item.verified);
-    const key = `${harness}:${model?.id}`;
-    const verification = config.verifications[key];
-    if (!model || !binding || !verification) throw new Error('Verify the base model binding before adding a reasoning effort');
-    const efforts = [...new Set([...(binding.reasoningEfforts ?? []), effort])];
-    const effortEvidence = { ...(verification.effortEvidence ?? {}), [effort]: { verifiedAt: new Date().toISOString(), cliVersion, exitCode: 0 as const } };
-    config.bindings = config.bindings.map(item => item === binding ? { ...binding, reasoningEfforts: efforts } : item);
-    config.verifications[key] = { ...verification, reasoningEfforts: efforts, effortEvidence };
-    await this.persist(config);
+    return this.update(async (config, path) => {
+      const model = config.models.find(item => item.id === modelId || item.modelId === modelId);
+      const binding = config.bindings.find(item => item.harness === harness && item.model.id === model?.id && item.verified);
+      const key = `${harness}:${model?.id}`;
+      const verification = config.verifications[key];
+      if (!model || !binding || !verification) throw new Error('Verify the base model binding before adding a reasoning effort');
+      const efforts = [...new Set([...(binding.reasoningEfforts ?? []), effort])];
+      const effortEvidence = { ...(verification.effortEvidence ?? {}), [effort]: { verifiedAt: new Date().toISOString(), cliVersion, exitCode: 0 as const } };
+      config.bindings = config.bindings.map(item => item === binding ? { ...binding, reasoningEfforts: efforts } : item);
+      config.verifications[key] = { ...verification, reasoningEfforts: efforts, effortEvidence };
+      await this.persist(config, path);
+    });
   }
 
   async invalidateVersionMismatches(versions: Partial<Record<'codex' | 'dsh' | 'zcode', string | undefined>>): Promise<string[]> {
-    const config = await this.read();
-    const invalid = config.bindings.filter(binding => binding.verifiedCliVersion && versions[binding.harness] && binding.verifiedCliVersion !== versions[binding.harness]);
-    if (!invalid.length) return [];
-    const keys = new Set(invalid.map(binding => `${binding.harness}:${binding.model.id}`));
-    config.bindings = config.bindings.filter(binding => !keys.has(`${binding.harness}:${binding.model.id}`));
-    for (const key of keys) delete config.verifications[key];
-    await this.persist(config);
-    return [...keys];
+    return this.update(async (config, path) => {
+      const invalid = config.bindings.filter(binding => binding.verifiedCliVersion && versions[binding.harness] && binding.verifiedCliVersion !== versions[binding.harness]);
+      if (!invalid.length) return [];
+      const keys = new Set(invalid.map(binding => `${binding.harness}:${binding.model.id}`));
+      config.bindings = config.bindings.filter(binding => !keys.has(`${binding.harness}:${binding.model.id}`));
+      for (const key of keys) delete config.verifications[key];
+      await this.persist(config, path);
+      return [...keys];
+    });
   }
 
-  private async persist(config: LocalZeroConfig): Promise<void> {
-    await mkdir(dirname(this.path), { recursive: true });
-    const temp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+  private update<T>(change: (config: LocalZeroConfig, canonicalPath: string) => Promise<T>): Promise<T> {
+    return withConfigUpdate(this.path, async path => change(await this.read(), path));
+  }
+
+  private async persist(config: LocalZeroConfig, path: string): Promise<void> {
+    const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
     try {
       await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-      await rename(temp, this.path);
+      await rename(temp, path);
     } catch (error) {
       await rm(temp, { force: true }).catch(() => undefined);
       throw error;
@@ -267,6 +344,10 @@ function normalizeExecutionDefaults(value: NonNullable<LocalZeroConfig['executio
 
 function isSafeDshProfile(profile: string): boolean {
   return profile.toLowerCase() !== 'desktop' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(profile);
+}
+
+function sameModelTuple(left: ModelConfig, right: ModelConfig): boolean {
+  return left.id === right.id && left.provider === right.provider && left.modelId === right.modelId;
 }
 
 function isAbsoluteConfigDir(path: string): boolean {

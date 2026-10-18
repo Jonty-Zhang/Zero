@@ -227,14 +227,10 @@ export async function runBindingVerification(modelId: string, effort: string = '
     throw new Error(`Codex model verification failed; binding remains unavailable (status=${result.status}, exit=${String(result.exitCode)}, modelEvidence=${actualModel ?? 'missing'}).`);
   }
   const level = actualModel ? 'event_confirmed' : 'selector_only';
-  const oldBinding = current.bindings.find(item => item.harness === 'codex' && item.model.id === model.id);
-  const sameCliVersion = oldBinding?.verifiedCliVersion === version;
   const selectedEffort = effort as ReasoningEffort;
-  const reasoningEfforts: ReasoningEffort[] = [...new Set<ReasoningEffort>([...(sameCliVersion ? oldBinding?.reasoningEfforts ?? [] : []), selectedEffort])];
-  const oldVerification = sameCliVersion ? current.verifications[`codex:${model.id}`] : undefined;
   const verifiedAt = new Date().toISOString();
-  await config.markVerified('codex', model.id, { verifiedAt, cliVersion: version, requestedModel: model.modelId, exitCode: 0, level, reasoningEfforts,
-    effortEvidence: { ...(oldVerification?.effortEvidence ?? {}), [selectedEffort]: { verifiedAt, cliVersion: version, exitCode: 0 } }, ...(actualModel ? { actualModel } : {}) });
+  await config.markVerified('codex', model.id, { verifiedAt, cliVersion: version, requestedModel: model.modelId, exitCode: 0, level, reasoningEfforts: [selectedEffort],
+    effortEvidence: { [selectedEffort]: { verifiedAt, cliVersion: version, exitCode: 0 } }, ...(actualModel ? { actualModel } : {}) }, model);
   console.log(`Verified Codex binding ${model.id} at reasoning effort ${effort} (${version}); evidence level: ${level}${actualModel ? `; actual model: ${actualModel}` : ''}.`);
 }
 

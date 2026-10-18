@@ -37,4 +37,14 @@ DSH 将原样推理写到 stderr，旧提取器会把其中引用的 quota 与 R
 
 已从[官方 registry](https://registry.npmjs.org/@deepseek-ai/dsh-headless/0.1.5-rc.2)读取支持版本的[源码包](https://registry.npmjs.org/@deepseek-ai/dsh-headless/-/dsh-headless-0.1.5-rc.2.tgz)，sha512 与发布 integrity 一致，确认 `package/lib/index.js` 先写 `dsh: reasoning:`，终态为 `dsh: <code>: <message>` 或 driver 的 `dsh: <message>`。没有安装/执行包或调用模型；包元数据没有 gitHead，不声称对应某个 Git commit。完整适配器 134/134；root 独立重跑 DSH/截断相关 20/20。未带 framing 的旧 fallback 仍保留原有局限，Codex/ZCode 的终态顺序本轮不改；本机 DSH 入口未定位，不能据此宣称 live 验证。
 
+PR #4 已合并到 main `9847f69b7b591e29a0922b80579c4aaf0904e8c5`，树与固定验证提交 `153d1b9` 一致。本地全量 463/463；准确提交的 push/PR CI 四项均成功，Windows 463/463、Linux 461 通过及 2 项 Windows 专用跳过，前端 32/32、客户端 11/11、原生/发布/安装检查通过。
+
+## 配置并发及验证证据
+
+设置、注册和绑定验证曾各自读取旧 JSON 后整份替换。现以规范路径共享的进程内异步队列及独立 SQLite 写锁，保护所有八个 mutator 的完整读取、动态校验、修改和替换；JSON 仍是配置权威。只对 SQLite busy 做有界异步等待，异常、持锁进程退出及写入失败均释放锁；不会取消仍活跃的持锁者。网页保存只合并用户设置，保留最新模型、绑定、验证及私有 metadata。
+
+独立复审又复现实际 `runBindingVerification` 的另一处丢失：两个相同 CLI 版本的思考强度验证均成功，旧快照仍使其中一个 proof 消失。调用方现在只提交本次 proof，并在锁内按相同 provider/model tuple 及相同 binding/verification CLI 版本累积；相同 effort 的新证据覆盖旧证据，跨版本重新建立证据集合，模型 tuple 变化则拒绝旧验证结果且不改 JSON。
+
+新并发测试 24 项及原配置 6 项由 root 独立重跑 30/30；实现者及独立 reviewer 分别跑配置、并发、main、server 共 79/79、0 跳过。覆盖真实 CLI + HTTP、两个 CLI 进程、Windows 大小写/8.3/junction、结束持锁进程、10 秒等待超时、rename 失败和旧配置。模型调用均为离线替身，未消费真实额度。整项目及准确提交 CI 单独记录；明确全量 settings 替换仍以后写者为准，外部不通过 ConfigStore 的编辑不参与此互斥协议。
+
 所有新复现使用隔离 Git 工作区、SQLite 和本地 fake adapters，没有消耗真实模型额度或改写生产配置。执行进度见[持续审查计划](superpowers/plans/2026-10-18-continuous-audit.md)。
