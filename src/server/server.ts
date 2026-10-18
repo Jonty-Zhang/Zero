@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
-import { TaskStore, type CheckRunRecord, type CheckRunIntegrityFailureRecord } from '../core/task-store.js';
+import { TaskStore, GoalReviewRetryConflictError, type SequenceGoalReviewRetryRequest, type CheckRunRecord, type CheckRunIntegrityFailureRecord } from '../core/task-store.js';
 import { selectTaskCheckEvidence } from './task-check-evidence.js';
 import { CodexAdapter } from '../adapters/codex.js';
 import { IdempotencyConflictError, submissionRequestHash, validateSubmissionKey } from '../core/submission-idempotency.js';
@@ -24,6 +24,7 @@ export interface TaskStorePort {
   createSequenceIdempotent?(submissions: TaskSubmission[], metadata: TaskSequenceMetadata, request: { key: string; requestHash: string }): { record: TaskSequenceRecord; replayed: boolean };
   getSequence(id: string): (TaskSequenceRecord & { goalReview?: SequenceGoalReview }) | undefined;
   listSequences(): Array<TaskSequenceRecord & { goalReview?: SequenceGoalReview }>;
+  requestSequenceGoalReviewRetry?(sequenceId: string, expectedAttemptId: string): SequenceGoalReviewRetryRequest;
   get(id: string): TaskRecord | undefined;
   list(status?: TaskStatus): TaskRecord[];
   fail(id: string, expected: TaskStatus | TaskStatus[], reason: string, owner?: string): TaskRecord;
@@ -48,6 +49,8 @@ export interface ZeroServerOptions {
   adapters?: AdapterMap;
   /** Nudge the scheduler after a successful task insert. */
   enqueue?: (taskId: string) => void | Promise<void>;
+  /** Nudge aggregate review after its explicit retry request has been persisted. */
+  enqueueGoalReview?: (sequenceId: string) => void | Promise<void>;
   /** Must ask the active Worker to stop the complete task process tree. */
   cancel?: (taskId: string) => boolean | Promise<boolean>;
   staticDir?: string;
@@ -136,6 +139,23 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
         if (!sequence) throw new HttpError(404, '任务序列不存在');
         return json(res, 200, mapSequence(sequence));
       }
+      const retryGoalPath = url.pathname.match(/^\/api\/sequences\/([^/]+)\/goal-review\/retry$/);
+      if (retryGoalPath && req.method === 'POST') {
+        const id = decodeURIComponent(retryGoalPath[1]!);
+        if (!options.store.getSequence(id)) throw new HttpError(404, '任务序列不存在');
+        const raw = await bodyJson(req, options.maxBodyBytes);
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, '重新验收请求必须是对象');
+        const input = raw as Record<string, unknown>;
+        if (Object.keys(input).some(key => key !== 'attemptId')) throw new HttpError(400, '重新验收请求包含不支持的字段');
+        const attemptId = stringField(input.attemptId, 'attemptId', 1, 256);
+        if (!options.store.requestSequenceGoalReviewRetry) throw new HttpError(501, '此任务存储不支持持久重新验收请求');
+        options.store.requestSequenceGoalReviewRetry(id, attemptId);
+        const queued = options.store.getSequence(id)!;
+        if (options.enqueueGoalReview) void Promise.resolve().then(() => options.enqueueGoalReview!(id)).catch(() => {
+          console.warn('[zero] Goal review retry is persisted; scheduler nudge could not complete.');
+        });
+        return json(res, 202, mapSequence(queued));
+      }
       if (url.pathname === '/api/tasks' && req.method === 'GET') return json(res, 200, options.store.list().map(mapTaskList));
       if (url.pathname === '/api/tasks' && req.method === 'POST') {
         const raw = await bodyJson(req, options.maxBodyBytes);
@@ -166,7 +186,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     }
     await staticFile(res, url.pathname, options.staticDir);
   } catch (error) {
-    const code = error instanceof HttpError ? error.status : error instanceof IdempotencyConflictError ? 409 : 500;
+    const code = error instanceof HttpError ? error.status : error instanceof IdempotencyConflictError || error instanceof GoalReviewRetryConflictError ? 409 : 500;
     json(res, code, { error: message(error) });
   }
 }
@@ -609,6 +629,8 @@ function mapSequence(sequence: TaskSequenceRecord & { goalReview?: SequenceGoalR
 function mapSequenceGoalReview(review: SequenceGoalReview) {
   return {
     state: review.state,
+    ...(review.attemptId ? { attemptId: review.attemptId } : {}),
+    ...(review.retryRequestedAt ? { retryRequestedAt: review.retryRequestedAt } : {}),
     ...(review.result ? { result: mapReview(review.result) } : {}),
     ...(review.retryAt ? { retryAt: review.retryAt } : {}),
     createdAt: review.createdAt,

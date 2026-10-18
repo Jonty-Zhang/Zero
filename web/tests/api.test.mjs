@@ -3,6 +3,34 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { api } from '../src/api.ts';
 
+test('goal review retry posts the exact source attempt and encoded sequence path without task submission keys', async (t) => {
+  const sourceAttempt = 'attempt/source ?中文';
+  const sequence = { id: 'sequence/中文 ?', status: 'blocked', goalReview: { state: 'verdict', attemptId: sourceAttempt, retryRequestedAt: '2026-10-18T00:00:00Z', result: { verdict: 'blocked' } } };
+  let received;
+  let status = 202;
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = { path: req.url, method: req.method, headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString()) };
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(status === 202 ? sequence : { error: '最新验收尝试已变化' }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  const nativeFetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', (path, init) => nativeFetch(`http://127.0.0.1:${server.address().port}${path}`, init));
+  assert.deepEqual(await api.retrySequenceGoalReview(sequence.id, sourceAttempt), sequence);
+  assert.equal(received.path, `/api/sequences/${encodeURIComponent(sequence.id)}/goal-review/retry`);
+  assert.equal(received.method, 'POST');
+  assert.equal(received.headers['content-type'], 'application/json');
+  assert.equal(received.headers['x-idempotency-key'], undefined);
+  assert.deepEqual(received.body, { attemptId: sourceAttempt });
+  status = 409;
+  await assert.rejects(api.retrySequenceGoalReview(sequence.id, sourceAttempt), { message: '最新验收尝试已变化' });
+  assert.deepEqual(received.body, { attemptId: sourceAttempt });
+  assert.equal(received.headers['x-idempotency-key'], undefined);
+});
+
 test('API failures show the server error message without JSON syntax', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ error: '仓库路径不存在' }), {
     status: 400, headers: { 'Content-Type': 'application/json' },

@@ -14,7 +14,7 @@ import type { ZCodeAppServerPeerOptions } from '../adapters/zcode-app-server-pee
 import { runZCodeProtocolSession } from '../adapters/zcode-protocol-session.js';
 import type { ZCodeProtocolPeer, ZCodeProtocolSessionResult } from '../adapters/zcode-protocol-session.js';
 import { GitWorktreeManager } from '../core/git-worktree.js';
-import { TaskStore } from '../core/task-store.js';
+import { TaskStore, GoalReviewRetryConflictError } from '../core/task-store.js';
 import type { StartupGenerationAttestation } from '../core/task-store.js';
 import { TestRunner } from '../core/test-runner.js';
 import { TaskRouter } from '../orchestrator/router.js';
@@ -166,7 +166,7 @@ export async function startZeroServer(options: { host?: string; port?: number } 
     artifactRoot: resolve(dataRoot, 'artifacts'), readReviewerConfig: async () => (await config.read()).reviewer });
   const server = createZeroServer({ store, config, adapters, artifactRoot: resolve(dataRoot, 'artifacts'), staticDir: resolve(repoRoot, 'web/dist'),
     trustedProxyHosts: (process.env.ZERO_TRUSTED_PROXY_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean),
-    enqueue: () => kick(), cancel: taskId => worker.cancel(taskId) });
+    enqueue: () => kick(), enqueueGoalReview: () => kick(), cancel: taskId => worker.cancel(taskId) });
   let busy = false;
   let activePromise: Promise<void> | undefined;
   const kick = () => {
@@ -647,6 +647,9 @@ export function createSequenceGoalReviewScheduler(options: {
       if ((!sequence.objective && !sequence.acceptanceCriteria?.length) || !sequence.steps.length || sequence.steps.some(step => step.task.status !== 'done')) continue;
       const reviewRoot = resolve(artifactRoot, 'goal-review');
       const previous = store.sequenceGoalReview(sequence.id);
+      const retry = store.pendingSequenceGoalReviewRetry(sequence.id);
+      const startAttempt = (fingerprint: string) => store.startSequenceGoalReview(sequence.id, fingerprint,
+        undefined, undefined, retry?.sourceAttemptId, previous?.attemptId ?? null);
       if (previous?.state === 'verdict' && previous.result?.verdict === 'changes_requested' &&
         (goalRevisionRetryAfter.get(previous.attemptId) ?? 0) > Date.now()) continue;
       if (previous?.state === 'running' && previous.generationId === store.startupGeneration().id &&
@@ -657,13 +660,15 @@ export function createSequenceGoalReviewScheduler(options: {
       catch (error) {
         const fingerprint = createHash('sha256').update(JSON.stringify({ sequenceId: sequence.id, objective: sequence.objective,
           acceptanceCriteria: sequence.acceptanceCriteria, stepIds: sequence.steps.map(step => step.task.id), reason: safeGoalBlockReason(error) })).digest('hex');
-        if (previous?.evidenceFingerprint === fingerprint && previous.state === 'verdict') continue;
-        const attempt = store.startSequenceGoalReview(sequence.id, fingerprint);
+        if (previous?.evidenceFingerprint === fingerprint && previous.state === 'verdict' && !retry) continue;
+        let attempt;
+        try { attempt = startAttempt(fingerprint); }
+        catch (error) { if (error instanceof GoalReviewRetryConflictError) continue; throw error; }
         store.finishSequenceGoalReview({ attemptId: attempt.attemptId, verifiedEvidenceFingerprint: fingerprint,
           result: goalBlockedResult(safeGoalBlockReason(error)) });
         return;
       }
-      if (previous?.evidenceFingerprint === before.fingerprint && previous.state === 'verdict') {
+      if (previous?.evidenceFingerprint === before.fingerprint && previous.state === 'verdict' && !retry) {
         if (previous.result?.verdict !== 'changes_requested') continue;
         if (sequence.goalRevisionCount >= sequence.maxGoalRevisions) continue;
         try {
@@ -681,10 +686,12 @@ export function createSequenceGoalReviewScheduler(options: {
         }
       }
       if (previous?.evidenceFingerprint === before.fingerprint && previous.state === 'quota' && previous.retryAt && Date.parse(previous.retryAt) > Date.now()) continue;
-      const attempt = store.startSequenceGoalReview(sequence.id, before.fingerprint);
-      const cfg = await options.readReviewerConfig();
-      const goalReviewer = new GoalReviewer({ codex, model: cfg.modelId ?? undefined, reasoningEffort: cfg.reasoningEffort ?? undefined });
+      let attempt;
+      try { attempt = startAttempt(before.fingerprint); }
+      catch (error) { if (error instanceof GoalReviewRetryConflictError) continue; throw error; }
       try {
+        const cfg = await options.readReviewerConfig();
+        const goalReviewer = new GoalReviewer({ codex, model: cfg.modelId ?? undefined, reasoningEffort: cfg.reasoningEffort ?? undefined });
         const execution = await goalReviewer.review({ sequenceId: sequence.id, objective: sequence.objective,
           acceptanceCriteria: sequence.acceptanceCriteria, stepEvidence: before.stepEvidence, workspacePath: before.workspacePath,
           artifactRoot: reviewRoot, attemptId: attempt.attemptId, model: cfg.modelId ?? undefined,

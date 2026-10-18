@@ -60,6 +60,7 @@ export const api = {
   sequences: (options?: RequestOptions) => request<TaskSequence[] | { sequences: TaskSequence[] }>('/api/sequences', options),
   sequence: (id: string, options?: RequestOptions) => request<TaskSequence>(`/api/sequences/${encodeURIComponent(id)}`, options),
   createSequence: (payload: unknown) => submit<TaskSequence>('/api/sequences', payload),
+  retrySequenceGoalReview: (id: string, attemptId: string) => request<TaskSequence>(`/api/sequences/${encodeURIComponent(id)}/goal-review/retry`, { method: 'POST', body: JSON.stringify({ attemptId }) }),
   cancelTask: (id: string) => request<void>(`/api/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
   config: (options?: RequestOptions) => request<Config>('/api/config', options),
   saveConfig: (config: Config) => request<Config>('/api/config', { method: 'PUT', body: JSON.stringify(config) }),

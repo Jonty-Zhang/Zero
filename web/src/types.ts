@@ -88,6 +88,8 @@ export type Handoff = {
 export type TaskSequenceStatus = 'queued' | 'running' | 'waiting' | 'blocked' | 'steps_completed' | 'completed';
 export type SequenceGoalReview = {
   state: 'running' | 'quota' | 'verdict';
+  attemptId?: string;
+  retryRequestedAt?: string;
   result?: ReviewResult;
   retryAt?: string;
   createdAt: string;

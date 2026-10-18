@@ -3,9 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import App from './App';
 import { api } from './api';
-import type { Task } from './types';
+import type { Task, TaskSequence } from './types';
 
-vi.mock('./api', () => ({ api: { tasks: vi.fn(), task: vi.fn(), capabilities: vi.fn(), sequences: vi.fn(), config: vi.fn(), cancelTask: vi.fn(), createTask: vi.fn(), createSequence: vi.fn(), saveConfig: vi.fn() } }));
+vi.mock('./api', () => ({ api: { tasks: vi.fn(), task: vi.fn(), capabilities: vi.fn(), sequences: vi.fn(), sequence: vi.fn(), retrySequenceGoalReview: vi.fn(), config: vi.fn(), cancelTask: vi.fn(), createTask: vi.fn(), createSequence: vi.fn(), saveConfig: vi.fn() } }));
 const tasks: Task[] = [
   { id: 'alpha', title: '修复登录回调', status: 'running', repoPath: 'C:/repo/zero', route: { harnessId: 'codex', modelId: 'model-a' } },
   { id: 'beta', title: '更新文档', status: 'done', repoPath: 'C:/repo/docs', route: { harnessId: 'dsh' } },
@@ -13,6 +13,18 @@ const tasks: Task[] = [
 ];
 const capability = { harnesses: [{ id: 'codex', name: 'Codex', available: true }], bindings: [], allocator: { models: [], reasoningEfforts: [] }, reviewer: { models: [], reasoningEfforts: [] } };
 const config = { allocator: { kind: 'codex', modelId: null, reasoningEffort: null }, reviewer: { modelId: null, reasoningEffort: null } };
+const blockedSequence = (): TaskSequence => ({ id: 'sequence-retry', objective: '可重试的整体目标', status: 'blocked', maxGoalRevisions: 2, goalRevisionCount: 0,
+  createdAt: '', updatedAt: '', steps: [{ position: 0, task: { ...tasks[1]!, id: 'step-one' } }, { position: 1, task: { ...tasks[1]!, id: 'step-two' } }],
+  goalReview: { state: 'verdict', attemptId: 'blocked-attempt', createdAt: '', result: { verdict: 'blocked', summary: '审核器连接失败', findings: [{ message: '保留上一轮失败发现' }] } } });
+async function openSequence(sequence: TaskSequence) {
+  vi.mocked(api.sequences).mockResolvedValue([sequence]);
+  vi.mocked(api.sequence).mockResolvedValue(sequence);
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: /步骤已完成 · 更新于/ }));
+  const dialog = await screen.findByRole('dialog', { name: '目标进度' });
+  await within(dialog).findByText(/^有序步骤/);
+  return dialog;
+}
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(api.tasks).mockResolvedValue(tasks);
@@ -24,6 +36,64 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 describe('task workspace', () => {
+  it('queues the exact blocked goal attempt once and keeps its findings during a delayed refresh', async () => {
+    const sequence = blockedSequence();
+    const dialog = await openSequence(sequence);
+    let finish!: (value: TaskSequence) => void;
+    vi.mocked(api.retrySequenceGoalReview).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    let refresh!: (value: TaskSequence) => void;
+    vi.mocked(api.sequence).mockImplementation(() => new Promise(resolve => { refresh = resolve; }));
+    const button = within(dialog).getByRole('button', { name: '重新验收' });
+    fireEvent.click(button);
+    expect(api.retrySequenceGoalReview).toHaveBeenCalledWith('sequence-retry', 'blocked-attempt');
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => finish(sequence));
+    expect(await within(dialog).findByText(/重新验收已排队/)).toBeTruthy();
+    expect(within(dialog).getByText(/保留上一轮失败发现/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: '重新验收' }));
+    expect(api.retrySequenceGoalReview).toHaveBeenCalledTimes(1);
+    await act(async () => refresh({ ...sequence, goalReview: { ...sequence.goalReview!, attemptId: 'next-blocked-attempt' } }));
+    expect((within(dialog).getByRole('button', { name: '重新验收' }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(within(dialog).getByRole('button', { name: '重新验收' }));
+    expect(api.retrySequenceGoalReview).toHaveBeenLastCalledWith('sequence-retry', 'next-blocked-attempt');
+  });
+  it('shows persisted goal retry queue state and retains the previous verdict', async () => {
+    const sequence = blockedSequence();
+    sequence.goalReview = { ...sequence.goalReview!, retryRequestedAt: '2026-10-18T00:00:00Z' };
+    const dialog = await openSequence(sequence);
+    expect(within(dialog).getByText(/重新验收已排队/)).toBeTruthy();
+    expect((within(dialog).getByRole('button', { name: '重新验收' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(dialog).getByText(/保留上一轮失败发现/)).toBeTruthy();
+  });
+  it('allows retry when goal acceptance criteria exist without an objective title', async () => {
+    const sequence = blockedSequence();
+    delete sequence.objective;
+    sequence.acceptanceCriteria = ['整体结果需要通过验收'];
+    const dialog = await openSequence(sequence);
+    expect((within(dialog).getByRole('button', { name: '重新验收' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+  it('refreshes the goal after a rejected stale retry and displays the server error', async () => {
+    const sequence = blockedSequence();
+    const dialog = await openSequence(sequence);
+    vi.mocked(api.retrySequenceGoalReview).mockRejectedValue(new Error('验收尝试已变化，请刷新'));
+    vi.mocked(api.sequence).mockResolvedValue({ ...sequence, goalReview: { state: 'running', attemptId: 'latest-attempt', createdAt: '' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: '重新验收' }));
+    expect(await within(dialog).findByText('验收尝试已变化，请刷新')).toBeTruthy();
+    expect(await within(dialog).findByText('正在进行目标级 Codex 验收')).toBeTruthy();
+    expect(within(dialog).queryByRole('button', { name: '重新验收' })).toBeNull();
+    expect(api.sequence).toHaveBeenCalledTimes(2);
+  });
+  it.each(['legacy', 'pass', 'changes_requested', 'running', 'quota', 'incomplete', 'no-goal'])(
+    'does not offer a blocked-goal retry for %s state', async state => {
+      const sequence = blockedSequence();
+      if (state === 'legacy') delete sequence.goalReview!.attemptId;
+      else if (state === 'incomplete') sequence.steps[0]!.task.status = 'running';
+      else if (state === 'no-goal') delete sequence.objective;
+      else if (state === 'running' || state === 'quota') sequence.goalReview = { ...sequence.goalReview!, state };
+      else sequence.goalReview!.result!.verdict = state;
+      const dialog = await openSequence(sequence);
+      expect(within(dialog).queryByRole('button', { name: '重新验收' })).toBeNull();
+    });
   it('shows the observed attempt error alongside a separately labelled executor claim', async () => {
     vi.mocked(api.task).mockResolvedValue({ ...tasks[0]!, attempts: [{ id: 'failed-attempt', status: 'failed',
       summary: 'Harness reported a different model', executorSummary: 'I completed the task.' }] } as Task);

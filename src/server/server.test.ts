@@ -684,7 +684,7 @@ test('POST /api/sequences rejects out-of-range size and GET returns 404 for miss
   } finally { await f.close(); }
 });
 
-test('sequence GET detail and list expose the aggregate PASS result without internal review evidence', async () => {
+test('sequence GET exposes aggregate review identity without private fingerprint or generation evidence', async () => {
   const f = await createFixture();
   try {
     const sequence = f.store.createSequence([
@@ -715,6 +715,7 @@ test('sequence GET detail and list expose the aggregate PASS result without inte
     const detail = await detailResponse.json() as { goalReview: Record<string, unknown> };
     const expectedReview = {
       state: 'verdict',
+      attemptId: attempt.attemptId,
       result: { verdict: 'pass', summary: 'The combined result meets the goal.', findings: [] },
       createdAt: startedAt.toISOString(),
       completedAt: completedAt.toISOString(),
