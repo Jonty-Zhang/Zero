@@ -22,6 +22,7 @@ import type {
 } from "../domain/types.js";
 import { HANDOFF_V1_MAX_BYTES, parseHandoffV1 } from "../domain/handoff.js";
 import { IdempotencyConflictError, validateSubmissionKey } from "./submission-idempotency.js";
+import { buildGoalRevisionDraft, GoalRevisionCapacityError } from "../domain/goal-revision.js";
 
 type Json = string | null;
 type TaskRow = {
@@ -1493,42 +1494,90 @@ export class TaskStore {
 
   finishSequenceGoalReview(input: { attemptId: string; result?: GoalReviewResult; retryAt?: string; verifiedEvidenceFingerprint?: string; now?: Date }): SequenceGoalReviewRecord {
     const now = input.now ?? new Date();
-    const completedAt = now.toISOString();
-    const row = this.#db.prepare("SELECT * FROM task_sequence_goal_reviews WHERE attempt_id=?").get(input.attemptId) as Record<string, unknown> | undefined;
-    if (!row || row.state !== "running") throw new Error("Aggregate goal review attempt is not running");
+    if (!Number.isFinite(now.getTime())) throw new Error("Aggregate goal completion requires a valid time");
     if (input.retryAt !== undefined) {
       if (input.result || !Number.isFinite(Date.parse(input.retryAt))) throw new Error("Quota goal review requires only a valid retry time");
+    } else if (!input.result || !isValidGoalReviewResult(input.result)) throw new Error("Aggregate goal review must contain a valid reviewer verdict and target");
     this.#transaction(() => {
+      const row = this.#db.prepare("SELECT * FROM task_sequence_goal_reviews WHERE attempt_id=?").get(input.attemptId) as Record<string, unknown> | undefined;
+      if (!row || row.state !== "running") throw new Error("Aggregate goal review attempt is not running");
+      const completedAt = new Date(Math.max(now.getTime(), Date.parse(String(row.created_at)))).toISOString();
       const latest = this.#db.prepare("SELECT attempt_id FROM task_sequence_goal_reviews WHERE sequence_id=? ORDER BY created_at DESC,attempt_id DESC LIMIT 1")
         .get(String(row.sequence_id)) as { attempt_id: string } | undefined;
-      if (latest?.attempt_id !== input.attemptId) throw new Error("Aggregate goal review attempt was superseded");
-        this.#db.prepare("UPDATE task_sequence_goal_reviews SET state='quota',retry_at=?,completed_at=? WHERE attempt_id=? AND state='running'")
+      if (latest?.attempt_id !== input.attemptId) throw new GoalReviewRetryConflictError("Aggregate goal review attempt was superseded");
+      if (input.retryAt !== undefined) {
+        const changed = this.#db.prepare("UPDATE task_sequence_goal_reviews SET state='quota',retry_at=?,completed_at=? WHERE attempt_id=? AND state='running'")
           .run(input.retryAt!, completedAt, input.attemptId);
+        if (Number(changed.changes) !== 1) throw new GoalReviewRetryConflictError("Aggregate goal review changed before quota persistence");
         this.#event(this.#goalReviewEventTask(String(row.sequence_id)), "task_sequence.goal_review_quota", { sequenceId: row.sequence_id, attemptId: row.attempt_id, retryAt: input.retryAt }, completedAt);
-      });
-      return this.sequenceGoalReviewByAttempt(input.attemptId)!;
-    }
-    if (!input.result || !isValidGoalReviewResult(input.result)) throw new Error("Aggregate goal review must contain a valid reviewer verdict and target");
-    let result = input.result;
-    if (input.verifiedEvidenceFingerprint !== row.evidence_fingerprint) {
-      result = { verdict: "blocked", summary: "Aggregate evidence changed during review; a fresh review is required.", findings: [
-        { severity: "high", evidence: "The repository snapshot or persisted step evidence changed while the reviewer was running.", requestedChange: "Run a fresh aggregate goal review against the current evidence." },
-      ] };
-    }
-    this.#transaction(() => {
-      const latest = this.#db.prepare("SELECT attempt_id FROM task_sequence_goal_reviews WHERE sequence_id=? ORDER BY created_at DESC,attempt_id DESC LIMIT 1")
-        .get(String(row.sequence_id)) as { attempt_id: string } | undefined;
-      if (latest?.attempt_id !== input.attemptId) throw new Error("Aggregate goal review attempt was superseded");
-      const sequence = this.#db.prepare("SELECT 1 FROM task_sequences WHERE id=?").get(String(row.sequence_id));
-      const counts = this.#db.prepare("SELECT COUNT(*) AS n,SUM(CASE WHEN t.status='done' THEN 1 ELSE 0 END) AS done FROM task_sequence_steps s JOIN tasks t ON t.id=s.task_id WHERE s.sequence_id=?")
-        .get(String(row.sequence_id)) as { n: number; done: number | null };
-      if (!sequence || counts.n < 2 || Number(counts.n) !== Number(counts.done)) throw new Error("Sequence steps changed before aggregate verdict persistence");
-      this.#db.prepare("UPDATE task_sequence_goal_reviews SET state='verdict',result=?,completed_at=? WHERE attempt_id=? AND state='running'")
+        return;
+      }
+      const sequence = this.getSequence(String(row.sequence_id));
+      if (!sequence || sequence.steps.length < 2 || sequence.steps.some(step => step.task.status !== "done")) throw new Error("Sequence steps changed before aggregate verdict persistence");
+      let result = input.result!;
+      let capacity: GoalRevisionCapacityError | undefined;
+      if (input.verifiedEvidenceFingerprint !== row.evidence_fingerprint) {
+        result = { verdict: "blocked", summary: "Aggregate evidence changed during review; a fresh review is required.", findings: [
+          { severity: "high", evidence: "The repository snapshot or persisted step evidence changed while the reviewer was running.", requestedChange: "Run a fresh aggregate goal review against the current evidence." },
+        ] };
+      } else {
+        capacity = this.#goalRevisionCapacity(sequence, result);
+        if (capacity) result = this.#goalCapacityBlocked(result, capacity);
+      }
+      const changed = this.#db.prepare("UPDATE task_sequence_goal_reviews SET state='verdict',result=?,completed_at=? WHERE attempt_id=? AND state='running'")
         .run(JSON.stringify(result), completedAt, input.attemptId);
+      if (Number(changed.changes) !== 1) throw new GoalReviewRetryConflictError("Aggregate goal review changed before verdict persistence");
+      if (capacity) this.#goalCapacityEvent(String(row.sequence_id), input.attemptId, input.attemptId, input.result!, capacity, completedAt);
       this.#event(this.#goalReviewEventTask(String(row.sequence_id)), "task_sequence.goal_review_verdict",
         { sequenceId: row.sequence_id, attemptId: row.attempt_id, evidenceFingerprint: row.evidence_fingerprint, verdict: result.verdict, summary: result.summary }, completedAt);
     });
     return this.sequenceGoalReviewByAttempt(input.attemptId)!;
+  }
+
+  /** Append a terminal, retryable classification of an old unbuildable verdict, without rewriting history or invoking a provider. */
+  normalizeSequenceGoalRevisionCapacity(input: { sequenceId: string; sourceAttemptId: string; evidenceFingerprint: string; expectedStepIds: string[] }, now = new Date()): SequenceGoalReviewRecord {
+    let attemptId = "";
+    this.#transaction(() => {
+      const source = this.sequenceGoalReview(input.sequenceId);
+      const sequence = this.getSequence(input.sequenceId);
+      const linked = this.#db.prepare("SELECT 1 FROM task_sequence_goal_revisions WHERE sequence_id=? AND review_attempt_id=?").get(input.sequenceId, input.sourceAttemptId);
+      if (!Number.isFinite(now.getTime()) || !source || source.attemptId !== input.sourceAttemptId || source.state !== "verdict" || source.result?.verdict !== "changes_requested"
+        || source.evidenceFingerprint !== input.evidenceFingerprint || !sequence || !this.#completedSequenceHasGoal(input.sequenceId)
+        || JSON.stringify(sequence.steps.map(step => step.task.id)) !== JSON.stringify(input.expectedStepIds) || linked) {
+        throw new GoalReviewRetryConflictError("Goal remediation normalization source or sequence changed");
+      }
+      const capacity = this.#goalRevisionCapacity(sequence, source.result);
+      if (!capacity) throw new GoalReviewRetryConflictError("Goal remediation has no independently verified capacity failure");
+      const createdAt = new Date(Math.max(now.getTime(), Date.parse(source.createdAt) + 1)).toISOString();
+      const result = this.#goalCapacityBlocked(source.result, capacity);
+      attemptId = randomUUID();
+      this.#db.prepare("INSERT INTO task_sequence_goal_reviews(attempt_id,sequence_id,generation_id,evidence_fingerprint,state,result,created_at,completed_at) VALUES(?,?,?,?,'verdict',?,?,?)")
+        .run(attemptId, input.sequenceId, this.#startupGeneration.id, input.evidenceFingerprint, JSON.stringify(result), createdAt, createdAt);
+      this.#event(this.#goalReviewEventTask(input.sequenceId), "task_sequence.goal_review_started", { sequenceId: input.sequenceId, attemptId,
+        evidenceFingerprint: input.evidenceFingerprint, normalizationOfAttemptId: input.sourceAttemptId }, createdAt);
+      this.#goalCapacityEvent(input.sequenceId, input.sourceAttemptId, attemptId, source.result, capacity, createdAt);
+      this.#event(this.#goalReviewEventTask(input.sequenceId), "task_sequence.goal_review_verdict", { sequenceId: input.sequenceId, attemptId,
+        evidenceFingerprint: input.evidenceFingerprint, verdict: result.verdict, summary: result.summary }, createdAt);
+    });
+    return this.sequenceGoalReviewByAttempt(attemptId)!;
+  }
+
+  #goalRevisionCapacity(sequence: TaskSequenceRecord, result: GoalReviewResult): GoalRevisionCapacityError | undefined {
+    if (result.verdict !== "changes_requested" || sequence.goalRevisionCount >= sequence.maxGoalRevisions) return undefined;
+    try { buildGoalRevisionDraft(sequence, result); }
+    catch (error) { if (error instanceof GoalRevisionCapacityError) return error; }
+    // Target/state refusals remain ordinary verdicts, subject to independent append authorization.
+    return undefined;
+  }
+
+  #goalCapacityBlocked(original: GoalReviewResult, capacity: GoalRevisionCapacityError): GoalReviewResult {
+    return { verdict: "blocked", summary: `Automatic goal remediation cannot be built: ${capacity.message}. No user criteria or findings were discarded. A fresh review may still exceed this limit.`, findings: original.findings };
+  }
+
+  #goalCapacityEvent(sequenceId: string, sourceAttemptId: string, newAttemptId: string, originalResult: GoalReviewResult, capacity: GoalRevisionCapacityError, at: string): void {
+    this.#event(this.#goalReviewEventTask(sequenceId), "task_sequence.goal_remediation_blocked", {
+      sequenceId, sourceAttemptId, newAttemptId, originalResult, code: capacity.code, actual: capacity.actual, limit: capacity.limit,
+    }, at);
   }
 
   /**
@@ -1550,6 +1599,7 @@ export class TaskStore {
         { sequence_id: string; state: string; result: string | null } | undefined;
       const latest = this.#db.prepare("SELECT attempt_id FROM task_sequence_goal_reviews WHERE sequence_id=? ORDER BY created_at DESC,attempt_id DESC LIMIT 1")
         .get(sequenceId) as { attempt_id: string } | undefined;
+      if (latest?.attempt_id !== reviewAttemptId) throw new GoalReviewRetryConflictError("Goal revision requires the latest aggregate changes_requested verdict for this sequence");
       if (!sequence || !review || review.sequence_id !== sequenceId || latest?.attempt_id !== reviewAttemptId || review.state !== "verdict" ||
           !review.result || !isValidGoalReviewResult(JSON.parse(review.result) as GoalReviewResult) ||
           (JSON.parse(review.result) as GoalReviewResult).verdict !== "changes_requested") {
