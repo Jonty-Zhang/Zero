@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } 
 import { Activity, Search, LayoutList, Columns3, Layers3, AlertCircle, ArrowDown, ArrowRight, ArrowUp, Check, CheckCircle2, ChevronDown, CircleHelp, Clock3, Code2, FileText, FolderGit2, ListOrdered, LoaderCircle, Plus, RefreshCw, Settings2, ShieldCheck, Target, TerminalSquare, X, XCircle } from 'lucide-react';
 import { api } from './api';
 import { usePolling } from './usePolling';
-import type { Binding, Capabilities, Choice, Config, ExecutionSelection, HarnessHealth, Status, Task, TaskSequence, TestResult } from './types';
+import type { Capabilities, Choice, Config, ExecutionSelection, HarnessHealth, Status, Task, TaskSequence, TestResult } from './types';
 
 const columns: { id: Status; label: string; tone: string }[] = [
   { id: 'pending', label: '待处理', tone: 'slate' }, { id: 'running', label: '执行中', tone: 'blue' },
@@ -175,7 +175,8 @@ function TaskCard({ task, onClick }: { task: Task; onClick: () => void }) {
 function SequenceProgressSection({ sequences, error, onOpen, onCreate }: { sequences: TaskSequence[]; error: string; onOpen: (id: string) => void; onCreate: () => void }) {
   if (!sequences.length && !error) return <section className="sequence-section"><div className="sequence-section-heading"><div><h2><Target size={16} />目标序列</h2><p>把一个目标拆成至少两个按顺序执行的任务。</p></div><Button onClick={onCreate}><ListOrdered size={14} />提交目标</Button></div></section>;
   return <section className="sequence-section"><div className="sequence-section-heading"><div><h2><Target size={16} />目标序列</h2><p>按顺序查看目标拆解任务的进度。</p></div><Button onClick={onCreate}><ListOrdered size={14} />提交目标</Button></div>
-    {error ? <div className="alert error compact"><AlertCircle size={15} />{error}</div> : <div className="sequence-list">{sequences.map(sequence => {
+    {error && <div className="alert error compact" role="alert"><AlertCircle size={15} /><div>{sequences.length > 0 && <b>刷新失败，显示上次同步的目标</b>}<span>{error}</span></div></div>}
+    {sequences.length > 0 && <div className="sequence-list">{sequences.map(sequence => {
       const completed = sequence.steps.filter(step => step.task.status === 'done').length;
       const activeGoalRevision = activeGoalRevisionTask(sequence);
       const allStepsDone = sequence.steps.length > 0 && completed === sequence.steps.length;
@@ -194,7 +195,10 @@ function SequenceProgressSection({ sequences, error, onOpen, onCreate }: { seque
   </section>;
 }
 
-type SequenceStepDraft = { prompt: string; criteria: string; checks: string; harnessId: string; modelId: string; reasoningEffort: string };
+type SequenceStepDraft = { repoPath: string; baseRef: string; prompt: string; criteria: string; checks: string; harnessId: string; modelId: string; reasoningEffort: string };
+function resolveSequenceStepRepository(step: Pick<SequenceStepDraft, 'repoPath' | 'baseRef'>, defaultRepoPath: string, defaultBaseRef: string): { repoPath: string; baseRef: string } {
+  return { repoPath: step.repoPath.trim() || defaultRepoPath.trim(), baseRef: step.baseRef.trim() || defaultBaseRef.trim() || 'HEAD' };
+}
 function isGoalRevisionStep(sequence: TaskSequence, index: number) {
   return sequence.goalRevisionCount > 0 && index >= Math.max(0, sequence.steps.length - sequence.goalRevisionCount);
 }
@@ -204,15 +208,17 @@ function activeGoalRevisionTask(sequence: TaskSequence) {
 function SequenceSubmitModal({ capabilities, onClose, onCreated }: { capabilities: Capabilities | null; onClose: () => void; onCreated: (sequence: TaskSequence) => void }) {
   const [repoPath, setRepoPath] = useState(''); const [baseRef, setBaseRef] = useState('HEAD'); const [objective, setObjective] = useState(''); const [goalCriteria, setGoalCriteria] = useState('');
   const [maxRevisions, setMaxRevisions] = useState(2); const [maxGoalRevisions, setMaxGoalRevisions] = useState(2);
-  const blankStep = (): SequenceStepDraft => ({ prompt: '', criteria: '', checks: '', harnessId: '', modelId: '', reasoningEffort: '' });
+  const blankStep = (): SequenceStepDraft => ({ repoPath: '', baseRef: '', prompt: '', criteria: '', checks: '', harnessId: '', modelId: '', reasoningEffort: '' });
   const [steps, setSteps] = useState<SequenceStepDraft[]>([blankStep(), blankStep()]);
   const [busy, setBusy] = useState(false); const [error, setError] = useState('');
   const dialogRef = useDialog(onClose, busy);
   const bindings = useMemo(() => (capabilities?.bindings ?? []).filter(binding => binding.available && capabilities?.harnesses.some(harness => harness.id === binding.harnessId && harness.available)), [capabilities]);
   const harnessChoices = [...new Map(bindings.map(binding => [binding.harnessId, binding])).values()].map(binding => ({ id: binding.harnessId, label: capabilities?.harnesses.find(harness => harness.id === binding.harnessId)?.name || binding.harnessId }));
   const updateStep = (index: number, key: keyof SequenceStepDraft, value: string) => setSteps(current => current.map((step, i) => i === index ? { ...step, [key]: value, ...(key === 'harnessId' ? { modelId: '', reasoningEffort: '' } : key === 'modelId' ? { reasoningEffort: '' } : {}) } : step));
+  const repositories = steps.map(step => resolveSequenceStepRepository(step, repoPath, baseRef));
   const submit = async (event: FormEvent) => {
     event.preventDefault(); if (busy) return; setError('');
+    if (repositories.some(repository => !repository.repoPath)) return;
     if (steps.length < 2 || steps.some(step => step.prompt.trim().length < 8 || !step.checks.trim())) { setError('至少需要两个步骤，每个步骤的描述至少填写 8 个字符，并提供检查命令。'); return; }
     for (const [index, step] of steps.entries()) {
       const candidates = bindings.filter(binding => (!step.harnessId || binding.harnessId === step.harnessId) && (!step.modelId || binding.modelId === step.modelId));
@@ -221,23 +227,28 @@ function SequenceSubmitModal({ capabilities, onClose, onCreated }: { capabilitie
     }
     setBusy(true);
     try {
-      const created = await api.createSequence({ ...(objective.trim() ? { objective: objective.trim() } : {}), ...(goalCriteria.trim() ? { acceptanceCriteria: goalCriteria.split('\n').map(line => line.trim()).filter(Boolean) } : {}), maxGoalRevisions, tasks: steps.map(step => ({ repoPath: repoPath.trim(), baseRef: baseRef.trim() || null, prompt: step.prompt.trim(), acceptanceCriteria: step.criteria.trim(), checkCommands: step.checks.split('\n').map(line => line.trim()).filter(Boolean), maxRevisions, execution: { harnessId: step.harnessId || null, modelId: step.modelId || null, reasoningEffort: step.reasoningEffort || null } })) });
+      const created = await api.createSequence({ ...(objective.trim() ? { objective: objective.trim() } : {}), ...(goalCriteria.trim() ? { acceptanceCriteria: goalCriteria.split('\n').map(line => line.trim()).filter(Boolean) } : {}), maxGoalRevisions, tasks: steps.map((step, index) => ({ ...repositories[index]!, prompt: step.prompt.trim(), acceptanceCriteria: step.criteria.trim(), checkCommands: step.checks.split('\n').map(line => line.trim()).filter(Boolean), maxRevisions, execution: { harnessId: step.harnessId || null, modelId: step.modelId || null, reasoningEffort: step.reasoningEffort || null } })) });
       onCreated(created);
     } catch (e) { setError(e instanceof Error ? e.message : '目标提交失败，请稍后重试'); }
     finally { setBusy(false); }
   };
-  return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="提交有序任务序列" className="modal submit-modal sequence-submit-modal"><div className="modal-heading"><div><div className="eyebrow">目标执行</div><h2>提交有序任务序列</h2><p>Zero 会按顺序执行这些步骤，后续步骤接续前一步的结果。</p></div><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
-    <form onSubmit={submit} className="submit-form"><fieldset disabled={busy}><div className="form-grid"><Field label="仓库路径 *" hint="所有步骤使用此仓库"><input required value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="例如 C:\\projects\\my-app" /></Field><Field label="基础分支 / Ref" hint="所有步骤使用此 Ref"><input value={baseRef} onChange={e => setBaseRef(e.target.value)} placeholder="HEAD" /></Field></div>
+  return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="提交有序任务序列" className="modal submit-modal sequence-submit-modal"><div className="modal-heading"><div><div className="eyebrow">目标执行</div><h2>提交有序任务序列</h2><p>步骤按顺序执行；同一规范仓库的后续步骤接续已验证结果，不同仓库分别维护历史。</p></div><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
+    <form onSubmit={submit} className="submit-form"><fieldset disabled={busy}><div className="form-grid"><Field label="默认仓库路径" hint="步骤仓库留空时继承；每步均指定仓库时此处可留空"><input value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="例如 C:\\projects\\my-app" /></Field><Field label="默认基础 Ref" hint="步骤 Ref 留空时继承；此处留空使用 HEAD"><input value={baseRef} onChange={e => setBaseRef(e.target.value)} placeholder="HEAD" /></Field></div>
       <Field label="整体目标" hint="可选；留空时按步骤完成情况结束序列。"><input value={objective} onChange={e => setObjective(e.target.value)} placeholder="例如：为服务添加可靠的登录与账户管理" /></Field>
       <Field label="目标级验收标准" hint="可选，逐行填写。这些标准不会由单个步骤的完成状态自动判定。"><textarea rows={2} value={goalCriteria} onChange={e => setGoalCriteria(e.target.value)} placeholder="列出需要整体评估的目标条件" /></Field>
       <div className="form-grid"><Field label="每个步骤的最大返工次数" hint="单个任务执行时允许的内容返工次数"><input type="number" min="0" max="10" value={maxRevisions} onChange={e => setMaxRevisions(Number(e.target.value))} /></Field><Field label="自动目标返工上限" hint="整体目标验收要求修改后，最多自动追加的返工任务数（0–5）"><input type="number" min="0" max="5" value={maxGoalRevisions} onChange={e => setMaxGoalRevisions(Math.max(0, Math.min(5, Number(e.target.value))))} /></Field></div>
-      <div className="section-divider"><span>按顺序执行的步骤</span><span>至少 2 步，共用仓库与基础 Ref</span></div>
+      <div className="section-divider"><span>按顺序执行的步骤</span><span>至少 2 步，可分别指定仓库与基础 Ref</span></div>
       {steps.map((step, index) => {
         const stepBindings = bindings.filter(binding => !step.harnessId || binding.harnessId === step.harnessId);
         const modelChoices = [...new Map(stepBindings.map(binding => [binding.modelId, binding])).values()].map(binding => ({ id: binding.modelId, label: binding.modelName || binding.modelId }));
         const matchingBindings = stepBindings.filter(binding => !step.modelId || binding.modelId === step.modelId);
         const effortChoices = step.modelId ? [...new Map(matchingBindings.flatMap(binding => binding.reasoningEfforts ?? []).map(choice => [choice.id, choice])).values()] : [];
+        const repository = repositories[index]!;
+        const repositoryErrorId = `sequence-repository-error-${index}`;
         return <section className="sequence-step-editor" key={index}><div className="execution-stage-title"><b>步骤 {index + 1}</b><div className="stage-actions"><button type="button" className="link-button" aria-label={`将步骤 ${index + 1} 上移`} title="上移" disabled={index === 0} onClick={() => setSteps(current => current.map((item, i) => i === index - 1 ? current[index]! : i === index ? current[index - 1]! : item))}><ArrowUp size={13} /></button><button type="button" className="link-button" aria-label={`将步骤 ${index + 1} 下移`} title="下移" disabled={index === steps.length - 1} onClick={() => setSteps(current => current.map((item, i) => i === index ? current[index + 1]! : i === index + 1 ? current[index]! : item))}><ArrowDown size={13} /></button><button type="button" className="link-button" disabled={steps.length <= 2} onClick={() => setSteps(current => current.filter((_, i) => i !== index))}><X size={13} />移除</button></div></div>
+        <div className="form-grid"><Field label={`步骤 ${index + 1} 仓库路径`} hint="留空继承默认仓库路径"><input value={step.repoPath} onChange={e => updateStep(index, 'repoPath', e.target.value)} aria-invalid={!repository.repoPath || undefined} aria-describedby={!repository.repoPath ? repositoryErrorId : undefined} placeholder="可选，覆盖本步骤的仓库" /></Field><Field label={`步骤 ${index + 1} 基础 Ref`} hint="留空继承默认基础 Ref"><input value={step.baseRef} onChange={e => updateStep(index, 'baseRef', e.target.value)} placeholder="可选，覆盖本步骤的 Ref" /></Field></div>
+        <div className="sequence-repository-preview"><span>生效仓库：<code>{repository.repoPath || '待填写'}</code></span><span>配置基础 Ref：<code>{repository.baseRef}</code></span></div>
+        {!repository.repoPath && <p id={repositoryErrorId} className="sequence-repository-error" role="status">步骤 {index + 1} 缺少仓库路径：请填写默认仓库路径或本步骤仓库路径。</p>}
         <Field label={`步骤 ${index + 1} 描述 *`}><textarea required minLength={8} rows={3} value={step.prompt} onChange={e => updateStep(index, 'prompt', e.target.value)} placeholder="描述这一阶段要实现或验证的内容" /></Field>
         <div className="form-grid"><Field label="步骤验收标准" hint="可选，逐行填写"><textarea rows={2} value={step.criteria} onChange={e => updateStep(index, 'criteria', e.target.value)} placeholder="此步骤需要满足的条件" /></Field><Field label="检查命令 *" hint="必填，每行一条。没有检查命令将无法通过验收。"><textarea required rows={2} value={step.checks} onChange={e => updateStep(index, 'checks', e.target.value)} placeholder={'例如\nnpm test'} /></Field></div>
         <div className="form-grid three"><Field label="Harness"><Select value={step.harnessId} onChange={value => updateStep(index, 'harnessId', value)} choices={harnessChoices} placeholder="继承项目/全局后自动分配" /></Field><Field label="模型"><Select value={step.modelId} onChange={value => updateStep(index, 'modelId', value)} choices={modelChoices} placeholder="继承项目/全局后自动分配" disabled={!capabilities || !stepBindings.length} /></Field><Field label="思考强度"><Select value={step.reasoningEffort} onChange={value => updateStep(index, 'reasoningEffort', value)} choices={effortChoices} placeholder="继承项目/全局后自动分配" disabled={!step.modelId || effortChoices.length === 0} /></Field></div>
@@ -245,7 +256,7 @@ function SequenceSubmitModal({ capabilities, onClose, onCreated }: { capabilitie
       })}
       <Button onClick={() => setSteps(current => current.length < 16 ? [...current, blankStep()] : current)} disabled={steps.length >= 16}><Plus size={14} />添加步骤</Button>
       {capabilities && bindings.length > 0 ? <div className="inline-info sequence-allocator-note"><Activity size={14} />每个步骤可单独指定 Harness、模型和思考强度；留空字段先继承项目/全局预设，再由分配器补全。</div> : <div className="inline-warning sequence-allocator-note"><AlertCircle size={14} />当前没有可用的已验证执行组合；留空字段仍会先继承项目/全局预设，再交由分配器选择。</div>}
-      {error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}<div className="modal-footer"><Button disabled={busy} onClick={onClose}>取消</Button><Button variant="primary" type="submit" disabled={busy || !repoPath.trim() || steps.some(step => step.prompt.trim().length < 8 || !step.checks.trim())}>{busy ? <><LoaderCircle size={15} className="spin" />正在提交</> : <><ListOrdered size={16} />提交目标序列</>}</Button></div>
+      {error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}<div className="modal-footer"><Button disabled={busy} onClick={onClose}>取消</Button><Button variant="primary" type="submit" disabled={busy || repositories.some(repository => !repository.repoPath) || steps.some(step => step.prompt.trim().length < 8 || !step.checks.trim())}>{busy ? <><LoaderCircle size={15} className="spin" />正在提交</> : <><ListOrdered size={16} />提交目标序列</>}</Button></div>
     </fieldset></form></section></div>;
 }
 
@@ -301,8 +312,7 @@ function SubmitModal({ capabilities, capabilityError, allocatorKind, onClose, on
   const filteredBindings = bindings.filter(b => !harnessId || b.harnessId === harnessId);
   const harnessChoices = [...new Map(bindings.map(b => [b.harnessId, b])).values()].map(b => ({ id: b.harnessId, label: capabilities?.harnesses.find(h => h.id === b.harnessId)?.name || b.harnessId }));
   const modelChoices = [...new Map(filteredBindings.map(b => [b.modelId, b])).values()].map(b => ({ id: b.modelId, label: b.modelName || b.modelId }));
-  const selectedBinding: Binding | undefined = bindings.find(b => b.modelId === modelId && (!harnessId || b.harnessId === harnessId));
-  const effortChoices = selectedBinding?.reasoningEfforts ?? (modelId ? [...new Map(bindings.filter(b => b.modelId === modelId).flatMap(b => b.reasoningEfforts ?? []).map(e => [e.id, e])).values()] : []);
+  const effortChoices = modelId ? [...new Map(filteredBindings.filter(b => b.modelId === modelId).flatMap(b => b.reasoningEfforts ?? []).map(e => [e.id, e])).values()] : [];
   const submit = async (event: FormEvent) => { event.preventDefault(); if (busy) return; if (!checks.trim()) { setError('请至少填写一条检查命令。'); return; } setError(''); setBusy(true); try { const created = await api.createTask({ repoPath: repoPath.trim(), baseRef: baseRef.trim() || null, prompt: prompt.trim(), acceptanceCriteria: criteria.trim(), maxRevisions, checkCommands: checks.split('\n').map(s => s.trim()).filter(Boolean), execution: { harnessId: harnessId || null, modelId: modelId || null, reasoningEffort: effort || null }, ...(stages.length ? { executionStages: stages.map(stage => ({ ...(stage.objective.trim() ? { objective: stage.objective.trim() } : {}), ...(stage.harnessId ? { harnessId: stage.harnessId } : {}), ...(stage.modelId ? { modelId: stage.modelId } : {}), ...(stage.reasoningEffort ? { reasoningEffort: stage.reasoningEffort } : {}) })) } : {}) }); onCreated(created); } catch (e) { setError(e instanceof Error ? e.message : '提交失败，请稍后重试'); } finally { setBusy(false); } };
   const allocatorName = allocatorKind === 'api' ? 'API 模型' : 'Codex';
   return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="提交执行任务" className="modal submit-modal"><div className="modal-heading"><div><div className="eyebrow">新建任务</div><h2>提交执行任务</h2><p>未指定的执行选项由 {allocatorName} 分配器根据可用能力补全。</p></div><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
