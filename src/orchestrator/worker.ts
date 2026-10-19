@@ -1803,7 +1803,7 @@ export class TaskWorker {
   }
 
   #initialExecutionBrief(task: TaskRecord, brief: string): string {
-    const criteria = boundedAcceptanceCriteria(task.acceptanceCriteria ?? [], task.id);
+    const criteria = task.acceptanceCriteria ?? [];
     if (!criteria.length) return brief;
     return `${brief}\n\nAcceptance criteria:\n${criteria.map(item => `- ${item}`).join("\n")}`;
   }
