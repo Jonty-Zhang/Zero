@@ -21,7 +21,7 @@ import { TaskRouter } from '../orchestrator/router.js';
 import { OpenAICompatibleCoordinator } from '../orchestrator/openai-compatible-coordinator.js';
 import { TaskReviewer } from '../orchestrator/reviewer.js';
 import { GoalReviewer, goalReviewInputFingerprint } from '../orchestrator/goal-reviewer.js';
-import { buildGoalRevisionSubmission } from '../orchestrator/goal-revision.js';
+import { buildGoalRevisionSubmission, GoalRevisionCapacityError } from '../orchestrator/goal-revision.js';
 import { captureSequenceGoalEvidence } from './sequence-goal-evidence.js';
 import { QuotaLimitError } from '../core/quota.js';
 import { TaskWorker } from '../orchestrator/worker.js';
@@ -672,7 +672,18 @@ export function createSequenceGoalReviewScheduler(options: {
           store.appendSequenceGoalRevision(sequence.id, previous.attemptId, submission);
           goalRevisionRetryAfter.delete(previous.attemptId);
           return;
-        } catch {
+        } catch (error) {
+          if (error instanceof GoalReviewRetryConflictError) continue;
+          if (error instanceof GoalRevisionCapacityError) {
+            try {
+              store.normalizeSequenceGoalRevisionCapacity({ sequenceId: sequence.id, sourceAttemptId: previous.attemptId,
+                evidenceFingerprint: before.fingerprint, expectedStepIds: sequence.steps.map(step => step.task.id) });
+              return;
+            } catch (normalizationError) {
+              if (normalizationError instanceof GoalReviewRetryConflictError) continue;
+              // DB/IO failures retain the original verdict and the existing backoff.
+            }
+          }
           goalRevisionRetryAfter.set(previous.attemptId, Date.now() + 5_000);
           if (!warnedGoalRevisionAttempts.has(previous.attemptId)) {
             warnedGoalRevisionAttempts.add(previous.attemptId);
@@ -685,6 +696,8 @@ export function createSequenceGoalReviewScheduler(options: {
       let attempt;
       try { attempt = startAttempt(before.fingerprint); }
       catch (error) { if (error instanceof GoalReviewRetryConflictError) continue; throw error; }
+      let completion: Parameters<TaskStore['finishSequenceGoalReview']>[0];
+      let reviewFailed = false;
       try {
         const cfg = await options.readReviewerConfig();
         const goalReviewer = new GoalReviewer({ codex, model: cfg.modelId ?? undefined, reasoningEffort: cfg.reasoningEffort ?? undefined });
@@ -697,20 +710,22 @@ export function createSequenceGoalReviewScheduler(options: {
           acceptanceCriteria: sequence.acceptanceCriteria, stepEvidence: before.stepEvidence, repositories: before.repositories }) &&
           execution.evidenceFingerprint === before.snapshotFingerprint &&
           execution.verifiedSnapshotFingerprint === after.snapshotFingerprint ? after.fingerprint : '';
-        store.finishSequenceGoalReview({ attemptId: attempt.attemptId, result: execution.result, verifiedEvidenceFingerprint: verifiedFingerprint });
-        return;
+        completion = { attemptId: attempt.attemptId, result: execution.result, verifiedEvidenceFingerprint: verifiedFingerprint };
       } catch (error) {
         if (error instanceof QuotaLimitError) {
           const retryAt = error.retryAt && Date.parse(error.retryAt) > Date.now()
             ? error.retryAt : new Date(Date.now() + 5 * 60 * 60_000).toISOString();
-          store.finishSequenceGoalReview({ attemptId: attempt.attemptId, retryAt });
-          return;
+          completion = { attemptId: attempt.attemptId, retryAt };
+        } else {
+          completion = { attemptId: attempt.attemptId, verifiedEvidenceFingerprint: before.fingerprint,
+            result: goalBlockedResult('Aggregate reviewer or evidence verification could not complete safely.') };
+          reviewFailed = true;
         }
-        store.finishSequenceGoalReview({ attemptId: attempt.attemptId, verifiedEvidenceFingerprint: before.fingerprint,
-          result: goalBlockedResult('Aggregate reviewer or evidence verification could not complete safely.') });
-        console.warn('[zero] Aggregate goal review was blocked safely.');
-        return;
       }
+      // A persistence failure must propagate with its rollback intact; it is not a second reviewer verdict.
+      store.finishSequenceGoalReview(completion);
+      if (reviewFailed) console.warn('[zero] Aggregate goal review was blocked safely.');
+      return;
     }
   };
 }

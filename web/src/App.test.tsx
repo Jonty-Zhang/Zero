@@ -360,6 +360,19 @@ describe('sequence repository authoring', () => {
 });
 
 describe('task workspace', () => {
+  it('keeps long goal titles bounded while preserving the full objective and criteria in the scrollable drawer', async () => {
+    const sequence = blockedSequence();
+    sequence.objective = 'Implement the detailed product requirements. '.repeat(240).slice(0, 10000);
+    sequence.acceptanceCriteria = ['Preserve every detailed requirement'];
+    const dialog = await openSequence(sequence);
+    expect(within(dialog).getByRole('heading', { level: 2 }).textContent!.length).toBeLessThan(150);
+    expect(document.querySelector('.sequence-card-head b')!.textContent!.length).toBeLessThan(150);
+    const content = dialog.querySelector<HTMLElement>('.drawer-content')!;
+    expect(within(content).getByRole('heading', { name: '整体目标' })).toBeTruthy();
+    expect(content.textContent).toContain(sequence.objective);
+    expect(within(content).getByText('Preserve every detailed requirement')).toBeTruthy();
+    expect((within(content).getByRole('button', { name: '重新验收' }) as HTMLButtonElement).disabled).toBe(false);
+  });
   it('keeps cached goal cards usable after a failed poll and replaces them on recovery', async () => {
     vi.useFakeTimers();
     const sequence = blockedSequence();
