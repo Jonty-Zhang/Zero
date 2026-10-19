@@ -19,6 +19,8 @@ npm run build
 
 任务和序列的基础 Ref 默认使用 `HEAD`。网页提交必须为任务或每个序列步骤提供至少一条检查命令，避免队列接受后因无验证门禁而失败。提交请求进行中禁止关闭表单；设置保存时冻结字段以防新编辑被响应覆盖。敏感任务草稿不会写入浏览器存储。
 
+目标序列表单提供默认仓库与基础 Ref，每个步骤都可单独覆盖；步骤字段留空时动态继承默认值，默认 Ref 留空使用 `HEAD`。每步都指定仓库时，默认仓库可留空。行内预览显示生效仓库与配置 Ref，缺少仓库时直接标明步骤并禁用提交。移动或移除步骤时，仓库、Ref、描述、检查与执行选择保持在同一行。修改仓库不会重置手动执行选择，服务端会按规范仓库匹配项目预设并验证整批任务。同一仓库的后续步骤接续已验证结果，不同仓库分别维护历史。
+
 当序列的全部步骤完成，但目标验收因临时故障显示 `blocked` 时，处理故障后可在目标详情点击“重新验收”。请求排队后会保留原判定和发现，刷新页面或重启服务不会丢失；新的验收仍检查最终 Git 证据，不会重置返工预算。额度等待和进行中的验收不能用此入口绕过。弹窗及详情抽屉限制键盘焦点在内部，提交禁用控件后仍可安全使用 Tab；关闭后返回原入口。
 
 ## 测试
@@ -29,7 +31,7 @@ npm run build
 
 前端使用 JSON API。任务列表可直接返回数组，也兼容 `{ "tasks": [] }`。
 
-- `GET /api/capabilities`：返回 `{ harnesses, bindings, allocator, reviewer }`。`harnesses` 项为 `{ id, name, available, reason? }`；`bindings` 项为 `{ harnessId, modelId, modelName?, available, reason?, reasoningEfforts: [{ id, label }] }`。`allocator` 和 `reviewer` 分别包含 `models` 与 `reasoningEfforts` 选项数组。UI 只允许手动选择 `available: true` 且其 Harness 同样可用的组合；思考强度只来自所选已验证 binding。
+- `GET /api/capabilities`：返回 `{ harnesses, bindings, allocator, reviewer }`。`harnesses` 项为 `{ id, name, available, reason? }`；`bindings` 项为 `{ harnessId, modelId, modelName?, available, reason?, reasoningEfforts: [{ id, label }] }`。`allocator` 和 `reviewer` 分别包含 `models` 与 `reasoningEfforts` 选项数组。UI 只允许手动选择 `available: true` 且其 Harness 同样可用的组合；未指定 Harness 时，所选模型的思考强度取匹配可用 bindings 的并集，指定后收窄到该 Harness。
 - `GET /api/tasks`：任务数组或 `{ tasks }`。
 - `GET /api/tasks/:id`：任务详情，建议包含 `id`, `status`, `prompt`, `acceptanceCriteria`, `repoPath`, `baseRef`, `createdAt`, `route`, `attempts`, `tests`, `review`, `logs`, `report`, `error`。
 - 详情还包含 `executionStages`（原始提交的执行选择）、按顺序记录的 `stages` 和 `handoffs`。阶段提供 `id`、`sequence`、`role`、`status`、`predecessorStageId`、Harness/模型/思考强度、输入输出指纹、时间和错误；交接提供来源 attempt、工作树状态、摘要、完成项、决策、文件、检查、风险和后续步骤。`attempts` 附带 `id`、`stageId`、`role` 与 `exitCode`。旧任务或兼容存储缺少证据时返回空数组，不补造记录。
