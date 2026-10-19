@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import App from './App';
 import { api } from './api';
-import type { Task, TaskSequence } from './types';
+import type { Config, Task, TaskSequence } from './types';
 
 vi.mock('./api', () => ({ api: { tasks: vi.fn(), task: vi.fn(), capabilities: vi.fn(), sequences: vi.fn(), sequence: vi.fn(), retrySequenceGoalReview: vi.fn(), config: vi.fn(), cancelTask: vi.fn(), createTask: vi.fn(), createSequence: vi.fn(), saveConfig: vi.fn() } }));
 const tasks: Task[] = [
@@ -46,6 +46,102 @@ beforeEach(() => {
   vi.mocked(api.task).mockImplementation(async id => tasks.find(t => t.id === id)!);
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); });
+
+describe('polling workspace filters', () => {
+  it.each([
+    { view: '列表视图', field: 'Harness 筛选', selected: 'codex', changedTask: { ...tasks[0]!, route: { harnessId: 'zcode' } } },
+    { view: '看板视图', field: 'Harness 筛选', selected: 'codex', changedTask: { ...tasks[0]!, route: { harnessId: 'zcode' } } },
+    { view: '列表视图', field: '仓库筛选', selected: 'C:/repo/zero', changedTask: { ...tasks[0]!, repoPath: 'C:/repo/other' } },
+    { view: '看板视图', field: '仓库筛选', selected: 'C:/repo/zero', changedTask: { ...tasks[0]!, repoPath: 'C:/repo/other' } },
+  ])('retains the selected $field across missing values, reappearance and clear in $view', async scenario => {
+    vi.useFakeTimers();
+    const initialTasks = [tasks[0]!, tasks[1]!];
+    const changedTasks = [scenario.changedTask, tasks[1]!];
+    vi.mocked(api.tasks).mockResolvedValueOnce(initialTasks).mockResolvedValueOnce(changedTasks).mockResolvedValueOnce(initialTasks).mockResolvedValue(changedTasks);
+    // Task routes determine filter values even when capabilities currently list none.
+    vi.mocked(api.capabilities).mockResolvedValue({ ...capability, harnesses: [] });
+    render(<App />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: scenario.view }));
+    const search = screen.getByRole('searchbox') as HTMLInputElement;
+    const status = screen.getByLabelText('状态筛选') as HTMLSelectElement;
+    const repo = screen.getByLabelText('仓库筛选') as HTMLSelectElement;
+    const harness = screen.getByLabelText('Harness 筛选') as HTMLSelectElement;
+    fireEvent.change(search, { target: { value: '登录' } });
+    fireEvent.change(status, { target: { value: 'running' } });
+    fireEvent.change(repo, { target: { value: 'C:/repo/zero' } });
+    fireEvent.change(harness, { target: { value: 'codex' } });
+    expect(screen.getByText('修复登录回调')).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(4500); });
+    const selected = screen.getByLabelText(scenario.field) as HTMLSelectElement;
+    expect(selected.value).toBe(scenario.selected);
+    expect(selected.selectedOptions[0]?.textContent).toContain(scenario.selected);
+    expect(screen.getByRole('heading', { name: '没有符合条件的任务' })).toBeTruthy();
+    expect(screen.queryByText('修复登录回调')).toBeNull();
+    expect(search.value).toBe('登录');
+    expect(status.value).toBe('running');
+    expect(repo.value).toBe('C:/repo/zero');
+    expect(harness.value).toBe('codex');
+    await act(async () => { await vi.advanceTimersByTimeAsync(4500); });
+    expect(screen.getByText('修复登录回调')).toBeTruthy();
+    expect(selected.value).toBe(scenario.selected);
+    expect(selected.selectedOptions[0]?.textContent).toBe(scenario.selected);
+    expect(optionValues(selected).filter(value => value === scenario.selected)).toHaveLength(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(4500); });
+    fireEvent.click(screen.getByRole('button', { name: '清除筛选' }));
+    expect(search.value).toBe('');
+    expect(status.value).toBe('');
+    expect(repo.value).toBe('');
+    expect(harness.value).toBe('');
+    expect(screen.getByText('修复登录回调')).toBeTruthy();
+    expect(screen.getByText('更新文档')).toBeTruthy();
+    expect(optionValues(selected)).not.toContain(scenario.selected);
+  });
+});
+
+describe('settings read recovery', () => {
+  it('clears a failed read after retry loads fresh settings and allows editing and saving them', async () => {
+    const recovered: Config = {
+      allocator: { kind: 'api', modelId: null, reasoningEffort: null, api: { baseUrl: 'https://router.example/v1', model: 'recovered-api-model', keyEnv: 'ZERO_RECOVERED_ROUTER_KEY' } },
+      reviewer: { modelId: 'recovered-reviewer', reasoningEffort: 'high' },
+    };
+    vi.mocked(api.config).mockResolvedValueOnce(config as Config).mockRejectedValueOnce(new Error('initial-config-read-503')).mockResolvedValue(recovered);
+    vi.mocked(api.saveConfig).mockImplementation(async value => value);
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    fireEvent.click(screen.getByRole('button', { name: '路由设置' }));
+    expect(await screen.findByText('initial-config-read-503')).toBeTruthy();
+    expect(screen.queryByRole('group', { name: '路由设置表单' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    const form = await screen.findByRole('group', { name: '路由设置表单' });
+    expect((within(form).getByLabelText(/^API HTTPS 地址/) as HTMLInputElement).value).toBe('https://router.example/v1');
+    expect((within(form).getByLabelText('API 模型') as HTMLInputElement).value).toBe('recovered-api-model');
+    expect((within(form).getByLabelText('审核模型') as HTMLSelectElement).value).toBe('recovered-reviewer');
+    expect(screen.queryByText('initial-config-read-503')).toBeNull();
+    fireEvent.change(within(form).getByLabelText('API 模型'), { target: { value: 'edited-after-retry' } });
+    fireEvent.click(within(form).getByRole('button', { name: '保存设置' }));
+    await screen.findByRole('button', { name: '已保存' });
+    expect(api.saveConfig).toHaveBeenCalledWith(expect.objectContaining({
+      allocator: expect.objectContaining({ kind: 'api', api: { baseUrl: 'https://router.example/v1', model: 'edited-after-retry', keyEnv: 'ZERO_RECOVERED_ROUTER_KEY' } }),
+      reviewer: { modelId: 'recovered-reviewer', reasoningEffort: 'high' },
+    }));
+    expect(screen.queryByText('initial-config-read-503')).toBeNull();
+  });
+  it('shows the latest retry failure without inventing settings or offering save', async () => {
+    vi.mocked(api.config).mockResolvedValueOnce(config as Config).mockRejectedValueOnce(new Error('initial-config-read-503')).mockRejectedValue(new Error('latest-config-read-503'));
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    fireEvent.click(screen.getByRole('button', { name: '路由设置' }));
+    await screen.findByText('initial-config-read-503');
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    expect(await screen.findByText('latest-config-read-503')).toBeTruthy();
+    expect(screen.queryByText('initial-config-read-503')).toBeNull();
+    expect(screen.queryByRole('group', { name: '路由设置表单' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '保存设置' })).toBeNull();
+    expect(screen.getByRole('button', { name: '重试' })).toBeTruthy();
+    expect(api.saveConfig).not.toHaveBeenCalled();
+  });
+});
 
 describe('sequence repository authoring', () => {
   async function openForm() {

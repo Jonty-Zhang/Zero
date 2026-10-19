@@ -127,8 +127,8 @@ export default function App() {
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(''), 3200); return () => clearTimeout(timer); }, [notice]);
   const refreshAll = () => { void taskState.refresh(); void capState.refresh(); void seqState.refresh(); };
   const counts = Object.fromEntries(columns.map(c => [c.id, tasks.filter(t => t.status === c.id).length])) as Record<Status, number>;
-  const repos = [...new Set(tasks.map(task => task.repoPath).filter((value): value is string => Boolean(value)))].sort();
-  const harnesses = [...new Set(tasks.map(task => task.route?.harnessId).filter((value): value is string => Boolean(value)))].sort();
+  const repos = [...new Set([repo, ...tasks.map(task => task.repoPath)].filter((value): value is string => Boolean(value)))].sort();
+  const harnesses = [...new Set([harness, ...tasks.map(task => task.route?.harnessId)].filter((value): value is string => Boolean(value)))].sort();
   const filtered = tasks.filter(task => (!search.trim() || [task.title, task.repoPath, task.id, task.route?.modelId].join(' ').toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())) && (!status || task.status === status) && (!repo || task.repoPath === repo) && (!harness || task.route?.harnessId === harness)).sort((a, b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || ''));
   const clearFilters = () => { setSearch(''); setStatus(''); setRepo(''); setHarness(''); };
   return <div className="app-shell">
@@ -464,7 +464,7 @@ function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabi
   const apiAllocatorConfig = config?.allocator.api ?? emptyApiAllocatorConfig;
   return <><section className="page-heading"><div><div className="eyebrow">执行策略</div><h1>路由设置</h1><p>可选择 Codex 订阅或 API 模型作为分配器，审核始终由 Codex Reviewer 完成。</p></div></section>
     <div className="settings-layout"><div className="settings-main">
-      {loading ? <div className="settings-card loading-state"><LoaderCircle className="spin" size={21} />正在读取设置…</div> : error && !config ? <div className="alert error"><AlertCircle size={17} /><div><b>设置暂不可用</b><span>{error}</span></div><Button onClick={() => { setLoading(true); api.config().then(c => setConfig(normalizeConfig(c))).catch(e => setError(String(e))).finally(() => setLoading(false)); }}>重试</Button></div> : config && <fieldset disabled={busy} className="settings-fields" aria-label="路由设置表单">
+      {loading ? <div className="settings-card loading-state"><LoaderCircle className="spin" size={21} />正在读取设置…</div> : error && !config ? <div className="alert error"><AlertCircle size={17} /><div><b>设置暂不可用</b><span>{error}</span></div><Button onClick={() => { setLoading(true); api.config().then(c => { setConfig(normalizeConfig(c)); setError(''); }).catch(e => setError(e instanceof Error ? e.message : '配置读取失败')).finally(() => setLoading(false)); }}>重试</Button></div> : config && <fieldset disabled={busy} className="settings-fields" aria-label="路由设置表单">
         <section className="settings-card"><div className="settings-card-head"><div className="role-icon codex"><Activity size={18} /></div><div><h2>{allocatorName}分配器</h2><p>{config.allocator.kind === 'api' ? '使用兼容 OpenAI API 的模型决定任务执行路线。' : '使用 Codex 订阅和 Codex CLI 配置决定任务执行路线。'}</p></div><span className="fixed-badge">可切换</span></div>
           <Field label="分配器来源"><Select value={config.allocator.kind} onChange={kind => setConfig(prev => prev ? { ...normalizeConfig(prev), allocator: { ...prev.allocator, kind: kind as Config['allocator']['kind'] } } : prev)} choices={[{ id: 'codex', label: 'Codex 订阅' }, { id: 'api', label: 'API 模型' }]} placeholder="选择分配器" /></Field>
           {config.allocator.kind === 'api' ? <>
