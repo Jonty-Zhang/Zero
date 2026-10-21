@@ -16,7 +16,7 @@ import type {
   TaskStatus,
 } from "../domain/types.js";
 import { GitWorktreeManager, type WorktreeCreationEvidence, type WorktreeCreationPlan, type WorktreeInfo, type WorktreeReviewSnapshot } from "../core/git-worktree.js";
-import { TaskStore } from "../core/task-store.js";
+import { TaskStore, TaskCancellationConflictError } from "../core/task-store.js";
 import type {
   CheckRunSnapshot,
   ReviewPackageRecord,
@@ -135,7 +135,7 @@ export interface TaskReport {
 /** Executes one leased task. SQLite remains authoritative; external work is never retried after an interrupted attempt. */
 export class TaskWorker {
   readonly #options: Required<Pick<TaskWorkerOptions, "leaseMs" | "heartbeatIntervalMs">> & TaskWorkerOptions;
-  readonly #active = new Map<string, { controller: AbortController; adapter?: HarnessAdapter; attempt?: Attempt; cancelRequested: boolean }>();
+  readonly #active = new Map<string, { taskId: string; owner: string; generationId: string; controller: AbortController; adapter?: HarnessAdapter; attempt?: Attempt; cancelRequested: boolean }>();
 
   constructor(options: TaskWorkerOptions) {
     this.#options = { leaseMs: 60_000, heartbeatIntervalMs: Math.max(1_000, Math.floor((options.leaseMs ?? 60_000) / 3)), ...options };
@@ -146,6 +146,10 @@ export class TaskWorker {
     // Lease expiry is not proof that a prior child process stopped. Quarantine
     // expired active work before considering any new claim.
     this.#options.store.recoverExpired();
+    for (const request of this.#options.store.listTaskCancellations()) {
+      const cancelled = this.#options.store.finishDrainedTaskCancellation(request.taskId);
+      if (cancelled) await this.#writeMissingCancellationReport(cancelled);
+    }
     for (const candidate of this.#options.store.listLeaseExpiryRecoveryCandidates()) {
       let worktreeExists: boolean;
       try {
@@ -377,6 +381,9 @@ export class TaskWorker {
     worktree: WorktreeInfo, reviewPackage: ReviewPackageRecord, reviewRecoveryProof: NonNullable<ReviewReworkRunContext["reviewRecoveryProof"]>): Promise<TaskRecord> {
     const result = await this.#resumeReviewRecovery(taskId, owner, recoveryClaimId, worktree, reviewPackage);
     if (result.status !== "running" || result.leaseOwner !== owner) return result;
+    if (this.#options.store.getTaskCancellation(taskId)) {
+      return (await this.#finishSettledCancellation(taskId, owner, result.claimGenerationId!, false)) ?? this.#requireTask(taskId);
+    }
     const verdict = this.#options.store.packageReviewVerdicts(taskId).at(-1);
     if (!verdict || verdict.packageId !== reviewPackage.id || verdict.result.verdict !== "changes_requested") return result;
     const continuation = this.#options.store.getReviewReworkContinuation(taskId);
@@ -480,7 +487,7 @@ export class TaskWorker {
     if (task.status !== "running" || task.leaseOwner !== owner) throw new Error(`Task ${taskId} is not leased by ${owner}`);
     if (this.#active.has(taskId)) throw new Error(`Task ${taskId} is already active in this worker`);
     if (reworkResume) this.#assertReviewReworkResume(task, owner, reworkResume);
-    const active = { controller: new AbortController(), cancelRequested: false } as { controller: AbortController; adapter?: HarnessAdapter; attempt?: Attempt; cancelRequested: boolean };
+    const active = { taskId, owner, generationId: task.claimGenerationId!, controller: new AbortController(), cancelRequested: false } as { taskId: string; owner: string; generationId: string; controller: AbortController; adapter?: HarnessAdapter; attempt?: Attempt; cancelRequested: boolean };
     this.#active.set(taskId, active);
     let leaseLost = false;
     let activeAttempt: Attempt | undefined;
@@ -514,6 +521,11 @@ export class TaskWorker {
     let reworkFirstWriterRecovery = false;
     const interval = setInterval(() => {
       try {
+        if (this.#options.store.getTaskCancellation(taskId)) {
+          active.cancelRequested = true;
+          active.controller.abort(new Error("Cancelled by user"));
+          if (active.adapter && active.attempt) void active.adapter.cancel?.(taskId, active.attempt.id).catch(() => undefined);
+        }
         if (!this.#options.store.heartbeat(taskId, owner, this.#options.leaseMs)) {
           leaseLost = true;
           active.controller.abort(new Error("Task lease was lost"));
@@ -628,6 +640,8 @@ export class TaskWorker {
           executionStageIndex = 0;
           revisionBrief = task.prompt;
         } catch (error) {
+          const cancelledTask = await this.#finishSettledCancellation(taskId, owner, active.generationId, leaseLost);
+          if (cancelledTask) return cancelledTask;
           try {
             return this.#options.store.quarantineClaimedExecutionRecovery(taskId, owner, errorText(error));
           } catch {
@@ -886,6 +900,7 @@ export class TaskWorker {
             });
         }
         activeCheckRunId = checkRun.id;
+        this.#assertNotCancelled(active);
         const checks = await this.#options.testRunner.run(requiredChecks, worktree.path, { signal: active.controller.signal });
         for (const check of checks) {
           this.#options.store.recordCheckResult(checkRun.id, { owner, generationId }, check);
@@ -1028,6 +1043,7 @@ export class TaskWorker {
         // checks snapshot: re-run checks and bind the fresh results to this tree.
         if (!checksSnapshot || legacyReviewCheckpoint) {
           checksSnapshot = reviewSnapshotIdentity(await this.#options.worktrees.prepareReview(worktree));
+          this.#assertNotCancelled(active);
           const resumedChecks = await this.#options.testRunner.run(requiredChecks, worktree.path, { signal: active.controller.signal });
           finalChecks = resumedChecks;
           const executionStageIds = new Set(this.#options.store.stages(taskId)
@@ -1194,6 +1210,8 @@ export class TaskWorker {
           throw new Error("Git returned a candidate that does not match the persisted commit intent");
         }
         this.#options.store.recordCommitOperationCandidate(operation.id, { owner, generationId }, candidate.commit);
+        this.#assertNotCancelled(active);
+        this.#assertLease(taskId, owner, () => leaseLost);
         resultCommit = await this.#options.worktrees.applyReviewedCommitCandidate(worktree, candidate, commitSnapshot);
         if (!resultCommit) throw new Error("No changes were committed; refusing to mark a no-op task DONE");
         const diff = reviewSnapshot.diff;
@@ -1216,6 +1234,7 @@ export class TaskWorker {
         });
         // Archive all evidence before the irreversible DONE transition. The DB remains authoritative
         // if a crash occurs here; readReport overlays the live state when serving the artifact.
+        this.#assertNotCancelled(active);
         const reportOperationId = await this.#writeDoneReport(taskId, { task, baseCommit, resultCommit, diff, checks: finalChecks,
           authoritativeCheckAttemptId: finalCheckAttemptId, commitOperationId: operation.id, owner, generationId });
         this.#assertLease(taskId, owner, () => leaseLost);
@@ -1225,6 +1244,8 @@ export class TaskWorker {
         if (finalBranch.ref !== operation.branchRef || finalBranch.head !== candidate.commit || resultCommit !== candidate.commit) {
           throw new Error("Task branch changed after report completion and before DONE");
         }
+        this.#assertNotCancelled(active);
+        this.#assertLease(taskId, owner, () => leaseLost);
         task = this.#options.store.completeReviewedTask({
           taskId,
           reportOperationId,
@@ -1245,15 +1266,18 @@ export class TaskWorker {
         return this.#requireTask(taskId);
       }
     } catch (error) {
-      const cancelled = active.cancelRequested;
+      const cancelled = active.cancelRequested || Boolean(this.#options.store.getTaskCancellation(taskId));
       errorMessage = cancelled ? "Cancelled by user" : errorText(error);
       if (worktreeCreationIntentPending) {
+        if (cancelled) return (await this.#finishSettledCancellation(taskId, owner, active.generationId, leaseLost)) ?? this.#requireTask(taskId);
         try {
           this.#assertLease(taskId, owner, () => leaseLost);
           task = this.#options.store.requireWorktreeRecovery(taskId, owner, errorMessage, { phase: "execute_or_observe" });
         } catch {
           // A lost lease leaves the durable intent for recoverExpired to quarantine.
         }
+        const cancelledTask = await this.#finishSettledCancellation(taskId, owner, active.generationId, leaseLost);
+        if (cancelledTask) return cancelledTask;
         return this.#options.store.get(taskId) ?? task;
       }
       const quotaFailure = error instanceof QuotaLimitError && !cancelled && !leaseLost;
@@ -1311,7 +1335,7 @@ export class TaskWorker {
         } catch {
           // A sealed package cannot fall back to the generic route/execute checkpoint.
           // Leave the reviewing lease untouched so expiry enters guardian recovery.
-          return this.#options.store.get(taskId) ?? task;
+          return (await this.#finishSettledCancellation(taskId, owner, active.generationId, leaseLost)) ?? this.#requireTask(taskId);
         }
       }
       if (executionStage && !leaseLost && this.#options.store.getStage(executionStage.id)?.status === "running") {
@@ -1375,7 +1399,7 @@ export class TaskWorker {
         } catch {
           // Never fall back to generic route/execute quota resume for a bound revision.
           // Keeping the live lease untouched lets normal lease recovery quarantine it.
-          return this.#options.store.get(taskId) ?? task;
+          return (await this.#finishSettledCancellation(taskId, owner, active.generationId, leaseLost)) ?? this.#requireTask(taskId);
         }
       }
       if (quotaFailure && !executionStageFinalizationFailed && !leaseLost && worktree && baseCommit) {
@@ -1418,17 +1442,29 @@ export class TaskWorker {
           errorMessage = `Unable to preserve quota checkpoint: ${errorText(pauseError)}`;
         }
       }
+      const cancelledTask = await this.#finishSettledCancellation(taskId, owner, active.generationId, leaseLost);
+      if (cancelledTask) return cancelledTask;
+      let failurePersisted = false;
       if (!leaseLost) {
         const current = this.#options.store.get(taskId);
         if (current && current.status !== "done" && current.status !== "failed" && current.leaseOwner === owner) {
-          try { task = this.#options.store.fail(taskId, current.status, errorMessage, owner); } catch { /* preserve the original failure */ }
+          try {
+            task = this.#options.store.fail(taskId, current.status, errorMessage, owner);
+            failurePersisted = true;
+          } catch {
+            // An independent cancellation transaction may have won after the read.
+            const cancelledTask = await this.#finishSettledCancellation(taskId, owner, active.generationId, leaseLost);
+            if (cancelledTask) return cancelledTask;
+          }
         }
       }
-      if (!markedDone) {
+      if (failurePersisted && !markedDone) {
         try {
-          const diff = worktree ? await this.#options.worktrees.diff(worktree) : undefined;
-          await this.#writeReport(taskId, "failed", { task: this.#options.store.get(taskId) ?? task, baseCommit, resultCommit, error: errorMessage, diff,
-            checks: finalChecks, authoritativeCheckAttemptId: finalCheckAttemptId });
+          if (this.#options.store.reportOperations(taskId).length === 0) {
+            const diff = worktree ? await this.#options.worktrees.diff(worktree) : undefined;
+            await this.#writeReport(taskId, "failed", { task: this.#options.store.get(taskId) ?? task, baseCommit, resultCommit, error: errorMessage, diff,
+              checks: finalChecks, authoritativeCheckAttemptId: finalCheckAttemptId });
+          }
         } catch { /* the task failure remains in SQLite if artifact storage is unavailable */ }
       }
       return this.#options.store.get(taskId) ?? task;
@@ -1444,6 +1480,8 @@ export class TaskWorker {
     if (!task || !["running", "reviewing", "revision"].includes(task.status)) return false;
     const active = this.#active.get(taskId);
     if (!active) return false;
+    try { this.#options.store.requestTaskCancellation(taskId, active.owner, active.generationId); }
+    catch (error) { if (error instanceof TaskCancellationConflictError) return false; throw error; }
     active.cancelRequested = true;
     active.controller.abort(new Error("Cancelled by user"));
     if (active.adapter && active.attempt) {
@@ -1459,12 +1497,17 @@ export class TaskWorker {
     const generationId = task.claimGenerationId;
     if (task.status !== "reviewing" || task.leaseOwner !== owner || !generationId) return task;
     if (this.#active.has(taskId)) return task;
-    const active = { controller: new AbortController(), cancelRequested: false };
+    const active: { taskId: string; owner: string; generationId: string; controller: AbortController; cancelRequested: boolean; adapter?: HarnessAdapter; attempt?: Attempt } = { taskId, owner, generationId, controller: new AbortController(), cancelRequested: false };
     this.#active.set(taskId, active);
     let leaseLost = false;
     let reviewAttempt: Attempt | undefined;
     const interval = setInterval(() => {
       try {
+        if (this.#options.store.getTaskCancellation(taskId)) {
+          active.cancelRequested = true;
+          active.controller.abort(new Error("Cancelled by user"));
+          if (active.adapter && active.attempt) void active.adapter.cancel?.(taskId, active.attempt.id).catch(() => undefined);
+        }
         if (!this.#options.store.heartbeat(taskId, owner, this.#options.leaseMs)) {
           leaseLost = true;
           active.controller.abort(new Error("Task lease was lost"));
@@ -1503,6 +1546,7 @@ export class TaskWorker {
         const activeWithAttempt = active as typeof active & { adapter?: HarnessAdapter; attempt?: Attempt };
         activeWithAttempt.adapter = this.#options.adapters.get("codex");
         activeWithAttempt.attempt = reviewAttempt;
+        this.#assertNotCancelled(active);
         const review = await this.#options.reviewer.review(task, worktree, reviewPackage.route, checks, before.diff, { attemptId: reviewAttempt.id });
         this.#assertNotCancelled(active);
         this.#assertLease(taskId, owner, () => leaseLost);
@@ -1569,6 +1613,8 @@ export class TaskWorker {
       if (operation.status === "intent") {
         this.#assertNotCancelled(active);
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+        this.#assertNotCancelled(active);
+        this.#assertLease(taskId, owner, () => leaseLost);
         const generated = await this.#options.worktrees.createReviewedCommitCandidate(worktree, operation.preHead, snapshot,
           { opId: operation.id, message: operation.message, timestamp: operation.timestamp });
         if (generated.opId !== operation.id || generated.branchRef !== operation.branchRef || generated.preHead !== operation.preHead
@@ -1585,6 +1631,8 @@ export class TaskWorker {
       if (branch.head.toLowerCase() === operation.preHead.toLowerCase()) {
         this.#assertNotCancelled(active);
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+        this.#assertNotCancelled(active);
+        this.#assertLease(taskId, owner, () => leaseLost);
         const applied = await this.#options.worktrees.applyReviewedCommitCandidate(worktree, candidate, snapshot);
         if (applied !== candidate.commit) throw new Error("Recovered commit candidate was not applied exactly");
       } else if (branch.head.toLowerCase() !== candidate.commit.toLowerCase()) {
@@ -1607,6 +1655,8 @@ export class TaskWorker {
       let reportOperation = reports.at(-1);
       if (!reportOperation) {
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
+        this.#assertNotCancelled(active);
+        this.#assertLease(taskId, owner, () => leaseLost);
         const diff = reviewPackage.snapshot.diff;
         if (!diff.trim()) throw new Error("Recovered reviewed package has an empty diff");
         const reportOperationId = await this.#writeDoneReport(taskId, { task, baseCommit: worktree.baseCommit,
@@ -1614,6 +1664,7 @@ export class TaskWorker {
           commitOperationId: operation.id, owner, generationId });
         reportOperation = this.#options.store.getReportOperation(reportOperationId);
       } else {
+        this.#assertNotCancelled(active);
         if (reportOperation.artifactDirectory !== this.#artifactDirectory(taskId)
           || reportOperation.reportPath !== resolve(reportOperation.artifactDirectory, "report.json")
           || reportOperation.diffPath !== resolve(reportOperation.artifactDirectory, "result.diff")) {
@@ -1645,6 +1696,8 @@ export class TaskWorker {
       if (finalBranch.ref !== operation.branchRef || finalBranch.head.toLowerCase() !== candidate.commit.toLowerCase()) {
         throw new Error("Task branch changed after report verification and before DONE");
       }
+      this.#assertNotCancelled(active);
+      this.#assertLease(taskId, owner, () => leaseLost);
       this.#options.store.completeReviewedTask({ taskId, reportOperationId: reportOperation.id, owner, generationId,
         gitEvidence: { branchRef: finalBranch.ref, refHead: finalBranch.head, worktreeHead: candidate.commit,
           treeId: operation.treeId, diffHash: operation.diffHash, candidateObjectVerified: true,
@@ -1689,6 +1742,8 @@ export class TaskWorker {
           });
         } catch { /* stale ownership leaves the durable attempt for lease recovery */ }
       }
+      const cancelledTask = await this.#finishSettledCancellation(taskId, owner, generationId, leaseLost);
+      if (cancelledTask) return cancelledTask;
       // Leave the leased task in reviewing. Once its heartbeat stops, recoverExpired
       // returns it to quarantine and the guardian can retry the same immutable boundary.
       return this.#options.store.get(taskId) ?? task;
@@ -1696,6 +1751,31 @@ export class TaskWorker {
       clearInterval(interval);
       this.#active.delete(taskId);
     }
+  }
+
+  async #finishSettledCancellation(taskId: string, owner: string, generationId: string, leaseLost: boolean): Promise<TaskRecord | undefined> {
+    if (!this.#options.store.getTaskCancellation(taskId)) return;
+    // The current operation has settled; persistence errors must remain observable.
+    if (!leaseLost) {
+      const cancelled = this.#options.store.finishTaskCancellation(taskId, owner, generationId);
+      if (cancelled) await this.#writeMissingCancellationReport(cancelled);
+      return cancelled ?? this.#requireTask(taskId);
+    }
+    return this.#requireTask(taskId);
+  }
+
+  async #writeMissingCancellationReport(task: TaskRecord): Promise<void> {
+    // Existing archives (including quota/history) and operation-backed bytes remain immutable.
+    if (this.#options.store.reportOperations(task.id).length) return;
+    const directory = this.#artifactDirectory(task.id);
+    const root = resolve(this.#options.artifactRoot);
+    const rel = relative(root, directory);
+    if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error("Report path escapes artifact root");
+    try {
+      const serialized = this.#serializeReport(task.id, "failed", { task, error: task.failureReason }, directory);
+      await mkdir(directory, { recursive: true });
+      await writeFile(resolve(directory, "report.json"), serialized.reportBytes, { flag: "wx" });
+    } catch { /* Terminal cancellation remains durable if the optional archive cannot be created. */ }
   }
 
   #requireCurrentReviewPackage(input: {
@@ -1740,7 +1820,8 @@ export class TaskWorker {
     return pkg;
   }
 
-  #assertNotCancelled(active: { controller: AbortController; cancelRequested: boolean }): void {
+  #assertNotCancelled(active: { taskId: string; controller: AbortController; cancelRequested: boolean }): void {
+    if (this.#options.store.getTaskCancellation(active.taskId)) active.cancelRequested = true;
     if (active.cancelRequested || active.controller.signal.aborted) throw new Error("Cancelled by user");
   }
 

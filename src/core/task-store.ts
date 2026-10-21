@@ -542,6 +542,18 @@ function validateExecutionStages(submission: TaskSubmission): void {
 }
 
 /** SQLite-backed source of truth. Methods are synchronous and each state change is transactional. */
+export interface TaskCancellationRequest {
+  taskId: string;
+  owner: string;
+  generationId: string;
+  claimEventId: number;
+  requestedAt: string;
+}
+
+export class TaskCancellationConflictError extends Error {
+  constructor(message: string) { super(message); this.name = "TaskCancellationConflictError"; }
+}
+
 export class TaskStore {
   readonly #db: DatabaseSync;
   readonly #startupGeneration: StartupGenerationRecord;
@@ -597,6 +609,14 @@ export class TaskStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
         type TEXT NOT NULL, at TEXT NOT NULL, payload TEXT
       );
+      CREATE TABLE IF NOT EXISTS task_cancellation_requests (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id), owner TEXT NOT NULL,
+        generation_id TEXT NOT NULL REFERENCES startup_generations(id), claim_event_id INTEGER NOT NULL REFERENCES events(id), requested_at TEXT NOT NULL
+      );
+      CREATE TRIGGER IF NOT EXISTS task_cancellation_requests_no_update BEFORE UPDATE ON task_cancellation_requests
+        BEGIN SELECT RAISE(ABORT,'task cancellation requests are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS task_cancellation_requests_no_delete BEFORE DELETE ON task_cancellation_requests
+        BEGIN SELECT RAISE(ABORT,'task cancellation requests are immutable'); END;
       CREATE TABLE IF NOT EXISTS attempts (
         id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), sequence INTEGER NOT NULL,
         role TEXT NOT NULL, status TEXT NOT NULL, harness TEXT, model TEXT, reasoning_effort TEXT,
@@ -877,6 +897,109 @@ export class TaskStore {
   }
 
   startupGeneration(): StartupGenerationRecord { return { ...this.#startupGeneration }; }
+
+  getTaskCancellation(taskId: string): TaskCancellationRequest | undefined {
+    const row = this.#db.prepare("SELECT * FROM task_cancellation_requests WHERE task_id=?").get(taskId) as
+      { task_id: string; owner: string; generation_id: string; claim_event_id: number; requested_at: string } | undefined;
+    return row ? { taskId: row.task_id, owner: row.owner, generationId: row.generation_id, claimEventId: row.claim_event_id, requestedAt: row.requested_at } : undefined;
+  }
+
+  listTaskCancellations(): TaskCancellationRequest[] {
+    return (this.#db.prepare("SELECT c.task_id FROM task_cancellation_requests c JOIN tasks t ON t.id=c.task_id WHERE t.status NOT IN ('done','failed') ORDER BY c.requested_at,c.task_id")
+      .all() as Array<{ task_id: string }>).map(row => this.getTaskCancellation(row.task_id)!);
+  }
+
+  /** Persist acceptance before any caller acknowledges or signals the child process. */
+  requestTaskCancellation(taskId: string, owner: string, generationId: string, now = new Date()): TaskCancellationRequest {
+    if (!owner?.trim() || !generationId || !(now instanceof Date) || !Number.isFinite(now.getTime())) throw new TaskCancellationConflictError("Cancellation requires a valid current claim");
+    return this.#transaction(() => {
+      const task = this.get(taskId);
+      const claim = this.#db.prepare("SELECT id,payload FROM events WHERE task_id=? AND type='task.claimed' ORDER BY id DESC LIMIT 1")
+        .get(taskId) as { id: number; payload: string } | undefined;
+      const proof = claim ? JSON.parse(claim.payload) as { owner?: string; generationId?: string } : undefined;
+      if (!task || !["running", "reviewing", "revision"].includes(task.status) || task.leaseOwner !== owner ||
+          task.claimGenerationId !== generationId || this.#startupGeneration.id !== generationId || !task.leaseExpiresAt ||
+          !Number.isFinite(Date.parse(task.leaseExpiresAt)) || Date.parse(task.leaseExpiresAt) <= now.getTime() || !claim || proof?.owner !== owner || proof.generationId !== generationId) {
+        throw new TaskCancellationConflictError("Cancellation claim is stale, expired, or already terminal");
+      }
+      const previous = this.getTaskCancellation(taskId);
+      if (previous) {
+        if (previous.owner !== owner || previous.generationId !== generationId || previous.claimEventId !== claim.id) throw new TaskCancellationConflictError("Cancellation belongs to a different claim");
+        return previous;
+      }
+      const request = { taskId, owner, generationId, claimEventId: claim.id, requestedAt: now.toISOString() };
+      this.#db.prepare("INSERT INTO task_cancellation_requests(task_id,owner,generation_id,claim_event_id,requested_at) VALUES(?,?,?,?,?)")
+        .run(taskId, owner, generationId, claim.id, request.requestedAt);
+      this.#event(taskId, "task.cancel_requested", { ...request,
+        commitOperations: this.commitOperations(taskId).map(op => ({ id: op.id, status: op.status, candidateSha: op.candidateSha })),
+        reportOperations: this.reportOperations(taskId).map(op => ({ id: op.id, status: op.status, reportSha256: op.reportSha256 })),
+      }, request.requestedAt);
+      return request;
+    });
+  }
+
+  /** The live worker calls this only after its current operation has actually settled. */
+  finishTaskCancellation(taskId: string, owner: string, generationId: string, now = new Date()): TaskRecord | undefined {
+    return this.#finishTaskCancellation(taskId, { owner, generationId }, now);
+  }
+
+  /** A later startup may finish without new work only after proving the source generation drained. */
+  finishDrainedTaskCancellation(taskId: string, now = new Date()): TaskRecord | undefined {
+    return this.#finishTaskCancellation(taskId, undefined, now);
+  }
+
+  #finishTaskCancellation(taskId: string, live: { owner: string; generationId: string } | undefined, now: Date): TaskRecord | undefined {
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new Error("Cancellation completion requires a valid timestamp");
+    return this.#transaction(() => {
+      const task = this.get(taskId); const request = this.getTaskCancellation(taskId);
+      if (!task || !request || task.claimGenerationId !== request.generationId) return;
+      const claims = this.#db.prepare("SELECT id,payload FROM events WHERE task_id=? AND type='task.claimed' ORDER BY id DESC LIMIT 1").get(taskId) as { id: number; payload: string } | undefined;
+      const claim = claims ? JSON.parse(claims.payload) as { owner?: string; generationId?: string } : undefined;
+      if (claims?.id !== request.claimEventId || claim?.owner !== request.owner || claim.generationId !== request.generationId) return;
+      if (live) {
+        if (live.owner !== request.owner || live.generationId !== request.generationId || this.#startupGeneration.id !== live.generationId ||
+            !["running", "reviewing", "revision"].includes(task.status) || task.leaseOwner !== live.owner ||
+            !task.leaseExpiresAt || !Number.isFinite(Date.parse(task.leaseExpiresAt)) || Date.parse(task.leaseExpiresAt) <= now.getTime()) return;
+      } else {
+        if (!this.#verifiedGuardianLineage(request.generationId, this.#startupGeneration.id)) return;
+        if (task.status === "recovery_required") {
+          const evidence = task.recoveryEvidence;
+          if (task.leaseOwner || task.leaseExpiresAt || evidence?.kind !== "lease_expiry" || evidence.leaseOwner !== request.owner ||
+              evidence.claimGenerationId !== request.generationId || !["running", "reviewing", "revision"].includes(String(evidence.previousStatus))) return;
+        } else if (!["running", "reviewing", "revision"].includes(task.status) || task.leaseOwner !== request.owner) return;
+      }
+      const events = this.events(taskId).filter(event => event.id > request.claimEventId);
+      const stages = this.stages(taskId).filter(stage => stage.status === "running" && stage.generationId === request.generationId && events.some(event => event.type === "stage.started" &&
+        event.payload?.stageId === stage.id && event.payload?.generationId === request.generationId && event.payload?.processStartId === stage.processStartId));
+      const stageIds = new Set(stages.map(stage => stage.id));
+      const attempts = this.attempts(taskId).filter(attempt => attempt.status === "running" && (!attempt.stageId || stageIds.has(attempt.stageId)) &&
+        events.some(event => event.type === "attempt.started" && (event.payload?.attempt as { id?: string } | undefined)?.id === attempt.id));
+      const at = now.toISOString(); const reason = "Cancelled by user";
+      for (const attempt of attempts) {
+        this.#db.prepare("UPDATE attempts SET status='interrupted',finished_at=?,error=? WHERE id=? AND status='running'").run(at, reason, attempt.id);
+        this.#event(taskId, "attempt.finished", { attempt: { ...attempt, status: "interrupted", finishedAt: at, error: reason } }, at);
+      }
+      for (const stage of stages) {
+        this.#db.prepare("UPDATE stages SET status='interrupted',finished_at=?,error=? WHERE id=? AND status='running' AND generation_id=?")
+          .run(at, reason, stage.id, request.generationId);
+        this.#event(taskId, "stage.finished", { stageId: stage.id, status: "interrupted", processStartId: stage.processStartId, error: reason }, at);
+      }
+      const changed = this.#db.prepare(`UPDATE tasks SET status='failed',failure_reason=?,updated_at=?,lease_owner=NULL,lease_expires_at=NULL,
+        heartbeat_at=NULL,active_attempt_id=NULL,recovery_reason=NULL,recovery_evidence=NULL WHERE id=? AND status=? AND claim_generation_id=?`)
+        .run(reason, at, taskId, task.status, request.generationId);
+      if (Number(changed.changes) !== 1) throw new TaskCancellationConflictError("Cancellation custody changed during completion");
+      this.#db.prepare("DELETE FROM quota_pauses WHERE task_id=?").run(taskId);
+      this.#disableExecutionRecoveryCheckpoint(taskId, at, "terminal:cancelled");
+      this.#event(taskId, "task.cancelled", { request, authority: live ? "live_operation_stopped" : "guardian_generation_drained", previousStatus: task.status,
+        recoveryReason: task.recoveryReason, recoveryEvidence: task.recoveryEvidence, interruptedAttemptIds: attempts.map(a => a.id), interruptedStageIds: stages.map(s => s.id) }, at);
+      this.#event(taskId, "task.transition", { from: [task.status], to: "failed", reason }, at);
+      return this.get(taskId);
+    });
+  }
+
+  #assertTaskAcceptsWork(taskId: string): void {
+    if (this.getTaskCancellation(taskId)) throw new TaskCancellationConflictError("Task cancellation was accepted; new work is forbidden");
+  }
 
   /**
    * Returns true only when this startup's persisted guardian proof directly names the requested
@@ -1777,7 +1900,8 @@ export class TaskStore {
             JOIN tasks earlier_task ON earlier_task.id=earlier_step.task_id
             WHERE current_step.task_id=t.id AND earlier_task.status<>'done') AS sequence_eligible
         FROM tasks t LEFT JOIN quota_pauses q ON q.task_id=t.id
-        WHERE t.status='pending' OR (t.status='waiting' AND q.retry_at<=?) ORDER BY t.created_at,t.id`).all(at) as
+        WHERE (t.status='pending' OR (t.status='waiting' AND q.retry_at<=?))
+          AND NOT EXISTS (SELECT 1 FROM task_cancellation_requests cancel WHERE cancel.task_id=t.id) ORDER BY t.created_at,t.id`).all(at) as
         Array<{ id: string; status: TaskStatus; checkpoint: string | null; sequence_eligible: number }>;
       const row = candidates.find(candidate => {
         if (!candidate.sequence_eligible) return false;
@@ -1806,6 +1930,7 @@ export class TaskStore {
   recordWorktreeCreationIntent(taskId: string, owner: string, plan: unknown): WorktreeCreationRecord {
     const at = new Date().toISOString();
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
       if (!task || !this.#hasLiveTaskLease(task, owner)) throw new Error(`Task ${taskId} is not actively leased by ${owner}`);
       const existing = this.#db.prepare("SELECT task_id FROM worktree_creations WHERE task_id=?").get(taskId);
@@ -1838,6 +1963,7 @@ export class TaskStore {
   requireWorktreeRecovery(taskId: string, owner: string, reason: string, evidence?: unknown): TaskRecord {
     const at = new Date().toISOString();
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
       if (!task || !this.#hasLiveTaskLease(task, owner)) throw new Error(`Task ${taskId} is not actively leased by ${owner}`);
       const intent = this.#db.prepare("SELECT lease_owner FROM worktree_creations WHERE task_id=?").get(taskId) as { lease_owner: string } | undefined;
@@ -1887,6 +2013,7 @@ export class TaskStore {
     const sql = `UPDATE tasks SET status=?, updated_at=?${options.incrementRevision ? ", revision_count=revision_count+1" : ""}${options.clearLease ? ", lease_owner=NULL, lease_expires_at=NULL, heartbeat_at=NULL" : ""} WHERE id=? AND status IN (${marks})${leaseClause}`;
     if (options.owner !== undefined) args.push(options.owner);
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(id);
       const changed = this.#db.prepare(sql).run(...args);
       if (Number(changed.changes) !== 1) throw new Error(`Task ${id} state transition rejected (expected ${expectedList.join("|")})`);
       if (next === "failed" && options.reason) this.#db.prepare("UPDATE tasks SET failure_reason=? WHERE id=?").run(options.reason, id);
@@ -1971,6 +2098,7 @@ export class TaskStore {
     const expires = new Date(now.getTime() + leaseMs).toISOString();
     let claimed = false;
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       if (!this.#executionRecoveryEligibility(taskId)) return;
       const task = this.#db.prepare("SELECT recovery_reason,recovery_evidence,claim_generation_id,revision_count,payload FROM tasks WHERE id=?").get(taskId) as {
         recovery_reason: string | null; recovery_evidence: string; claim_generation_id: string; revision_count: number; payload: string;
@@ -2066,6 +2194,7 @@ export class TaskStore {
     const expires = new Date(now.getTime() + leaseMs).toISOString();
     let claimed: ReviewRecoveryClaimRecord | undefined;
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,recovery_evidence,recovery_reason,payload
         FROM tasks WHERE id=?`).get(taskId) as {
           status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null;
@@ -2293,6 +2422,7 @@ export class TaskStore {
     if (!reason.trim()) throw new Error("recovery quarantine reason is required");
     const at = new Date().toISOString();
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const row = this.#db.prepare("SELECT status,lease_owner,recovery_evidence FROM tasks WHERE id=?").get(taskId) as {
         status: TaskStatus; lease_owner: string | null; recovery_evidence: string | null;
       } | undefined;
@@ -2379,6 +2509,7 @@ export class TaskStore {
     }
     const at = new Date().toISOString();
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare("SELECT status,recovery_evidence FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; recovery_evidence: string | null } | undefined;
       const recoveryEvidence = task?.recovery_evidence ? JSON.parse(task.recovery_evidence) as Record<string, unknown> : undefined;
       if (!task || task.status !== "recovery_required" || recoveryEvidence?.kind !== "lease_expiry" || recoveryEvidence.claimProtocolVersion !== 2) {
@@ -2406,6 +2537,7 @@ export class TaskStore {
     if (!Number.isFinite(retryAt.getTime()) || retryAt.getTime() <= Date.now()) throw new Error("Quota retryAt must be a future timestamp");
     const at = new Date().toISOString();
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const row = this.#db.prepare("SELECT status,lease_owner FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; lease_owner: string | null } | undefined;
       if (!row || row.lease_owner !== owner || !["running", "reviewing", "revision"].includes(row.status)) throw new Error(`Task ${taskId} is not actively leased by ${owner}`);
       const previous = this.#db.prepare("SELECT retry_count FROM quota_pauses WHERE task_id=?").get(taskId) as { retry_count: number } | undefined;
@@ -2433,6 +2565,7 @@ export class TaskStore {
     }
     const at = now.toISOString();
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,active_attempt_id
         FROM tasks WHERE id=?`).get(taskId) as {
           status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null;
@@ -2511,6 +2644,7 @@ export class TaskStore {
     const expires = new Date(now.getTime() + leaseMs).toISOString();
     let result: ReviewQuotaResumeClaimRecord | undefined;
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,payload
         FROM tasks WHERE id=?`).get(taskId) as {
           status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null;
@@ -2707,6 +2841,7 @@ export class TaskStore {
     }
     const at = now.toISOString();
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,active_attempt_id,revision_count
         FROM tasks WHERE id=?`).get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null;
           claim_generation_id: string | null; active_attempt_id: string | null; revision_count: number } | undefined;
@@ -2831,6 +2966,7 @@ export class TaskStore {
     const expires = new Date(now.getTime() + leaseMs).toISOString();
     let result: ReviewReworkQuotaResumeClaimRecord | undefined;
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,revision_count
         FROM tasks WHERE id=?`).get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null;
           claim_generation_id: string | null; revision_count: number } | undefined;
@@ -3033,6 +3169,7 @@ export class TaskStore {
     if (!this.get(taskId)) throw new Error(`Unknown task ${taskId}`);
     let stage!: StageRecord;
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       if (input.predecessorStageId) {
         const predecessor = this.getStage(input.predecessorStageId);
         if (!predecessor || predecessor.taskId !== taskId) throw new Error("Predecessor stage must belong to the same task");
@@ -3073,6 +3210,7 @@ export class TaskStore {
     return this.#transaction(() => {
       const stage = this.getStage(stageId);
       if (!stage) throw new Error(`Unknown stage ${stageId}`);
+      this.#assertTaskAcceptsWork(stage.taskId);
       const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(stage.taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
       if (!task || !this.#hasLiveStageLease(task, owner, stage.role)) throw new Error(`Task ${stage.taskId} is not leased by ${owner} for ${stage.role} (wrong state or expired lease)`);
       if (stage.processStartId !== processStartId) throw new Error(`Stage ${stageId} process generation does not match`);
@@ -3184,6 +3322,7 @@ export class TaskStore {
     }
     let attempt!: Attempt;
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       if (options.stageId) {
         const currentTask = this.#db.prepare("SELECT status,lease_owner,lease_expires_at FROM tasks WHERE id=?").get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null } | undefined;
         const currentStage = this.#db.prepare("SELECT role,status,harness,harness_version,model,reasoning_effort,binding_version,config_hash FROM stages WHERE id=? AND task_id=?")
@@ -3406,6 +3545,7 @@ export class TaskStore {
     const at = now.toISOString();
     let result!: BeginReviewReworkResult;
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const existing = this.#db.prepare(`SELECT * FROM rework_continuations WHERE task_id=? AND package_id=? AND verdict_id=?`)
         .get(taskId, input.packageId, input.verdictId) as Record<string, unknown> | undefined;
       const task = this.#db.prepare(`SELECT status,revision_count,lease_owner,lease_expires_at,claim_generation_id,payload
@@ -3586,6 +3726,7 @@ export class TaskStore {
     const at = now.toISOString();
     let result!: BeginReviewReworkCheckRetryResult;
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const continuation = this.getReviewReworkContinuation(taskId, continuationId);
       const task = this.#db.prepare(`SELECT status,revision_count,lease_owner,lease_expires_at,claim_generation_id,active_attempt_id,payload
         FROM tasks WHERE id=?`).get(taskId) as { status: TaskStatus; revision_count: number; lease_owner: string | null;
@@ -3762,6 +3903,7 @@ export class TaskStore {
     const expires = new Date(now.getTime() + leaseMs).toISOString();
     let claimed: ReviewReworkClaimRecord | undefined;
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare(`SELECT status,lease_owner,lease_expires_at,claim_generation_id,recovery_evidence,payload,revision_count
         FROM tasks WHERE id=?`).get(taskId) as {
           status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null;
@@ -3970,6 +4112,7 @@ export class TaskStore {
         .get(input.packageId) as Record<string, unknown> | undefined;
       if (!pkg || pkg.check_status !== "completed") throw new Error("Commit intent requires a completed package check run");
       const taskId = String(pkg.task_id);
+      this.#assertTaskAcceptsWork(taskId);
       if (input.branchRef !== `refs/heads/zero/${taskId}` || pkg.branch_ref !== input.branchRef) {
         throw new Error("Commit intent must target the package's exact task branch ref");
       }
@@ -4065,6 +4208,7 @@ export class TaskStore {
         .get(input.packageId) as Record<string, unknown> | undefined;
       if (!pkg || pkg.check_status !== "completed") throw new Error("Recovered commit requires a completed package check run");
       const taskId = String(pkg.task_id);
+      this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id,payload FROM tasks WHERE id=?")
         .get(taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null; payload: string } | undefined;
       this.#assertCommitOperationLease(task, input.owner, input.generationId);
@@ -4228,6 +4372,7 @@ export class TaskStore {
         throw new Error("Report operation requires an applied commit operation with verified candidate evidence");
       }
       const taskId = String(commit.task_id);
+      this.#assertTaskAcceptsWork(taskId);
       const artifactDirectory = path.resolve(input.artifactDirectory ?? "");
       if (!path.isAbsolute(input.artifactDirectory ?? "") || input.artifactDirectory !== artifactDirectory || path.basename(artifactDirectory) !== taskId) {
         throw new Error("Report artifact directory must be the fixed task directory ending in the exact task ID");
@@ -4355,6 +4500,7 @@ export class TaskStore {
     }
     const at = new Date().toISOString();
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(input.taskId);
       const taskRow = this.#db.prepare("SELECT * FROM tasks WHERE id=?").get(input.taskId) as TaskRow | undefined;
       this.#assertCommitOperationLease(taskRow ? {
         status: taskRow.status, lease_owner: taskRow.lease_owner, lease_expires_at: taskRow.lease_expires_at,
@@ -4508,6 +4654,7 @@ export class TaskStore {
     const id = randomUUID();
     const createdAt = new Date().toISOString();
     this.#transaction(() => {
+      this.#assertTaskAcceptsWork(input.taskId);
       const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id,payload FROM tasks WHERE id=?")
         .get(input.taskId) as { status: TaskStatus; lease_owner: string | null; lease_expires_at: string | null; claim_generation_id: string | null; payload: string } | undefined;
       this.#assertReviewLease(task, input.owner, input.generationId);

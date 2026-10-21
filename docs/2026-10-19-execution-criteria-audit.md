@@ -22,4 +22,8 @@ Final independent Astra high review approved the frozen files, checked their exa
 
 The actual checkout's canonical `npm test` passed 589/589 with zero failures or skips (863007 ms). Both reviewed source hashes still matched the saved full-run receipt afterward. The public-tree check passed for all 166 tracked files, and both working/staged diff checks passed. Web code is unchanged in this round; final exact-source Linux/Windows CI remains required before integration.
 
-All fixtures use local deterministic adapters and real SQLite, Git worktrees and configured checks. No external provider was invoked. Exact-source CI and main integration remain pending and must be recorded in the resulting PR.
+All fixtures use local deterministic adapters and real SQLite, Git worktrees and configured checks. No external provider was invoked.
+
+## Integration receipt
+
+Source `391e65ecfe195b63064dcddb3a23acd690f50538`, tree `f442531be78c4a383e686e5a69be0b31a89a4e2d`, passed both [push CI](https://github.com/Jonty-Zhang/Zero/actions/runs/39225002234) and [PR CI](https://github.com/Jonty-Zhang/Zero/actions/runs/39249417254). Windows passed 589/589 core tests; Linux passed 585 with four platform skips. Both passed web 58/58 and request lifecycle 11/11. Windows native guardian, release staging, installer, manual launch, uninstall and data-retention checks passed. [PR #10](https://github.com/Jonty-Zhang/Zero/pull/10) merged normally as `e9dd7812e9c4cd030cac29bcb184dce92fd53bdf`. Its signed object, parents and identical tested tree were verified, then local and GitHub main were confirmed equal.

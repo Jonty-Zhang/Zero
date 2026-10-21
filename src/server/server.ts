@@ -544,18 +544,9 @@ async function cancelTask(res: ServerResponse, id: string, options: ZeroServerOp
     return json(res, 200, { ok: true });
   }
   if (!['running', 'reviewing', 'revision'].includes(task.status)) throw new HttpError(409, '任务已结束，无法取消');
-  const stopped = options.cancel ? await options.cancel(id) : await cancelThroughAdapter(id, task, options);
+  const stopped = options.cancel ? await options.cancel(id) : false;
   if (!stopped) throw new HttpError(503, 'Worker 未确认取消请求；任务状态保持不变');
   json(res, 202, { ok: true, status: task.status });
-}
-
-async function cancelThroughAdapter(id: string, task: TaskRecord, options: ZeroServerOptions): Promise<boolean> {
-  const attempt = options.store.attempts(id).find(item => item.status === 'running');
-  if (!attempt || typeof attempt.id !== 'string' || typeof attempt.harness !== 'string') return false;
-  const adapter = options.adapters?.[attempt.harness as HarnessName];
-  if (!adapter?.cancel) return false;
-  await adapter.cancel(id, attempt.id);
-  return true;
 }
 
 async function taskDetail(res: ServerResponse, id: string, options: ZeroServerOptions): Promise<void> {
@@ -689,8 +680,9 @@ async function taskReport(res: ServerResponse, id: string, options: ZeroServerOp
   if (!canonicalReport || !canonicalReport.startsWith(directory + sep)) throw new HttpError(404, '执行报告不存在');
   const report = JSON.parse(await readFile(canonicalReport, 'utf8')) as Record<string, unknown>;
   // SQLite is authoritative if a process crashed between report rename and the final DB transition.
-  if (report.task && typeof report.task === 'object') report.task = { ...(report.task as Record<string, unknown>), status: task.status };
+  report.task = task;
   report.finalStatus = task.status;
+  if (task.status === 'failed') report.error = task.failureReason;
   const bytes = Buffer.from(JSON.stringify(report, null, 2));
   res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="zero-${id}.json"`, 'Content-Length': bytes.length, 'Cache-Control': 'no-store' });
   res.end(bytes);
