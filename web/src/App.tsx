@@ -427,6 +427,15 @@ function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabi
   const [config, setConfig] = useState<Config | null>(null); const [loading, setLoading] = useState(true); const [error, setError] = useState(''); const [busy, setBusy] = useState(false); const [saved, setSaved] = useState(false);
   const [projectPath, setProjectPath] = useState('');
   useEffect(() => { let live = true; api.config().then(c => { if (live) { setConfig(normalizeConfig(c)); setError(''); } }).catch(e => { if (live) setError(e instanceof Error ? e.message : '配置读取失败'); }).finally(() => { if (live) setLoading(false); }); return () => { live = false; }; }, []);
+  useEffect(() => {
+    if (!saved) return;
+    const timer = window.setTimeout(() => setSaved(false), 2200);
+    return () => window.clearTimeout(timer);
+  }, [saved]);
+  const editConfig = (change: (current: Config) => Config) => {
+    setSaved(false);
+    setConfig(current => current ? change(normalizeConfig(current)) : current);
+  };
   const save = async () => {
     if (!config) return;
     const emptyProject = config.executionDefaults?.projects.find(project => !normalizeSelection(project.execution));
@@ -443,21 +452,21 @@ function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabi
         return;
       }
     }
-    setBusy(true); setError(''); try { const updated = normalizeConfig(await api.saveConfig(normalizeConfig(config))); setConfig(updated); setSaved(true); onSaved('路由设置已保存', updated.allocator.kind); window.setTimeout(() => setSaved(false), 2200); } catch (e) { setError(e instanceof Error ? e.message : '保存失败'); } finally { setBusy(false); }
+    setBusy(true); setError(''); try { const updated = normalizeConfig(await api.saveConfig(normalizeConfig(config))); setConfig(updated); setSaved(true); onSaved('路由设置已保存', updated.allocator.kind); } catch (e) { setError(e instanceof Error ? e.message : '保存失败'); } finally { setBusy(false); }
   };
-  const update = (role: 'allocator' | 'reviewer', key: 'modelId' | 'reasoningEffort', value: string) => setConfig(prev => prev ? { ...normalizeConfig(prev), [role]: { ...prev[role], [key]: value || null, ...(key === 'modelId' ? { reasoningEffort: null } : {}) } } : prev);
-  const updateApi = (key: keyof ApiAllocatorConfig, value: string) => setConfig(prev => prev ? { ...normalizeConfig(prev), allocator: { ...prev.allocator, api: { ...(prev.allocator.api ?? emptyApiAllocatorConfig), [key]: value || null } } } : prev);
-  const updateGlobalDefault = (execution: ExecutionSelection | null) => setConfig(prev => { if (!prev) return prev; const normalized = normalizeConfig(prev); return { ...normalized, executionDefaults: { ...normalized.executionDefaults!, global: normalizeSelection(execution) } }; });
-  const updateProjectDefault = (index: number, execution: ExecutionSelection) => setConfig(prev => { if (!prev) return prev; const normalized = normalizeConfig(prev); return { ...normalized, executionDefaults: { ...normalized.executionDefaults!, projects: normalized.executionDefaults!.projects.map((project, i) => i === index ? { ...project, execution } : project) } }; });
+  const update = (role: 'allocator' | 'reviewer', key: 'modelId' | 'reasoningEffort', value: string) => editConfig(prev => ({ ...prev, [role]: { ...prev[role], [key]: value || null, ...(key === 'modelId' ? { reasoningEffort: null } : {}) } }));
+  const updateApi = (key: keyof ApiAllocatorConfig, value: string) => editConfig(prev => ({ ...prev, allocator: { ...prev.allocator, api: { ...(prev.allocator.api ?? emptyApiAllocatorConfig), [key]: value || null } } }));
+  const updateGlobalDefault = (execution: ExecutionSelection | null) => editConfig(prev => ({ ...prev, executionDefaults: { ...prev.executionDefaults!, global: normalizeSelection(execution) } }));
+  const updateProjectDefault = (index: number, execution: ExecutionSelection) => editConfig(prev => ({ ...prev, executionDefaults: { ...prev.executionDefaults!, projects: prev.executionDefaults!.projects.map((project, i) => i === index ? { ...project, execution } : project) } }));
   const addProjectDefault = () => {
     const path = projectPath.trim();
     if (!path || !/^([a-zA-Z]:[\\/]|\\\\|\/)/.test(path)) { setError('请输入仓库的绝对路径。'); return; }
     const projects = config?.executionDefaults?.projects ?? [];
     if (projects.some(project => project.repoPath.trim().replaceAll('\\', '/').toLowerCase() === path.replaceAll('\\', '/').toLowerCase())) { setError('这个仓库路径已添加。'); return; }
-    setConfig(prev => { if (!prev) return prev; const normalized = normalizeConfig(prev); const defaults = normalized.executionDefaults!; return { ...normalized, executionDefaults: { ...defaults, projects: [...defaults.projects, { repoPath: path, execution: {} }] } }; });
+    editConfig(prev => ({ ...prev, executionDefaults: { ...prev.executionDefaults!, projects: [...prev.executionDefaults!.projects, { repoPath: path, execution: {} }] } }));
     setProjectPath(''); setError('');
   };
-  const removeProjectDefault = (index: number) => setConfig(prev => { if (!prev) return prev; const normalized = normalizeConfig(prev); return { ...normalized, executionDefaults: { ...normalized.executionDefaults!, projects: normalized.executionDefaults!.projects.filter((_, i) => i !== index) } }; });
+  const removeProjectDefault = (index: number) => editConfig(prev => ({ ...prev, executionDefaults: { ...prev.executionDefaults!, projects: prev.executionDefaults!.projects.filter((_, i) => i !== index) } }));
   const options = (role: 'allocator' | 'reviewer', key: 'models' | 'reasoningEfforts') => capabilities?.[role]?.[key] ?? [];
   const effortOptions = (role: 'allocator' | 'reviewer') => {
     const modelId = config?.[role].modelId;
@@ -471,7 +480,7 @@ function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabi
     <div className="settings-layout"><div className="settings-main">
       {loading ? <div className="settings-card loading-state"><LoaderCircle className="spin" size={21} />正在读取设置…</div> : error && !config ? <div className="alert error"><AlertCircle size={17} /><div><b>设置暂不可用</b><span>{error}</span></div><Button onClick={() => { setLoading(true); api.config().then(c => { setConfig(normalizeConfig(c)); setError(''); }).catch(e => setError(e instanceof Error ? e.message : '配置读取失败')).finally(() => setLoading(false)); }}>重试</Button></div> : config && <fieldset disabled={busy} className="settings-fields" aria-label="路由设置表单">
         <section className="settings-card"><div className="settings-card-head"><div className="role-icon codex"><Activity size={18} /></div><div><h2>{allocatorName}分配器</h2><p>{config.allocator.kind === 'api' ? '使用兼容 OpenAI API 的模型决定任务执行路线。' : '使用 Codex 订阅和 Codex CLI 配置决定任务执行路线。'}</p></div><span className="fixed-badge">可切换</span></div>
-          <Field label="分配器来源"><Select value={config.allocator.kind} onChange={kind => setConfig(prev => prev ? { ...normalizeConfig(prev), allocator: { ...prev.allocator, kind: kind as Config['allocator']['kind'] } } : prev)} choices={[{ id: 'codex', label: 'Codex 订阅' }, { id: 'api', label: 'API 模型' }]} placeholder="选择分配器" /></Field>
+          <Field label="分配器来源"><Select value={config.allocator.kind} onChange={kind => editConfig(prev => ({ ...prev, allocator: { ...prev.allocator, kind: kind as Config['allocator']['kind'] } }))} choices={[{ id: 'codex', label: 'Codex 订阅' }, { id: 'api', label: 'API 模型' }]} placeholder="选择分配器" /></Field>
           {config.allocator.kind === 'api' ? <>
             <div className="form-grid" style={{ marginTop: 14 }}><Field label="API HTTPS 地址" hint="必须使用 HTTPS。此处仅配置服务地址。"><input type="url" inputMode="url" pattern="https://.+" title="API 地址必须以 https:// 开头" value={apiAllocatorConfig.baseUrl ?? ''} onChange={e => updateApi('baseUrl', e.target.value)} placeholder="https://api.example.com/v1" /></Field><Field label="API 模型"><input value={apiAllocatorConfig.model ?? ''} onChange={e => updateApi('model', e.target.value)} placeholder="例如 gpt-4.1" /></Field></div>
             <div className="form-grid"><Field label="密钥环境变量名" hint="填写服务端环境变量的名称，例如 ZERO_ALLOCATOR_API_KEY；不要填写密钥值。"><input autoComplete="off" spellCheck={false} value={apiAllocatorConfig.keyEnv ?? ''} onChange={e => updateApi('keyEnv', e.target.value)} placeholder="ZERO_ALLOCATOR_API_KEY" /></Field></div>
