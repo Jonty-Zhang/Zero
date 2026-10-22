@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { access, readFile, realpath, stat } from 'node:fs/promises';
+import { access, open, readFile, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { extname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -708,9 +708,29 @@ async function readArtifactText(path: string | undefined, artifactRoot: string |
   const target = await realpath(path).catch(() => undefined);
   if (!target || !target.startsWith(root + sep)) return undefined;
   try {
-    const info = await stat(target);
-    if (!info.isFile() || info.size > 256 * 1024) return '[日志超过单次详情读取上限]';
-    return await readFile(target, 'utf8');
+    // Opening a FIFO can wait for a writer; preserve the non-file guard first.
+    if (!(await stat(target)).isFile()) return '[日志超过单次详情读取上限]';
+    const handle = await open(target, 'r');
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) return '[日志超过单次详情读取上限]';
+      const limit = 256 * 1024;
+      const start = Math.max(0, info.size - limit);
+      const length = Math.min(info.size, limit);
+      const bytes = Buffer.allocUnsafe(length);
+      let read = 0;
+      // Fix both ends to this snapshot, even if an active agent keeps appending.
+      while (read < length) {
+        const { bytesRead } = await handle.read(bytes, read, length - read, start + read);
+        if (!bytesRead) break;
+        read += bytesRead;
+      }
+      let offset = 0;
+      // The byte limit can cut through the first UTF-8 character of a tail.
+      if (start > 0) while (offset < read && (bytes[offset]! & 0xc0) === 0x80) offset++;
+      const text = bytes.toString('utf8', offset, read);
+      return start > 0 ? `[日志已截断，仅显示最后 256 KiB]\n${text}` : text;
+    } finally { await handle.close(); }
   } catch { return undefined; }
 }
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { HandoffRecord, HarnessAdapter, HarnessCapabilities, RunRequest, RunResult, TaskSubmission } from '../domain/types.js';
@@ -364,8 +364,91 @@ test('task detail includes bounded check stdout and stderr while excluding artif
       output: 'Check exited with code 1\n--- stdout ---\nParser regression: expected rejection\n--- stderr ---\nAssertionError: invalid bytes accepted',
     });
     assert.equal(Object.hasOwn(detail.tests[1]!, 'output'), false);
-    assert.equal(detail.tests[2]?.output, '--- stdout ---\n[日志超过单次详情读取上限]');
+    assert.ok(detail.tests[2]?.output === '--- stdout ---\n[日志已截断，仅显示最后 256 KiB]\n' + 'x'.repeat(256 * 1024), 'oversized check output must contain its bounded tail and truncation notice');
     assert.equal(JSON.stringify(detail.tests).includes('outside-root-private-content'), false);
+  } finally { await f.close(); }
+});
+
+test('task detail tails long attempt and check logs and refreshes appended archive output', async () => {
+  const f = await createFixture();
+  const limit = 256 * 1024;
+  const notice = '[日志已截断，仅显示最后 256 KiB]\n';
+  try {
+    const task = f.store.submit({ repoPath: f.repoPath, baseRef: 'main', prompt: 'Inspect the latest agent and validation failures in long archives.' });
+    await mkdir(f.artifactRoot, { recursive: true });
+    const logs = ['attempt.stdout', 'attempt.stderr', 'check.stdout', 'check.stderr'].map(name => ({
+      path: join(f.artifactRoot, `${name}.log`),
+      bytes: Buffer.from(`${name}: omitted beginning\n${'x'.repeat(limit)}\nLATEST ${name}: useful failure evidence`),
+    }));
+    for (const log of logs) await writeFile(log.path, log.bytes);
+    const attempt = f.store.createAttempt(task.id, 'route', { harness: 'codex', model: 'codex-main' });
+    f.store.finishAttempt(attempt.id, { status: 'failed', exitCode: 1, stdoutPath: logs[0]!.path, stderrPath: logs[1]!.path });
+    const outsidePath = join(f.root, 'outside-artifacts.log');
+    await writeFile(outsidePath, 'outside-artifact-root private content');
+    const outsideAttempt = f.store.createAttempt(task.id, 'route', { harness: 'codex', model: 'codex-main' });
+    f.store.finishAttempt(outsideAttempt.id, { status: 'failed', exitCode: 1, stdoutPath: outsidePath, stderrPath: join(f.artifactRoot, 'missing.log') });
+    f.store.saveCheck(task.id, { id: 'long-check', argv: ['node', '--test'], status: 'failed', exitCode: 1, durationMs: 2,
+      error: 'Check exited with code 1', stdoutPath: logs[2]!.path, stderrPath: logs[3]!.path });
+    const tail = (bytes: Buffer) => notice + bytes.subarray(bytes.length - limit).toString('utf8');
+    const response = await fetch(`${f.url}/api/tasks/${task.id}`);
+    assert.equal(response.status, 200);
+    const detail = await response.json() as { attempts: Array<{ logs?: string }>; logs?: string; tests: Array<{ output?: string }> };
+    const attemptLogs = `--- stdout ---\n${tail(logs[0]!.bytes)}\n--- stderr ---\n${tail(logs[1]!.bytes)}`;
+    assert.ok(detail.attempts[0]?.logs === attemptLogs, 'attempt stdout and stderr must contain their exact bounded tails');
+    assert.equal(Object.hasOwn(detail.attempts[1]!, 'logs'), false, 'outside and missing attempt artifacts must stay excluded');
+    assert.ok(detail.logs === `Attempt 1\n${attemptLogs}`, 'combined task logs must preserve the bounded attempt output');
+    assert.ok(detail.tests[0]?.output === `Check exited with code 1\n--- stdout ---\n${tail(logs[2]!.bytes)}\n--- stderr ---\n${tail(logs[3]!.bytes)}`, 'check stdout and stderr must contain their exact bounded tails');
+    for (const log of logs) assert.deepEqual(await readFile(log.path), log.bytes, 'detail reads must preserve every archived byte');
+
+    const appended = Buffer.from('\nNEWEST check.stderr: appended diagnostic');
+    await appendFile(logs[3]!.path, appended);
+    const refreshedResponse = await fetch(`${f.url}/api/tasks/${task.id}`);
+    assert.equal(refreshedResponse.status, 200);
+    const refreshed = await refreshedResponse.json() as typeof detail;
+    assert.ok(refreshed.tests[0]?.output === `Check exited with code 1\n--- stdout ---\n${tail(logs[2]!.bytes)}\n--- stderr ---\n${tail(Buffer.concat([logs[3]!.bytes, appended]))}`, 'a new detail request must read the newly appended tail');
+    assert.ok(refreshed.attempts[0]?.logs === attemptLogs, 'reading a changed check log must not change attempt output');
+    for (const [index, log] of logs.entries()) assert.deepEqual(await readFile(log.path), index === 3 ? Buffer.concat([log.bytes, appended]) : log.bytes);
+  } finally { await f.close(); }
+});
+
+test('task detail preserves log boundaries, UTF-8 and empty archives', async () => {
+  const f = await createFixture();
+  const limit = 256 * 1024;
+  const notice = '[日志已截断，仅显示最后 256 KiB]\n';
+  try {
+    const task = f.store.submit({ repoPath: f.repoPath, baseRef: 'main', prompt: 'Preserve bounded and Unicode log output without changing archived bytes.' });
+    await mkdir(f.artifactRoot, { recursive: true });
+    const exactSuffix = Buffer.from('恰好边界');
+    const exact = Buffer.concat([Buffer.alloc(limit - exactSuffix.length, 'x'), exactSuffix]);
+    const unicode = Buffer.from('汉'.repeat(Math.ceil(limit / 3) + 2));
+    const emoji = Buffer.from('🙂'.repeat(limit / 4 + 1) + '!');
+    assert.notEqual((unicode.length - limit) % 3, 0, 'the tail must start inside a UTF-8 sequence');
+    const cases = [
+      { name: 'small', bytes: Buffer.from('small 日志\n'), output: '--- stdout ---\nsmall 日志\n' },
+      { name: 'empty', bytes: Buffer.alloc(0), output: undefined },
+      { name: 'exact', bytes: exact, output: `--- stdout ---\n${exact.toString('utf8')}` },
+      { name: 'unicode', bytes: unicode, output: `--- stdout ---\n${notice}${'汉'.repeat(Math.floor(limit / 3))}` },
+      { name: 'emoji', bytes: emoji, output: `--- stdout ---\n${notice}${'🙂'.repeat(limit / 4 - 1)}!` },
+    ];
+    for (const item of cases) {
+      const path = join(f.artifactRoot, `${item.name}.log`);
+      await writeFile(path, item.bytes);
+      f.store.saveCheck(task.id, { id: item.name, argv: ['node'], status: 'failed', exitCode: 1, durationMs: 1, stdoutPath: path });
+    }
+    const directory = join(f.artifactRoot, 'not-a-file'); await mkdir(directory);
+    f.store.saveCheck(task.id, { id: 'directory', argv: ['node'], status: 'failed', exitCode: 1, durationMs: 1, stdoutPath: directory });
+    const response = await fetch(`${f.url}/api/tasks/${task.id}`);
+    assert.equal(response.status, 200);
+    const detail = await response.json() as { tests: Array<{ name: string; output?: string }> };
+    for (const item of cases) {
+      const check = detail.tests.find(check => check.name === item.name)!;
+      assert.ok(check.output === item.output, `${item.name} output must preserve the expected bounded text`);
+      if (item.output === undefined) assert.equal(Object.hasOwn(check, 'output'), false);
+      assert.deepEqual(await readFile(join(f.artifactRoot, `${item.name}.log`)), item.bytes);
+    }
+    assert.equal(detail.tests.find(check => check.name === 'unicode')?.output?.includes('\uFFFD'), false);
+    assert.equal(detail.tests.find(check => check.name === 'emoji')?.output?.includes('\uFFFD'), false);
+    assert.equal(detail.tests.find(check => check.name === 'directory')?.output, '--- stdout ---\n[日志超过单次详情读取上限]');
   } finally { await f.close(); }
 });
 
