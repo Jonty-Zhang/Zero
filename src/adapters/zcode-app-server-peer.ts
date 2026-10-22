@@ -151,6 +151,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
   private closing = false;
   private childClosed = false;
   private closePromise?: Promise<void>;
+  private terminationPromise?: Promise<void>;
   private readonly requestTimeoutMs: number;
   private readonly initialFrameTimeoutMs: number;
   private readonly connectionId = randomUUID();
@@ -864,7 +865,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
       this.pending.delete(id);
     }
     for (const state of this.subscriptions.values()) this.setSubscriptionError(state, error);
-    void terminateChildTree(this.child).catch(() => undefined);
+    void this.terminateProcessTree().catch(() => undefined);
   }
 
   private emitDiagnostic(
@@ -893,16 +894,30 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     });
   }
 
+  private terminateProcessTree(): Promise<void> {
+    return this.terminationPromise ??= terminateChildTree(this.child);
+  }
+
   private async closeProcess(): Promise<void> {
-    if (this.childClosed) return;
+    if (this.childClosed) {
+      await this.terminationPromise;
+      return;
+    }
     if (!this.child.pid) {
       if (await this.waitForChildClose(5_000)) return;
       throw new Error('ZCode app-server close was not observed after launch failure');
     }
-    this.child.stdin.end();
-    if (await this.waitForChildClose(750)) return;
+    // An in-flight failure teardown owns the still-live process tree. Ending
+    // stdin here could make its root exit before the tree tool can find it.
+    if (!this.terminationPromise) {
+      this.child.stdin.end();
+      if (await this.waitForChildClose(750)) {
+        await this.terminationPromise;
+        return;
+      }
+    }
     let terminationError: Error | undefined;
-    try { await terminateChildTree(this.child); } catch {
+    try { await this.terminateProcessTree(); } catch {
       terminationError = new Error('ZCode app-server process tree termination failed');
     }
     if (!await this.waitForChildClose(5_000)) {
@@ -1363,6 +1378,9 @@ async function terminateChildTree(child: ChildProcessWithoutNullStreams): Promis
         else resolveKill();
       });
     }).catch(() => { treeKillFailed = true; });
+    // Successful /T /F already confirms the tree operation. A second root kill
+    // can report false while Node has not yet observed the OS process exit.
+    if (!treeKillFailed) return;
   } else {
     try { process.kill(-child.pid, 'SIGKILL'); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
