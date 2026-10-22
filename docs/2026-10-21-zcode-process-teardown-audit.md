@@ -27,3 +27,7 @@ On October 22, the restricted sandbox denied Windows taskkill with Access denied
 The preceding complete cancellation/report run ended with 617/620 passing. Its other two failures involved an incomplete handoff snapshot and a worktree-creation recovery result. Instrumented isolated reruns passed, but the original tests removed their fixture details; their exact historical Git errors remain unproven. The next complete run must retain enough diagnostic information to investigate any recurrence.
 
 All verification after the user's boundary instruction uses files, fixtures, caches and configuration inside this repository. Failed and superseded reproductions remain retained there and are not represented as passing results.
+
+## Complete-run follow-up, October 22
+
+The subsequent complete core suite finished with **639/639 passing and exit 0**, including all 36 ZCode peer/teardown cases and the previously failing quota and aggregate-evidence cases. The diagnostic observer was enabled and concurrency remained at its default. All 178 source/build hashes matched the run-start receipt and current applied source. This supersedes the pending verification status above; it does not establish the historical underlying Git errors of the two earlier failures. The earlier failed logs remain retained. Exact command, counts and hashes are documented in [the full regression audit](2026-10-22-full-regression-audit.md). GitHub publication remains unfulfilled.
