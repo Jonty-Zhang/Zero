@@ -96,19 +96,32 @@ export function createCodexAdapter(bindings: ModelBinding[], config: Omit<Adapte
 }
 
 export function createZeroServer(options: ZeroServerOptions): Server {
-  const server = createServer((req, res) => { void handleRequest(req, res, options); });
+  // UI refreshes may overlap across windows or after a client disconnects. Share
+  // only active probes of this exact config; mutations still validate afresh.
+  const pendingCapabilities = new Map<string, ReturnType<typeof capabilities>>();
+  const readCapabilities = async () => {
+    const config = await options.config.read();
+    const key = JSON.stringify(config);
+    const pending = pendingCapabilities.get(key);
+    if (pending) return pending;
+    const probe = capabilities(options, config);
+    pendingCapabilities.set(key, probe);
+    try { return await probe; }
+    finally { if (pendingCapabilities.get(key) === probe) pendingCapabilities.delete(key); }
+  };
+  const server = createServer((req, res) => { void handleRequest(req, res, options, readCapabilities); });
   server.on('clientError', (_error, socket) => socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'));
   return server;
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, options: ZeroServerOptions): Promise<void> {
+async function handleRequest(req: IncomingMessage, res: ServerResponse, options: ZeroServerOptions, readCapabilities: () => ReturnType<typeof capabilities>): Promise<void> {
   try {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     validateLocalHost(req, options.trustedProxyHosts ?? []);
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method ?? '') && url.pathname.startsWith('/api/')) validateMutationOrigin(req);
     if (req.method === 'GET' && url.pathname === '/api/health') return json(res, 200, { status: 'ok' });
     if (url.pathname.startsWith('/api/')) {
-      if (req.method === 'GET' && url.pathname === '/api/capabilities') return json(res, 200, await capabilities(options));
+      if (req.method === 'GET' && url.pathname === '/api/capabilities') return json(res, 200, await readCapabilities());
       if (url.pathname === '/api/config' && req.method === 'GET') return json(res, 200, await readPublicConfig(options));
       if (url.pathname === '/api/config' && req.method === 'PUT') return json(res, 200, await updatePublicConfig(options, await bodyJson(req, options.maxBodyBytes)));
       if (url.pathname === '/api/sequences' && req.method === 'GET') return json(res, 200, options.store.listSequences().map(mapSequence));
@@ -239,8 +252,8 @@ async function parseSequence(raw: unknown, options: ZeroServerOptions): Promise<
   return { submissions, metadata };
 }
 
-async function capabilities(options: ZeroServerOptions) {
-  const config = await options.config.read();
+async function capabilities(options: ZeroServerOptions, snapshot?: LocalZeroConfig) {
+  const config = snapshot ?? await options.config.read();
   const adapters = options.adapters ?? createDefaultAdapters(config.bindings);
   const reports = new Map<HarnessName, Awaited<ReturnType<HarnessAdapter['probe']>>>();
   await Promise.all(KNOWN_HARNESSES.map(async id => {
