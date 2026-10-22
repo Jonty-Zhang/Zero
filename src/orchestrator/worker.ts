@@ -67,6 +67,8 @@ interface WorkerCheckpoint {
 }
 
 export interface RouteContext {
+  signal?: AbortSignal;
+  onCoordinator?: (adapter: HarnessAdapter, model: string, reasoningEffort?: string) => void;
   attemptId: string;
   cwd: string;
   baseCommit: string;
@@ -702,7 +704,8 @@ export class TaskWorker {
         this.#assertLease(taskId, owner, () => leaseLost);
         if (stage === "route") {
           const routeTask = this.#taskForExecutionStage(task, executionStageIndex);
-          const routeAttempt = this.#options.store.createAttempt(taskId, "route", { owner, harness: "codex" });
+          const routeAttempt = this.#options.store.createAttempt(taskId, "route", { owner });
+          let coordinator: { harness: string; model?: string; reasoningEffort?: string } = { harness: "codex" };
           if (reviewReworkContinuationId) {
             this.#options.store.checkpointReviewRework(taskId, reviewReworkContinuationId, { owner, generationId: task.claimGenerationId! }, {
               phase: "route_started", checkpoint: { attemptId: routeAttempt.id, revision, executionStageIndex, continuingExecution },
@@ -714,6 +717,11 @@ export class TaskWorker {
           this.#assertNotCancelled(active);
           try {
             const route = await this.#options.router.route(routeTask, {
+              signal: active.controller.signal,
+              onCoordinator: (adapter, model, reasoningEffort) => {
+                active.adapter = adapter;
+                coordinator = { harness: adapter.id, model, ...(reasoningEffort ? { reasoningEffort } : {}) };
+              },
               attemptId: routeAttempt.id,
               cwd: worktree.path,
               baseCommit,
@@ -724,6 +732,7 @@ export class TaskWorker {
             this.#validateRoute(routeTask, route);
             this.#options.store.saveRoute(route);
             this.#options.store.finishAttempt(routeAttempt.id, {
+              ...coordinator,
               status: "succeeded",
               stdoutPath: route.artifacts?.stdoutPath,
               stderrPath: route.artifacts?.stderrPath,
@@ -733,7 +742,8 @@ export class TaskWorker {
             finalRoute = route;
             stage = "execute";
           } catch (error) {
-            this.#options.store.finishAttempt(routeAttempt.id, { status: "failed", error: errorText(error) });
+            this.#options.store.finishAttempt(routeAttempt.id, { ...coordinator,
+              status: active.cancelRequested || leaseLost ? "interrupted" : "failed", error: errorText(error) });
             activeAttempt = undefined;
             active.adapter = undefined;
             active.attempt = undefined;

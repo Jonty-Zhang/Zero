@@ -38,6 +38,8 @@ export interface RouterConfig {
 }
 
 export interface RouterContext {
+  signal?: AbortSignal;
+  onCoordinator?: (adapter: HarnessAdapter, model: string, reasoningEffort?: string) => void;
   attemptId?: string;
   cwd: string;
   baseCommit: string;
@@ -47,6 +49,8 @@ export interface RouterContext {
 }
 
 export interface RouteInput {
+  signal?: AbortSignal;
+  onCoordinator?: (adapter: HarnessAdapter, model: string, reasoningEffort?: string) => void;
   taskId: string;
   submission: TaskSubmission;
   candidates: RouteCandidate[];
@@ -99,6 +103,8 @@ export class TaskRouter {
       ? await this.config.summarizeRepository(context.cwd, context.baseCommit)
       : `Base commit: ${context.baseCommit}\nConfigured checks: ${context.checks.map((check) => `${check.id}: ${check.argv.join(' ')}`).join('\n') || '(none)'}`;
     const analysis = await this.decide({
+      signal: context.signal,
+      onCoordinator: context.onCoordinator,
       taskId: task.id,
       submission: task,
       candidates,
@@ -113,6 +119,8 @@ export class TaskRouter {
   }
 
   async decide(input: RouteInput): Promise<RouteAnalysis> {
+    input.signal?.throwIfAborted();
+    input.onCoordinator?.(this.coordinator, this.config.coordinatorModel, this.config.coordinatorReasoningEffort);
     const caps = await this.coordinator.probe();
     this.validateCoordinator(caps);
     const candidates = this.filterCandidates(input.candidates);
@@ -129,7 +137,12 @@ export class TaskRouter {
       ? await createTrustedCodexCwd({ artifactRoot: this.config.artifactDir, purpose: 'route', taskWorkspace: this.config.cwd })
       : undefined;
     let run: RunResult;
+    const cancelCoordinator = () => {
+      void this.coordinator.cancel?.(input.taskId, attemptId).catch(() => undefined);
+    };
+    input.signal?.addEventListener('abort', cancelCoordinator, { once: true });
     try {
+      input.signal?.throwIfAborted();
       run = await this.coordinator.run({
         taskId: input.taskId,
         attemptId,
@@ -144,7 +157,11 @@ export class TaskRouter {
         readOnly: true,
         ...(this.config.timeoutMs ? { deadline: new Date(Date.now() + this.config.timeoutMs).toISOString() } : {}),
       });
-    } finally { await trustedCwd?.dispose(); }
+    } finally {
+      input.signal?.removeEventListener('abort', cancelCoordinator);
+      await trustedCwd?.dispose();
+    }
+    input.signal?.throwIfAborted();
     if (run.status !== 'completed' || run.exitCode !== 0) {
       if (run.quota) throw new QuotaLimitError(`${this.coordinatorLabel()} route paused because the model usage limit was reached`, run.quota.retryAt);
       throw new RouteError(`${this.coordinatorLabel()} route call did not complete successfully (${run.status}, exit=${String(run.exitCode)}): ${run.error ?? 'no error detail'}`);

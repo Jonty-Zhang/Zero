@@ -2873,7 +2873,7 @@ export class TaskStore {
         .get(attempt.stage_id, taskId) as Record<string, unknown> | undefined : undefined;
       const runningWriter = this.#db.prepare("SELECT 1 FROM stages WHERE task_id=? AND generation_id=? AND role IN ('implement','revise') AND status='running' LIMIT 1")
         .get(taskId, this.#startupGeneration.id);
-      const routeQuota = attempt?.role === "route" && attempt.harness === "codex" &&
+      const routeQuota = attempt?.role === "route" && ["codex", "api-coordinator"].includes(attempt.harness ?? "") &&
         (!stage || stage.role === "route" && stage.generation_id === this.#startupGeneration.id &&
           ["succeeded", "failed", "interrupted"].includes(String(stage.status)) && stage.finished_at != null);
       const executionQuota = attempt && ["implement", "revise"].includes(attempt.role) && stage &&
@@ -3010,7 +3010,7 @@ export class TaskStore {
         .get(attempt.stage_id, taskId) as Record<string, unknown> | undefined : undefined;
       const runningWriter = this.#db.prepare("SELECT 1 FROM stages WHERE task_id=? AND generation_id=? AND role IN ('implement','revise') AND status='running' LIMIT 1")
         .get(taskId, priorGenerationId);
-      const routeQuota = attempt?.role === "route" && attempt.harness === "codex" &&
+      const routeQuota = attempt?.role === "route" && ["codex", "api-coordinator"].includes(attempt.harness ?? "") &&
         (checkpoint.stageId === null ? !stage && Number((this.#db.prepare("SELECT COALESCE(MAX(sequence),0) AS n FROM stages WHERE task_id=?")
           .get(taskId) as { n: number }).n) === checkpoint.stageSequence :
           Boolean(stage && attempt.stage_id === checkpoint.stageId && stage.role === "route" &&

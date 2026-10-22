@@ -635,7 +635,7 @@ test("rework quota waits are excluded from generic claims and resume only once w
   }
 });
 
-test("rework route quota pauses a terminal Codex route attempt without requiring a route stage", () => {
+for (const harness of ["codex", "api-coordinator"]) test(`rework route quota pauses and resumes a terminal ${harness} route attempt without requiring a route stage`, () => {
   const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, ":memory:", undefined, 2);
   try {
     const { observed } = registerReviewRecoveryWorktree(f);
@@ -645,19 +645,93 @@ test("rework route quota pauses a terminal Codex route attempt without requiring
       owner: f.owner, generationId: f.generationId });
     assert.equal(begun.kind, "started");
     if (begun.kind !== "started") return;
-    const routeAttempt = f.store.createAttempt(f.task.id, "route", { owner: f.owner, harness: "codex" });
-    f.store.finishAttempt(routeAttempt.id, { status: "interrupted", error: "Codex usage limit reached" });
+    const routeAttempt = f.store.createAttempt(f.task.id, "route", { owner: f.owner, harness });
+    f.store.finishAttempt(routeAttempt.id, { status: "interrupted", error: "Coordinator usage limit reached" });
     const now = new Date();
     const inspection = reviewReworkRecoveryInput(f, observed, now);
+    const dueAt = new Date(now.getTime() + 60_000);
     const paused = f.store.pauseReviewReworkForQuota(f.task.id, f.owner, { continuationId: begun.continuation.id,
-      attemptId: routeAttempt.id, retryAt: new Date(now.getTime() + 60_000).toISOString(), reason: "Codex usage limit reached",
+      attemptId: routeAttempt.id, retryAt: dueAt.toISOString(), reason: "Coordinator usage limit reached",
       identity: inspection.identity, gitState: inspection.gitState, now });
     assert.equal(paused.status, "waiting");
     assert.equal(paused.resumeCheckpoint?.kind, "rework_quota");
     const checkpoint = f.store.quotaCheckpoint(f.task.id)!;
     assert.equal(checkpoint.stageId, null);
     assert.equal(checkpoint.attemptId, routeAttempt.id);
+    const resumed = f.store.claimReviewReworkQuotaResume(f.task.id, "route-quota-resumed", {
+      ...reviewReworkRecoveryInput(f, observed, dueAt), leaseMs: 60_000,
+    });
+    assert.ok(resumed);
+    assert.equal(resumed.continuationId, begun.continuation.id);
+    assert.equal(resumed.recoveredGeneration, false);
+    assert.equal(f.store.get(f.task.id)?.status, "running");
+    assert.equal(f.store.get(f.task.id)?.leaseOwner, "route-quota-resumed");
+    assert.equal(f.store.attempts(f.task.id).at(-1)?.harness, harness);
   } finally { f.store.close(); }
+});
+
+test("rework route quota rejects an unsupported coordinator harness at pause", () => {
+  const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, ":memory:", undefined, 2);
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const begun = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: f.owner, generationId: f.generationId });
+    assert.equal(begun.kind, "started");
+    if (begun.kind !== "started") throw new Error("Review rework fixture did not begin");
+    const routeAttempt = f.store.createAttempt(f.task.id, "route", { owner: f.owner, harness: "unknown-coordinator" });
+    f.store.finishAttempt(routeAttempt.id, { status: "interrupted", error: "Unverified coordinator usage limit" });
+    const now = new Date();
+    const inspection = reviewReworkRecoveryInput(f, observed, now);
+    assert.throws(() => f.store.pauseReviewReworkForQuota(f.task.id, f.owner, { continuationId: begun.continuation.id,
+      attemptId: routeAttempt.id, retryAt: new Date(now.getTime() + 60_000).toISOString(), reason: "Coordinator usage limit reached",
+      identity: inspection.identity, gitState: inspection.gitState, now }), /latest terminal quota attempt/);
+    assert.equal(f.store.get(f.task.id)?.status, "running");
+    assert.equal(f.store.quotaCheckpoint(f.task.id), undefined);
+  } finally { f.store.close(); }
+});
+
+for (const harness of ["api-coordinator", "unknown-coordinator"]) test(`rework route quota ${harness === "api-coordinator" ? "accepts API coordinator" : "rejects unsupported coordinator"} when claiming a saved pause`, async () => {
+  const root = await mkdtemp(join(process.cwd(), ".zero-rework-route-quota-harness-"));
+  const path = join(root, "tasks.sqlite");
+  const f = reviewFixture([{ id: "unit", argv: ["node", "test.js"] }], 60_000, path, undefined, 2);
+  try {
+    const { observed } = registerReviewRecoveryWorktree(f);
+    const pkg = completeReviewPackage(f);
+    const verdict = finishChangesRequested(f, pkg.id);
+    const begun = f.store.beginReviewRework(f.task.id, { packageId: pkg.id, verdictId: verdict.id,
+      owner: f.owner, generationId: f.generationId });
+    assert.equal(begun.kind, "started");
+    if (begun.kind !== "started") throw new Error("Review rework fixture did not begin");
+    const routeAttempt = f.store.createAttempt(f.task.id, "route", { owner: f.owner, harness: "codex" });
+    f.store.finishAttempt(routeAttempt.id, { status: "interrupted", error: "Coordinator usage limit reached" });
+    const now = new Date();
+    const dueAt = new Date(now.getTime() + 60_000);
+    const inspection = reviewReworkRecoveryInput(f, observed, now);
+    f.store.pauseReviewReworkForQuota(f.task.id, f.owner, { continuationId: begun.continuation.id,
+      attemptId: routeAttempt.id, retryAt: dueAt.toISOString(), reason: "Coordinator usage limit reached",
+      identity: inspection.identity, gitState: inspection.gitState, now });
+    const editor = new DatabaseSync(path);
+    try { editor.prepare("UPDATE attempts SET harness=? WHERE id=?").run(harness, routeAttempt.id); }
+    finally { editor.close(); }
+    const resumed = f.store.claimReviewReworkQuotaResume(f.task.id, "verified-route-resume", {
+      ...reviewReworkRecoveryInput(f, observed, dueAt), leaseMs: 60_000,
+    });
+    if (harness === "api-coordinator") {
+      assert.ok(resumed);
+      assert.equal(resumed.continuationId, begun.continuation.id);
+      assert.equal(f.store.get(f.task.id)?.status, "running");
+      assert.equal(f.store.get(f.task.id)?.leaseOwner, "verified-route-resume");
+    } else {
+      assert.equal(resumed, undefined);
+      assert.equal(f.store.get(f.task.id)?.status, "waiting");
+      assert.equal(f.store.get(f.task.id)?.leaseOwner, undefined);
+    }
+  } finally {
+    f.store.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("rework quota wait resumes after multiple idle guardian restarts and records verified lineage", async () => {
