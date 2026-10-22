@@ -3098,7 +3098,8 @@ export class TaskStore {
     const expires = new Date(now.getTime() + leaseMs).toISOString();
     return this.#transaction(() => {
       const changed = this.#db.prepare(`UPDATE tasks SET heartbeat_at=?, lease_expires_at=?, updated_at=?
-        WHERE id=? AND lease_owner=? AND status IN ('running','reviewing','revision')`).run(at, expires, at, id, owner);
+        WHERE id=? AND lease_owner=? AND status IN ('running','reviewing','revision')
+          AND lease_expires_at > ?`).run(at, expires, at, id, owner, at);
       if (Number(changed.changes)) this.#event(id, "task.heartbeat", { owner, leaseExpiresAt: expires }, at);
       return Number(changed.changes) === 1;
     });
