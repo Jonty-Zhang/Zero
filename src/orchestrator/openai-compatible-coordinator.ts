@@ -1,5 +1,6 @@
 import type { HarnessAdapter, HarnessCapabilities, RunRequest, RunResult } from '../domain/types.js';
 import { readFile } from 'node:fs/promises';
+import { requiresAccountAction } from '../core/quota.js';
 
 export interface OpenAICompatibleCoordinatorConfig {
   baseUrl: string;
@@ -97,10 +98,20 @@ export class OpenAICompatibleCoordinator implements HarnessAdapter {
 
     if (signal.aborted) { await response.body?.cancel().catch(() => undefined); return stopped(); }
     if (response.status === 429) {
-      await response.body?.cancel().catch(() => undefined);
+      let accountAction = false;
+      try {
+        const body: unknown = JSON.parse(await readBounded(response, this.maxResponseBytes));
+        if (isRecord(body) && isRecord(body.error)) {
+          accountAction = ['code', 'type', 'message'].some(field =>
+            typeof body.error[field] === 'string' && requiresAccountAction(body.error[field]));
+        }
+      } catch { /* Unreadable error details retain generic HTTP 429 recovery. */ }
+      if (signal.aborted) return stopped();
+      if (accountAction) return { status: 'failed', exitCode: 429, requestedModel: this.config.model,
+        durationMs: Date.now() - started, error: 'API coordinator account requires attention' };
       const retryAt = retryAtFromHeader(response.headers.get('retry-after'));
       return { status: 'failed', exitCode: 429, requestedModel: this.config.model, durationMs: Date.now() - started,
-        error: 'API coordinator was rate limited', quota: { source: response.headers.has('retry-after') ? 'retry_after' : 'fallback', ...(retryAt ? { retryAt } : {}) } };
+        error: 'API coordinator was rate limited', quota: { source: retryAt ? 'retry_after' : 'fallback', ...(retryAt ? { retryAt } : {}) } };
     }
     if (!response.ok) {
       await response.body?.cancel().catch(() => undefined);
@@ -149,7 +160,8 @@ function retryAtFromHeader(value: string | null): string | undefined {
   if (!value) return undefined;
   const seconds = Number(value);
   const timestamp = Number.isFinite(seconds) ? Date.now() + Math.max(0, seconds) * 1000 : Date.parse(value);
-  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : undefined;
+  const date = new Date(timestamp);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, any> { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }

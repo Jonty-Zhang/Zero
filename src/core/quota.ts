@@ -7,9 +7,13 @@ const QUOTA_PATTERNS = [
   /quota (?:has been )?(?:exceeded|reached)/i,
 ];
 
+/** Known account failures require intervention rather than an automatic quota retry. */
+export function requiresAccountAction(text: string): boolean {
+  return /insufficient_quota|credit_balance_exhausted|organization_spend_limit_exceeded|billing_hard_limit_reached|payment required/i.test(text);
+}
+
 export function classifyQuota(text: string, now = Date.now()): QuotaSignal | undefined {
-  // Billing and authorization failures require account action; sleeping cannot restore them.
-  if (/insufficient_quota|credit_balance_exhausted|organization_spend_limit_exceeded|billing_hard_limit_reached|payment required/i.test(text)) return undefined;
+  if (requiresAccountAction(text)) return undefined;
   if (!QUOTA_PATTERNS.some(pattern => pattern.test(text))) return undefined;
   const retryAfter = text.match(/retry-after\s*[:=]\s*(\d{1,9})/i);
   if (retryAfter) {
