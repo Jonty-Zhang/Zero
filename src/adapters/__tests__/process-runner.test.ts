@@ -4,6 +4,90 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildChildEnv, runProcess } from '../process-runner.js';
+import { CodexLifecycleTrace } from '../codex-lifecycle-trace.js';
+
+for (const duringTrace of [false, true]) {
+  test(`runner does not spawn when cancelled ${duringTrace ? 'while opening a lifecycle trace' : 'before entry'}`, async context => {
+    const directory = await mkdtemp(join(tmpdir(), 'zero-process-prelaunch-'));
+    const controller = new AbortController();
+    let spawned = 0;
+    let traceOpened!: () => void;
+    let releaseTrace!: () => void;
+    const entered = new Promise<void>(resolve => { traceOpened = resolve; });
+    const released = new Promise<void>(resolve => { releaseTrace = resolve; });
+    const originalOpen = CodexLifecycleTrace.open.bind(CodexLifecycleTrace);
+    let running: ReturnType<typeof runProcess> | undefined;
+    try {
+      if (duringTrace) context.mock.method(CodexLifecycleTrace, 'open', async (path: string) => {
+        traceOpened(); await released; return originalOpen(path);
+      });
+      else controller.abort();
+      running = runProcess({ executable: 'must-not-spawn', args: ['private-prompt'], cwd: directory, env: {},
+        signal: controller.signal, timeoutMs: 5_000, lifecycleTracePath: join(directory, 'trace.jsonl'),
+        spawnProcess: () => { spawned++; throw new Error('Unexpected process launch'); } });
+      if (duringTrace) { await entered; controller.abort(); releaseTrace(); }
+      const result = await running;
+      assert.equal(result.status, 'cancelled');
+      assert.equal(result.exitCode, null);
+      assert.equal(spawned, 0);
+      assert.ok(!JSON.stringify(result).includes('private-prompt'));
+    } finally {
+      releaseTrace();
+      if (running) await running;
+      context.mock.restoreAll();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const duringTrace of [false, true]) {
+  test(`runner refuses an elapsed deadline ${duringTrace ? 'after lifecycle preparation' : 'before entry'}`, async context => {
+    const directory = await mkdtemp(join(tmpdir(), 'zero-process-deadline-'));
+    let spawned = 0;
+    const originalOpen = CodexLifecycleTrace.open.bind(CodexLifecycleTrace);
+    try {
+      context.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+      const deadline = Date.now() + (duringTrace ? 10_000 : 0);
+      if (duringTrace) context.mock.method(CodexLifecycleTrace, 'open', async (path: string) => {
+        const trace = await originalOpen(path);
+        context.mock.timers.setTime(deadline);
+        return trace;
+      });
+      const result = await runProcess({ executable: 'must-not-spawn', args: [], cwd: directory, env: {},
+        timeoutMs: 10_000, deadlineMs: deadline, lifecycleTracePath: join(directory, 'trace.jsonl'),
+        spawnProcess: () => { spawned++; throw new Error('Unexpected process launch'); } });
+      assert.equal(result.status, 'timed_out');
+      assert.equal(result.exitCode, null);
+      assert.equal(spawned, 0);
+    } finally {
+      context.mock.restoreAll();
+      context.mock.timers.reset();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test('runner uses only the remaining absolute deadline after lifecycle preparation', async context => {
+  const directory = await mkdtemp(join(tmpdir(), 'zero-process-deadline-budget-'));
+  const originalOpen = CodexLifecycleTrace.open.bind(CodexLifecycleTrace);
+  try {
+    context.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const deadline = Date.now() + 10_000;
+    context.mock.method(CodexLifecycleTrace, 'open', async (path: string) => {
+      const trace = await originalOpen(path);
+      context.mock.timers.setTime(deadline - 500);
+      return trace;
+    });
+    const result = await runProcess({ executable: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'],
+      cwd: directory, env: {}, timeoutMs: 10_000, deadlineMs: deadline, lifecycleTracePath: join(directory, 'trace.jsonl') });
+    assert.equal(result.status, 'timed_out');
+    assert.match(result.error ?? '', /exceeded 500 ms timeout/);
+  } finally {
+    context.mock.restoreAll();
+    context.mock.timers.reset();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 async function waitForTrace(path: string, condition: (text: string) => boolean, timeoutMs = 3_000): Promise<string> {
   const deadline = Date.now() + timeoutMs;

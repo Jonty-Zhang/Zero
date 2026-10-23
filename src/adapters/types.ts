@@ -143,6 +143,8 @@ export interface ProcessOutcome {
 }
 
 export interface ProcessRunnerOptions {
+  /** Optional absolute deadline in epoch milliseconds, including asynchronous launch preparation. */
+  deadlineMs?: number;
   executable: string;
   args: string[];
   cwd: string;

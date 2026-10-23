@@ -40,11 +40,26 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
   protected abstract parseOutput(stdout: string, stderr: string): ParsedOutput;
 
   async run(request: RunRequest): Promise<RunResult> {
+    const activeKey = JSON.stringify([request.taskId, request.attemptId]);
+    if (this.active.has(activeKey)) return this.domainResult('failed', null, 0, { error: 'Harness attempt is already running' });
+    const controller = new AbortController();
+    this.active.set(activeKey, controller);
+    try { return await this.runRequest(request, controller.signal); }
+    catch (error) {
+      if (controller.signal.aborted) return this.cancelledResult(request);
+      throw error;
+    } finally {
+      if (this.active.get(activeKey) === controller) this.active.delete(activeKey);
+    }
+  }
+
+  private async runRequest(request: RunRequest, signal: AbortSignal): Promise<RunResult> {
     if (request.harness !== this.id) return this.domainResult('failed', null, 0, { error: `Request harness ${request.harness} does not match adapter ${this.id}` });
     const binding = this.findBinding(request.model);
     if (!binding) return this.domainResult('failed', null, 0, { requestedModel: request.model, error: `No verified ${this.id} binding is configured for model ${request.model}` });
     if (binding.harness !== this.id || !binding.verified) return this.domainResult('failed', null, 0, { requestedModel: request.model, error: 'Model binding is not verified for this harness' });
     const liveProbe = await this.probe();
+    if (signal.aborted) return this.cancelledResult(request);
     if (!liveProbe.available || !liveProbe.models.includes(binding.model.id)) {
       return this.domainResult('failed', null, 0, { requestedModel: binding.model.modelId, error: liveProbe.unavailableReason ?? `Model binding ${binding.model.id} is not verified for the installed ${this.id} CLI version` });
     }
@@ -72,33 +87,32 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
     };
     try {
       const invocation = await this.prepare(ctx, binding);
+      if (signal.aborted) return this.cancelledResult(request);
+      if (deadline !== undefined && deadline <= Date.now()) return this.domainResult('timed_out', null, 0, {
+        requestedModel: binding.model.modelId, error: 'Run deadline elapsed during preparation',
+      });
       const startedAt = new Date().toISOString();
       const started = Date.now();
       const child = buildChildEnv(ctx.envAllowlist, ctx.secretRefs, ctx.resolveSecret, invocation.env);
       const outputFormat = invocation.outputFormat ?? (this.id === 'dsh' ? 'text' : 'jsonl');
       const streamedOutput = outputFormat === 'jsonl' ? new StreamingOutputParser(invocation.parseOutput, child.secrets) : undefined;
-      const controller = new AbortController();
-      const activeKey = `${request.taskId}:${request.attemptId}`;
-      this.active.set(activeKey, controller);
       const lifecycleTracePath = this.id === 'codex' && request.artifactDir
         ? join(request.artifactDir, `${safeName(request.taskId)}-${safeName(request.attemptId)}.lifecycle.jsonl`)
         : undefined;
-      let outcome;
-      try {
-        outcome = await runProcess({
-          executable: invocation.executable,
-          args: invocation.args,
-          stdin: invocation.stdin,
-          cwd: invocation.cwd,
-          env: child.env,
-          timeoutMs,
-          maxLogBytes: this.config.maxLogBytes,
-          lifecycleTracePath,
-          secrets: child.secrets,
-          signal: controller.signal,
-          ...(streamedOutput ? { onStdoutChunk: (chunk: Buffer | string) => streamedOutput.consume(chunk) } : {}),
-        });
-      } finally { this.active.delete(activeKey); }
+      const outcome = await runProcess({
+        executable: invocation.executable,
+        args: invocation.args,
+        stdin: invocation.stdin,
+        cwd: invocation.cwd,
+        env: child.env,
+        timeoutMs,
+        ...(deadline !== undefined ? { deadlineMs: deadline } : {}),
+        maxLogBytes: this.config.maxLogBytes,
+        lifecycleTracePath,
+        secrets: child.secrets,
+        signal,
+        ...(streamedOutput ? { onStdoutChunk: (chunk: Buffer | string) => streamedOutput.consume(chunk) } : {}),
+      });
       const diagnostic = invocation.parseOutput(outcome.stdout, outcome.stderr);
       const streamed = streamedOutput?.finish({ failedProcess: outcome.status === 'failed' && outcome.exitCode !== 0 });
       // The stream owns the final message (the log may end before it), but a
@@ -162,6 +176,7 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
         ...(quota ? { quota } : {}),
       };
     } catch (error) {
+      if (signal.aborted) return this.cancelledResult(request);
       return this.domainResult('failed', null, 0, {
         requestedModel: binding.model.modelId,
         error: error instanceof Error ? error.message : String(error),
@@ -170,7 +185,14 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
   }
 
   async cancel(taskId: string, attemptId: string): Promise<void> {
-    this.active.get(`${taskId}:${attemptId}`)?.abort();
+    this.active.get(JSON.stringify([taskId, attemptId]))?.abort();
+  }
+
+  private cancelledResult(request: RunRequest): RunResult {
+    return this.domainResult('cancelled', null, 0, {
+      requestedModel: this.findBinding(request.model)?.model.modelId ?? request.model,
+      error: 'Harness run was cancelled',
+    });
   }
 
   private async persistArtifacts(artifactDir: string, taskId: string, attemptId: string, stdout: string, stderr: string, parsed: ParsedOutput): Promise<Pick<RunResult, 'stdoutPath' | 'stderrPath' | 'eventsPath'>> {

@@ -15,10 +15,19 @@ const TRUNCATION = '\n[Zero: output truncated at configured byte limit]\n';
  */
 export async function runProcess(options: ProcessRunnerOptions): Promise<ProcessOutcome> {
   const startedAt = Date.now();
+  const stopped = beforeProcessStart(options);
+  if (stopped) return stopped;
   const maxBytes = options.maxLogBytes ?? DEFAULT_LOG_LIMIT;
   const spawnProcess = options.spawnProcess ?? ((executable, args, spawnOptions) =>
     spawn(executable, args, { ...spawnOptions, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: 'pipe' }));
   const lifecycleTrace = options.lifecycleTracePath ? await CodexLifecycleTrace.open(options.lifecycleTracePath) : undefined;
+  const stoppedAfterTrace = beforeProcessStart(options);
+  if (stoppedAfterTrace) {
+    await lifecycleTrace?.close();
+    return stoppedAfterTrace;
+  }
+  const timeoutMs = options.deadlineMs === undefined ? options.timeoutMs
+    : Math.max(1, Math.min(options.timeoutMs, options.deadlineMs - Date.now()));
   let child: ChildProcess;
   try {
     child = spawnProcess(options.executable, options.args, {
@@ -58,11 +67,11 @@ export async function runProcess(options: ProcessRunnerOptions): Promise<Process
   const terminate = async (kind: 'timed_out' | 'cancelled'): Promise<void> => {
     if (settled || status !== 'completed') return;
     status = kind;
-    forcedError = kind === 'timed_out' ? `Process exceeded ${options.timeoutMs} ms timeout` : 'Process was cancelled';
+    forcedError = kind === 'timed_out' ? `Process exceeded ${timeoutMs} ms timeout` : 'Process was cancelled';
     await terminateTree(child);
   };
 
-  const timer = setTimeout(() => { void terminate('timed_out'); }, Math.max(1, options.timeoutMs));
+  const timer = setTimeout(() => { void terminate('timed_out'); }, Math.max(1, timeoutMs));
   const onAbort = (): void => { void terminate('cancelled'); };
   if (options.signal?.aborted) onAbort();
   else options.signal?.addEventListener('abort', onAbort, { once: true });
@@ -95,6 +104,15 @@ export async function runProcess(options: ProcessRunnerOptions): Promise<Process
     ...(stderrBytes > maxBytes ? { stderrTruncated: true } : {}),
     ...(forcedError ? { error: forcedError } : {}),
   };
+}
+
+function beforeProcessStart(options: ProcessRunnerOptions): ProcessOutcome | undefined {
+  if (options.signal?.aborted) return { status: 'cancelled', exitCode: null, stdout: '', stderr: '', error: 'Process was cancelled before start' };
+  if (options.deadlineMs !== undefined) {
+    if (!Number.isFinite(options.deadlineMs)) return { status: 'failed', exitCode: null, stdout: '', stderr: '', error: 'Process deadline is not a valid timestamp' };
+    if (options.deadlineMs <= Date.now()) return { status: 'timed_out', exitCode: null, stdout: '', stderr: '', error: 'Run deadline elapsed before process start' };
+  }
+  return undefined;
 }
 
 function failedSpawn(error: unknown): ProcessOutcome {
