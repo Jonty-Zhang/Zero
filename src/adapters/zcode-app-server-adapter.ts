@@ -245,6 +245,15 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
 
   async run(request: RunRequest): Promise<RunResult> {
     const started = Date.now();
+    const activeKey = JSON.stringify([request.taskId, request.attemptId]);
+    if (this.active.has(activeKey)) return result('failed', 'A ZCode app-server run is already active for this task attempt', started, { requestedModel: request.model });
+    const controller = new AbortController();
+    this.active.set(activeKey, controller);
+    try { return await this.runRequest(request, started, controller); }
+    finally { if (this.active.get(activeKey) === controller) this.active.delete(activeKey); }
+  }
+
+  private async runRequest(request: RunRequest, started: number, controller: AbortController): Promise<RunResult> {
     if (request.harness !== this.id) return result('failed', 'Request harness does not match ZCode', started);
     if (!SUPPORTED_ROLES.has(request.role)) return result('failed', 'ZCode app-server supports implementation and revision runs only', started);
     if (!this.entry || !isJavaScriptEntry(this.entry)) return result('failed', 'ZCode app-server requires an absolute JavaScript CLI entry', started);
@@ -259,6 +268,7 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
     }
 
     const probe = await this.probeCli();
+    if (controller.signal.aborted) return result('cancelled', 'ZCode app-server run was cancelled', started, { requestedModel: binding.model.modelId });
     if (!probe.available) return result('failed', probe.reason ?? 'ZCode version/help probe failed', started, { requestedModel: binding.model.modelId });
     if (probe.version !== binding.verifiedCliVersion || probe.version !== binding.verificationEvidence.cliVersion) {
       return result('failed', 'Installed ZCode CLI version does not match the verified binding version', started, { requestedModel: binding.model.modelId, harnessVersion: probe.version });
@@ -268,10 +278,6 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
     if (deadline !== undefined && !Number.isFinite(deadline)) return result('failed', 'Run deadline is not a valid timestamp', started, { requestedModel: binding.model.modelId });
     if (deadline !== undefined && deadline <= Date.now()) return result('timed_out', 'Run deadline has already elapsed', started, { requestedModel: binding.model.modelId, harnessVersion: probe.version });
     const timeoutMs = deadline === undefined ? this.timeoutMs : Math.min(this.timeoutMs, deadline - Date.now());
-    const controller = new AbortController();
-    const activeKey = `${request.taskId}:${request.attemptId}`;
-    if (this.active.has(activeKey)) return result('failed', 'A ZCode app-server run is already active for this task attempt', started, { requestedModel: binding.model.modelId });
-    this.active.set(activeKey, controller);
     const timer = setTimeout(() => controller.abort(new Error('ZCode app-server run timed out')), timeoutMs);
 
     try {
@@ -328,12 +334,11 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
         });
     } finally {
       clearTimeout(timer);
-      this.active.delete(activeKey);
     }
   }
 
   async cancel(taskId: string, attemptId: string): Promise<void> {
-    this.active.get(`${taskId}:${attemptId}`)?.abort(new Error('ZCode app-server run cancelled'));
+    this.active.get(JSON.stringify([taskId, attemptId]))?.abort(new Error('ZCode app-server run cancelled'));
   }
 
   private async probeCli(): Promise<{ available: boolean; version?: string; reason?: string }> {

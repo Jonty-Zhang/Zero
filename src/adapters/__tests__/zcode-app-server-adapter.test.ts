@@ -496,3 +496,77 @@ test('protocol timeout is reported as timed_out and closes the peer', async () =
   assert.equal(result.status, 'timed_out');
   assert.equal(peer.isClosed(), true);
 });
+
+for (const phase of ['--version', '--help']) {
+  test(`cancellation during desktop ${phase} preparation never launches an app-server`, async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const cli = probeCommand();
+    let launches = 0;
+    const adapter = new ZCodeAppServerAdapter({ zcodeEntry: 'C:/tools/zcode/cli.mjs', bindings: [binding()],
+      runProbeCommand: async args => {
+        if (args[0] === phase) { entered(); await released; }
+        return cli.run(args);
+      }, launchPeer: async () => { launches++; return fakePeer().peer; } });
+    const running = adapter.run(request());
+    try {
+      await preparing;
+      await adapter.cancel('task-7', 'attempt-2');
+      release();
+      const result = await running;
+      assert.equal(result.status, 'cancelled');
+      assert.equal(result.requestedModel, 'GLM-5.3-Flash');
+      assert.equal(launches, 0);
+    } finally { release(); await running; }
+  });
+}
+
+test('a duplicate desktop attempt is refused while the first is still preparing', async () => {
+  let entered!: () => void;
+  let release!: () => void;
+  const preparing = new Promise<void>(resolve => { entered = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const cli = probeCommand();
+  let first = true;
+  let launches = 0;
+  const adapter = new ZCodeAppServerAdapter({ zcodeEntry: 'C:/tools/zcode/cli.mjs', bindings: [binding()],
+    runProbeCommand: async args => {
+      if (first) { first = false; entered(); await released; }
+      return cli.run(args);
+    }, launchPeer: async () => { launches++; return fakePeer().peer; } });
+  const running = adapter.run(request());
+  try {
+    await preparing;
+    const duplicate = await adapter.run(request());
+    assert.equal(duplicate.status, 'failed');
+    assert.match(duplicate.error ?? '', /already active/);
+    assert.equal(launches, 0);
+    release();
+    assert.equal((await running).status, 'completed');
+    assert.equal(launches, 1);
+  } finally { release(); await running; }
+});
+
+test('desktop cancellation keys keep adjacent task and attempt identities independent', async () => {
+  const peer = fakePeer({ blockAfterStart: true });
+  const state = adapterHarness({ peer });
+  const running = state.adapter.run(request({ taskId: 'task:part', attemptId: 'attempt' }));
+  try {
+    await peer.turnObserved;
+    await state.adapter.cancel('task', 'part:attempt');
+    assert.equal(state.launchOptions()?.signal?.aborted, false);
+  } finally { await state.adapter.cancel('task:part', 'attempt'); await running; }
+});
+
+test('desktop probe failure releases its reservation for a later normal run', async () => {
+  const cli = probeCommand();
+  let fail = true;
+  const adapter = new ZCodeAppServerAdapter({ zcodeEntry: 'C:/tools/zcode/cli.mjs', bindings: [binding()],
+    runProbeCommand: async args => fail ? { code: 1, stdout: '', stderr: '' } : cli.run(args),
+    launchPeer: async () => fakePeer().peer });
+  assert.equal((await adapter.run(request())).status, 'failed');
+  fail = false;
+  assert.equal((await adapter.run(request())).status, 'completed');
+});
