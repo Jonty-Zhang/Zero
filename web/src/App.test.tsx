@@ -532,14 +532,19 @@ describe('task workspace', () => {
     const dialog = await openSequence(sequence);
     expect((within(dialog).getByRole('button', { name: '重新验收' }) as HTMLButtonElement).disabled).toBe(false);
   });
-  it('refreshes the goal after a rejected stale retry and displays the server error', async () => {
+  it('shows the retry error until a newer goal attempt loads after a rejected stale retry', async () => {
     const sequence = blockedSequence();
     const dialog = await openSequence(sequence);
     vi.mocked(api.retrySequenceGoalReview).mockRejectedValue(new Error('验收尝试已变化，请刷新'));
-    vi.mocked(api.sequence).mockResolvedValue({ ...sequence, goalReview: { state: 'running', attemptId: 'latest-attempt', createdAt: '' } });
+    let finishRefresh!: (value: TaskSequence) => void;
+    vi.mocked(api.sequence).mockImplementation(() => new Promise(resolve => { finishRefresh = resolve; }));
     fireEvent.click(within(dialog).getByRole('button', { name: '重新验收' }));
     expect(await within(dialog).findByText('验收尝试已变化，请刷新')).toBeTruthy();
+    expect(api.retrySequenceGoalReview).toHaveBeenCalledWith('sequence-retry', 'blocked-attempt');
+    expect(api.sequence).toHaveBeenCalledTimes(2);
+    await act(async () => finishRefresh({ ...sequence, goalReview: { state: 'running', attemptId: 'latest-attempt', createdAt: '' } }));
     expect(await within(dialog).findByText('正在进行目标级 Codex 验收')).toBeTruthy();
+    expect(within(dialog).queryByText('验收尝试已变化，请刷新')).toBeNull();
     expect(within(dialog).queryByRole('button', { name: '重新验收' })).toBeNull();
     expect(api.sequence).toHaveBeenCalledTimes(2);
   });

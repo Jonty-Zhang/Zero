@@ -268,8 +268,9 @@ function SequenceSubmitModal({ capabilities, onClose, onCreated }: { capabilitie
 function SequenceDrawer({ id, onClose, onOpenTask }: { id: string; onClose: () => void; onOpenTask: (taskId: string) => void }) {
   const state = usePolling(id, loadSequence);
   const sequence = state.data; const error = state.error;
-  const [retryBusy, setRetryBusy] = useState(false);
-  const [retryError, setRetryError] = useState('');
+  const [retryBusyAttempt, setRetryBusyAttempt] = useState<string | null>(null);
+  const [retryFailure, setRetryFailure] = useState<{ attemptId: string; message: string } | null>(null);
+  const retryOperation = useRef(0);
   const [acknowledgedAttempt, setAcknowledgedAttempt] = useState<string | null>(null);
   const dialogRef = useDialog(onClose);
   const status = sequence?.status;
@@ -281,14 +282,17 @@ function SequenceDrawer({ id, onClose, onOpenTask }: { id: string; onClose: () =
   const goalCapExhausted = Boolean(sequence && allStepsDone && !activeGoalRevision && sequence.goalReview?.state === 'verdict' && sequence.goalReview.result?.verdict === 'changes_requested' && sequence.goalRevisionCount >= sequence.maxGoalRevisions);
   const retryEligible = Boolean(sequence && allStepsDone && (sequence.objective || sequence.acceptanceCriteria?.length)
     && sequence.goalReview?.state === 'verdict' && sequence.goalReview.result?.verdict === 'blocked' && sequence.goalReview.attemptId);
+  const retryBusy = Boolean(retryBusyAttempt && retryBusyAttempt === sequence?.goalReview?.attemptId);
+  const retryError = retryEligible && retryFailure?.attemptId === sequence?.goalReview?.attemptId ? retryFailure?.message : undefined;
   const retryQueued = Boolean(sequence?.goalReview?.retryRequestedAt || sequence?.goalReview?.attemptId && acknowledgedAttempt === sequence.goalReview.attemptId);
   const retryGoalReview = async () => {
     const attemptId = sequence?.goalReview?.attemptId;
     if (!retryEligible || !attemptId || retryBusy || retryQueued) return;
-    setRetryBusy(true); setRetryError('');
-    try { await api.retrySequenceGoalReview(id, attemptId); setAcknowledgedAttempt(attemptId); }
-    catch (error) { setRetryError(error instanceof Error ? error.message : '重新验收请求失败，请稍后重试'); }
-    finally { setRetryBusy(false); void state.refresh(); }
+    const operation = ++retryOperation.current;
+    setRetryBusyAttempt(attemptId); setRetryFailure(null);
+    try { await api.retrySequenceGoalReview(id, attemptId); if (operation === retryOperation.current) setAcknowledgedAttempt(attemptId); }
+    catch (error) { if (operation === retryOperation.current) setRetryFailure({ attemptId, message: error instanceof Error ? error.message : '重新验收请求失败，请稍后重试' }); }
+    finally { if (operation === retryOperation.current) { setRetryBusyAttempt(null); void state.refresh(); } }
   };
   return <div className="drawer-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}><aside ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="目标进度" className="task-drawer sequence-drawer"><header className="drawer-header"><div><div className="eyebrow">目标进度</div><h2>{sequence ? sequenceTitle(sequence) : '正在读取目标'}</h2></div><button className="icon-button" aria-label="关闭详情" onClick={onClose}><X size={18} /></button></header>
     {error && !sequence ? <div className="alert error"><AlertCircle size={17} /><div><b>目标读取失败</b><span>{error}</span></div></div> : !sequence ? <div className="loading-state"><LoaderCircle className="spin" size={22} />正在读取目标进度…</div> : <div className="drawer-content">{error && <div className="alert stale-banner" role="alert">刷新失败，显示上次同步内容：{error}</div>}
