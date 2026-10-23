@@ -121,7 +121,7 @@ export default function App() {
   const [showSubmit, setShowSubmit] = useState(false);
   const [showSequenceSubmit, setShowSequenceSubmit] = useState(false);
   const [selectedSequenceId, setSelectedSequenceId] = useState<string | null>(null);
-  const [notice, setNotice] = useState('');
+  const [notice, setNotice] = useState<{ message: string } | null>(null);
   const [search, setSearch] = useState(''); const [status, setStatus] = useState('');
   const [repo, setRepo] = useState(''); const [harness, setHarness] = useState('');
   const [view, setView] = useState<'list' | 'board'>('list');
@@ -129,7 +129,7 @@ export default function App() {
   const degraded = connected && Boolean(capState.error || seqState.error);
   const connectionLabel = connected ? degraded ? '部分接口暂不可用' : '本地服务已连接' : taskState.loading ? '正在连接本地服务' : '本地服务未连接';
   useEffect(() => { const controller = new AbortController(); void api.config({ signal: controller.signal }).then(config => { if (!controller.signal.aborted) setAllocatorKind(config.allocator.kind); }).catch(() => {}); return () => controller.abort(); }, []);
-  useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(''), 3200); return () => clearTimeout(timer); }, [notice]);
+  useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(null), 3200); return () => clearTimeout(timer); }, [notice]);
   const refreshAll = () => { void taskState.refresh(); void capState.refresh(); void seqState.refresh(); };
   const counts = Object.fromEntries(columns.map(c => [c.id, tasks.filter(t => t.status === c.id).length])) as Record<Status, number>;
   const repos = [...new Set([repo, ...tasks.map(task => task.repoPath)].filter((value): value is string => Boolean(value)))].sort();
@@ -151,13 +151,13 @@ export default function App() {
           {taskState.error && <div className="alert error" role="alert"><AlertCircle size={17} /><div><b>{taskState.data ? '连接中断，当前显示上次同步的任务' : '无法连接 Zero 服务'}</b><span>{taskState.error}。请确认本地服务已启动。</span></div><button onClick={() => void taskState.refresh()}><RefreshCw size={14} />重试</button></div>}
           {taskState.loading ? <div className="loading-state"><LoaderCircle className="spin" size={24} /><span>正在连接 Zero 服务…</span></div> : !tasks.length ? <div className="empty-state"><div className="empty-icon"><TerminalSquare size={26} /></div><h2>{taskState.error ? '等待本地服务连接' : '准备好开始第一个任务'}</h2><p>{taskState.error ? '连接恢复后，已有任务会显示在这里。' : '描述目标，设置检查命令，然后查看 Agent 的执行与审核结果。'}</p>{!taskState.error && <Button variant="primary" onClick={() => setShowSubmit(true)}><Plus size={16} />创建第一个任务</Button>}</div> : !filtered.length ? <div className="empty-state filter-empty"><Search size={27} /><h2>没有符合条件的任务</h2><p>试试其他关键词，或清除筛选查看全部任务。</p><Button onClick={clearFilters}>清除筛选</Button></div> : view === 'list' ? <TaskTable tasks={filtered} onOpen={setSelectedId} /> : <div className="board">{columns.map(col => { const items = filtered.filter(task => task.status === col.id); return <section className="board-column" key={col.id}><div className="column-heading"><span className={`column-dot ${col.tone}`} /><b>{col.label}</b><span className="column-count">{items.length}</span></div><div className="cards">{items.map(task => <TaskCard key={task.id} task={task} onClick={() => setSelectedId(task.id)} />)}{!items.length && <div className="column-empty">暂无任务</div>}</div></section>; })}</div>}
           {!!tasks.length && <div className="table-footer">显示 {filtered.length} / {tasks.length} 个任务<span>任务状态来自本地执行节点</span></div>}
-        </section></> : <SettingsPage capabilities={capabilities} onSaved={(message, kind) => { setAllocatorKind(kind); setNotice(message); }} onRetry={capState.refresh} />}
+        </section></> : <SettingsPage capabilities={capabilities} onSaved={(message, kind) => { setAllocatorKind(kind); setNotice({ message }); }} onRetry={capState.refresh} />}
     </main>
-    {selectedId && <TaskDrawer key={selectedId} task={detail.data} loading={detail.loading} loadError={detail.error} onClose={() => setSelectedId(null)} onCancel={async () => { if (!detail.data || detail.data.id !== selectedId) return; await api.cancelTask(detail.data.id); setNotice('已发送取消请求'); void detail.refresh(); void taskState.refresh(); }} />}
-    {showSubmit && <SubmitModal capabilities={capabilities} capabilityError={capState.error} allocatorKind={allocatorKind} onClose={() => setShowSubmit(false)} onCreated={task => { setShowSubmit(false); setSelectedId(task.id); setNotice('任务已加入队列'); refreshAll(); }} />}
+    {selectedId && <TaskDrawer key={selectedId} task={detail.data} loading={detail.loading} loadError={detail.error} onClose={() => setSelectedId(null)} onCancel={async () => { if (!detail.data || detail.data.id !== selectedId) return; await api.cancelTask(detail.data.id); setNotice({ message: '已发送取消请求' }); void detail.refresh(); void taskState.refresh(); }} />}
+    {showSubmit && <SubmitModal capabilities={capabilities} capabilityError={capState.error} allocatorKind={allocatorKind} onClose={() => setShowSubmit(false)} onCreated={task => { setShowSubmit(false); setSelectedId(task.id); setNotice({ message: '任务已加入队列' }); refreshAll(); }} />}
     {showSequenceSubmit && <SequenceSubmitModal capabilities={capabilities} onClose={() => setShowSequenceSubmit(false)} onCreated={sequence => { setShowSequenceSubmit(false); setSelectedSequenceId(sequence.id); refreshAll(); }} />}
     {selectedSequenceId && <SequenceDrawer key={selectedSequenceId} id={selectedSequenceId} onClose={() => setSelectedSequenceId(null)} onOpenTask={id => { setSelectedSequenceId(null); setSelectedId(id); }} />}
-    {notice && <div className="toast" role="status"><CheckCircle2 size={16} />{notice}</div>}
+    {notice && <div className="toast" role="status"><CheckCircle2 size={16} />{notice.message}</div>}
   </div>;
 }
 
