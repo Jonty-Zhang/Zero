@@ -187,6 +187,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
     let peer: ZCodeAppServerPeer | undefined;
     try {
       validateOptions(options);
+      options.signal?.throwIfAborted();
       await access(options.entry);
       const bundledProviderConfig = await findBundledProviderConfig(options.entry);
       const taskStat = await stat(options.taskWorktree);
@@ -214,6 +215,7 @@ export class ZCodeAppServerPeer implements ZCodeProtocolPeer {
         }
       }
 
+      options.signal?.throwIfAborted();
       const child = spawn(process.execPath, [options.entry, 'app-server'], {
         cwd: options.taskWorktree,
         env: childEnvironment(options.profileMode, options.dataBaseDir, bundledProviderConfig),
