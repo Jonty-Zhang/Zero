@@ -43,8 +43,9 @@ export class TestRunner {
     const environment = this.#safeEnvironment();
     let invocation;
     try { invocation = await resolveCheckInvocation(check.argv, cwd, environment); }
-    catch (error) { return { id: check.id, argv: [...check.argv], status: 'spawn_error', exitCode: null,
+    catch (error) { options.signal?.throwIfAborted(); return { id: check.id, argv: [...check.argv], status: 'spawn_error', exitCode: null,
       durationMs: Date.now() - started, error: error instanceof Error ? error.message : String(error) }; }
+    options.signal?.throwIfAborted();
     const logName = `${basename(check.id).replace(/[^a-zA-Z0-9_-]/g, "_")}-${randomUUID()}`;
     let stdoutPath: string | undefined;
     let stderrPath: string | undefined;
@@ -52,6 +53,7 @@ export class TestRunner {
     let stderrFile: ReturnType<typeof createWriteStream> | undefined;
     if (this.#logDirectory) {
       await mkdir(this.#logDirectory, { recursive: true });
+      options.signal?.throwIfAborted();
       stdoutPath = resolve(this.#logDirectory, `${logName}.stdout.log`);
       stderrPath = resolve(this.#logDirectory, `${logName}.stderr.log`);
       stdoutFile = createWriteStream(stdoutPath, { flags: "wx" });
