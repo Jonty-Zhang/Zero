@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
+import { guardRuntimeBindings, matchesRuntimeBinding, RUNTIME_BINDING_RESTART_REQUIRED } from './runtime-binding-guard.js';
 import { TaskStore, GoalReviewRetryConflictError, type SequenceGoalReviewRetryRequest, type CheckRunRecord, type CheckRunIntegrityFailureRecord } from '../core/task-store.js';
 import { selectTaskCheckEvidence } from './task-check-evidence.js';
 import { CodexAdapter } from '../adapters/codex.js';
@@ -66,12 +67,15 @@ const KNOWN_HARNESSES: HarnessName[] = ['codex', 'dsh', 'zcode'];
 const SECURITY_HEADERS = { 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'" };
 const JSON_HEADERS = { ...SECURITY_HEADERS, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
 
-export function createDefaultAdapters(bindings: ModelBinding[]): AdapterMap {
-  return {
-    codex: createCodexAdapter(bindings),
-    dsh: new DshAdapter({ bindings, dshHome: resolve(zeroDataRoot(), 'dsh-home') }),
-    zcode: new ZCodeCompositeAdapter({ bindings }),
+export function createDefaultAdapters(bindings: ModelBinding[], config?: Pick<ConfigPort, 'read'>): AdapterMap {
+  const snapshot = structuredClone(bindings);
+  const adapters: AdapterMap = {
+    codex: createCodexAdapter(snapshot),
+    dsh: new DshAdapter({ bindings: snapshot, dshHome: resolve(zeroDataRoot(), 'dsh-home') }),
+    zcode: new ZCodeCompositeAdapter({ bindings: snapshot }),
   };
+  if (config) for (const id of KNOWN_HARNESSES) adapters[id] = guardRuntimeBindings(adapters[id]!, snapshot, () => config.read());
+  return adapters;
 }
 
 function zeroDataRoot(): string {
@@ -264,10 +268,10 @@ async function capabilities(options: ZeroServerOptions, snapshot?: LocalZeroConf
   }));
   const bindings = config.bindings.map(binding => {
     const result = reports.get(binding.harness);
-    const selectorResult = !!result?.available && result.models.includes(binding.model.id);
+    const selectorResult = !!result?.available && result.models.includes(binding.model.id) && matchesRuntimeBinding(binding, result);
     const verification = config.verifications?.[`${binding.harness}:${binding.model.id}`];
     const available = binding.verified && !!verification && selectorResult;
-    const reason = !binding.verified || !verification ? '该模型绑定尚未通过验证（尚未通过真实调用验证）' : !result?.available ? result?.unavailableReason ?? 'Harness 不可用' : !selectorResult ? '当前 CLI 探测未确认此模型绑定' : undefined;
+    const reason = !binding.verified || !verification ? '该模型绑定尚未通过验证（尚未通过真实调用验证）' : !result?.available ? result?.unavailableReason ?? 'Harness 不可用' : !selectorResult ? result?.modelUnavailableReasons?.[binding.model.id] ?? (result?.runtimeBindingFingerprints ? RUNTIME_BINDING_RESTART_REQUIRED : '当前 CLI 探测未确认此模型绑定') : undefined;
     const verificationLevel = verification?.level;
     return { harnessId: binding.harness, modelId: binding.model.id, modelName: binding.model.modelId, available, ...(reason ? { reason } : {}), ...(verificationLevel ? { verificationLevel } : {}),
       reasoningEfforts: available ? (binding.reasoningEfforts ?? result?.reasoningEfforts ?? []).map(id => ({ id, label: id })) : [] };

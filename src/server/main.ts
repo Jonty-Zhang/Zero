@@ -8,6 +8,7 @@ import { win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ModelBinding, ModelConfig, ReasoningEffort } from '../adapters/types.js';
 import { resolveModelIdentity } from '../adapters/model-binding.js';
+import { matchesRuntimeBinding } from './runtime-binding-guard.js';
 import { ZCodeAppServerAdapter, ZCodeDesktopCatalogPeerExitError } from '../adapters/zcode-app-server-adapter.js';
 import type { ZCodeAppServerAdapterConfig } from '../adapters/zcode-app-server-adapter.js';
 import { ZCodeAppServerPeer } from '../adapters/zcode-app-server-peer.js';
@@ -107,7 +108,7 @@ export async function startZeroServer(options: { host?: string; port?: number } 
   const config = new ConfigStore(resolve(dataRoot, 'config.json'));
   const initialConfig = await config.read();
   const verifiedBindings = initialConfig.bindings.filter((binding): binding is ModelBinding => binding.verified);
-  const adapters = createDefaultAdapters(verifiedBindings);
+  const adapters = createDefaultAdapters(verifiedBindings, config);
   const startupProbes = await Promise.all([adapters.codex!.probe(), adapters.dsh!.probe(), adapters.zcode!.probe()]);
   // The composite ZCode capability may reflect either the isolated CLI or the
   // desktop app-server. Each selector checks its own pinned version; one probe
@@ -129,7 +130,7 @@ export async function startZeroServer(options: { host?: string; port?: number } 
     return cfg.bindings.filter(binding => binding.verified && !!cfg.verifications?.[`${binding.harness}:${binding.model.id}`]).flatMap(binding => {
       const caps = byHarness.get(binding.harness);
       const healthy = !!caps?.available;
-      const available = healthy && !!caps?.models.includes(binding.model.id);
+      const available = healthy && !!caps?.models.includes(binding.model.id) && matchesRuntimeBinding(binding, caps);
       return [{ bindingId: `${binding.harness}:${binding.model.id}`, harness: binding.harness, model: binding.model.id,
         verified: binding.verified, available, healthy,
         reasoningEfforts: binding.reasoningEfforts ?? caps?.reasoningEfforts ?? [], capabilities: caps?.roles ?? [], }];

@@ -263,6 +263,10 @@ export interface HarnessCapabilities {
   roles?: AttemptRole[];
   available: boolean;
   unavailableReason?: string;
+  /** Per-model runtime gating, such as a binding that changed since startup. */
+  modelUnavailableReasons?: Record<string, string>;
+  /** Opaque captured-binding identities used to compare config and probe snapshots. */
+  runtimeBindingFingerprints?: Record<string, string>;
   /** CLI capability probe does not contact providers or validate model authentication. */
   probeEvidence?: {
     versionAndHelp: "passed" | "failed";
