@@ -5,6 +5,7 @@ import { buildChildEnv, runProcess } from './process-runner.js';
 import type { AdapterRunResult, HarnessId, Invocation, ModelBinding, ParsedOutput, ReasoningEffort, RunContext } from './types.js';
 import { classifyQuota } from '../core/quota.js';
 import { dshProviderError, plaintextProviderError, StreamingOutputParser } from './output-parser.js';
+import { resolveModelBinding } from './model-binding.js';
 
 export interface AdapterConfig {
   executable?: string;
@@ -211,7 +212,7 @@ export abstract class BaseHarnessAdapter implements DomainAdapter {
   }
 
   protected findBinding(model: string): ModelBinding | undefined {
-    return this.bindings.find((binding) => binding.model.id === model || binding.model.modelId === model);
+    return resolveModelBinding(this.bindings.filter(binding => binding.harness === this.id), model);
   }
 
   protected supportedBindings(): string[] {

@@ -1,5 +1,6 @@
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { resolveModelBinding } from './model-binding.js';
 import type { HarnessAdapter, HarnessCapabilities, RunRequest, RunResult } from '../domain/types.js';
 import { ZCodeAppServerPeer } from './zcode-app-server-peer.js';
 import type { ZCodeAppServerDiagnosticEvent, ZCodeAppServerPeerOptions, ZCodeAppServerTransportFailureCategory } from './zcode-app-server-peer.js';
@@ -258,10 +259,8 @@ export class ZCodeAppServerAdapter implements HarnessAdapter {
     if (!SUPPORTED_ROLES.has(request.role)) return result('failed', 'ZCode app-server supports implementation and revision runs only', started);
     if (!this.entry || !isJavaScriptEntry(this.entry)) return result('failed', 'ZCode app-server requires an absolute JavaScript CLI entry', started);
 
-    const matches = this.bindings.filter(binding => isExistingDesktopBinding(binding) &&
-      (binding.model.id === request.model || binding.model.modelId === request.model));
-    if (matches.length !== 1) return result('failed', 'No unique existing-desktop ZCode binding matches the requested model', started, { requestedModel: request.model });
-    const binding = matches[0] as ExistingDesktopBinding;
+    const binding = resolveModelBinding(this.bindings.filter(isExistingDesktopBinding), request.model);
+    if (!binding) return result('failed', 'No unique existing-desktop ZCode binding matches the requested model', started, { requestedModel: request.model });
     if (!isBindingEvidenceValid(binding)) return result('failed', 'ZCode existing-desktop binding is unverified or has inconsistent selector evidence', started, { requestedModel: binding.model.modelId });
     if (request.reasoningEffort === undefined || !binding.reasoningEfforts?.includes(request.reasoningEffort as ReasoningEffort)) {
       return result('failed', 'ZCode existing-desktop runs require an explicitly verified reasoning effort', started, { requestedModel: binding.model.modelId });
