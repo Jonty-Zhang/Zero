@@ -7,6 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ModelBinding, ModelConfig, ReasoningEffort } from '../adapters/types.js';
+import { resolveModelIdentity } from '../adapters/model-binding.js';
 import { ZCodeAppServerAdapter, ZCodeDesktopCatalogPeerExitError } from '../adapters/zcode-app-server-adapter.js';
 import type { ZCodeAppServerAdapterConfig } from '../adapters/zcode-app-server-adapter.js';
 import { ZCodeAppServerPeer } from '../adapters/zcode-app-server-peer.js';
@@ -201,8 +202,8 @@ export async function runBindingVerification(modelId: string, effort: string = '
   if (!['minimal', 'low', 'medium', 'high', 'xhigh'].includes(effort)) throw new Error('Reasoning effort must be minimal, low, medium, high or xhigh');
   const config = new ConfigStore(resolve(dataRoot, 'config.json'));
   const current = await config.read();
-  const model = current.models.find(item => item.id === modelId || item.modelId === modelId);
-  if (!model) throw new Error(`Unknown model ${modelId}. Add it to ${resolve(dataRoot, 'config.json')} first.`);
+  const model = resolveModelIdentity(current.models, modelId, item => item);
+  if (!model) throw new Error(`Unknown or ambiguous model ${modelId}. Add a unique model entry to ${resolve(dataRoot, 'config.json')} first.`);
   const binding: ModelBinding = { harness: 'codex', model, selector: 'cli_argument', verified: true, reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh'] };
   const adapter = createCodexAdapter([binding], { timeoutMs: 90_000, maxLogBytes: 128 * 1024 });
   const caps = await adapter.probe();

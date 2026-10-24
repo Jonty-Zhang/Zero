@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { ModelBinding, ModelConfig, ReasoningEffort } from '../adapters/types.js';
+import { resolveModelIdentity } from '../adapters/model-binding.js';
 import type { ExecutionSelection } from '../domain/types.js';
 
 export interface LocalZeroConfig {
@@ -151,8 +152,8 @@ export class ConfigStore {
 
   async markVerified(harness: 'codex', modelId: string, evidence: Omit<LocalZeroConfig['verifications'][string], 'reasoningEfforts'> & { reasoningEfforts?: ReasoningEffort[] }, expectedModel?: ModelConfig): Promise<void> {
     return this.update(async (config, path) => {
-      const model = config.models.find(item => item.id === modelId || item.modelId === modelId);
-      if (!model) throw new Error(`Unknown model ID: ${modelId}`);
+      const model = resolveModelIdentity(config.models, modelId, item => item);
+      if (!model) throw new Error(`Unknown or ambiguous model ID: ${modelId}`);
       if (expectedModel && !sameModelTuple(model, expectedModel)) {
         throw new Error(`Local model ${modelId} changed during Codex verification; run verification again`);
       }
@@ -295,7 +296,7 @@ export class ConfigStore {
 
   async markReasoningEffortVerified(harness: 'codex', modelId: string, effort: ReasoningEffort, cliVersion: string): Promise<void> {
     return this.update(async (config, path) => {
-      const model = config.models.find(item => item.id === modelId || item.modelId === modelId);
+      const model = resolveModelIdentity(config.models, modelId, item => item);
       const binding = config.bindings.find(item => item.harness === harness && item.model.id === model?.id && item.verified);
       const key = `${harness}:${model?.id}`;
       const verification = config.verifications[key];
