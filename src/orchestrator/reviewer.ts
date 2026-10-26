@@ -154,11 +154,17 @@ function chooseReviewer(caps: HarnessCapabilities, route: RouteDecision, request
   } else {
     model = models.find((candidate) => candidate !== route.model) ?? models[0]!;
   }
-  const efforts = caps.reasoningEfforts ?? [];
-  let reasoningEffort = requestedEffort;
-  if (reasoningEffort && !efforts.includes(reasoningEffort)) throw new Error(`Reviewer reasoning effort is not supported by Codex: ${reasoningEffort}`);
-  if (!reasoningEffort && efforts.length) reasoningEffort = efforts.includes('high') ? 'high' : efforts.includes('medium') ? 'medium' : [...efforts].sort()[0];
+  const reasoningEffort = chooseReviewerReasoningEffort(caps, model, requestedEffort);
   return { model, ...(reasoningEffort ? { reasoningEffort } : {}) };
+}
+
+/** Prefer a verified effort for the selected model, never another model's capability. */
+export function chooseReviewerReasoningEffort(caps: HarnessCapabilities, model: string, requestedEffort?: string): string | undefined {
+  const efforts = caps.modelReasoningEfforts ? caps.modelReasoningEfforts[model] ?? [] : caps.reasoningEfforts ?? [];
+  let reasoningEffort = requestedEffort;
+  if (reasoningEffort && !efforts.includes(reasoningEffort)) throw new Error(`Reviewer reasoning effort is not supported by Codex model ${model}: ${reasoningEffort}`);
+  if (!reasoningEffort && efforts.length) reasoningEffort = efforts.includes('high') ? 'high' : efforts.includes('medium') ? 'medium' : [...efforts].sort()[0];
+  return reasoningEffort;
 }
 
 function makeReviewPrompt(task: TaskRecord, worktree: WorktreeInfo, route: RouteDecision, checks: CheckResult[], diff: string, snapshotSummary: string): string {

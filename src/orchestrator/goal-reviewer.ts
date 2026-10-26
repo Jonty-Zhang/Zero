@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { GoalReviewResult, HarnessAdapter, RunResult } from '../domain/types.js';
 import { QuotaLimitError } from '../core/quota.js';
 import { createTrustedCodexCwd, createTrustedGoalCwd, type GoalProjectSource, type GoalProjectSnapshot, type ProjectSnapshot } from './trusted-codex-cwd.js';
-import { parseReviewOutput } from './reviewer.js';
+import { chooseReviewerReasoningEffort, parseReviewOutput } from './reviewer.js';
 
 export interface GoalReviewInput {
   sequenceId: string;
@@ -74,8 +74,7 @@ export class GoalReviewer {
     if (!capabilities.available || capabilities.models.length === 0) throw new Error('Codex aggregate reviewer is unavailable');
     const model = input.model ?? this.config.model ?? [...capabilities.models].sort()[0]!;
     if (!capabilities.models.includes(model)) throw new Error('Configured aggregate reviewer model is not a verified Codex binding');
-    const effort = input.reasoningEffort ?? this.config.reasoningEffort ?? (capabilities.reasoningEfforts?.includes('high') ? 'high' : undefined);
-    if (effort && !(capabilities.reasoningEfforts ?? []).includes(effort)) throw new Error('Configured aggregate reviewer reasoning effort is unavailable');
+    const effort = chooseReviewerReasoningEffort(capabilities, model, input.reasoningEffort ?? this.config.reasoningEffort);
     validateSources(input.repositories);
     const inputFingerprint = goalReviewInputFingerprint(input);
     const multi = (input.repositories?.length ?? 0) > 1;

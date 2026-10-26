@@ -1,7 +1,9 @@
 import type { HarnessCapabilities } from '../domain/types.js';
 import { BaseHarnessAdapter, probeExecutable, parseJsonLines } from './base.js';
 import type { AdapterConfig } from './base.js';
-import type { Invocation, ModelBinding, ParsedOutput, RunContext } from './types.js';
+import type { Invocation, ModelBinding, ParsedOutput, ReasoningEffort, RunContext } from './types.js';
+
+const DEFAULT_REASONING_EFFORTS: ReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 
 export class CodexAdapter extends BaseHarnessAdapter {
   readonly id = 'codex' as const;
@@ -16,12 +18,15 @@ export class CodexAdapter extends BaseHarnessAdapter {
   async probe(): Promise<HarnessCapabilities> {
     const result = await probeExecutable(this, ['exec', '--help'], ['--json', '--model', '--sandbox', '--cd', '--output-schema', '-c', '--ignore-user-config', '--ephemeral']);
     const available = !result.reason;
-    const models = this.bindingsForVersion(this.bindings.filter((binding) => binding.harness === 'codex'), result.version).map((binding) => binding.model.id);
+    const bindings = this.bindingsForVersion(this.bindings.filter((binding) => binding.harness === 'codex'), result.version);
+    const models = bindings.map((binding) => binding.model.id);
     return {
       harness: this.id,
       ...(result.version ? { version: result.version } : {}),
       models: available ? models : [],
-      reasoningEfforts: available ? ['minimal', 'low', 'medium', 'high', 'xhigh'] : [],
+      reasoningEfforts: available ? [...DEFAULT_REASONING_EFFORTS] : [],
+      modelReasoningEfforts: Object.fromEntries((available ? bindings : []).map(binding =>
+        [binding.model.id, [...(binding.reasoningEfforts ?? DEFAULT_REASONING_EFFORTS)]])),
       roles: ['implement', 'revise', 'review', 'route'],
       available,
       probeEvidence: {
@@ -43,7 +48,7 @@ export class CodexAdapter extends BaseHarnessAdapter {
     if (this.config.codexWindowsSandbox) args.push('-c', `windows.sandbox=${this.config.codexWindowsSandbox}`);
     if (context.role === 'review' || context.role === 'allocate') args.push('--ignore-user-config', '--ephemeral');
     if (context.reasoningEffort) {
-      const supported = binding.reasoningEfforts ?? ['minimal', 'low', 'medium', 'high', 'xhigh'];
+      const supported = binding.reasoningEfforts ?? DEFAULT_REASONING_EFFORTS;
       if (!supported.includes(context.reasoningEffort)) throw new Error(`Codex model binding does not support reasoning effort ${context.reasoningEffort}`);
       args.push('-c', `model_reasoning_effort=${context.reasoningEffort}`);
     }

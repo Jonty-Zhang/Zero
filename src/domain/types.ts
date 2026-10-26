@@ -284,6 +284,8 @@ export interface HarnessCapabilities {
   version?: string;
   models: string[];
   reasoningEfforts?: string[];
+  /** Model-specific allowed efforts; an empty list means to use the CLI default. */
+  modelReasoningEfforts?: Record<string, string[]>;
   roles?: AttemptRole[];
   available: boolean;
   unavailableReason?: string;
