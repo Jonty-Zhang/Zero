@@ -65,6 +65,44 @@ describe('Boss project entry', () => {
     expect(api.createTask).not.toHaveBeenCalled();
     expect((screen.getByLabelText('你想完成什么 *') as HTMLTextAreaElement).value).toBe('设计并实现这个项目，自己验证');
   });
+  it.each(['文件夹不存在或没有访问权限', 'Failed to fetch'])('does not offer a stale folder after navigation fails: %s', async message => {
+    vi.mocked(api.folders).mockResolvedValueOnce({ path: 'C:\\previous-folder', parent: 'C:\\', folders: [{ name: 'old-child', path: 'C:\\previous-folder\\old-child' }] })
+      .mockRejectedValueOnce(new Error(message))
+      .mockResolvedValueOnce({ path: 'C:\\intended-folder', parent: 'C:\\', folders: [] });
+    modal(); fillGoal(); fireEvent.click(screen.getByRole('button', { name: '浏览文件夹' }));
+    await screen.findByRole('button', { name: 'old-child' });
+    fireEvent.change(screen.getByLabelText('新文件夹名称'), { target: { value: 'old-draft' } });
+    fireEvent.change(screen.getByLabelText('浏览路径'), { target: { value: 'C:\\intended-folder' } });
+    fireEvent.click(screen.getByRole('button', { name: '打开路径' }));
+    expect((await screen.findByRole('alert')).textContent).toContain(message);
+    expect(screen.queryByRole('button', { name: '选择此文件夹' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'old-child' })).toBeNull();
+    expect(screen.queryByLabelText('新文件夹名称')).toBeNull();
+    expect((screen.getByLabelText('项目文件夹 *') as HTMLInputElement).value).toBe('C:/projects/plain');
+    expect((screen.getByLabelText('你想完成什么 *') as HTMLTextAreaElement).value).toBe('设计并实现这个项目，自己验证');
+    expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '打开路径' }));
+    const choose = await screen.findByRole('button', { name: '选择此文件夹' });
+    expect((screen.getByLabelText('新文件夹名称') as HTMLInputElement).value).toBe('');
+    expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.click(choose);
+    expect((screen.getByLabelText('项目文件夹 *') as HTMLInputElement).value).toBe('C:\\intended-folder');
+    expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled();
+  });
+  it('retains a failed child navigation target so retry opens that child rather than its previous parent', async () => {
+    vi.mocked(api.folders).mockResolvedValueOnce({ path: 'C:\\parent', parent: 'C:\\', folders: [{ name: 'requested-child', path: 'C:\\parent\\requested-child' }] })
+      .mockRejectedValueOnce(new Error('暂时无法读取子文件夹'))
+      .mockResolvedValueOnce({ path: 'C:\\parent\\requested-child', parent: 'C:\\parent', folders: [] });
+    modal(); fireEvent.click(screen.getByRole('button', { name: '浏览文件夹' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'requested-child' }));
+    expect((await screen.findByRole('alert')).textContent).toContain('暂时无法读取子文件夹');
+    expect((screen.getByLabelText('浏览路径') as HTMLInputElement).value).toBe('C:\\parent\\requested-child');
+    expect(screen.queryByRole('button', { name: '选择此文件夹' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '打开路径' }));
+    await screen.findByRole('button', { name: '选择此文件夹' });
+    expect(api.folders).toHaveBeenLastCalledWith('C:\\parent\\requested-child', { signal: expect.any(AbortSignal) });
+    expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled();
+  });
   it('Enter on a new folder name selects that folder without submitting the previous project', async () => {
     vi.mocked(api.folders).mockResolvedValue({ path: 'C:\\projects', parent: 'C:\\', folders: [] });
     modal(); fillGoal(); fireEvent.click(screen.getByRole('button', { name: '浏览文件夹' }));

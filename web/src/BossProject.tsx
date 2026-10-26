@@ -44,6 +44,7 @@ export function BossProjectModal({ capabilities, capabilityError, onClose, onAdv
     const controller = new AbortController();
     folderRequest.current = controller;
     setBrowsing(true); setFolderBusy(true); setFolderError('');
+    setListing(null); setNewName(''); setBrowsePath(target ?? '');
     try {
       const result = await api.folders(target, { signal: controller.signal });
       if (!controller.signal.aborted) { setListing(result); setBrowsePath(result.path); setNewName(''); }
