@@ -84,6 +84,7 @@ test('one objective drives Boss consultation, cross-harness work, adaptive deleg
           store.addBossMessage(task.id, 'user', 'The export must preserve names');
         } else {
           assert.match(request.prompt, /Integrate export/);
+          assert.match(request.prompt, /The export must preserve names/, 'the next Harness receives the complete human requirement, not only the lead stage summary');
           assert.equal(await readFile(join(request.cwd, 'result.txt'), 'utf8'), 'storage');
           await writeFile(join(request.cwd, 'result.txt'), 'integrated-export');
         }
@@ -161,10 +162,11 @@ for (const pause of ['plan', 'writer'] as const) test(`quota in ${pause} resumes
       checks: [{ id: 'export', argv: [process.execPath, '-e', "require('node:assert/strict').equal(require('node:fs').readFileSync('export.txt','utf8'),'storage-export')"] }] };
     const dsh: HarnessAdapter = { id: 'dsh', async probe() { return { harness: 'dsh', available: true, models: ['cheap'] }; }, async run(request) {
       storageRuns++; await writeFile(join(request.cwd, 'storage.txt'), storageRuns === 1 && pause === 'writer' ? 'partial' : 'storage');
+      if (storageRuns > 1) assert.match(request.prompt, /Keep the original export names while resuming/);
       if (pause === 'writer' && storageRuns === 1) return { status: 'failed', exitCode: 1, durationMs: 1, quota: { source: 'provider_message', retryAt: new Date(Date.now() + 60000).toISOString() } };
       return complete('Storage completed');
     } };
-    const zcode: HarnessAdapter = { id: 'zcode', async probe() { return { harness: 'zcode', available: true, models: ['builder'] }; }, async run(request) { exportRuns++; await writeFile(join(request.cwd, 'export.txt'), `${await readFile(join(request.cwd, 'storage.txt'), 'utf8')}-export`); return complete('Export completed'); } };
+    const zcode: HarnessAdapter = { id: 'zcode', async probe() { return { harness: 'zcode', available: true, models: ['builder'] }; }, async run(request) { exportRuns++; assert.match(request.prompt, /Keep the original export names while resuming/); await writeFile(join(request.cwd, 'export.txt'), `${await readFile(join(request.cwd, 'storage.txt'), 'utf8')}-export`); return complete('Export completed'); } };
     const worker = new TaskWorker({ store, worktrees, testRunner: new TestRunner(), artifactRoot: join(root, 'artifacts'), adapters: new Map([['dsh', dsh], ['zcode', zcode]]),
       boss: { async plan(_current, context) { plans++; if (pause === 'plan' && plans === 2) throw new QuotaLimitError('Boss planning limit', new Date(Date.now() + 60000).toISOString()); return { ...definitions, stages: context.completedStages ? definitions.stages.slice(1) : definitions.stages }; } },
       router: { async route(current) { return { taskId: current.id, harness: current.selection!.harness!, model: current.selection!.model!, reason: 'Boss chosen worker', selectionSource: 'task', decidedAt: new Date().toISOString() }; } },
@@ -173,6 +175,7 @@ for (const pause of ['plan', 'writer'] as const) test(`quota in ${pause} resumes
     assert.equal(waiting?.status, 'waiting', waiting?.failureReason);
     assert.equal(waiting.resumeCheckpoint?.executionStageIndex, pause === 'writer' ? 0 : 1);
     assert.equal(storageRuns, 1); assert.equal(exportRuns, 0);
+    store.addBossMessage(task.id, 'user', 'Keep the original export names while resuming');
     const db = new DatabaseSync(join(root, 'queue.sqlite'));
     try { db.prepare('UPDATE quota_pauses SET retry_at=? WHERE task_id=?').run(new Date(Date.now() - 1000).toISOString(), task.id); } finally { db.close(); }
     const done = await worker.runNext('after-quota');
@@ -180,6 +183,57 @@ for (const pause of ['plan', 'writer'] as const) test(`quota in ${pause} resumes
     assert.equal(done?.failureReason, undefined, 'successful quota recovery clears the active error');
     assert.equal(storageRuns, pause === 'writer' ? 2 : 1, 'only the interrupted writer may resume'); assert.equal(exportRuns, 1); assert.equal(plans, pause === 'writer' ? 2 : 3);
     assert.equal(store.stages(task.id).filter(stage => stage.role === 'implement' && stage.status === 'succeeded').length, 2);
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+for (const revisionCause of ['checks', 'review'] as const) test(`human requirements reach the first writer and ${revisionCause}-requested revision without promoting model discussion to human instructions`, async () => {
+  const { root, repo, store, worktrees } = await fixture();
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: 'HEAD', prompt: 'Create a product', boss: { preference: 'lead' } });
+    const original = store.addBossMessage(task.id, 'user', 'Preserve all original labels exactly: 导出 / Export');
+    const requests: RunRequest[] = [];
+    const plan: BossPlan = { summary: 'Implement the product', acceptanceCriteria: ['The product is complete'], boss: { harness: 'codex', model: 'lead' }, maxRevisions: 1,
+      stages: [{ harness: 'dsh', model: 'cheap', objective: 'Implement the agreed product' }],
+      checks: [{ id: 'product', argv: [process.execPath, '-e', revisionCause === 'checks'
+        ? "require('node:assert/strict').equal(require('node:fs').readFileSync('result.txt','utf8'),'complete')"
+        : "require('node:assert/strict').ok(require('node:fs').existsSync('result.txt'))"] }] };
+    const adapter: HarnessAdapter = { id: 'dsh', async probe() { return { harness: 'dsh', available: true, models: ['cheap'] }; }, async run(request) {
+      requests.push(request);
+      assert.match(request.prompt, /Preserve all original labels exactly: 导出 \/ Export/);
+      assert.match(request.prompt, /Keep the existing public API during implementation/);
+      assert.doesNotMatch(request.prompt, /consultant-only-opinion/);
+      if (request.role === 'implement') {
+        store.addBossMessage(task.id, 'user', 'Preserve keyboard navigation in the revision');
+        await writeFile(join(request.cwd, 'result.txt'), 'initial');
+      } else {
+        assert.match(request.prompt, /Preserve keyboard navigation in the revision/);
+        assert.match(request.prompt, revisionCause === 'checks' ? /Failed checks/ : /Reviewer verdict/);
+        await writeFile(join(request.cwd, 'result.txt'), 'complete');
+      }
+      return complete('Product work finished');
+    } };
+    let routes = 0;
+    let reviews = 0;
+    const worker = new TaskWorker({ store, worktrees, testRunner: new TestRunner(), artifactRoot: join(root, 'artifacts'), adapters: new Map([['dsh', adapter]]),
+      boss: { async plan(_current, context) {
+        assert.ok(context.messages.some(message => message.id === original.id));
+        context.onMessage({ role: 'consultant', content: 'consultant-only-opinion', harness: 'dsh', model: 'cheap' });
+        return plan;
+      } },
+      router: { async route(current) {
+        if (++routes === 1) store.addBossMessage(task.id, 'user', 'Keep the existing public API during implementation');
+        return { taskId: current.id, harness: 'dsh', model: 'cheap', reason: 'Boss chosen worker', selectionSource: 'task', decidedAt: new Date().toISOString() };
+      } },
+      reviewer: { async review() {
+        if (revisionCause === 'review' && ++reviews === 1) return { harness: 'codex', model: 'lead', exitCode: 0,
+          result: { verdict: 'changes_requested', summary: 'Finish the implementation against every accepted user update', findings: [{ severity: 'medium', file: 'result.txt', evidence: 'The artifact is still initial', requestedChange: 'Complete the product' }] } };
+        return { harness: 'codex', model: 'lead', exitCode: 0, result: { verdict: 'pass', summary: 'Verified the final product', findings: [] } };
+      } } });
+    const done = await worker.runNext('human-context');
+    assert.equal(done?.status, 'done', done?.failureReason);
+    assert.deepEqual(requests.map(request => request.role), ['implement', 'revise']);
+    assert.deepEqual(done.checks, plan.checks, 'new requirements cannot rewrite the frozen validation contract');
+    assert.equal(await readFile(join(root, 'worktrees', task.id, 'result.txt'), 'utf8'), 'complete');
   } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 

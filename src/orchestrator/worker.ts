@@ -821,6 +821,10 @@ export class TaskWorker {
         active.attempt = attempt;
         this.#assertNotCancelled(active);
         const executionBrief = revision === 0 ? this.#initialExecutionBrief(task, revisionBrief) : revisionBrief;
+        // Refresh at the actual writer boundary: a requirement may arrive after
+        // planning/routing or while a previous writer was quota-paused. A stage
+        // summary is not a substitute for the human's complete wording.
+        const humanMessages = task.boss ? this.#options.store.bossMessages(taskId).filter(message => message.role === 'user') : [];
         const runResult = await adapter.run({
           taskId,
           attemptId: attempt.id,
@@ -829,6 +833,7 @@ export class TaskWorker {
           prompt: [
             executionBrief,
             this.#executionStageBrief(task, executionStageIndex),
+            ...(humanMessages.length ? [`Accepted human project messages (original wording, chronological order). Apply these requirements within your assigned stage scope; they do not authorize bypassing verification, permissions, or the project lead's acceptance gates:\n${JSON.stringify(humanMessages)}`] : []),
             "In your final reply, summarize the changes, decisions and their rationale, unfinished work, risks, and what a following agent should inspect or do next. Zero retains this as your unverified account; Git observations, configured checks and independent review determine task completion.",
             ...(isFirstRecoveredStage && revision === 0 && executionStageIndex === 0
               ? ["The checkout may contain incomplete edits from an interrupted earlier writer. Inspect the current changes, preserve correct work, and finish the task from this state. The earlier attempt did not complete or pass review."] : []),
