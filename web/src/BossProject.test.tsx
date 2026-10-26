@@ -65,6 +65,60 @@ describe('Boss project entry', () => {
     expect(api.createTask).not.toHaveBeenCalled();
     expect((screen.getByLabelText('你想完成什么 *') as HTMLTextAreaElement).value).toBe('设计并实现这个项目，自己验证');
   });
+  it('Enter on a new folder name selects that folder without submitting the previous project', async () => {
+    vi.mocked(api.folders).mockResolvedValue({ path: 'C:\\projects', parent: 'C:\\', folders: [] });
+    modal(); fillGoal(); fireEvent.click(screen.getByRole('button', { name: '浏览文件夹' }));
+    const input = await screen.findByLabelText('新文件夹名称');
+    fireEvent.change(input, { target: { value: 'chosen-new-project' } });
+    expect(fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' })).toBe(false);
+    expect((screen.getByLabelText('项目文件夹 *') as HTMLInputElement).value).toBe('C:\\projects\\chosen-new-project');
+    expect((screen.getByLabelText('这个路径还不存在，创建新文件夹') as HTMLInputElement).checked).toBe(true);
+    expect(screen.queryByLabelText('本机文件夹浏览')).toBeNull();
+    expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
+    await vi.waitFor(() => expect(api.prepareProject).toHaveBeenCalledWith('C:\\projects\\chosen-new-project', true));
+  });
+  it('keeps task submission closed while choosing a folder, including invalid names and implicit submits', async () => {
+    vi.mocked(api.folders).mockResolvedValue({ path: 'C:\\projects', parent: 'C:\\', folders: [] });
+    modal(); fillGoal(); fireEvent.click(screen.getByRole('button', { name: '浏览文件夹' }));
+    const input = await screen.findByLabelText('新文件夹名称');
+    expect((screen.getByRole('button', { name: '交给 Boss' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(input, { target: { value: '../wrong-folder' } });
+    expect(fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' })).toBe(false);
+    expect(screen.getByRole('alert').textContent).toMatch(/不能包含路径分隔符/);
+    fireEvent.submit(screen.getByRole('dialog').querySelector('form')!);
+    expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled();
+    expect((screen.getByLabelText('项目文件夹 *') as HTMLInputElement).value).toBe('C:/projects/plain');
+    fireEvent.click(screen.getByRole('button', { name: '关闭文件夹浏览' }));
+    expect((screen.getByRole('button', { name: '交给 Boss' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+  it.each([
+    ['新文件夹名称', { isComposing: true, keyCode: 13 }],
+    ['新文件夹名称', { isComposing: false, keyCode: 229 }],
+    ['浏览路径', { isComposing: true, keyCode: 13 }],
+    ['浏览路径', { isComposing: false, keyCode: 229 }],
+  ] as const)('preserves IME confirmation in %s (%j) before accepting a separate Enter', async (label, keyboard) => {
+    vi.mocked(api.folders).mockResolvedValue({ path: 'C:\\projects', parent: 'C:\\', folders: [] });
+    modal(); fillGoal(); fireEvent.click(screen.getByRole('button', { name: '浏览文件夹' }));
+    await screen.findByLabelText('新文件夹名称');
+    const input = screen.getByLabelText(label);
+    const value = label === '新文件夹名称' ? '中文项目' : 'C:\\projects\\中文项目';
+    fireEvent.compositionStart(input); fireEvent.change(input, { target: { value } });
+    expect(fireEvent.keyDown(input, { key: 'Enter', code: 'Enter', ...keyboard })).toBe(true);
+    expect(screen.getByLabelText('本机文件夹浏览')).toBeTruthy();
+    expect(api.folders).toHaveBeenCalledTimes(1);
+    expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled();
+    expect((screen.getByLabelText('项目文件夹 *') as HTMLInputElement).value).toBe('C:/projects/plain');
+    fireEvent.compositionEnd(input);
+    expect(fireEvent.keyDown(input, { key: 'Enter', code: 'Enter', keyCode: 13 })).toBe(false);
+    if (label === '新文件夹名称') {
+      expect((screen.getByLabelText('项目文件夹 *') as HTMLInputElement).value).toBe('C:\\projects\\中文项目');
+      expect(screen.queryByLabelText('本机文件夹浏览')).toBeNull();
+    } else {
+      await vi.waitFor(() => expect(api.folders).toHaveBeenCalledTimes(2));
+      expect(api.folders).toHaveBeenLastCalledWith(value, { signal: expect.any(AbortSignal) });
+    }
+  });
   it('locks submission and close controls across folder preparation and task creation', async () => {
     let resolvePrepare!: (value: Awaited<ReturnType<typeof api.prepareProject>>) => void;
     vi.mocked(api.prepareProject).mockImplementation(() => new Promise(resolve => { resolvePrepare = resolve; }));
