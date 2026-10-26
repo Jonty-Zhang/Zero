@@ -13,6 +13,7 @@
   --shadow:0 24px 90px #29221c29;
   font-family:'Zero Sans','Microsoft YaHei',sans-serif;
   font-size:15px;
+  scrollbar-gutter:stable;
   background:#f7f5f1;
   color:var(--ink)
 }
@@ -20,6 +21,8 @@
 body {
   line-height:1.7
 }
+body:has([aria-modal="true"]) { overflow:hidden; }
+.submit-form, .drawer-content { overscroll-behavior-y:contain; }
 button,input,select,textarea {
   accent-color:var(--blue)
 }
