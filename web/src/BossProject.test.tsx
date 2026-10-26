@@ -34,7 +34,7 @@ describe('Boss project entry', () => {
     expect(within(dialog).getByLabelText('Boss 与团队偏好（可选）')).toBeTruthy();
     expect(within(dialog).queryByRole('combobox')).toBeNull();
     expect(within(dialog).queryByLabelText(/检查命令|最大返工|基础分支|执行阶段/)).toBeNull();
-    fireEvent.click(within(dialog).getByRole('button', { name: '高级模式：手动执行任务' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: '手动配置' }));
     expect(screen.getByRole('dialog', { name: '提交执行任务' })).toBeTruthy();
   });
   it('prepares a plain folder and submits the original natural preference with no invented checks or route', async () => {
@@ -57,7 +57,7 @@ describe('Boss project entry', () => {
     modal({ capabilities: active as Capabilities | null, capabilityError: error, onCreated }); fillGoal();
     fireEvent.change(screen.getByLabelText('Boss 与团队偏好（可选）'), { target: { value: '老板模型名字可能写得不准确' } });
     expect((screen.getByRole('button', { name: '交给 Boss' }) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText(/正在确认 Codex|尚无可用的 Codex|能力读取失败/)).toBeTruthy();
+    expect(screen.getByText(/正在确认 Codex|尚无可用的 Codex|无法读取可用模型/)).toBeTruthy();
     fireEvent.submit(screen.getByRole('dialog').querySelector('form')!);
     await act(async () => {});
     expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled(); expect(onCreated).not.toHaveBeenCalled();
@@ -260,11 +260,11 @@ describe('Boss settings and project conversation', () => {
   it('does not mistake a live worktree or missing historical delivery data for a completed result', () => {
     const view = render(<ProjectDelivery task={{ ...task, delivery: { path: 'C:/worktree', branch: 'zero/task' } }} />);
     expect(screen.getByRole('region', { name: '任务工作目录' })).toBeTruthy();
-    expect(screen.getByText(/任务尚未验收完成/)).toBeTruthy();
-    expect(screen.queryByText('项目成果已准备好')).toBeNull();
+    expect(screen.getByText(/尚未验收/)).toBeTruthy();
+    expect(screen.queryByRole('region', { name: '项目成果' })).toBeNull();
     view.rerender(<ProjectDelivery task={{ ...task, status: 'done', repoPath: 'C:/must-not-be-output' }} />);
     expect(screen.queryByText('C:/must-not-be-output')).toBeNull();
-    expect(screen.getByText(/服务端未提供可确认的成果目录/)).toBeTruthy();
+    expect(screen.getByText(/成果目录尚未确认/)).toBeTruthy();
     expect(screen.queryByRole('button', { name: '复制路径' })).toBeNull();
   });
   it('keeps the actual result path selectable when clipboard access is unavailable', async () => {

@@ -1,0 +1,3 @@
+/* Keep functional legacy layout in a lower cascade layer.
+   workspace.css owns the current typography, surfaces and component styling. */
+@import './styles.css' layer(legacy);

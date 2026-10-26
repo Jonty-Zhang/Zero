@@ -1,0 +1,44 @@
+{
+  "verifiedDate": "2026-10-27",
+  "filesHashed": 226,
+  "fontFaces": 214,
+  "allSourceUrlsSameOrigin": true,
+  "allFontDisplaySwap": true,
+  "woff2HeaderAndBrotliCmapValidated": 214,
+  "gb2312Method": "6763 Han positions B0A1-F7FE excluding D7FA-D7FE, decoded with WHATWG gbk; actual nonzero cmap glyphs intersected with shipped CSS unicode ranges",
+  "families": [
+    {
+      "family": "Zero Sans",
+      "woff2Files": 102,
+      "bytes": 4516584,
+      "cmapCodePoints": 13668,
+      "cssRoutedCodePoints": 13666,
+      "gb2312Han": 6763,
+      "gb2312HanMissing": 0
+    },
+    {
+      "family": "Zero Serif",
+      "woff2Files": 102,
+      "bytes": 6051944,
+      "cmapCodePoints": 13699,
+      "cssRoutedCodePoints": 13697,
+      "gb2312Han": 6763,
+      "gb2312HanMissing": 0
+    },
+    {
+      "family": "Zero Display",
+      "woff2Files": 4,
+      "bytes": 67148,
+      "cmapCodePoints": 319,
+      "cssRoutedCodePoints": 316
+    },
+    {
+      "family": "Zero Mono",
+      "woff2Files": 6,
+      "bytes": 86244,
+      "cmapCodePoints": 663,
+      "cssRoutedCodePoints": 663
+    }
+  ],
+  "cssSha256": "075250683db0a6b92125bede3a8676a7a20fdffff4d00fa2d4046acdb51c4154"
+}

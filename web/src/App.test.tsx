@@ -414,7 +414,7 @@ describe('task workspace', () => {
     render(<App />);
     await screen.findByText('修复登录回调');
     fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
-    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
     const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
     const [harness, model, effort] = within(dialog).getAllByRole('combobox');
     fireEvent.change(model!, { target: { value: 'shared-model' } });
@@ -433,7 +433,7 @@ describe('task workspace', () => {
     render(<App />);
     await screen.findByText('修复登录回调');
     fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
-    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
     const [harness, model, effort] = within(screen.getByRole('dialog')).getAllByRole('combobox');
     fireEvent.change(harness!, { target: { value: 'dsh' } });
     fireEvent.change(model!, { target: { value: 'shared-model' } });
@@ -455,7 +455,7 @@ describe('task workspace', () => {
     render(<App />);
     await act(async () => {});
     fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
-    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
     const [harness, model, effort] = within(screen.getByRole('dialog')).getAllByRole('combobox');
     fireEvent.change(model!, { target: { value: 'shared-model' } });
     fireEvent.change(effort!, { target: { value: 'high' } });
@@ -578,7 +578,7 @@ describe('task workspace', () => {
     render(<App />);
     await screen.findByText('修复登录回调');
     fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
-    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
     const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
     fireEvent.change(within(dialog).getByLabelText(/仓库路径/), { target: { value: 'C:/repo/zero' } });
     fireEvent.change(within(dialog).getByLabelText('任务描述 *'), { target: { value: '实现登录并由另一名执行者补全检查' } });
@@ -674,7 +674,7 @@ describe('task workspace', () => {
     vi.mocked(api.createTask).mockReturnValue(new Promise(() => {}));
     render(<App />);
     fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
-    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
     const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
     expect(within(dialog).getByDisplayValue('HEAD')).toBeTruthy();
     fireEvent.change(within(dialog).getByLabelText(/仓库路径/), { target: { value: 'C:/repo/zero' } });
@@ -815,7 +815,7 @@ describe('task workspace', () => {
     const opener = await screen.findByRole('button', { name: '提交任务' });
     opener.focus();
     fireEvent.click(opener);
-    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
     const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
     fireEvent.change(within(dialog).getByLabelText(/仓库路径/), { target: { value: 'C:/repo/zero' } });
     fireEvent.change(within(dialog).getByLabelText('任务描述 *'), { target: { value: '完成目标并检查结果' } });

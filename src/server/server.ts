@@ -819,7 +819,7 @@ async function staticFile(res: ServerResponse, pathname: string, staticDir = res
   res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': contentType(extname(target)), 'Content-Length': bytes.length, 'Cache-Control': target.endsWith('index.html') ? 'no-cache' : 'public, max-age=31536000, immutable' });
   res.end(bytes);
 }
-function contentType(ext: string) { return ({ '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json; charset=utf-8' } as Record<string,string>)[ext] ?? 'application/octet-stream'; }
+function contentType(ext: string) { return ({ '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json; charset=utf-8', '.woff2': 'font/woff2' } as Record<string,string>)[ext] ?? 'application/octet-stream'; }
 
 async function bodyJson(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<unknown> {
   const chunks: Buffer[] = []; let length = 0;

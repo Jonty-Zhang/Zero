@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { AlertCircle, ArrowUp, BrainCircuit, CheckCircle2, Copy, Folder, FolderPlus, LoaderCircle, MessageSquare, Send, X } from 'lucide-react';
+import { AlertCircle, ArrowUp, Copy, Folder, FolderPlus, LoaderCircle, MessageSquare, Send, X } from 'lucide-react';
 import { api } from './api';
 import { useDialog } from './dialog';
 import type { Capabilities, Task } from './types';
 
-const preferenceExample = '例如：Boss 用 Codex gpt6.1sol high，负责设计和验收；具体操作交给便宜模型或 DeepSeek Harness，复杂问题先讨论。';
+const preferenceExample = 'Codex gpt6.1sol high 负责设计与验收，日常实现交给便宜模型或 DeepSeek，复杂问题先讨论。';
 type FolderListing = Awaited<ReturnType<typeof api.folders>>;
 type BossSubmission = { draftKey: string; payload: { repoPath: string; prompt: string; boss: { preference: string } } };
 
@@ -20,7 +20,19 @@ export function ProjectDelivery({ task }: { task: Task }) {
     try { await navigator.clipboard.writeText(task.delivery.path); setCopied(true); }
     catch { setCopyError('复制未成功，请选中下方路径手动复制。'); }
   };
-  return <section className={`project-delivery ${completed ? 'completed' : ''}`} aria-label={completed ? '项目成果' : '任务工作目录'}><div className="project-delivery-heading"><Folder size={19} /><div><h3>{completed ? '项目成果已准备好' : '任务工作目录'}</h3><p>{completed ? '成果保存在下方独立文件夹中，原选文件夹未自动回写。' : 'Agent 在下方独立目录中工作；任务尚未验收完成。'}</p></div></div>{task.delivery?.path ? <><div className="project-delivery-path"><code>{task.delivery.path}</code><button type="button" className="button secondary" onClick={() => void copyPath()}><Copy size={14} />{copied ? '已复制路径' : '复制路径'}</button></div><p className="field-hint">{completed ? '将路径粘贴到电脑文件资源管理器即可查看成果。Zero 不会自动合并、覆盖原目录或推送 GitHub。' : '此路径是实际任务工作区，不是原项目目录。'}</p>{task.delivery.branch && <p className="delivery-version">任务分支：<code>{task.delivery.branch}</code></p>}{task.delivery.resultCommit && <p className="delivery-version">成果提交：<code>{task.delivery.resultCommit}</code></p>}{copied && <span className="sr-only" role="status">成果文件夹路径已复制</span>}{copyError && <p role="alert" className="folder-error">{copyError}</p>}</> : <p className="folder-error">服务端未提供可确认的成果目录。请查看执行报告确认实际路径；原项目目录不能作为成果目录。</p>}</section>;
+  return <section className={`project-delivery ${completed ? 'completed' : ''}`} aria-label={completed ? '项目成果' : '任务工作目录'}>
+    <div className="project-delivery-heading"><Folder size={18} /><div><h3>{completed ? '项目成果' : '工作目录'}</h3><p>{completed ? '独立成果目录，原选文件夹未自动回写。' : '独立工作区，尚未验收。'}</p></div></div>
+    {task.delivery?.path ? <>
+      <div className="project-delivery-path"><code>{task.delivery.path}</code><button type="button" className="button secondary" onClick={() => void copyPath()}><Copy size={14} />{copied ? '已复制路径' : '复制路径'}</button></div>
+      {completed && <p className="delivery-note">不会自动合并或推送 GitHub。</p>}
+      {(task.delivery.branch || task.delivery.resultCommit) && <dl className="delivery-version-list">
+        {task.delivery.branch && <div><dt>分支</dt><dd><code>{task.delivery.branch}</code></dd></div>}
+        {task.delivery.resultCommit && <div><dt>提交</dt><dd><code>{task.delivery.resultCommit}</code></dd></div>}
+      </dl>}
+      {copied && <span className="sr-only" role="status">成果文件夹路径已复制</span>}
+      {copyError && <p role="alert" className="folder-error">{copyError}</p>}
+    </> : <p className="folder-error">成果目录尚未确认，请查看执行报告。</p>}
+  </section>;
 }
 
 export function BossProjectModal({ capabilities, capabilityError, onClose, onAdvanced, onCreated }: { capabilities: Capabilities | null; capabilityError: string; onClose: () => void; onAdvanced: () => void; onCreated: (task: Task) => void }) {
@@ -84,21 +96,20 @@ export function BossProjectModal({ capabilities, capabilityError, onClose, onAdv
     finally { submitting.current = false; setBusy(false); }
   };
   return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="交给 Boss" className="modal submit-modal boss-submit">
-    <div className="modal-heading"><div><div className="eyebrow"><BrainCircuit size={14} />BOSS / 项目负责人</div><h2>你说目标，Boss 负责推进</h2><p>选择项目位置，写下目标，其余交给 Boss 和团队。</p></div><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
+    <div className="modal-heading boss-project-heading"><h2>新建项目</h2><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
     <form onSubmit={submit} className="submit-form"><fieldset disabled={busy}>
-      <div className="field"><label htmlFor="boss-project-path" className="field-label">项目文件夹 *</label><div className="boss-folder-input"><input id="boss-project-path" required value={path} onChange={e => setPath(e.target.value)} placeholder="选择已有文件夹，或输入新文件夹完整路径" /><button className="button secondary" type="button" onClick={() => void browse(path.trim() || undefined)}><Folder size={15} />浏览文件夹</button></div><span className="field-hint">可使用普通文件夹；Zero 会准备项目版本记录，方便保留和检查改动。</span></div>
+      <div className="field"><label htmlFor="boss-project-path" className="field-label">项目文件夹 *</label><div className="boss-folder-input"><input id="boss-project-path" required value={path} onChange={e => setPath(e.target.value)} placeholder="选择文件夹或输入完整路径" /><button className="button secondary" type="button" onClick={() => void browse(path.trim() || undefined)}><Folder size={15} />浏览文件夹</button></div><span className="field-hint">支持普通文件夹，无需预先配置 Git。</span></div>
       <label className="boss-create-toggle"><input type="checkbox" checked={create} onChange={e => setCreate(e.target.checked)} />这个路径还不存在，创建新文件夹</label>
       {browsing && <section className="folder-browser" aria-label="本机文件夹浏览"><div className="folder-browser-head"><b>选择本机文件夹</b><button type="button" className="icon-button" aria-label="关闭文件夹浏览" onClick={closeBrowser}><X size={15} /></button></div><div className="boss-folder-input"><label className="field"><span className="field-label">浏览路径</span><input value={browsePath} onChange={e => setBrowsePath(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); void browse(browsePath.trim() || undefined); } }} /></label><button type="button" className="button secondary" disabled={folderBusy} onClick={() => void browse(browsePath.trim() || undefined)}>打开路径</button></div>
-        {folderBusy ? <p role="status"><LoaderCircle size={15} className="spin" />正在读取文件夹…</p> : <>{listing?.parent && <button type="button" className="link-button" onClick={() => void browse(listing.parent!)}><ArrowUp size={14} />上一级</button>}{listing && <><p className="folder-current">{listing.path}</p><div className="folder-list">{listing.folders.map(folder => <button type="button" key={folder.path} onClick={() => void browse(folder.path)}><Folder size={15} />{folder.name}</button>)}{!listing.folders.length && <p>此文件夹没有子文件夹，可以直接选择。</p>}</div><div className="folder-browser-actions"><button type="button" className="button primary" onClick={() => selectFolder()}>选择此文件夹</button><label className="field"><span className="field-label">新文件夹名称</span><input value={newName} onChange={e => setNewName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); selectFolder(true); } }} placeholder="例如 my-project" /></label><button type="button" className="button secondary" disabled={!newName.trim()} onClick={() => selectFolder(true)}><FolderPlus size={15} />使用新文件夹</button></div></>}</>}
+        {folderBusy ? <p role="status"><LoaderCircle size={15} className="spin" />正在读取文件夹…</p> : <>{listing?.parent && <button type="button" className="link-button" onClick={() => void browse(listing.parent!)}><ArrowUp size={14} />上一级</button>}{listing && <><p className="folder-current">{listing.path}</p><div className="folder-list">{listing.folders.map(folder => <button type="button" key={folder.path} onClick={() => void browse(folder.path)}><Folder size={15} />{folder.name}</button>)}{!listing.folders.length && <p>没有子文件夹</p>}</div><div className="folder-browser-actions"><button type="button" className="button primary" onClick={() => selectFolder()}>选择此文件夹</button><label className="field"><span className="field-label">新文件夹名称</span><input value={newName} onChange={e => setNewName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); selectFolder(true); } }} placeholder="例如 my-project" /></label><button type="button" className="button secondary" disabled={!newName.trim()} onClick={() => selectFolder(true)}><FolderPlus size={15} />使用新文件夹</button></div></>}</>}
         {folderError && <p role="alert" className="folder-error">{folderError}</p>}
       </section>}
-      <label className="field"><span className="field-label">你想完成什么 *</span><textarea aria-label="你想完成什么 *" required rows={5} value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="直接描述目标、背景和需要注意的事项。方案、分工、测试和验收都交给 Boss。" /></label>
-      <label className="field"><span className="field-label">Boss 与团队偏好（可选）</span><textarea aria-label="Boss 与团队偏好（可选）" rows={3} value={preference} onChange={e => setPreference(e.target.value)} placeholder={preferenceExample} /><span className="field-hint">用自己的话写即可，模型名称不必准确。Boss 会结合已连接的可用模型判断；留空使用全局 Boss 偏好。</span></label>
-      <div className="boss-process"><span><BrainCircuit size={16} />设计与讨论</span><span>→</span><span>跨 Agent 分工</span><span>→</span><span><CheckCircle2 size={16} />检查与验收</span></div>
-      {capabilityError ? <div className="inline-warning"><AlertCircle size={15} />能力读取失败：{capabilityError}。请确认服务连接后重试，已填写的内容会保留。</div> : !capabilities ? <p className="field-hint" role="status">正在确认 Codex 项目负责人是否可用…</p> : !leadReady ? <div className="inline-warning"><AlertCircle size={15} /><div>尚无可用的 Codex 项目负责人。请先连接并验证 Codex 模型，再刷新能力状态；其他 Harness 可以参与后续分工。{codex?.reason && <p>Codex：{codex.reason}</p>}</div></div> : <p className="field-hint">偏好是请求，实际采用的模型、讨论和分工会记录在任务详情中。</p>}
-      {retrySubmission && !busy && <p className="field-hint">上次提交尚未确认。可重试原请求以确认是否已接收，不会重复创建任务。</p>}
+      <label className="field"><span className="field-label">你想完成什么 *</span><textarea aria-label="你想完成什么 *" required rows={5} value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="描述目标、背景和约束。方案、分工与验收由负责人处理。" /></label>
+      <label className="field"><span className="field-label">Boss 与团队偏好（可选）</span><textarea aria-label="Boss 与团队偏好（可选）" rows={3} value={preference} onChange={e => setPreference(e.target.value)} placeholder={preferenceExample} /><span className="field-hint">模型名称不必准确；留空使用默认偏好。</span></label>
+      {capabilityError ? <div className="inline-warning"><AlertCircle size={15} />无法读取可用模型：{capabilityError}。请重试，草稿已保留。</div> : !capabilities ? <p className="field-hint" role="status">正在确认 Codex 是否可用…</p> : !leadReady ? <div className="inline-warning"><AlertCircle size={15} /><div>尚无可用的 Codex 项目负责人。请先连接并验证 Codex 模型，再刷新。{codex?.reason && <p>Codex：{codex.reason}</p>}</div></div> : null}
+      {retrySubmission && !busy && <p className="field-hint">上次提交结果未确认。重试不会重复创建任务。</p>}
       {error && <div className="alert error compact" role="alert"><AlertCircle size={16} />{error}</div>}
-      <div className="modal-footer"><button type="button" className="link-button" disabled={busy} onClick={onAdvanced}>高级模式：手动执行任务</button><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || browsing || !submissionReady || !path.trim() || !prompt.trim()}>{busy ? <><LoaderCircle size={15} className="spin" />正在交给 Boss</> : <><Send size={15} />{retrySubmission ? '确认上次提交' : '交给 Boss'}</>}</button></div>
+      <div className="modal-footer"><button type="button" className="link-button" disabled={busy} onClick={onAdvanced}>手动配置</button><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || browsing || !submissionReady || !path.trim() || !prompt.trim()}>{busy ? <><LoaderCircle size={15} className="spin" />正在交给 Boss</> : <><Send size={15} />{retrySubmission ? '确认上次提交' : '交给 Boss'}</>}</button></div>
     </fieldset></form>
   </section></div>;
 }
@@ -119,9 +130,23 @@ export function BossProgress({ task, onMessage }: { task: Task; onMessage: () =>
     catch (e) { setError(e instanceof Error ? e.message : '发送失败'); }
     finally { sending.current = false; setBusy(false); }
   };
-  return <section className="detail-block boss-progress" aria-label="Boss 项目进展"><h3><BrainCircuit size={16} />Boss 项目负责人</h3>{task.boss?.preference && <p className="boss-preference"><b>你的偏好</b><span>{task.boss.preference}</span></p>}
-    {task.bossPlan ? <div className="boss-plan"><h4>设计与分工方案</h4><p className="pre-wrap">{task.bossPlan.summary}</p><h4>验收目标</h4><ul>{task.bossPlan.acceptanceCriteria.map((item, i) => <li key={i}>{item}</li>)}</ul><h4>Agent 分工</h4>{task.bossPlan.stages.map((stage, i) => <article key={i} className="boss-plan-stage"><b>{i + 1}. {stage.objective}</b><span>{[stage.harness, stage.model, stage.reasoningEffort].filter(Boolean).join(' · ') || '由 Boss 根据执行时的能力分配'}</span></article>)}<details><summary>Boss 选择的验证方式</summary>{task.bossPlan.checks.map(check => <p key={check.id}><b>{check.id}</b> <code>{check.argv.join(' ')}</code></p>)}</details></div> : <p className="evidence-note">尚未记录 Boss 方案。设计、讨论和分工结果将在这里显示。</p>}
-    <h4><MessageSquare size={14} />讨论与补充</h4><div className="boss-message-list">{(task.bossMessages ?? []).map(message => <article key={message.id} className={`boss-message ${message.role}`}><div><b>{message.role === 'user' ? '你' : message.role === 'consultant' ? '参与讨论的 Agent' : 'Boss'}</b><span>{[message.harness, message.model].filter(Boolean).join(' · ')}</span><time>{new Date(message.at).toLocaleString('zh-CN')}</time></div><p>{message.content}</p></article>)}</div>
-    <form onSubmit={send}><label className="field"><span className="field-label">给 Boss 补充信息或提问</span><textarea rows={3} maxLength={16000} disabled={busy || !canMessage} value={content} onChange={e => { setContent(e.target.value); setSent(false); }} placeholder="补充要求、说明背景，或提出问题…" /></label><p className="field-hint">{terminal ? '任务已结束，不能追加要求或自动重开。请新建后续任务继续。' : !canMessage ? 'Boss 正在验收本轮结果，暂不能追加要求。请等待验收结束后新建后续任务。' : '消息会保留，Boss 在下一个安全处理点读取，不会打断正在执行的 Agent。'}</p><button className="button secondary" type="submit" disabled={busy || !canMessage || !content.trim()}>{busy ? '正在发送…' : '发送给 Boss'}</button>{sent && <p role="status">消息已保存，等待 Boss 处理。</p>}{error && <p role="alert" className="folder-error">{error}</p>}</form>
+  return <section className="detail-block boss-progress" aria-label="Boss 项目进展">
+    <div className="boss-section-heading"><h3>项目方案</h3>{task.boss?.preference && <details className="boss-preference"><summary>团队偏好</summary><p>{task.boss.preference}</p></details>}</div>
+    {task.bossPlan ? <div className="boss-plan">
+      <p className="boss-plan-summary pre-wrap">{task.bossPlan.summary}</p>
+      <div className="boss-plan-grid">
+        <section className="boss-acceptance"><h4>验收标准</h4><ul>{task.bossPlan.acceptanceCriteria.map((item, i) => <li key={i}>{item}</li>)}</ul></section>
+        <section className="boss-assignments"><h4>分工</h4><div className="boss-stage-list">{task.bossPlan.stages.map((stage, i) => <article key={i} className="boss-plan-stage"><span className="boss-stage-index" aria-hidden="true">{String(i + 1).padStart(2, '0')}</span><div><h5>{stage.objective}</h5><p className="boss-stage-route">{[stage.harness, stage.model, stage.reasoningEffort].filter(Boolean).join(' · ') || '待分配'}</p></div></article>)}</div></section>
+      </div>
+      <details className="boss-validation"><summary>验证命令</summary><ul>{task.bossPlan.checks.map(check => <li key={check.id}><span>{check.id}</span><code>{check.argv.join(' ')}</code></li>)}</ul></details>
+    </div> : <p className="boss-plan-empty">方案尚未生成。</p>}
+    <section className="boss-discussion" aria-label="项目讨论"><h4><MessageSquare size={15} />讨论</h4>
+      <div className="boss-message-list">{(task.bossMessages ?? []).map(message => <article key={message.id} className={`boss-message ${message.role}`}><header className="boss-message-meta"><b>{message.role === 'user' ? '你' : message.role === 'consultant' ? '顾问' : 'Boss'}</b><span>{[message.harness, message.model].filter(Boolean).join(' · ')}</span><time dateTime={message.at} title={new Date(message.at).toLocaleString('zh-CN')}>{new Date(message.at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</time></header><p>{message.content}</p></article>)}</div>
+      <form onSubmit={send} className="boss-message-form" aria-disabled={!canMessage}>
+        <label className="field"><span className="field-label">给 Boss 补充信息或提问</span><textarea rows={3} maxLength={16000} disabled={busy || !canMessage} value={content} onChange={e => { setContent(e.target.value); setSent(false); }} placeholder="补充要求或提问…" /></label>
+        <div className="boss-message-actions"><p className="boss-message-status">{terminal ? '任务已结束。继续工作请新建后续任务。' : !canMessage ? '正在验收。新要求请在验收后新建后续任务。' : '消息将在下个安全处理点读取。'}</p><button className="button secondary" type="submit" disabled={busy || !canMessage || !content.trim()}>{busy ? '发送中…' : '发送给 Boss'}<Send size={14} /></button></div>
+        {sent && <p role="status" className="boss-message-receipt">已发送，等待处理。</p>}{error && <p role="alert" className="folder-error">{error}</p>}
+      </form>
+    </section>
   </section>;
 }
