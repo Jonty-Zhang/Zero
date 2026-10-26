@@ -17,7 +17,9 @@ import { DatabaseSync } from 'node:sqlite';
 
 const complete = (final: string): RunResult => ({ status: 'completed', exitCode: 0, durationMs: 1, final });
 async function fixture() {
-  const root = await mkdtemp(join(process.cwd(), 'data/verification/boss-projects-root/worker-'));
+  const base = join(process.cwd(), 'data/verification/boss-worker-tests');
+  await mkdir(base, { recursive: true });
+  const root = await mkdtemp(join(base, 'worker-'));
   const repo = join(root, 'project'); await mkdir(repo);
   await writeFile(join(repo, 'README.md'), 'A local project.\n');
   await prepareProjectFolder(repo);

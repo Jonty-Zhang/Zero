@@ -232,6 +232,9 @@ test('consultation quota or cancellation stops the decision loop and discards it
 test('Boss snapshots preserve deep project files under a long artifact root without copying template hooks', async () => {
   let calls = 0;
   const deepRelative = join('nested-project-directory-'.repeat(4), 'additional-project-directory-'.repeat(4), 'implementation.mjs');
+  // Make the artifact location genuinely long on Linux too, while keeping the
+  // mkdtemp parent below Windows' directory-creation limit.
+  const artifactDirectory = 'long-artifact-location-'.padEnd(Math.max(22, 140 - tmpdir().length - 18), 'x');
   const f = await fixture(async (request, purpose) => {
     calls++;
     assert.ok(request.cwd.length > 170, 'exercise a long real artifact location');
@@ -241,7 +244,7 @@ test('Boss snapshots preserve deep project files under a long artifact root with
     assert.ok(copy.length > 400, 'preserve an actual deeply nested project file');
     assert.equal(await readFile(copy, 'utf8'), 'export const deep = true;\n');
     return result(plan());
-  }, candidates, 'long-artifact-location-');
+  }, candidates, artifactDirectory);
   try {
     const file = join(f.workspace, deepRelative);
     await mkdir(dirname(file), { recursive: true });
