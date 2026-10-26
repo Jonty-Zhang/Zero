@@ -42,7 +42,12 @@ export function useDialog(onClose: () => void, busy = false) {
     return () => {
       document.removeEventListener('keydown', onKey, true);
       document.removeEventListener('focusin', containFocus);
-      if (previous?.isConnected) previous.focus();
+      if (previous?.isConnected && previous !== document.body && previous !== document.documentElement) {
+        previous.focus({ preventScroll: true });
+        if (document.activeElement === previous) return;
+      }
+      // Polling can remove or disable the original trigger while details are open.
+      document.querySelector<HTMLElement>('main[tabindex="-1"]')?.focus({ preventScroll: true });
     };
   }, []);
   useEffect(() => {

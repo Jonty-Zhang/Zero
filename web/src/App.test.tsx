@@ -47,6 +47,51 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
+describe('task drawer focus after workspace polling', () => {
+  it.each([
+    { label: 'replaces the opener task with another task', nextTasks: [tasks[1]!] },
+    { label: 'removes every task from the workspace', nextTasks: [] as Task[] },
+  ])('returns focus to the main workspace when polling $label', async ({ nextTasks }) => {
+    vi.useFakeTimers();
+    vi.mocked(api.tasks).mockResolvedValueOnce([tasks[0]!]).mockResolvedValue(nextTasks);
+    render(<App />);
+    await act(async () => {});
+    const opener = screen.getByRole('button', { name: '修复登录回调' });
+    opener.focus();
+    fireEvent.click(opener);
+    await act(async () => {});
+    const dialog = screen.getByRole('dialog', { name: '任务详情' });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(4500); });
+    expect(api.tasks).toHaveBeenCalledTimes(2);
+    expect(opener.isConnected).toBe(false);
+    expect(screen.queryByRole('button', { name: '修复登录回调' })).toBeNull();
+    if (nextTasks.length) expect(screen.getByRole('button', { name: '更新文档' })).toBeTruthy();
+    else expect(screen.getByRole('heading', { name: '准备好开始第一个任务' })).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: '关闭详情' }));
+    expect(screen.queryByRole('dialog', { name: '任务详情' })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole('main'));
+  });
+  it('prefers the original task button when it remains mounted after a workspace poll', async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.tasks).mockResolvedValueOnce([tasks[0]!]).mockResolvedValue([{ ...tasks[0]!, updatedAt: '2026-10-27T03:00:00Z' }, tasks[1]!]);
+    render(<App />);
+    await act(async () => {});
+    const opener = screen.getByRole('button', { name: '修复登录回调' });
+    opener.focus();
+    fireEvent.click(opener);
+    await act(async () => {});
+    const dialog = screen.getByRole('dialog', { name: '任务详情' });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(4500); });
+    expect(api.tasks).toHaveBeenCalledTimes(2);
+    expect(opener.isConnected).toBe(true);
+    expect(screen.getByRole('button', { name: '修复登录回调' })).toBe(opener);
+    fireEvent.click(within(dialog).getByRole('button', { name: '关闭详情' }));
+    expect(document.activeElement).toBe(opener);
+  });
+});
+
 describe('polling workspace filters', () => {
   it.each([
     { view: '列表视图', field: 'Agent 筛选', selected: 'codex', changedTask: { ...tasks[0]!, route: { harnessId: 'zcode' } } },

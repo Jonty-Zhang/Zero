@@ -39,6 +39,32 @@ function press(target: HTMLElement, key: string, options: KeyboardEventInit = {}
 
 afterEach(cleanup);
 
+function ChangingWorkspace({ openerState = 'ready', autoOpen = false }: { openerState?: 'ready' | 'removed' | 'disabled'; autoOpen?: boolean }) {
+  const [open, setOpen] = useState(autoOpen);
+  return <><main tabIndex={-1} aria-label="项目工作区">
+    {openerState !== 'removed' && <button type="button" disabled={openerState === 'disabled'} onClick={() => setOpen(true)}>查看项目</button>}
+    <button type="button">下一个项目</button>
+  </main>{open && <DraftDialog onClose={() => setOpen(false)} />}</>;
+}
+
+describe('dialog return focus when the workspace changes', () => {
+  it.each(['removed', 'disabled'] as const)('returns to the main workspace when the opener becomes %s', openerState => {
+    const view = render(<ChangingWorkspace />);
+    const opener = screen.getByRole('button', { name: '查看项目' });
+    opener.focus(); fireEvent.click(opener);
+    view.rerender(<ChangingWorkspace openerState={openerState} />);
+    press(screen.getByRole('dialog'), 'Escape');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole('main'));
+  });
+
+  it('returns to the main workspace when a dialog opened without a focused control', () => {
+    render(<ChangingWorkspace autoOpen />);
+    press(screen.getByRole('dialog'), 'Escape');
+    expect(document.activeElement).toBe(screen.getByRole('main'));
+  });
+});
+
 describe('dialog keyboard handling during IME composition', () => {
   it.each([
     ['isComposing', { isComposing: true, keyCode: 27 }],
