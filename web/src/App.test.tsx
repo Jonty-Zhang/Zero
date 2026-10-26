@@ -144,6 +144,71 @@ describe('polling workspace filters', () => {
   });
 });
 
+describe('saved Boss lead identity in workspace', () => {
+  const leadTask = (): Task => ({
+    id: 'boss-delegated-project', title: '跨 Agent 实验项目', status: 'running', repoPath: 'C:/repo/project',
+    route: { harnessId: 'dsh', modelId: 'cheap-worker', reasoningEffort: 'low' },
+    boss: { preference: '希望由 user-requested-model 负责，再自行选择执行者' },
+    bossPlan: {
+      summary: '先设计，再委派执行', acceptanceCriteria: ['验证结果'],
+      boss: { harness: 'codex', model: 'verified-lead', reasoningEffort: 'high' },
+      stages: [{ objective: '尚未执行的计划阶段', harness: 'planned-only', model: 'future-worker' }],
+      checks: [], maxRevisions: 2,
+    } as NonNullable<Task['bossPlan']> & { boss: { harness: string; model: string; reasoningEffort: string } },
+  });
+  async function openWorkspace(view: string, fixture: Task = leadTask()) {
+    vi.mocked(api.tasks).mockResolvedValue([fixture]);
+    // Connection capabilities must not invent membership in the task's Agent filter.
+    vi.mocked(api.capabilities).mockResolvedValue({ ...capability, harnesses: [{ id: 'unrelated-connected', name: 'Other', available: true }] });
+    render(<App />);
+    await screen.findByText('跨 Agent 实验项目');
+    fireEvent.click(screen.getByRole('button', { name: view }));
+  }
+  it.each(['列表视图', '看板视图'])('shows the saved lead separately from the execution route in %s', async view => {
+    await openWorkspace(view);
+    const lead = screen.getByLabelText('项目负责人');
+    expect(lead.textContent).toBe('Boss · codex · verified-lead · high');
+    expect(screen.getAllByText(/cheap-worker/).length).toBeGreaterThan(0);
+    expect(lead.textContent).not.toContain('user-requested-model');
+    expect(lead.textContent).not.toContain('cheap-worker');
+  });
+  it.each(['列表视图', '看板视图'])('finds the task by its saved lead model in %s', async view => {
+    await openWorkspace(view);
+    fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'verified-lead' } });
+    expect(screen.getByText('跨 Agent 实验项目')).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: '没有符合条件的任务' })).toBeNull();
+  });
+  it.each([
+    { view: '列表视图', agent: 'codex' }, { view: '看板视图', agent: 'codex' },
+    { view: '列表视图', agent: 'dsh' }, { view: '看板视图', agent: 'dsh' },
+  ])('finds the delegated task by $agent in $view', async ({ view, agent }) => {
+    await openWorkspace(view);
+    const filter = screen.getByLabelText('Agent 筛选');
+    expect(optionValues(filter)).toContain(agent);
+    fireEvent.change(filter, { target: { value: agent } });
+    expect((filter as HTMLSelectElement).value).toBe(agent);
+    expect(screen.getByText('跨 Agent 实验项目')).toBeTruthy();
+  });
+  it.each(['列表视图', '看板视图'])('excludes planned-only and unrelated connected Agents in %s', async view => {
+    await openWorkspace(view);
+    const values = optionValues(screen.getByLabelText('Agent 筛选'));
+    expect(values).not.toContain('planned-only');
+    expect(values).not.toContain('unrelated-connected');
+  });
+  it.each(['列表视图', '看板视图'])('does not infer a legacy Boss identity from preference or execution route in %s', async view => {
+    const legacyTask = leadTask();
+    const { boss: _savedLead, ...legacyPlan } = legacyTask.bossPlan as NonNullable<Task['bossPlan']> & { boss: unknown };
+    legacyTask.bossPlan = legacyPlan;
+    await openWorkspace(view, legacyTask);
+    expect(screen.queryByLabelText('项目负责人')).toBeNull();
+    expect(optionValues(screen.getByLabelText('Agent 筛选'))).toEqual(['', 'dsh']);
+    expect(screen.getAllByText(/cheap-worker/).length).toBeGreaterThan(0);
+    fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'user-requested-model' } });
+    expect(screen.queryByText('跨 Agent 实验项目')).toBeNull();
+    expect(screen.getByRole('heading', { name: '没有符合条件的任务' })).toBeTruthy();
+  });
+});
+
 describe('settings read recovery', () => {
   it('clears a failed read after retry loads fresh settings and allows editing and saving them', async () => {
     const recovered: Config = {

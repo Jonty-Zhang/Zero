@@ -1343,6 +1343,16 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
 .task-table .table-time {
   font-size:14px
 }
+.task-lead {
+  min-width:0;
+  margin:6px 0 0;
+  color:var(--muted);
+  font-size:14px;
+  line-height:1.7;
+  white-space:normal;
+  overflow-wrap:anywhere;
+}
+.boss-progress > .task-lead { margin:0 0 16px; }
 .sidebar .pulse-dot {
   box-shadow:none
 }

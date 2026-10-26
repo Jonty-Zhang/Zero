@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { AlertCircle, ArrowUp, Copy, Folder, FolderPlus, LoaderCircle, MessageSquare, Send, X } from 'lucide-react';
 import { api } from './api';
 import { RichText } from './RichText';
+import { TaskLead } from './TaskLead';
 import { useDialog } from './dialog';
 import type { Capabilities, Task } from './types';
 
@@ -153,6 +154,7 @@ export function BossProgress({ task, onMessage }: { task: Task; onMessage: () =>
   };
   return <section className="detail-block boss-progress" aria-label="Boss 项目进展">
     <div className="boss-section-heading"><h3>项目方案</h3>{task.boss?.preference && <details className="boss-preference"><summary>团队偏好</summary><p>{task.boss.preference}</p></details>}</div>
+    <TaskLead task={task} />
     {task.bossPlan ? <div className="boss-plan">
       <RichText className="boss-plan-summary">{task.bossPlan.summary}</RichText>
       <div className="boss-plan-grid">

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } 
 import { Activity, Search, LayoutList, Columns3, Layers3, AlertCircle, ArrowDown, ArrowRight, ArrowUp, Check, CheckCircle2, ChevronDown, CircleHelp, Clock3, Code2, FileText, FolderGit2, ListOrdered, LoaderCircle, Plus, RefreshCw, Settings2, ShieldCheck, Target, TerminalSquare, X, XCircle } from 'lucide-react';
 import { api } from './api';
 import { RichText } from './RichText';
+import { TaskLead } from './TaskLead';
 import { useDialog } from './dialog';
 import { BossProjectModal, BossProgress, ProjectDelivery, type BossProjectDraft } from './BossProject';
 import { usePolling } from './usePolling';
@@ -24,6 +25,7 @@ const date = (value?: string) => value ? new Date(value).toLocaleString('zh-CN',
 const retryDate = (value?: string) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
 const routeName = (route?: Task['route']) => [route?.harnessId, route?.modelId, route?.reasoningEffort].filter(Boolean).join(' · ') || '等待路由分配';
 const taskTitle = (task: Task) => task.title || task.prompt?.split('\n')[0]?.slice(0, 72) || `任务 ${task.id.slice(0, 8)}`;
+const taskAgents = (task: Task) => [task.route?.harnessId, task.bossPlan?.boss?.harness].filter((value): value is string => Boolean(value));
 const sequenceTitle = (sequence: TaskSequence) => {
   const title = sequence.objective?.trim().split(/\r?\n/, 1)[0] || taskTitle(sequence.steps[0]?.task ?? { id: sequence.id, status: 'pending' });
   return title.length > 96 ? `${title.slice(0, 96)}…` : title;
@@ -90,8 +92,8 @@ export default function App() {
   const refreshAll = () => { void taskState.refresh(); void capState.refresh(); void seqState.refresh(); };
   const counts = Object.fromEntries(columns.map(c => [c.id, tasks.filter(t => t.status === c.id).length])) as Record<Status, number>;
   const repos = [...new Set([repo, ...tasks.map(task => task.repoPath)].filter((value): value is string => Boolean(value)))].sort();
-  const harnesses = [...new Set([harness, ...tasks.map(task => task.route?.harnessId)].filter((value): value is string => Boolean(value)))].sort();
-  const filtered = tasks.filter(task => (!search.trim() || [task.title, task.repoPath, task.id, task.route?.modelId].join(' ').toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())) && (!status || task.status === status) && (!repo || task.repoPath === repo) && (!harness || task.route?.harnessId === harness)).sort((a, b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || ''));
+  const harnesses = [...new Set([harness, ...tasks.flatMap(taskAgents)].filter(Boolean))].sort();
+  const filtered = tasks.filter(task => (!search.trim() || [task.title, task.repoPath, task.id, task.route?.modelId, task.bossPlan?.boss?.model, ...taskAgents(task)].join(' ').toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())) && (!status || task.status === status) && (!repo || task.repoPath === repo) && (!harness || taskAgents(task).includes(harness))).sort((a, b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || ''));
   const clearFilters = () => { setSearch(''); setStatus(''); setRepo(''); setHarness(''); searchInput.current?.focus(); };
   return <div className="app-shell">
     <header className="sidebar" aria-label="工作区导航"><button className="brand" onClick={() => setPage('tasks')} aria-label="Zero 首页"><strong>zero<span>.</span></strong></button>
@@ -121,7 +123,7 @@ export default function App() {
 }
 
 function TaskTable({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: string) => void }) {
-  return <div className="table-scroll"><table className="task-table"><thead><tr><th>任务</th><th>状态</th><th>执行 Agent</th><th>项目</th><th>最近更新</th><th aria-label="打开任务" /></tr></thead><tbody>{tasks.map(task => <tr key={task.id}><td><button className="task-title-button" onClick={() => onOpen(task.id)}>{taskTitle(task)}</button></td><td><span className={`status-pill ${task.status}`}><span />{statusLabel[task.status] || task.status}</span></td><td><div className="table-agent"><span className="agent-avatar">{(task.route?.harnessId || '?').slice(0, 1).toUpperCase()}</span><div>{task.route?.harnessId || '待分配'}<small>{task.route?.modelId || '等待路由结果'}</small></div></div></td><td><div className="table-repo" title={task.repoPath}><FolderGit2 size={14} /><span>{task.repoPath?.split(/[\\/]/).filter(Boolean).at(-1) || '未指定'}</span></div>{task.baseRef && <small className="task-id">{task.baseRef}</small>}</td><td className="table-time">{date(task.updatedAt || task.createdAt)}</td><td><button className="icon-button" aria-label={`查看任务 ${taskTitle(task)}`} onClick={() => onOpen(task.id)}><ArrowRight size={16} /></button></td></tr>)}</tbody></table></div>;
+  return <div className="table-scroll"><table className="task-table"><thead><tr><th>任务</th><th>状态</th><th>执行 Agent</th><th>项目</th><th>最近更新</th><th aria-label="打开任务" /></tr></thead><tbody>{tasks.map(task => <tr key={task.id}><td><button className="task-title-button" onClick={() => onOpen(task.id)}>{taskTitle(task)}</button><TaskLead task={task} /></td><td><span className={`status-pill ${task.status}`}><span />{statusLabel[task.status] || task.status}</span></td><td><div className="table-agent"><span className="agent-avatar">{(task.route?.harnessId || '?').slice(0, 1).toUpperCase()}</span><div>{task.route?.harnessId || '待分配'}<small>{task.route?.modelId || '等待路由结果'}</small></div></div></td><td><div className="table-repo" title={task.repoPath}><FolderGit2 size={14} /><span>{task.repoPath?.split(/[\\/]/).filter(Boolean).at(-1) || '未指定'}</span></div>{task.baseRef && <small className="task-id">{task.baseRef}</small>}</td><td className="table-time">{date(task.updatedAt || task.createdAt)}</td><td><button className="icon-button" aria-label={`查看任务 ${taskTitle(task)}`} onClick={() => onOpen(task.id)}><ArrowRight size={16} /></button></td></tr>)}</tbody></table></div>;
 }
 function HarnessStrip({ harnesses, error }: { harnesses: HarnessHealth[]; error: string }) {
   const order = ['codex', 'dsh', 'zcode'];
@@ -133,7 +135,7 @@ function HarnessStrip({ harnesses, error }: { harnesses: HarnessHealth[]; error:
 function TaskCard({ task, onClick }: { task: Task; onClick: () => void }) {
   const doneTests = task.tests?.filter(t => t.status === 'passed' || t.status === 'success').length;
   const totalTests = task.tests?.length || 0;
-  return <button className="task-card" onClick={onClick}><div className="task-card-top"><span className={`status-pill ${task.status}`}>{statusLabel[task.status] || task.status}</span><span className="task-time">{date(task.updatedAt || task.createdAt)}</span></div><h3>{taskTitle(task)}</h3><p className="task-repo"><FolderGit2 size={13} />{task.repoPath || '未指定项目'}{task.baseRef && <span>@ {task.baseRef}</span>}</p>{task.status === 'waiting' && <p className="quota-card-note"><Clock3 size={12} />{retryDate(task.retryAt) ? `预计 ${retryDate(task.retryAt)} 自动重试` : '额度恢复后自动继续'}</p>}<div className="task-card-bottom"><span className="route-chip"><Activity size={12} />{routeName(task.route)}</span>{totalTests > 0 && <span className="test-count">{doneTests}/{totalTests} 检查</span>}</div></button>;
+  return <button className="task-card" onClick={onClick}><div className="task-card-top"><span className={`status-pill ${task.status}`}>{statusLabel[task.status] || task.status}</span><span className="task-time">{date(task.updatedAt || task.createdAt)}</span></div><h3>{taskTitle(task)}</h3><TaskLead task={task} /><p className="task-repo"><FolderGit2 size={13} />{task.repoPath || '未指定项目'}{task.baseRef && <span>@ {task.baseRef}</span>}</p>{task.status === 'waiting' && <p className="quota-card-note"><Clock3 size={12} />{retryDate(task.retryAt) ? `预计 ${retryDate(task.retryAt)} 自动重试` : '额度恢复后自动继续'}</p>}<div className="task-card-bottom"><span className="route-chip"><Activity size={12} />{routeName(task.route)}</span>{totalTests > 0 && <span className="test-count">{doneTests}/{totalTests} 检查</span>}</div></button>;
 }
 
 function SequenceProgressSection({ sequences, error, onOpen, onCreate }: { sequences: TaskSequence[]; error: string; onOpen: (id: string) => void; onCreate: () => void }) {

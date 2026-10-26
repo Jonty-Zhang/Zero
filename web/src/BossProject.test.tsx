@@ -25,6 +25,21 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+describe('recorded project lead', () => {
+  it('shows the saved Boss identity separately from the executor and preference', () => {
+    const bossPlan = { summary: '已保存的项目方案', acceptanceCriteria: [], stages: [], checks: [], maxRevisions: 2, boss: { harness: 'codex', model: 'actual-lead', reasoningEffort: 'high' } };
+    const { rerender } = render(<BossProgress task={{ ...task, route: { harnessId: 'dsh', modelId: 'worker' }, bossPlan }} onMessage={vi.fn()} />);
+    expect(screen.getByLabelText('项目负责人').textContent).toBe('Boss · codex · actual-lead · high');
+    rerender(<BossProgress task={{ ...task, bossPlan: { ...bossPlan, boss: { harness: 'codex', model: 'updated-lead' } } }} onMessage={vi.fn()} />);
+    expect(screen.getByLabelText('项目负责人').textContent).toBe('Boss · codex · updated-lead');
+  });
+  it('does not invent a lead for a historical plan without a saved Boss', () => {
+    render(<BossProgress task={{ ...task, route: { harnessId: 'dsh', modelId: 'worker' }, bossPlan: { summary: '旧方案', acceptanceCriteria: [], stages: [], checks: [], maxRevisions: 2 } }} onMessage={vi.fn()} />);
+    expect(screen.queryByLabelText('项目负责人')).toBeNull();
+    expect(screen.getByText(task.boss!.preference)).toBeTruthy();
+  });
+});
+
 describe('Boss draft handoff', () => {
   const original = { path: 'C:/projects/not-created-yet', prompt: '设计跨 Agent 项目并完成可靠验收', preference: 'Codex gpt6.1sol high；简单实现交给 DSH' };
   async function openDraft() {
