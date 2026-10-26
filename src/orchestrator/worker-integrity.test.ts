@@ -79,7 +79,8 @@ async function runIntegrityScenario(scenario: "content" | "head" | "branch" | "i
         assert.equal(detail.checkEvidence.state, 'historical', 'snapshot failure before a fresh run must not reuse preceding checks');
         assert.deepEqual(detail.tests, []);
       } else {
-        assert.equal(detail.checkEvidence.state, 'current');
+        assert.equal(detail.checkEvidence.state, 'current', JSON.stringify({ scenario, result,
+          attempts: store.attempts(task.id), runs: store.checkRuns(task.id), detail }));
       }
       if (scenario === 'content') assert.ok(detail.tests.every(check => check.status === 'passed'));
       else if (scenario === 'io') assert.match(result.failureReason!, /I\/O failure/);

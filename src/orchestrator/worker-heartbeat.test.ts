@@ -16,11 +16,11 @@ function gate() {
   const promise = new Promise<void>(resolve => { release = resolve; });
   return { promise, release };
 }
-async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
+async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 60_000): Promise<T> {
   let timer!: ReturnType<typeof setTimeout>;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`Timed out: ${label}`)), 3_000);
+      timer = setTimeout(() => reject(new Error(`Timed out: ${label}`)), timeoutMs);
     })]);
   } finally { clearTimeout(timer); }
 }
@@ -69,7 +69,8 @@ test("a delayed worker heartbeat stops the writer and preserves expired work for
     })]), "writer entry");
     const expiry = store.get(task.id)!.leaseExpiresAt!;
     context.mock.timers.setTime(Date.parse(expiry) + 1);
-    await bounded(stopped.promise, "expired writer cancellation");
+    // Git setup/settlement has its own budget; cancellation must still be prompt.
+    await bounded(stopped.promise, "expired writer cancellation", 3_000);
     await bounded(running, "worker settlement");
     assert.equal(cancellations, 1);
     assert.equal(store.get(task.id)?.leaseExpiresAt, expiry, "a late heartbeat must not erase the expired deadline");

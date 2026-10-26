@@ -121,6 +121,23 @@ test('long consultant advice is fully retained and reaches the lead without exce
   } finally { await f.dispose(); }
 });
 
+test('adaptive plans respect the total stage budget including the frozen completed prefix', async () => {
+  let remaining = 2;
+  const f = await fixture(async (request, purpose) => {
+    if (purpose === 'boss_selection') return result(selection());
+    assert.match(request.prompt, /1 to 1 concrete remaining stages/);
+    return result(plan({ stages: Array.from({ length: remaining }, () => ({ bindingId: 'dsh:deepseek', reasoningEffort: null, objective: 'Finish remaining work' })) }));
+  });
+  try {
+    f.context.completedStages = 15;
+    await assert.rejects(f.boss.plan(f.task, f.context), /remaining stage budget/);
+    remaining = 1;
+    assert.equal((await f.boss.plan(f.task, f.context)).stages.length, 1);
+    f.context.completedStages = 16;
+    await assert.rejects(f.boss.plan(f.task, f.context), /no remaining stage budget/);
+  } finally { await f.dispose(); }
+});
+
 test('Boss validates plans, model identities, supported efforts, nonempty meaningful checks, and strict JSON fields', async () => {
   const invalid = [
     plan({ stages: [] }), plan({ stages: [{ bindingId: 'codex:unverified', reasoningEffort: 'high', objective: 'Code it' }] }),

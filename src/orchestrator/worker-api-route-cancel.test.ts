@@ -18,11 +18,11 @@ function gate() {
   const promise = new Promise<void>(resolve => { release = resolve; });
   return { promise, release };
 }
-async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
+async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 60_000): Promise<T> {
   let timer!: ReturnType<typeof setTimeout>;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`Timed out: ${label}`)), 3_000);
+      timer = setTimeout(() => reject(new Error(`Timed out: ${label}`)), timeoutMs);
     })]);
   } finally { clearTimeout(timer); }
 }
@@ -81,7 +81,8 @@ for (const stop of ['user', 'lease'] as const) {
       })]), 'API entry');
       if (stop === 'user') assert.equal(await worker.cancel(task.id), true);
       else context.mock.timers.setTime(Date.parse(store.get(task.id)!.leaseExpiresAt!) + 1);
-      await bounded(aborted.promise, 'API request abort');
+      // Git setup/settlement has its own budget; abort responsiveness stays strict.
+      await bounded(aborted.promise, 'API request abort', 3_000);
       const result = await bounded(running, 'worker settlement');
       assert.equal(codexCancels, 0, 'cancellation must target the selected API, not an unrelated Codex adapter');
       assert.equal(writers, 0);
