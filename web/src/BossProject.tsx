@@ -10,28 +10,47 @@ type FolderListing = Awaited<ReturnType<typeof api.folders>>;
 type BossSubmission = { draftKey: string; payload: { repoPath: string; prompt: string; boss: { preference: string } } };
 
 export function ProjectDelivery({ task }: { task: Task }) {
-  const [copied, setCopied] = useState(false);
-  const [copyError, setCopyError] = useState('');
-  useEffect(() => { setCopied(false); setCopyError(''); }, [task.id, task.delivery?.path]);
+  const scope = JSON.stringify([task.id, task.delivery?.path ?? null]);
+  const currentScope = useRef(scope);
+  currentScope.current = scope;
+  const pendingCopy = useRef<{ scope: string } | null>(null);
+  const [feedback, setFeedback] = useState<{ scope: string; status: 'copying' | 'copied' | 'failed' } | null>(null);
+  useEffect(() => {
+    pendingCopy.current = null;
+    setFeedback(null);
+    return () => { pendingCopy.current = null; };
+  }, [scope]);
+  const copying = feedback?.scope === scope && feedback.status === 'copying';
+  const copied = feedback?.scope === scope && feedback.status === 'copied';
+  const copyFailed = feedback?.scope === scope && feedback.status === 'failed';
   const completed = task.status === 'done';
   if (!task.delivery?.path && (!completed || !task.boss)) return null;
   const copyPath = async () => {
-    if (!task.delivery?.path) return;
-    setCopied(false); setCopyError('');
-    try { await navigator.clipboard.writeText(task.delivery.path); setCopied(true); }
-    catch { setCopyError('复制未成功，请选中下方路径手动复制。'); }
+    if (!task.delivery?.path || pendingCopy.current?.scope === scope) return;
+    const request = { scope };
+    pendingCopy.current = request;
+    setFeedback({ scope, status: 'copying' });
+    const isCurrent = () => pendingCopy.current === request && currentScope.current === scope;
+    try {
+      await navigator.clipboard.writeText(task.delivery.path);
+      if (isCurrent()) setFeedback({ scope, status: 'copied' });
+    } catch {
+      if (isCurrent()) setFeedback({ scope, status: 'failed' });
+    } finally {
+      if (pendingCopy.current === request) pendingCopy.current = null;
+    }
   };
   return <section className={`project-delivery ${completed ? 'completed' : ''}`} aria-label={completed ? '项目成果' : '任务工作目录'}>
     <div className="project-delivery-heading"><Folder size={18} /><div><h3>{completed ? '项目成果' : '工作目录'}</h3><p>{completed ? '独立成果目录，原选文件夹未自动回写。' : '独立工作区，尚未验收。'}</p></div></div>
     {task.delivery?.path ? <>
-      <div className="project-delivery-path"><code>{task.delivery.path}</code><button type="button" className="button secondary" onClick={() => void copyPath()}><Copy size={14} />{copied ? '已复制路径' : '复制路径'}</button></div>
+      <div className="project-delivery-path"><code>{task.delivery.path}</code><button type="button" className="button secondary" disabled={copying} aria-busy={copying} onClick={() => void copyPath()}>{copying ? <LoaderCircle size={14} className="spin" /> : <Copy size={14} />}{copying ? '复制中…' : copied ? '已复制路径' : '复制路径'}</button></div>
       {completed && <p className="delivery-note">不会自动合并或推送 GitHub。</p>}
       {(task.delivery.branch || task.delivery.resultCommit) && <dl className="delivery-version-list">
         {task.delivery.branch && <div><dt>分支</dt><dd><code>{task.delivery.branch}</code></dd></div>}
         {task.delivery.resultCommit && <div><dt>提交</dt><dd><code>{task.delivery.resultCommit}</code></dd></div>}
       </dl>}
       {copied && <span className="sr-only" role="status">成果文件夹路径已复制</span>}
-      {copyError && <p role="alert" className="folder-error">{copyError}</p>}
+      {copyFailed && <p role="alert" className="folder-error">复制未成功，请选中下方路径手动复制。</p>}
     </> : <p className="folder-error">成果目录尚未确认，请查看执行报告。</p>}
   </section>;
 }

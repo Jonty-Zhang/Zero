@@ -1375,3 +1375,41 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
 .task-description { margin-top:20px; }
 
 .boss-message-list, .boss-message { min-width:0; }
+
+/* A readable type floor for evidence and secondary states left by the legacy UI.
+   Technical identifiers retain their deliberate 13px scale; prose uses 14–15px. */
+p, li { font-size:15px; }
+small, summary { font-size:14px; line-height:1.8; }
+small { color:var(--muted); }
+b { font-size:inherit; }
+code { font-size:13px; }
+h3 { font-size:18px; font-weight:600; line-height:1.7; }
+h4 { font-size:16px; font-weight:600; }
+.detail-list dt, .detail-list dd, .route-detail span, .route-detail b { font-size:14px; }
+.alert, .alert b, .alert span { font-size:14px; line-height:1.8; }
+.review-verdict, .finding, .report-link, .planned-stages { font-size:14px; }
+.review-verdict.pass { color:#356d4c; background:#e9f2e9; }
+.review-verdict.needs { color:#8a5d24; background:#fbefda; }
+.test-icon.good, .test-status.good { color:#356d4c; }
+.test-icon.bad, .test-status.bad { color:#a44138; }
+.stage-number { font-size:13px; border-color:#d9cfbd; color:#806744; background:#f3ecdf; }
+.stage-heading > b { font-size:15px; color:#51402a; }
+.stage-evidence:before { border-color:#d9cfbd; }
+.stage-body > details { color:#74634b; }
+.handoff-card { background:#f5f0e7; border-color:#ded4c3; color:#5f503b; font-size:14px; }
+.handoff-card > summary { color:#70573a; font-size:15px; }
+.handoff-card > summary:before { color:#877254; }
+.handoff-group > b { color:#635038; font-size:15px; }
+.handoff-group small { margin-top:5px; color:#776850; }
+.executor-summary { color:#65533b; background:#f5efe3; border-color:#e1d5bf; font-size:14px; }
+.executor-summary > b { font-size:14px; }
+.quota-wait-panel b { font-size:16px; }
+.quota-wait-panel p, .quota-wait-panel span, .quota-wait-panel small { font-size:14px; line-height:1.85; }
+.quota-wait-panel small { overflow-wrap:anywhere; }
+.project-delivery-heading h3 { font-size:18px; }
+.project-delivery-path .button { font-size:14px; height:40px; padding-inline:14px; }
+.sequence-detail-step-head > b { font-size:15px; }
+.sequence-step-repository, .sequence-repository-preview, .sequence-repository-error { font-size:14px; }
+.rich-text .task-list-item input { appearance:none; position:relative; vertical-align:middle; opacity:1; border:1px solid #95866e; border-radius:3px; background:#fffefa; }
+.rich-text .task-list-item input:checked { background:#527253; border-color:#527253; }
+.rich-text .task-list-item input:checked:after { content:'✓'; position:absolute; inset:-4px 0 0; color:#fff; font-family:'Zero Sans',sans-serif; font-size:14px; text-align:center; }

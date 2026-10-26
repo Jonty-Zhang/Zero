@@ -61,3 +61,12 @@ Validation: 134 frontend tests pass across ten files; TypeScript/Vite production
 Evidence: repository-contained `data/verification/frontend-reading-round3/`, with the separate dialog red/green receipt at `data/verification/dialog-ime-verification.json`.
 
 Markdown dependency and installed peer licenses (107 instances, MIT/ISC) are distributed with the frontend in web/public/THIRD_PARTY_NOTICES.txt; no missing license files were found in this closure.
+
+## Round 4: evidence text and delivery feedback
+
+- Expanding execution stages, handoffs, checks and reviews exposed 70 text nodes still rendered at 11–12px in the completed-task fixture. Evidence labels and secondary prose now use 14–15px, with technical identifiers retaining a deliberate 13px minimum. Completed, quota-waiting, recovery-required and failed details were checked separately.
+- Handoff and stage surfaces now use the paper palette. The passing review label initially measured 4.05:1 contrast; the revised green measures 5.33:1, and passing check text measures 6.04:1 against its actual surface. These are targeted measurements, not a claim of full accessibility certification.
+- Read-only Markdown checklist boxes now retain a visible checked/unchecked distinction instead of the browser's washed-out disabled treatment.
+- Delivery copy feedback belongs to the task and path that initiated it. Pending copies disable repeated clicks; a late resolution or rejection cannot label a replacement path as copied or attach an old failure to it. Existing permission-denied fallback remains. This does not cancel an operating-system clipboard write already in progress.
+
+Validation: all 143 frontend tests pass across ten files, including nine new delivery-copy regressions; the production build passes. The Edge fixture repeats previous reading, desktop, form and offline checks, audits visible text in all four detail states, and checks delivery changes through the normal task polling interval while a mocked clipboard promise is pending. Copying the replacement path then succeeds. The real clipboard, real task queue and providers remain untouched. Evidence is in repository-contained `data/verification/frontend-details-round4/`, with the separate copy regression receipt at `data/verification/delivery-copy-race-verification.json`.

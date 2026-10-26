@@ -316,6 +316,82 @@ describe('Boss settings and project conversation', () => {
   });
 });
 
+describe('delivery clipboard request ownership', () => {
+  const delivered = (id = 'delivery-a', path = 'C:/output-a'): Task => ({ ...task, id, status: 'done', delivery: { path, branch: `zero/${id}` } });
+
+  it.each([
+    ['path', 'resolve'], ['path', 'reject'], ['task', 'resolve'], ['task', 'reject'],
+  ] as const)('ignores a stale clipboard %s change followed by %s', async (changed, outcome) => {
+    let resolveCopy!: () => void; let rejectCopy!: (error: Error) => void;
+    const writeText = vi.fn().mockImplementationOnce(() => new Promise<void>((resolve, reject) => { resolveCopy = resolve; rejectCopy = reject; })).mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const initial = delivered();
+    const next = changed === 'path' ? delivered(initial.id, 'C:/output-b') : delivered('delivery-b', initial.delivery!.path);
+    const view = render(<ProjectDelivery task={initial} />);
+    fireEvent.click(screen.getByRole('button', { name: '复制路径' }));
+    expect(writeText).toHaveBeenCalledWith(initial.delivery!.path);
+    view.rerender(<ProjectDelivery task={next} />);
+    await act(async () => { if (outcome === 'resolve') resolveCopy(); else rejectCopy(new Error('old clipboard denied')); });
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('button', { name: '已复制路径' })).toBeNull();
+    expect((screen.getByRole('button', { name: '复制路径' }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: '复制路径' }));
+    await screen.findByRole('button', { name: '已复制路径' });
+    expect(writeText).toHaveBeenLastCalledWith(next.delivery!.path);
+    expect(writeText).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not start duplicate writes while the current path is still being copied', async () => {
+    let resolveCopy!: () => void;
+    const writeText = vi.fn().mockImplementation(() => new Promise<void>(resolve => { resolveCopy = resolve; }));
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    render(<ProjectDelivery task={delivered()} />);
+    const copy = screen.getByRole('button', { name: '复制路径' });
+    fireEvent.click(copy); fireEvent.click(copy);
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect((screen.getByRole('button', { name: '复制中…' }) as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => resolveCopy());
+    expect((screen.getByRole('button', { name: '已复制路径' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it.each(['resolve', 'reject'] as const)('keeps a newer copy in progress after an older request %s and unchanged polling', async outcome => {
+    let resolveOld!: () => void; let rejectOld!: (error: Error) => void; let resolveCurrent!: () => void;
+    const writeText = vi.fn().mockImplementationOnce(() => new Promise<void>((resolve, reject) => { resolveOld = resolve; rejectOld = reject; }))
+      .mockImplementationOnce(() => new Promise<void>(resolve => { resolveCurrent = resolve; }));
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const view = render(<ProjectDelivery task={delivered()} />);
+    fireEvent.click(screen.getByRole('button', { name: '复制路径' }));
+    const currentTask = delivered('delivery-b', 'C:/current-output');
+    view.rerender(<ProjectDelivery task={currentTask} />);
+    fireEvent.click(screen.getByRole('button', { name: '复制路径' }));
+    view.rerender(<ProjectDelivery task={{ ...currentTask, updatedAt: '2026-10-27T02:00:00Z', delivery: { ...currentTask.delivery! } }} />);
+    await act(async () => { if (outcome === 'resolve') resolveOld(); else rejectOld(new Error('old request failed')); });
+    expect((screen.getByRole('button', { name: '复制中…' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole('status')).toBeNull(); expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '复制中…' })); expect(writeText).toHaveBeenCalledTimes(2);
+    await act(async () => resolveCurrent());
+    expect(screen.getByRole('button', { name: '已复制路径' })).toBeTruthy();
+    expect(writeText).toHaveBeenLastCalledWith('C:/current-output');
+  });
+
+  it.each(['resolve', 'reject'] as const)('does not revive an abandoned request after returning to the original delivery: %s', async outcome => {
+    let resolveOld!: () => void; let rejectOld!: (error: Error) => void;
+    const writeText = vi.fn().mockImplementationOnce(() => new Promise<void>((resolve, reject) => { resolveOld = resolve; rejectOld = reject; })).mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const original = delivered();
+    const view = render(<ProjectDelivery task={original} />);
+    fireEvent.click(screen.getByRole('button', { name: '复制路径' }));
+    view.rerender(<ProjectDelivery task={delivered('delivery-b', 'C:/output-b')} />);
+    view.rerender(<ProjectDelivery task={{ ...original }} />);
+    await act(async () => { if (outcome === 'resolve') resolveOld(); else rejectOld(new Error('abandoned request failed')); });
+    expect(screen.queryByRole('status')).toBeNull(); expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '复制路径' }));
+    await screen.findByRole('button', { name: '已复制路径' });
+    expect(writeText).toHaveBeenCalledTimes(2); expect(writeText).toHaveBeenLastCalledWith(original.delivery!.path);
+  });
+});
+
 describe('Boss readable project content', () => {
   it('renders the plan and discussion as structured prose rather than literal Markdown', async () => {
     const markdown = '## 实施方案\n\n先确认 **恢复边界**，再实现。\n\n- 保留任务记录\n- 验证交接';
