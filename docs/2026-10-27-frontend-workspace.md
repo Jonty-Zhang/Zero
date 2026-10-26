@@ -1,5 +1,9 @@
 # Desktop workspace presentation refresh
 
+This records an earlier presentation pass. Its sidebar, green actions and Boss
+entry panel have since been replaced; see the [current frontend rebuild](2026-10-27-frontend-rebuild.md)
+for the implemented visual design, references and subsequent verification.
+
 ## Intent and references
 
 The user requested frontend improvements informed by open-source web interfaces.

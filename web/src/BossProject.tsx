@@ -8,6 +8,7 @@ import type { Capabilities, Task } from './types';
 const preferenceExample = 'Codex gpt6.1sol high 负责设计与验收，日常实现交给便宜模型或 DeepSeek，复杂问题先讨论。';
 type FolderListing = Awaited<ReturnType<typeof api.folders>>;
 type BossSubmission = { draftKey: string; payload: { repoPath: string; prompt: string; boss: { preference: string } } };
+export type BossProjectDraft = { path: string; prompt: string; preference: string; create: boolean; pendingSubmission: BossSubmission | null };
 
 export function ProjectDelivery({ task }: { task: Task }) {
   const scope = JSON.stringify([task.id, task.delivery?.path ?? null]);
@@ -55,11 +56,11 @@ export function ProjectDelivery({ task }: { task: Task }) {
   </section>;
 }
 
-export function BossProjectModal({ capabilities, capabilityError, onClose, onAdvanced, onCreated }: { capabilities: Capabilities | null; capabilityError: string; onClose: () => void; onAdvanced: () => void; onCreated: (task: Task) => void }) {
-  const [path, setPath] = useState('');
-  const [prompt, setPrompt] = useState('');
-  const [preference, setPreference] = useState('');
-  const [create, setCreate] = useState(false);
+export function BossProjectModal({ capabilities, capabilityError, initialDraft, onClose, onAdvanced, onCreated }: { capabilities: Capabilities | null; capabilityError: string; initialDraft?: BossProjectDraft | null; onClose: () => void; onAdvanced: (draft: BossProjectDraft) => void; onCreated: (task: Task) => void }) {
+  const [path, setPath] = useState(initialDraft?.path ?? '');
+  const [prompt, setPrompt] = useState(initialDraft?.prompt ?? '');
+  const [preference, setPreference] = useState(initialDraft?.preference ?? '');
+  const [create, setCreate] = useState(initialDraft?.create ?? false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [browsing, setBrowsing] = useState(false);
@@ -68,7 +69,7 @@ export function BossProjectModal({ capabilities, capabilityError, onClose, onAdv
   const [folderError, setFolderError] = useState('');
   const [browsePath, setBrowsePath] = useState('');
   const [newName, setNewName] = useState('');
-  const [pendingSubmission, setPendingSubmission] = useState<BossSubmission | null>(null);
+  const [pendingSubmission, setPendingSubmission] = useState<BossSubmission | null>(initialDraft?.pendingSubmission ?? null);
   const folderRequest = useRef<AbortController | null>(null);
   const submitting = useRef(false);
   const dialogRef = useDialog(onClose, busy);
@@ -129,7 +130,7 @@ export function BossProjectModal({ capabilities, capabilityError, onClose, onAdv
       {capabilityError ? <div className="inline-warning"><AlertCircle size={15} />无法读取可用模型：{capabilityError}。请重试，草稿已保留。</div> : !capabilities ? <p className="field-hint" role="status">正在确认 Codex 是否可用…</p> : !leadReady ? <div className="inline-warning"><AlertCircle size={15} /><div>尚无可用的 Codex 项目负责人。请先连接并验证 Codex 模型，再刷新。{codex?.reason && <p>Codex：{codex.reason}</p>}</div></div> : null}
       {retrySubmission && !busy && <p className="field-hint">上次提交结果未确认。重试不会重复创建任务。</p>}
       {error && <div className="alert error compact" role="alert"><AlertCircle size={16} />{error}</div>}
-      <div className="modal-footer"><button type="button" className="link-button" disabled={busy} onClick={onAdvanced}>手动配置</button><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || browsing || !submissionReady || !path.trim() || !prompt.trim()}>{busy ? <><LoaderCircle size={15} className="spin" />正在交给 Boss</> : <><Send size={15} />{retrySubmission ? '确认上次提交' : '交给 Boss'}</>}</button></div>
+      <div className="modal-footer"><button type="button" className="link-button" disabled={busy} onClick={() => onAdvanced({ path, prompt, preference, create, pendingSubmission })}>手动配置</button><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || browsing || !submissionReady || !path.trim() || !prompt.trim()}>{busy ? <><LoaderCircle size={15} className="spin" />正在交给 Boss</> : <><Send size={15} />{retrySubmission ? '确认上次提交' : '交给 Boss'}</>}</button></div>
     </fieldset></form>
   </section></div>;
 }

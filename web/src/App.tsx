@@ -3,7 +3,7 @@ import { Activity, Search, LayoutList, Columns3, Layers3, AlertCircle, ArrowDown
 import { api } from './api';
 import { RichText } from './RichText';
 import { useDialog } from './dialog';
-import { BossProjectModal, BossProgress, ProjectDelivery } from './BossProject';
+import { BossProjectModal, BossProgress, ProjectDelivery, type BossProjectDraft } from './BossProject';
 import { usePolling } from './usePolling';
 import type { Capabilities, Choice, Config, ExecutionSelection, HarnessHealth, Status, Task, TaskSequence, TestResult } from './types';
 
@@ -74,6 +74,7 @@ export default function App() {
   const detail = usePolling(selectedId, loadTask, 3500);
   const [showSubmit, setShowSubmit] = useState(false);
   const [showAdvancedSubmit, setShowAdvancedSubmit] = useState(false);
+  const [bossDraft, setBossDraft] = useState<BossProjectDraft | null>(null);
   const [showSequenceSubmit, setShowSequenceSubmit] = useState(false);
   const [selectedSequenceId, setSelectedSequenceId] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ message: string } | null>(null);
@@ -111,8 +112,8 @@ export default function App() {
         </section></> : <SettingsPage capabilities={capabilities} onSaved={(message, kind) => { setAllocatorKind(kind); setNotice({ message }); }} onRetry={capState.refresh} />}
     </main>
     {selectedId && <TaskDrawer onMessage={() => void detail.refresh()} key={selectedId} task={detail.data} loading={detail.loading} loadError={detail.error} onClose={() => setSelectedId(null)} onCancel={async () => { if (!detail.data || detail.data.id !== selectedId) return; await api.cancelTask(detail.data.id); setNotice({ message: '已发送取消请求' }); void detail.refresh(); void taskState.refresh(); }} />}
-    {showSubmit && <BossProjectModal capabilities={capabilities} capabilityError={capState.error} onClose={() => setShowSubmit(false)} onAdvanced={() => { setShowSubmit(false); setShowAdvancedSubmit(true); }} onCreated={task => { setShowSubmit(false); setSelectedId(task.id); setNotice({ message: '项目任务已交给 Boss' }); refreshAll(); }} />}
-    {showAdvancedSubmit && <SubmitModal capabilities={capabilities} capabilityError={capState.error} allocatorKind={allocatorKind} onClose={() => setShowAdvancedSubmit(false)} onCreated={task => { setShowAdvancedSubmit(false); setSelectedId(task.id); setNotice({ message: '任务已加入队列' }); refreshAll(); }} />}
+    {showSubmit && <BossProjectModal capabilities={capabilities} capabilityError={capState.error} initialDraft={bossDraft} onClose={() => { setShowSubmit(false); setBossDraft(null); }} onAdvanced={draft => { setBossDraft(draft); setShowSubmit(false); setShowAdvancedSubmit(true); }} onCreated={task => { setShowSubmit(false); setBossDraft(null); setSelectedId(task.id); setNotice({ message: '项目任务已交给 Boss' }); refreshAll(); }} />}
+    {showAdvancedSubmit && <SubmitModal capabilities={capabilities} capabilityError={capState.error} allocatorKind={allocatorKind} initialDraft={bossDraft} onClose={() => setShowAdvancedSubmit(false)} onCreated={task => { setShowAdvancedSubmit(false); setBossDraft(null); setSelectedId(task.id); setNotice({ message: '任务已加入队列' }); refreshAll(); }} />}
     {showSequenceSubmit && <SequenceSubmitModal capabilities={capabilities} onClose={() => setShowSequenceSubmit(false)} onCreated={sequence => { setShowSequenceSubmit(false); setSelectedSequenceId(sequence.id); refreshAll(); }} />}
     {selectedSequenceId && <SequenceDrawer key={selectedSequenceId} id={selectedSequenceId} onClose={() => setSelectedSequenceId(null)} onOpenTask={id => { setSelectedSequenceId(null); setSelectedId(id); }} />}
     {notice && <div className="toast" role="status"><CheckCircle2 size={16} />{notice.message}</div>}
@@ -270,8 +271,8 @@ function SequenceDrawer({ id, onClose, onOpenTask }: { id: string; onClose: () =
     </div>}</aside></div>;
 }
 
-function SubmitModal({ capabilities, capabilityError, allocatorKind, onClose, onCreated }: { capabilities: Capabilities | null; capabilityError: string; allocatorKind: Config['allocator']['kind']; onClose: () => void; onCreated: (task: Task) => void }) {
-  const [repoPath, setRepoPath] = useState(''); const [baseRef, setBaseRef] = useState('HEAD'); const [prompt, setPrompt] = useState(''); const [criteria, setCriteria] = useState(''); const [maxRevisions, setMaxRevisions] = useState(2); const [checks, setChecks] = useState('');
+function SubmitModal({ capabilities, capabilityError, allocatorKind, initialDraft, onClose, onCreated }: { capabilities: Capabilities | null; capabilityError: string; allocatorKind: Config['allocator']['kind']; initialDraft?: Pick<BossProjectDraft, 'path' | 'prompt'> | null; onClose: () => void; onCreated: (task: Task) => void }) {
+  const [repoPath, setRepoPath] = useState(initialDraft?.path ?? ''); const [baseRef, setBaseRef] = useState('HEAD'); const [prompt, setPrompt] = useState(initialDraft?.prompt ?? ''); const [criteria, setCriteria] = useState(''); const [maxRevisions, setMaxRevisions] = useState(2); const [checks, setChecks] = useState('');
   const [harnessId, setHarnessId] = useState(''); const [modelId, setModelId] = useState(''); const [effort, setEffort] = useState('');
   const [stages, setStages] = useState<Array<{ harnessId: string; modelId: string; reasoningEffort: string; objective: string }>>([]);
   const [busy, setBusy] = useState(false); const [error, setError] = useState('');

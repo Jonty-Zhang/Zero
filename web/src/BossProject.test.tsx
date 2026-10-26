@@ -25,6 +25,124 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+describe('Boss draft handoff', () => {
+  const original = { path: 'C:/projects/not-created-yet', prompt: '设计跨 Agent 项目并完成可靠验收', preference: 'Codex gpt6.1sol high；简单实现交给 DSH' };
+  async function openDraft() {
+    render(<App />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    fireEvent.change(screen.getByLabelText('项目文件夹 *'), { target: { value: original.path } });
+    fireEvent.change(screen.getByLabelText('你想完成什么 *'), { target: { value: original.prompt } });
+    fireEvent.change(screen.getByLabelText('Boss 与团队偏好（可选）'), { target: { value: original.preference } });
+    fireEvent.click(screen.getByLabelText('这个路径还不存在，创建新文件夹'));
+  }
+  function reopenBoss() {
+    fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    return screen.getByRole('dialog', { name: '交给 Boss' });
+  }
+  function expectOriginalDraft() {
+    expect((screen.getByLabelText('项目文件夹 *') as HTMLInputElement).value).toBe(original.path);
+    expect((screen.getByLabelText('你想完成什么 *') as HTMLTextAreaElement).value).toBe(original.prompt);
+    expect((screen.getByLabelText('Boss 与团队偏好（可选）') as HTMLTextAreaElement).value).toBe(original.preference);
+    expect((screen.getByLabelText('这个路径还不存在，创建新文件夹') as HTMLInputElement).checked).toBe(true);
+  }
+  function expectBlankDraft() {
+    expect((screen.getByLabelText('项目文件夹 *') as HTMLInputElement).value).toBe('');
+    expect((screen.getByLabelText('你想完成什么 *') as HTMLTextAreaElement).value).toBe('');
+    expect((screen.getByLabelText('Boss 与团队偏好（可选）') as HTMLTextAreaElement).value).toBe('');
+    expect((screen.getByLabelText('这个路径还不存在，创建新文件夹') as HTMLInputElement).checked).toBe(false);
+  }
+  it('carries the folder and goal into manual configuration without preparing, creating or inferring a route', async () => {
+    await openDraft();
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
+    const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
+    expect((within(dialog).getByLabelText(/仓库路径/) as HTMLInputElement).value).toBe(original.path);
+    expect((within(dialog).getByLabelText('任务描述 *') as HTMLTextAreaElement).value).toBe(original.prompt);
+    expect((within(dialog).getByLabelText('基础分支 / Ref') as HTMLInputElement).value).toBe('HEAD');
+    expect((within(dialog).getByLabelText(/检查命令/) as HTMLTextAreaElement).value).toBe('');
+    expect(within(dialog).getAllByRole('combobox').map(select => (select as HTMLSelectElement).value)).toEqual(['', '', '']);
+    expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled(); expect(api.folders).not.toHaveBeenCalled();
+  });
+  it('restores the entire original Boss draft after cancelling manual edits', async () => {
+    await openDraft();
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
+    fireEvent.change(screen.getByLabelText(/仓库路径/), { target: { value: 'C:/discarded-manual-folder' } });
+    fireEvent.change(screen.getByLabelText('任务描述 *'), { target: { value: '这些手动修改被取消' } });
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    reopenBoss(); expectOriginalDraft();
+    expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled();
+  });
+  it.each(['取消', '关闭对话框', 'Escape'])('clears a restored Boss draft when explicitly dismissed with %s', async action => {
+    await openDraft();
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    reopenBoss(); expectOriginalDraft();
+    if (action === 'Escape') fireEvent.keyDown(screen.getByLabelText('项目文件夹 *'), { key: 'Escape' });
+    else fireEvent.click(screen.getByRole('button', { name: action }));
+    reopenBoss(); expectBlankDraft();
+  });
+  it.each(['Boss', 'manual'])('clears the cached draft after a successful %s submission', async mode => {
+    await openDraft();
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
+    if (mode === 'Boss') {
+      fireEvent.click(screen.getByRole('button', { name: '取消' }));
+      reopenBoss(); expectOriginalDraft();
+      fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
+    } else {
+      expect((screen.getByLabelText('任务描述 *') as HTMLTextAreaElement).value).toBe(original.prompt);
+      fireEvent.change(screen.getByLabelText(/检查命令/), { target: { value: 'npm test' } });
+      fireEvent.click(screen.getByRole('button', { name: '加入任务队列' }));
+    }
+    const detail = await screen.findByRole('dialog', { name: '任务详情' });
+    fireEvent.click(within(detail).getByRole('button', { name: '关闭详情' }));
+    reopenBoss(); expectBlankDraft();
+    expect(api.createTask).toHaveBeenCalledTimes(1);
+    if (mode === 'manual') {
+      expect(api.prepareProject).not.toHaveBeenCalled();
+      expect(api.createTask).toHaveBeenCalledWith(expect.objectContaining({ repoPath: original.path, prompt: original.prompt, execution: { harnessId: null, modelId: null, reasoningEffort: null } }));
+      expect(vi.mocked(api.createTask).mock.calls[0]![0]).not.toHaveProperty('boss');
+    }
+  });
+  it('keeps a prepared uncertain Boss request unchanged across a manual round trip', async () => {
+    vi.mocked(api.prepareProject).mockResolvedValue({ path: 'C:/canonical-project', repoPath: 'C:/canonical-project', initialized: true });
+    vi.mocked(api.createTask).mockRejectedValueOnce(new Error('Response uncertain')).mockResolvedValueOnce(task);
+    await openDraft();
+    fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
+    await screen.findByText('Response uncertain');
+    const firstPayload = vi.mocked(api.createTask).mock.calls[0]![0];
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    reopenBoss(); expectOriginalDraft();
+    expect(screen.getByText('上次提交结果未确认。重试不会重复创建任务。')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '确认上次提交' }));
+    await screen.findByRole('dialog', { name: '任务详情' });
+    expect(api.prepareProject).toHaveBeenCalledTimes(1);
+    expect(api.prepareProject).toHaveBeenCalledWith(original.path, true);
+    expect(api.createTask).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.createTask).mock.calls[1]![0]).toEqual(firstPayload);
+    expect(firstPayload).toEqual({ repoPath: 'C:/canonical-project', prompt: original.prompt, boss: { preference: original.preference } });
+  });
+  it('restores an uncertain snapshot without preparation and allows confirmation even when capabilities disappear', async () => {
+    const onAdvanced = vi.fn();
+    vi.mocked(api.createTask).mockRejectedValueOnce(new Error('Response uncertain'));
+    const view = modal({ onAdvanced }); fillGoal();
+    fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
+    await screen.findByText('Response uncertain');
+    fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
+    expect(onAdvanced).toHaveBeenCalledWith({ path: 'C:/projects/plain', prompt: '设计并实现这个项目，自己验证', preference: '', create: false, pendingSubmission: { draftKey: JSON.stringify(['C:/projects/plain', false, '设计并实现这个项目，自己验证', '']), payload: { repoPath: 'C:/projects/plain', prompt: '设计并实现这个项目，自己验证', boss: { preference: '' } } } });
+    const draft = onAdvanced.mock.calls[0]![0];
+    const onCreated = vi.fn();
+    view.unmount();
+    modal({ initialDraft: draft, capabilities: null, capabilityError: 'Capability connection unavailable', onCreated });
+    expect(api.prepareProject).toHaveBeenCalledTimes(1); expect(api.createTask).toHaveBeenCalledTimes(1);
+    expect((screen.getByRole('button', { name: '确认上次提交' }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: '确认上次提交' }));
+    await vi.waitFor(() => expect(onCreated).toHaveBeenCalledWith(task));
+    expect(api.prepareProject).toHaveBeenCalledTimes(1); expect(api.createTask).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.createTask).mock.calls[1]![0]).toBe(draft.pendingSubmission.payload);
+  });
+});
+
 describe('Boss project entry', () => {
   it('defaults to the goal and free-form Boss preference without manual execution gates', async () => {
     render(<App />); fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
