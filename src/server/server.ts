@@ -468,6 +468,10 @@ async function parseSubmission(raw: unknown, options: ZeroServerOptions, capabil
   if (input.boss !== undefined) {
     const boss = parseBossPreference(input.boss);
     const prompt = stringField(input.prompt, 'prompt', 1, 100_000);
+    const capability = capabilitySnapshot ?? await capabilities(options);
+    if (!capability.harnesses.some(harness => harness.id === 'codex' && harness.available)) {
+      throw new HttpError(503, 'Boss 项目负责人暂不可用：请先连接并验证至少一个 Codex 模型，再重试。');
+    }
     const project = await prepareProjectFolder(input.repoPath);
     const baseRef = typeof input.baseRef === 'string' && input.baseRef.trim() ? input.baseRef.trim() : project.baseRef ?? 'HEAD';
     if (baseRef.length > 255 || baseRef.startsWith('-') || /[\0\r\n]/.test(baseRef)) throw new HttpError(400, 'baseRef 格式无效');

@@ -6,6 +6,7 @@ import type { Capabilities, Task } from './types';
 
 const preferenceExample = '例如：Boss 用 Codex gpt6.1sol high，负责设计和验收；具体操作交给便宜模型或 DeepSeek Harness，复杂问题先讨论。';
 type FolderListing = Awaited<ReturnType<typeof api.folders>>;
+type BossSubmission = { draftKey: string; payload: { repoPath: string; prompt: string; boss: { preference: string } } };
 
 export function ProjectDelivery({ task }: { task: Task }) {
   const [copied, setCopied] = useState(false);
@@ -35,9 +36,15 @@ export function BossProjectModal({ capabilities, capabilityError, onClose, onAdv
   const [folderError, setFolderError] = useState('');
   const [browsePath, setBrowsePath] = useState('');
   const [newName, setNewName] = useState('');
+  const [pendingSubmission, setPendingSubmission] = useState<BossSubmission | null>(null);
   const folderRequest = useRef<AbortController | null>(null);
   const submitting = useRef(false);
   const dialogRef = useDialog(onClose, busy);
+  const codex = capabilities?.harnesses.find(harness => harness.id === 'codex');
+  const leadReady = !capabilityError && !!codex?.available && !!capabilities?.bindings.some(binding => binding.harnessId === 'codex' && binding.available);
+  const draftKey = JSON.stringify([path.trim(), create, prompt.trim(), preference.trim()]);
+  const retrySubmission = pendingSubmission?.draftKey === draftKey ? pendingSubmission : null;
+  const submissionReady = leadReady || !!retrySubmission;
   useEffect(() => () => folderRequest.current?.abort(), []);
   const browse = async (target?: string) => {
     folderRequest.current?.abort();
@@ -61,16 +68,21 @@ export function BossProjectModal({ capabilities, capabilityError, onClose, onAdv
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (submitting.current || browsing || !path.trim() || !prompt.trim()) return;
+    if (submitting.current || browsing || !submissionReady || !path.trim() || !prompt.trim()) return;
     submitting.current = true; setBusy(true); setError(''); closeBrowser();
     try {
-      const project = await api.prepareProject(path.trim(), create);
-      const task = await api.createTask({ repoPath: project.repoPath, prompt: prompt.trim(), boss: { preference: preference.trim() } });
+      let submission = retrySubmission;
+      if (!submission) {
+        const project = await api.prepareProject(path.trim(), create);
+        submission = { draftKey, payload: { repoPath: project.repoPath, prompt: prompt.trim(), boss: { preference: preference.trim() } } };
+        setPendingSubmission(submission);
+      }
+      const task = await api.createTask(submission.payload);
+      setPendingSubmission(null);
       onCreated(task);
     } catch (e) { setError(e instanceof Error ? e.message : '提交失败，请重试'); }
     finally { submitting.current = false; setBusy(false); }
   };
-  const available = capabilities?.bindings.filter(binding => binding.available && capabilities.harnesses.some(h => h.id === binding.harnessId && h.available)) ?? [];
   return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="交给 Boss" className="modal submit-modal boss-submit">
     <div className="modal-heading"><div><div className="eyebrow">BOSS / 项目负责人</div><h2>你说目标，Boss 负责推进</h2><p>先设计与讨论，再分配合适的 Agent 和模型，最后检查验收。</p></div><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
     <form onSubmit={submit} className="submit-form"><fieldset disabled={busy}>
@@ -83,9 +95,10 @@ export function BossProjectModal({ capabilities, capabilityError, onClose, onAdv
       <label className="field"><span className="field-label">你想完成什么 *</span><textarea aria-label="你想完成什么 *" required rows={5} value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="直接描述目标、背景和需要注意的事项。方案、分工、测试和验收都交给 Boss。" /></label>
       <label className="field"><span className="field-label">Boss 与团队偏好（可选）</span><textarea aria-label="Boss 与团队偏好（可选）" rows={3} value={preference} onChange={e => setPreference(e.target.value)} placeholder={preferenceExample} /><span className="field-hint">用自己的话写即可，模型名称不必准确。Boss 会结合已连接的可用模型判断；留空使用全局 Boss 偏好。</span></label>
       <div className="boss-process"><span><BrainCircuit size={16} />设计与讨论</span><span>→</span><span>跨 Agent 分工</span><span>→</span><span><CheckCircle2 size={16} />检查与验收</span></div>
-      {capabilityError ? <div className="inline-warning"><AlertCircle size={15} />能力读取失败：{capabilityError}。请确认服务连接后重试。</div> : capabilities && !available.length ? <div className="inline-warning"><AlertCircle size={15} /><div>尚无已验证的执行组合。请在服务端连接并验证 Codex 或其他 Harness，再刷新能力状态。{capabilities.harnesses.filter(h => !h.available && h.reason).map(h => <p key={h.id}>{h.name}：{h.reason}</p>)}</div></div> : <p className="field-hint">偏好是请求，实际采用的模型、讨论和分工会记录在任务详情中。</p>}
+      {capabilityError ? <div className="inline-warning"><AlertCircle size={15} />能力读取失败：{capabilityError}。请确认服务连接后重试，已填写的内容会保留。</div> : !capabilities ? <p className="field-hint" role="status">正在确认 Codex 项目负责人是否可用…</p> : !leadReady ? <div className="inline-warning"><AlertCircle size={15} /><div>尚无可用的 Codex 项目负责人。请先连接并验证 Codex 模型，再刷新能力状态；其他 Harness 可以参与后续分工。{codex?.reason && <p>Codex：{codex.reason}</p>}</div></div> : <p className="field-hint">偏好是请求，实际采用的模型、讨论和分工会记录在任务详情中。</p>}
+      {retrySubmission && !busy && <p className="field-hint">上次提交尚未确认。可重试原请求以确认是否已接收，不会重复创建任务。</p>}
       {error && <div className="alert error compact" role="alert"><AlertCircle size={16} />{error}</div>}
-      <div className="modal-footer"><button type="button" className="link-button" disabled={busy} onClick={onAdvanced}>高级模式：手动执行任务</button><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || browsing || !path.trim() || !prompt.trim()}>{busy ? <><LoaderCircle size={15} className="spin" />正在交给 Boss</> : <><Send size={15} />交给 Boss</>}</button></div>
+      <div className="modal-footer"><button type="button" className="link-button" disabled={busy} onClick={onAdvanced}>高级模式：手动执行任务</button><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || browsing || !submissionReady || !path.trim() || !prompt.trim()}>{busy ? <><LoaderCircle size={15} className="spin" />正在交给 Boss</> : <><Send size={15} />{retrySubmission ? '确认上次提交' : '交给 Boss'}</>}</button></div>
     </fieldset></form>
   </section></div>;
 }

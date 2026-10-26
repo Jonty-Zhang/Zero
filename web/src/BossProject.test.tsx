@@ -45,6 +45,66 @@ describe('Boss project entry', () => {
     expect(api.prepareProject).toHaveBeenCalledWith('C:/projects/plain', false);
     expect(api.createTask).toHaveBeenCalledWith({ repoPath: 'C:/projects/plain', prompt: '设计并实现这个项目，自己验证', boss: { preference: 'Codex gpt6.1sol high，复杂问题讨论，其他交给 DSH' } });
   });
+  it.each([
+    ['能力读取中', null, ''],
+    ['能力读取失败', capabilities, '能力服务暂不可用'],
+    ['只有执行 Agent', { ...capabilities, harnesses: [{ id: 'dsh', name: 'DSH', available: true }], bindings: [{ harnessId: 'dsh', modelId: 'worker', available: true }] }, ''],
+    ['Codex CLI 没有已验证模型', { ...capabilities, bindings: [] }, ''],
+    ['Codex 模型验证已失效', { ...capabilities, bindings: [{ harnessId: 'codex', modelId: 'verified-model', available: false }] }, ''],
+    ['Codex Harness 不可用', { ...capabilities, harnesses: [{ id: 'codex', name: 'Codex', available: false, reason: 'Codex CLI 版本已变化' }] }, ''],
+  ] as const)('keeps the Boss draft without preparing or queuing when %s', async (_label, active, error) => {
+    const onCreated = vi.fn();
+    modal({ capabilities: active as Capabilities | null, capabilityError: error, onCreated }); fillGoal();
+    fireEvent.change(screen.getByLabelText('Boss 与团队偏好（可选）'), { target: { value: '老板模型名字可能写得不准确' } });
+    expect((screen.getByRole('button', { name: '交给 Boss' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/正在确认 Codex|尚无可用的 Codex|能力读取失败/)).toBeTruthy();
+    fireEvent.submit(screen.getByRole('dialog').querySelector('form')!);
+    await act(async () => {});
+    expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled(); expect(onCreated).not.toHaveBeenCalled();
+    expect((screen.getByLabelText('你想完成什么 *') as HTMLTextAreaElement).value).toBe('设计并实现这个项目，自己验证');
+    expect((screen.getByLabelText('Boss 与团队偏好（可选）') as HTMLTextAreaElement).value).toBe('老板模型名字可能写得不准确');
+  });
+  it('unlocks the same Boss draft after a verified Codex lead becomes available', async () => {
+    const props = { capabilityError: '', onClose: vi.fn(), onAdvanced: vi.fn(), onCreated: vi.fn() };
+    const view = render(<BossProjectModal {...props} capabilities={null} />); fillGoal();
+    fireEvent.change(screen.getByLabelText('Boss 与团队偏好（可选）'), { target: { value: '按我的偏好选择，名字不一定准确' } });
+    expect((screen.getByRole('button', { name: '交给 Boss' }) as HTMLButtonElement).disabled).toBe(true);
+    view.rerender(<BossProjectModal {...props} capabilities={capabilities} />);
+    expect((screen.getByRole('button', { name: '交给 Boss' }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
+    await vi.waitFor(() => expect(props.onCreated).toHaveBeenCalledWith(task));
+    expect(api.createTask).toHaveBeenCalledWith({ repoPath: 'C:/projects/plain', prompt: '设计并实现这个项目，自己验证', boss: { preference: '按我的偏好选择，名字不一定准确' } });
+  });
+  it('confirms an uncertain original submission after capabilities disappear without preparing the folder again', async () => {
+    vi.mocked(api.prepareProject).mockResolvedValue({ path: 'C:/canonical-project', repoPath: 'C:/canonical-project', initialized: true });
+    vi.mocked(api.createTask).mockRejectedValueOnce(new Error('Accepted response lost')).mockResolvedValueOnce(task);
+    const props = { capabilityError: '', onClose: vi.fn(), onAdvanced: vi.fn(), onCreated: vi.fn() };
+    const view = render(<BossProjectModal {...props} capabilities={capabilities} />); fillGoal();
+    fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
+    expect((await screen.findByRole('alert')).textContent).toContain('Accepted response lost');
+    view.rerender(<BossProjectModal {...props} capabilities={null} capabilityError="能力连接已中断" />);
+    const submit = screen.getByRole('dialog').querySelector('button[type=submit]') as HTMLButtonElement;
+    expect(submit.disabled).toBe(false);
+    fireEvent.submit(submit.closest('form')!);
+    await vi.waitFor(() => expect(props.onCreated).toHaveBeenCalledWith(task));
+    expect(api.prepareProject).toHaveBeenCalledTimes(1);
+    expect(api.createTask).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.createTask).mock.calls[1]![0]).toEqual(vi.mocked(api.createTask).mock.calls[0]![0]);
+    expect(api.createTask).toHaveBeenLastCalledWith({ repoPath: 'C:/canonical-project', prompt: '设计并实现这个项目，自己验证', boss: { preference: '' } });
+  });
+  it.each(['path', 'prompt', 'preference', 'create'] as const)('does not treat a changed %s as the original unconfirmed submission', async field => {
+    vi.mocked(api.createTask).mockRejectedValueOnce(new Error('Response uncertain'));
+    const props = { capabilityError: '', onClose: vi.fn(), onAdvanced: vi.fn(), onCreated: vi.fn() };
+    const view = render(<BossProjectModal {...props} capabilities={capabilities} />); fillGoal();
+    fireEvent.click(screen.getByRole('button', { name: '交给 Boss' })); await screen.findByRole('alert');
+    view.rerender(<BossProjectModal {...props} capabilities={null} />);
+    if (field === 'create') fireEvent.click(screen.getByLabelText('这个路径还不存在，创建新文件夹'));
+    else fireEvent.change(screen.getByLabelText(field === 'path' ? '项目文件夹 *' : field === 'prompt' ? '你想完成什么 *' : 'Boss 与团队偏好（可选）'), { target: { value: 'Changed draft' } });
+    const submit = screen.getByRole('dialog').querySelector('button[type=submit]') as HTMLButtonElement;
+    expect(submit.disabled).toBe(true); fireEvent.submit(submit.closest('form')!);
+    await act(async () => {});
+    expect(api.prepareProject).toHaveBeenCalledTimes(1); expect(api.createTask).toHaveBeenCalledTimes(1);
+  });
   it('browses the local server folder and selects a new child without creating it until submission', async () => {
     vi.mocked(api.folders).mockResolvedValue({ path: 'C:\\projects', parent: 'C:\\', folders: [{ name: 'existing', path: 'C:\\projects\\existing' }] });
     modal(); fireEvent.click(screen.getByRole('button', { name: '浏览文件夹' }));

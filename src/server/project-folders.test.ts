@@ -196,7 +196,15 @@ test('Boss submission accepts a normal folder and plain objective with no user-a
   const f = await fixture();
   const store = new TaskStore(join(f.root, 'tasks.sqlite'));
   const config = new ConfigStore(join(f.root, 'config.json'));
-  const server = createZeroServer({ store, config });
+  const model = { id: 'fixture-lead', provider: 'openai', modelId: 'offline-lead' };
+  await writeFile(config.path, JSON.stringify({ models: [model], bindings: [{ harness: 'codex', selector: 'cli_argument', verified: true, model, reasoningEfforts: ['high'] }],
+    allocator: { modelId: null, reasoningEffort: null }, reviewer: { modelId: null, reasoningEffort: null },
+    verifications: { 'codex:fixture-lead': { verifiedAt: '2026-10-26T00:00:00Z', cliVersion: 'offline-1', requestedModel: model.modelId,
+      exitCode: 0, level: 'selector_only', reasoningEfforts: ['high'] } } }));
+  const server = createZeroServer({ store, config, adapters: { codex: {
+    id: 'codex', async probe() { return { harness: 'codex', available: true, models: [model.id], reasoningEfforts: ['high'] }; },
+    async run() { throw new Error('Folder API tests must never execute a model'); },
+  } } });
   try {
     const project = join(f.root, 'boss-project'); await mkdir(project); await writeFile(join(project, 'input.md'), 'existing objective');
     await new Promise<void>(done => server.listen(0, '127.0.0.1', done));
