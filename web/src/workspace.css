@@ -976,23 +976,36 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
   line-height:1.9
 }
 
-.project-delivery,.project-delivery.completed {
-  background:#f0f3e9;
-  border-color:#d6dec8;
+.project-delivery {
+  --delivery-surface:#f7f3eb;
+  --delivery-border:#ded6c8;
+  --delivery-heading:#42382a;
+  --delivery-muted:#655b4c;
+  --delivery-path:#504538;
+  background:var(--delivery-surface);
+  border-color:var(--delivery-border);
   padding:22px
 }
+.project-delivery.completed {
+  --delivery-surface:#f0f3e9;
+  --delivery-border:#d6dec8;
+  --delivery-heading:#356d4c;
+  --delivery-muted:#5a674e;
+  --delivery-path:#4e6040
+}
+.project-delivery-heading { color:var(--delivery-heading); }
 .project-delivery-heading p {
-  color:#5a674e;
+  color:var(--delivery-muted);
   font-size:14px;
   line-height:1.85
 }
 .project-delivery-path {
-  border-color:#d6dec8;
+  border-color:var(--delivery-border);
   background:#fffefa;
   border-radius:5px
 }
 .project-delivery-path code {
-  color:#4e6040;
+  color:var(--delivery-path);
   font-size:14px
 }
 .delivery-version-list {
@@ -1000,19 +1013,20 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
   flex-wrap:wrap;
   gap:16px 32px;
   margin:16px 0 0;
-  font-size:13px
+  font-size:14px
 }
 .delivery-version-list>div {
   display:flex;
   gap:12px
 }
 .delivery-version-list dt {
-  color:#687359
+  color:var(--delivery-muted)
 }
 .delivery-version-list dd {
   margin:0;
   overflow-wrap:anywhere
 }
+.delivery-version-list code { font-size:14px; }
 
 .settings-layout {
   grid-template-columns:minmax(0,1fr) 280px;
