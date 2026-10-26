@@ -46,3 +46,18 @@ Browser logs and screenshots are stored in the ignored, repository-contained `da
 - Frontend: 121 tests pass, including two new interaction regressions that failed before implementation. Production build passes. The browser checks card boundaries at 960/1280/1440/1920, and repeats forms, details, focus, empty/offline states and font checks.
 
 Evidence for this round is in `data/verification/frontend-refinement-round2/`; it uses the same owned synthetic API/browser isolation as round 1.
+
+## Round 3: readable project material and IME-safe dialogs
+
+- Boss plans/discussions and the task description/acceptance criteria now render CommonMark/GFM headings, emphasis, lists, tables, block quotes, code and scoped footnotes using [react-markdown](https://github.com/remarkjs/react-markdown) 10.1.0 and [remark-gfm](https://github.com/remarkjs/remark-gfm) 4.0.1. Dependency versions are fixed in the web lockfile. Original task/message strings are not rewritten or stored differently.
+- The parser is a separate dynamic chunk (49.62 kB gzip in this build) requested only when readable task content mounts. The first project list does not load it. If that request fails, the original text stays visible rather than crashing the page.
+- HTML is displayed as text, with no raw-HTML plugin. Only explicit HTTP(S), mailto and scoped fragment references become active links. Agent-provided images are represented by alt text, so opening a task does not request an external image.
+- Code blocks use the local mono font, scroll within their own container and have a copy action that preserves the displayed code exactly. Clipboard denial keeps the code selectable; delayed completions cannot show success for replaced content.
+- Footnote IDs and descriptions are scoped per rendered message, so repeated note names across a discussion do not collide.
+- Dialog Escape now ignores active IME composition and keyCode 229. Regression tests first reproduced the draft-closing bug, then verified composition, normal close, busy state and focus containment/restoration.
+
+Validation: 134 frontend tests pass across ten files; TypeScript/Vite production build passes. Independent review ran 106 relevant tests plus two extra adversarial link/copy cases with no failures. The owned Edge fixture repeats prior desktop/form/offline checks, confirms the parser is absent from initial list requests, renders tables and long code, checks actual JetBrains Mono glyph use, keyboard code scrolling and narrower desktop details, and returns a real HTTP 503 for the parser to verify readable fallback. Browser clipboard is intentionally replaced with a fixture function; the real system clipboard is untouched. No task was submitted or real model called.
+
+Evidence: repository-contained `data/verification/frontend-reading-round3/`, with the separate dialog red/green receipt at `data/verification/dialog-ime-verification.json`.
+
+Markdown dependency and installed peer licenses (107 instances, MIT/ISC) are distributed with the frontend in web/public/THIRD_PARTY_NOTICES.txt; no missing license files were found in this closure.

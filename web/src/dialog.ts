@@ -24,6 +24,8 @@ export function useDialog(onClose: () => void, busy = false) {
     });
     (controls()[0] ?? element).focus();
     const onKey = (event: KeyboardEvent) => {
+      // Escape can dismiss the IME candidate window rather than the dialog.
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === 'Escape') { event.preventDefault(); if (!state.current.busy) state.current.onClose(); }
       if (event.key === 'Tab') {
         const items = controls(); const first = items[0]; const last = items.at(-1);

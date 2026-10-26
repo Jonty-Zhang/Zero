@@ -1,2 +1,3 @@
 # Preserve upstream font/license bytes so published SHA-256 manifests survive checkout.
 web/public/fonts/** -text
+web/public/THIRD_PARTY_NOTICES.txt -text

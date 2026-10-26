@@ -315,3 +315,15 @@ describe('Boss settings and project conversation', () => {
     expect((screen.getByLabelText('给 Boss 补充信息或提问') as HTMLTextAreaElement).value).toBe('需要保留这条消息');
   });
 });
+
+describe('Boss readable project content', () => {
+  it('renders the plan and discussion as structured prose rather than literal Markdown', async () => {
+    const markdown = '## 实施方案\n\n先确认 **恢复边界**，再实现。\n\n- 保留任务记录\n- 验证交接';
+    render(<BossProgress task={{ ...task, bossPlan: { summary: markdown, acceptanceCriteria: ['原有记录完整'], stages: [], checks: [], maxRevisions: 2 }, bossMessages: [{ id: 'formatted', role: 'boss', at: '2026-10-27T00:00:00.000Z', content: '| 检查 | 状态 |\n| --- | --- |\n| 交接 | 已验证 |\n\n```sh\nnpm test\n```' }] }} onMessage={vi.fn()} />);
+    expect(await screen.findByRole('heading', { name: '实施方案' })).toBeTruthy();
+    expect(screen.getByText('恢复边界').tagName).toBe('STRONG');
+    expect(screen.getByRole('table').textContent).toContain('已验证');
+    expect(screen.getByText('npm test').closest('pre')).toBeTruthy();
+    expect(screen.getByText('保留任务记录').closest('li')).toBeTruthy();
+  });
+});

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { AlertCircle, ArrowUp, Copy, Folder, FolderPlus, LoaderCircle, MessageSquare, Send, X } from 'lucide-react';
 import { api } from './api';
+import { RichText } from './RichText';
 import { useDialog } from './dialog';
 import type { Capabilities, Task } from './types';
 
@@ -133,7 +134,7 @@ export function BossProgress({ task, onMessage }: { task: Task; onMessage: () =>
   return <section className="detail-block boss-progress" aria-label="Boss 项目进展">
     <div className="boss-section-heading"><h3>项目方案</h3>{task.boss?.preference && <details className="boss-preference"><summary>团队偏好</summary><p>{task.boss.preference}</p></details>}</div>
     {task.bossPlan ? <div className="boss-plan">
-      <p className="boss-plan-summary pre-wrap">{task.bossPlan.summary}</p>
+      <RichText className="boss-plan-summary">{task.bossPlan.summary}</RichText>
       <div className="boss-plan-grid">
         <section className="boss-acceptance"><h4>验收标准</h4><ul>{task.bossPlan.acceptanceCriteria.map((item, i) => <li key={i}>{item}</li>)}</ul></section>
         <section className="boss-assignments"><h4>分工</h4><div className="boss-stage-list">{task.bossPlan.stages.map((stage, i) => <article key={i} className="boss-plan-stage"><span className="boss-stage-index" aria-hidden="true">{String(i + 1).padStart(2, '0')}</span><div><h5>{stage.objective}</h5><p className="boss-stage-route">{[stage.harness, stage.model, stage.reasoningEffort].filter(Boolean).join(' · ') || '待分配'}</p></div></article>)}</div></section>
@@ -141,7 +142,7 @@ export function BossProgress({ task, onMessage }: { task: Task; onMessage: () =>
       <details className="boss-validation"><summary>验证命令</summary><ul>{task.bossPlan.checks.map(check => <li key={check.id}><span>{check.id}</span><code>{check.argv.join(' ')}</code></li>)}</ul></details>
     </div> : <p className="boss-plan-empty">方案尚未生成。</p>}
     <section className="boss-discussion" aria-label="项目讨论"><h4><MessageSquare size={15} />讨论</h4>
-      <div className="boss-message-list">{(task.bossMessages ?? []).map(message => <article key={message.id} className={`boss-message ${message.role}`}><header className="boss-message-meta"><b>{message.role === 'user' ? '你' : message.role === 'consultant' ? '顾问' : 'Boss'}</b><span>{[message.harness, message.model].filter(Boolean).join(' · ')}</span><time dateTime={message.at} title={new Date(message.at).toLocaleString('zh-CN')}>{new Date(message.at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</time></header><p>{message.content}</p></article>)}</div>
+      <div className="boss-message-list">{(task.bossMessages ?? []).map(message => <article key={message.id} className={`boss-message ${message.role}`}><header className="boss-message-meta"><b>{message.role === 'user' ? '你' : message.role === 'consultant' ? '顾问' : 'Boss'}</b><span>{[message.harness, message.model].filter(Boolean).join(' · ')}</span><time dateTime={message.at} title={new Date(message.at).toLocaleString('zh-CN')}>{new Date(message.at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</time></header><RichText>{message.content}</RichText></article>)}</div>
       <form onSubmit={send} className="boss-message-form" aria-disabled={!canMessage}>
         <label className="field"><span className="field-label">给 Boss 补充信息或提问</span><textarea rows={3} maxLength={16000} disabled={busy || !canMessage} value={content} onChange={e => { setContent(e.target.value); setSent(false); }} placeholder="补充要求或提问…" /></label>
         <div className="boss-message-actions"><p className="boss-message-status">{terminal ? '任务已结束。继续工作请新建后续任务。' : !canMessage ? '正在验收。新要求请在验收后新建后续任务。' : '消息将在下个安全处理点读取。'}</p><button className="button secondary" type="submit" disabled={busy || !canMessage || !content.trim()}>{busy ? '发送中…' : '发送给 Boss'}<Send size={14} /></button></div>
