@@ -5,8 +5,9 @@ import { spawnSync } from 'node:child_process';
 import { extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { ConfigStore, type LocalZeroConfig } from './config-store.js';
 import { guardRuntimeBindings, matchesRuntimeBinding, RUNTIME_BINDING_RESTART_REQUIRED } from './runtime-binding-guard.js';
-import { TaskStore, GoalReviewRetryConflictError, type SequenceGoalReviewRetryRequest, type CheckRunRecord, type CheckRunIntegrityFailureRecord } from '../core/task-store.js';
+import { TaskStore, BossMessageConflictError, GoalReviewRetryConflictError, type SequenceGoalReviewRetryRequest, type CheckRunRecord, type CheckRunIntegrityFailureRecord } from '../core/task-store.js';
 import { selectTaskCheckEvidence } from './task-check-evidence.js';
+import { listProjectFolders, prepareProjectFolder, ProjectFolderError } from './project-folders.js';
 import { CodexAdapter } from '../adapters/codex.js';
 import { IdempotencyConflictError, submissionRequestHash, validateSubmissionKey } from '../core/submission-idempotency.js';
 import type { AdapterConfig } from '../adapters/base.js';
@@ -39,6 +40,10 @@ export interface TaskStorePort {
   checkRunIntegrityFailure?(runId: string): CheckRunIntegrityFailureRecord | undefined;
   reviews(taskId: string): ReviewResult[];
   events(taskId: string): TaskEvent[];
+  addBossMessage?(taskId: string, role: 'user', content: string): unknown;
+  bossMessages?(taskId: string): unknown[];
+  getWorktreeCreation?: TaskStore['getWorktreeCreation'];
+  commitOperations?: TaskStore['commitOperations'];
 }
 export interface ConfigPort {
   read(): Promise<LocalZeroConfig>;
@@ -126,6 +131,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     if (req.method === 'GET' && url.pathname === '/api/health') return json(res, 200, { status: 'ok' });
     if (url.pathname.startsWith('/api/')) {
       if (req.method === 'GET' && url.pathname === '/api/capabilities') return json(res, 200, await readCapabilities());
+      if (req.method === 'GET' && url.pathname === '/api/folders') {
+        validateMutationOrigin(req);
+        if (req.headers['sec-fetch-site'] === 'cross-site') throw new HttpError(403, '跨站读取文件夹请求已拒绝');
+        return json(res, 200, await listProjectFolders(url.searchParams.get('path') ?? process.cwd()));
+      }
+      if (req.method === 'POST' && url.pathname === '/api/projects/prepare') {
+        const raw = await bodyJson(req, options.maxBodyBytes);
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, '项目请求必须是对象');
+        const input = raw as Record<string, unknown>;
+        if (Object.keys(input).some(key => key !== 'path' && key !== 'create') || input.create !== undefined && typeof input.create !== 'boolean') throw new HttpError(400, '项目请求字段无效');
+        return json(res, 200, await prepareProjectFolder(input.path, input.create === true));
+      }
       if (url.pathname === '/api/config' && req.method === 'GET') return json(res, 200, await readPublicConfig(options));
       if (url.pathname === '/api/config' && req.method === 'PUT') return json(res, 200, await updatePublicConfig(options, await bodyJson(req, options.maxBodyBytes)));
       if (url.pathname === '/api/sequences' && req.method === 'GET') return json(res, 200, options.store.listSequences().map(mapSequence));
@@ -192,9 +209,20 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
         });
         return json(res, 201, mapTaskList(task));
       }
-      const taskPath = url.pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(cancel|report))?$/);
+      const taskPath = url.pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(cancel|report|messages))?$/);
       if (taskPath) {
         const id = decodeURIComponent(taskPath[1]!);
+        if (taskPath[2] === 'messages' && req.method === 'POST') {
+          const task = options.store.get(id);
+          if (!task) throw new HttpError(404, '任务不存在');
+          if (!task.boss) throw new HttpError(400, '此任务未启用 Boss 对话');
+          if (!options.store.addBossMessage || !options.store.bossMessages) throw new HttpError(501, '当前任务存储不支持负责人对话');
+          const raw = await bodyJson(req, options.maxBodyBytes);
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => key !== 'content')) throw new HttpError(400, '对话请求必须只包含 content');
+          const content = stringField((raw as Record<string, unknown>).content, 'content', 1, 16_000);
+          const entry = options.store.addBossMessage(id, 'user', content);
+          return json(res, 201, entry);
+        }
         if (taskPath[2] === 'cancel' && req.method === 'POST') return await cancelTask(res, id, options);
         if (taskPath[2] === 'report' && req.method === 'GET') return await taskReport(res, id, options);
         if (!taskPath[2] && req.method === 'GET') return await taskDetail(res, id, options);
@@ -203,7 +231,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     }
     await staticFile(res, url.pathname, options.staticDir);
   } catch (error) {
-    const code = error instanceof HttpError ? error.status : error instanceof IdempotencyConflictError || error instanceof GoalReviewRetryConflictError ? 409 : 500;
+    const code = error instanceof HttpError || error instanceof ProjectFolderError ? error.status : error instanceof IdempotencyConflictError || error instanceof GoalReviewRetryConflictError || error instanceof BossMessageConflictError ? 409 : 500;
     json(res, code, { error: message(error) });
   }
 }
@@ -294,6 +322,7 @@ async function capabilities(options: ZeroServerOptions, snapshot?: LocalZeroConf
 async function readPublicConfig(options: ZeroServerOptions) {
   const config = await options.config.read();
   return {
+    boss: config.boss ?? { preference: '' },
     allocator: { kind: config.allocator.kind ?? 'codex',
       modelId: config.allocator.modelId,
       reasoningEffort: config.allocator.reasoningEffort,
@@ -314,6 +343,7 @@ async function updatePublicConfig(options: ZeroServerOptions, raw: unknown) {
   const models = new Set(active.allocator.models.map((choice: { id: string }) => choice.id));
   const efforts = new Set(active.allocator.reasoningEfforts.map((choice: { id: string }) => choice.id));
   const config = await options.config.read();
+  if (input.boss !== undefined) config.boss = parseBossPreference(input.boss);
   const pick = (role: 'allocator' | 'reviewer') => {
     const value = input[role];
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HttpError(400, `${role} 必须是对象`);
@@ -355,7 +385,7 @@ async function updatePublicConfig(options: ZeroServerOptions, raw: unknown) {
   config.reviewer = pick('reviewer');
   if (input.executionDefaults !== undefined) config.executionDefaults = await parseExecutionDefaults(input.executionDefaults, active, config.executionDefaults);
   await options.config.write(config);
-  return { allocator: { ...config.allocator, ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) }, reviewer: config.reviewer,
+  return { boss: config.boss ?? { preference: '' }, allocator: { ...config.allocator, ...(config.allocator.api ? { api: { ...config.allocator.api } } : {}) }, reviewer: config.reviewer,
     executionDefaults: { global: publicExecutionSelection(config.executionDefaults?.global ?? null), projects: Object.entries(config.executionDefaults?.projects ?? {}).map(([repoPath, execution]) => ({ repoPath, execution: publicExecutionSelection(execution)! })) } };
 }
 
@@ -425,6 +455,16 @@ async function canonicalRepositoryPath(rawPath: string, label: string): Promise<
 async function parseSubmission(raw: unknown, options: ZeroServerOptions, capabilitySnapshot?: Awaited<ReturnType<typeof capabilities>>): Promise<TaskSubmission> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, '任务内容必须是 JSON 对象');
   const input = raw as Record<string, unknown>;
+  if (input.boss !== undefined) {
+    const boss = parseBossPreference(input.boss);
+    const prompt = stringField(input.prompt, 'prompt', 1, 100_000);
+    const project = await prepareProjectFolder(input.repoPath);
+    const baseRef = typeof input.baseRef === 'string' && input.baseRef.trim() ? input.baseRef.trim() : project.baseRef ?? 'HEAD';
+    if (baseRef.length > 255 || baseRef.startsWith('-') || /[\0\r\n]/.test(baseRef)) throw new HttpError(400, 'baseRef 格式无效');
+    const baseCheck = spawnSync('git', ['-C', project.repoPath, 'rev-parse', '--verify', '--end-of-options', `${baseRef}^{commit}`], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+    if (baseCheck.error || baseCheck.status !== 0) throw new HttpError(400, 'baseRef 必须指向项目中存在的提交');
+    return { repoPath: project.repoPath, baseRef, prompt, boss, acceptanceCriteria: [], checks: [], maxRevisions: 2 };
+  }
   const repoInput = stringField(input.repoPath, 'repoPath', 1, 4096);
   if (!isAbsolute(repoInput)) throw new HttpError(400, 'repoPath 必须是绝对路径');
   let repoPath: string;
@@ -461,6 +501,13 @@ async function parseSubmission(raw: unknown, options: ZeroServerOptions, capabil
   const selection = input.execution == null ? undefined : validateSelection(input.execution, capability);
   validateAvailableSelection({ ...inherited, ...selectionFields(selection ?? null) }, capability, 'execution effective selection');
   return { repoPath, baseRef, prompt, acceptanceCriteria: criteria, maxRevisions, checks, ...(selection ? { selection } : {}) };
+}
+
+function parseBossPreference(raw: unknown): { preference: string } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => key !== 'preference')) throw new HttpError(400, 'boss 必须是只包含 preference 的对象');
+  const preference = (raw as Record<string, unknown>).preference;
+  if (typeof preference !== 'string' || preference.length > 4000 || preference.includes('\0')) throw new HttpError(400, 'Boss 偏好必须是 0 到 4000 个字符的文本');
+  return { preference: preference.trim() };
 }
 
 function validateExecutionStages(rawStages: unknown, global: Record<string, string>, capability: Awaited<ReturnType<typeof capabilities>>): NonNullable<TaskSubmission['executionStages']> {
@@ -598,7 +645,14 @@ async function taskDetail(res: ServerResponse, id: string, options: ZeroServerOp
   ]);
   const reportPath = options.artifactRoot && /^[a-zA-Z0-9_-]{1,128}$/.test(id) ? join(resolve(options.artifactRoot), id, 'report.json') : undefined;
   const report = reportPath && (await access(reportPath).then(() => true).catch(() => false)) ? `/api/tasks/${encodeURIComponent(id)}/report` : undefined;
+  const creation = options.store.getWorktreeCreation?.(id);
+  const created = creation?.status === 'created' && creation.observed && typeof creation.observed === 'object'
+    ? creation.observed as { info?: { path?: unknown; branch?: unknown } } : undefined;
+  const resultCommit = task.status === 'done' ? options.store.commitOperations?.(id).filter(operation => operation.status === 'applied').at(-1)?.candidateSha : undefined;
+  const delivery = typeof created?.info?.path === 'string' && typeof created.info.branch === 'string'
+    ? { path: created.info.path, branch: created.info.branch, ...(resultCommit ? { resultCommit } : {}) } : undefined;
   json(res, 200, { ...mapTaskList(task), prompt: task.prompt, acceptanceCriteria: task.acceptanceCriteria?.join('\n'), baseRef: task.baseRef,
+    bossMessages: options.store.bossMessages?.(id) ?? [], delivery,
     maxRevisions: task.maxRevisions, route: route ? mapRoute(route) : undefined,
     executionStages: (task.executionStages ?? []).map(stage => ({ ...publicExecutionSelection(stage), ...(stage.objective !== undefined ? { objective: stage.objective } : {}) })),
     stages: stages.map(mapStage), handoffs: handoffs.map(mapHandoff),
@@ -611,6 +665,7 @@ function mapTaskList(task: TaskRecord) {
   const route = task.route;
   return { id: task.id, title: task.prompt.split(/\r?\n/, 1)[0]?.slice(0, 100), status: task.status,
     repoPath: task.repoPath, baseRef: task.baseRef, createdAt: task.createdAt, updatedAt: task.updatedAt,
+    boss: task.boss, bossPlan: task.bossPlan,
     maxRevisions: task.maxRevisions, route: route ? mapRoute(route as unknown as Record<string, unknown>) : undefined,
     retryAt: task.status === 'waiting' ? task.retryAt : undefined, error: task.failureReason,
     recoveryReason: task.recoveryReason, recoveryEvidence: task.recoveryEvidence };

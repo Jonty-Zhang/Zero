@@ -205,7 +205,7 @@ export async function createTrustedCodexCwd(options: TrustedCodexCwdOptions): Pr
     await mkdir(sandboxPath, { recursive: false, mode: 0o700 });
     createdPath = await realpath(sandboxPath);
     if (createdPath !== sandboxPath || !isWithin(artifactRoot, createdPath)) throw new Error('Trusted Codex cwd resolved outside artifactRoot');
-    await execFileAsync('git', ['init', '--quiet', '--initial-branch=main'], {
+    await execFileAsync('git', ['init', '--quiet', '--initial-branch=main', `--template=${templatePath}`], {
       cwd: createdPath,
       windowsHide: true,
       timeout: 10_000,
@@ -646,9 +646,9 @@ export async function worktreeGitEnvironment(globalConfigPath: string, taskWorks
     throw new Error('Source Git text configuration is unsupported');
   }
   const env = safeGitEnvironment(globalConfigPath);
-  env.GIT_CONFIG_COUNT = '4';
-  env.GIT_CONFIG_KEY_2 = 'core.autocrlf'; env.GIT_CONFIG_VALUE_2 = autocrlf;
-  env.GIT_CONFIG_KEY_3 = 'core.eol'; env.GIT_CONFIG_VALUE_3 = eol;
+  env.GIT_CONFIG_COUNT = '5';
+  env.GIT_CONFIG_KEY_3 = 'core.autocrlf'; env.GIT_CONFIG_VALUE_3 = autocrlf;
+  env.GIT_CONFIG_KEY_4 = 'core.eol'; env.GIT_CONFIG_VALUE_4 = eol;
   return { env, textNormalization: { autocrlf: autocrlf as WorktreeTextNormalization['autocrlf'], eol: eol as WorktreeTextNormalization['eol'] } };
 }
 
@@ -656,11 +656,14 @@ export function safeGitEnvironment(globalConfigPath: string): NodeJS.ProcessEnv 
   const env: NodeJS.ProcessEnv = {
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: globalConfigPath,
-    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_COUNT: '3',
     GIT_CONFIG_KEY_0: 'core.fsmonitor',
     GIT_CONFIG_VALUE_0: 'false',
     GIT_CONFIG_KEY_1: 'core.untrackedCache',
     GIT_CONFIG_VALUE_1: 'false',
+    // Scoped to these owned Git subprocesses; never changes user/system config.
+    GIT_CONFIG_KEY_2: 'core.longpaths',
+    GIT_CONFIG_VALUE_2: 'true',
     GIT_OPTIONAL_LOCKS: '0',
     GIT_TERMINAL_PROMPT: '0',
     GIT_NO_REPLACE_OBJECTS: '1',

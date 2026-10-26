@@ -27,6 +27,27 @@ export interface ExecutionStageDefinition extends ExecutionSelection {
   objective?: string;
 }
 
+export interface BossMessage {
+  id: string;
+  role: 'user' | 'boss' | 'consultant';
+  content: string;
+  at: string;
+  model?: string;
+  harness?: string;
+}
+
+/** An executable, persisted contract produced by the project lead. */
+export interface BossPlan {
+  summary: string;
+  acceptanceCriteria: string[];
+  stages: ExecutionStageDefinition[];
+  checks: CheckDefinition[];
+  maxRevisions: number;
+  boss: { harness: string; model: string; reasoningEffort?: string };
+  /** User messages included in the latest planning decision. */
+  messageCursor?: string;
+}
+
 export interface TaskSubmission {
   repoPath: string;
   baseRef: string;
@@ -40,6 +61,9 @@ export interface TaskSubmission {
   selection?: ExecutionSelection;
   /** Ordered execution stages in one task worktree. Omitted fields are completed by the configured coordinator. */
   executionStages?: ExecutionStageDefinition[];
+  /** Natural-language lead preference; executor choices belong to the lead. */
+  boss?: { preference: string };
+  bossPlan?: BossPlan;
 }
 
 /** A durable user-authored ordered collection of tasks. Sequence completion is derived from task records. */

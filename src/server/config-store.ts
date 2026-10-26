@@ -8,6 +8,7 @@ import { resolveModelIdentity } from '../adapters/model-binding.js';
 import type { ExecutionSelection } from '../domain/types.js';
 
 export interface LocalZeroConfig {
+  boss?: { preference: string };
   models: ModelConfig[];
   bindings: ModelBinding[];
   allocator: { kind?: 'codex' | 'api'; modelId: string | null; reasoningEffort: ReasoningEffort | null; api?: { baseUrl: string; model: string; keyEnv: string } };
@@ -101,6 +102,7 @@ export class ConfigStore {
       return {
         models: Array.isArray(parsed.models) ? parsed.models : [],
         bindings: Array.isArray(parsed.bindings) ? parsed.bindings : [],
+        ...(parsed.boss && typeof parsed.boss.preference === 'string' ? { boss: { preference: parsed.boss.preference } } : {}),
         allocator: { ...(parsed.allocator?.kind === 'api' || parsed.allocator?.kind === 'codex' ? { kind: parsed.allocator.kind } : {}),
           modelId: parsed.allocator?.modelId ?? null, reasoningEffort: parsed.allocator?.reasoningEffort ?? null,
           ...(parsed.allocator?.api ? { api: parsed.allocator.api } : {}) },
@@ -121,6 +123,7 @@ export class ConfigStore {
         ...previous,
         allocator: value.allocator,
         reviewer: value.reviewer,
+        ...(value.boss !== undefined ? { boss: value.boss } : {}),
         ...(value.executionDefaults !== undefined ? { executionDefaults: value.executionDefaults } : {}),
       };
       await this.persist(next, path);

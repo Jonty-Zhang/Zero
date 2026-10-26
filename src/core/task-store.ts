@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import type {
+  BossMessage,
+  BossPlan,
   Attempt,
   CheckResult,
   GoalReviewResult,
@@ -228,6 +230,10 @@ export interface SequenceGoalReviewRetryRequest {
 
 export class GoalReviewRetryConflictError extends Error {
   constructor(message: string) { super(message); this.name = "GoalReviewRetryConflictError"; }
+}
+
+export class BossMessageConflictError extends Error {
+  constructor(message: string) { super(message); this.name = 'BossMessageConflictError'; }
 }
 
 export type ReviewedTaskSequenceRecord = TaskSequenceRecord & {
@@ -1878,6 +1884,115 @@ export class TaskStore {
     return row ? this.#task(row) : undefined;
   }
 
+  /** Discussion is append-only; model-authored messages require the current live owner. */
+  addBossMessage(taskId: string, role: BossMessage['role'], content: string,
+    metadata: { owner?: string; harness?: string; model?: string } = {}): BossMessage {
+    return this.#transaction(() => {
+      const task = this.get(taskId);
+      if (!task?.boss) throw new Error('Unknown Boss project task');
+      if (!['user', 'boss', 'consultant'].includes(role) || typeof content !== 'string' || !content.trim() || content.trim().length > 16000) {
+        throw new Error('Boss message content must contain 1 to 16000 characters');
+      }
+      if (role === 'user' && (!['pending', 'running', 'revision', 'waiting'].includes(task.status) || this.getTaskCancellation(taskId))) {
+        throw new BossMessageConflictError(task.status === 'reviewing'
+          ? 'Boss 正在验收本轮结果，暂不能追加要求。请等待验收结束后新建后续任务。'
+          : '任务已停止或需要恢复检查，无法继续处理消息。请新建后续任务。');
+      }
+      if (role !== 'user') {
+        const claim = { status: task.status, lease_owner: task.leaseOwner ?? null, lease_expires_at: task.leaseExpiresAt ?? null };
+        if (!metadata.owner || (!this.#hasLiveTaskLease(claim, metadata.owner) && !this.#hasLiveStageLease(claim, metadata.owner, 'review'))) {
+          throw new Error('Boss message requires the live task lease owner');
+        }
+        this.#assertTaskAcceptsWork(taskId);
+      }
+      const message: BossMessage = { id: randomUUID(), role, content: content.trim(), at: new Date().toISOString(),
+        ...(metadata.harness ? { harness: metadata.harness } : {}), ...(metadata.model ? { model: metadata.model } : {}) };
+      this.#event(taskId, 'boss.message', message, message.at);
+      this.#db.prepare('UPDATE tasks SET updated_at=? WHERE id=?').run(message.at, taskId);
+      return message;
+    });
+  }
+
+  bossMessages(taskId: string): BossMessage[] {
+    return this.events(taskId).filter(event => event.type === 'boss.message').map(event => event.payload as unknown as BossMessage);
+  }
+
+  /** Freeze a lead-generated execution contract before any check evidence exists. */
+  saveBossPlan(taskId: string, owner: string, plan: BossPlan, completedStages = 0): TaskRecord {
+    return this.#transaction(() => {
+      const task = this.get(taskId);
+      if (!task?.boss) throw new Error('Unknown Boss project task');
+      if (!this.#hasLiveTaskLease({ status: task.status, lease_owner: task.leaseOwner ?? null, lease_expires_at: task.leaseExpiresAt ?? null }, owner)) {
+        throw new Error('Boss plan requires the live task lease owner');
+      }
+      this.#assertTaskAcceptsWork(taskId);
+      if (this.#db.prepare('SELECT 1 FROM check_runs WHERE task_id=? LIMIT 1').get(taskId)) throw new Error('Boss checks are frozen after validation starts');
+      if (this.#db.prepare("SELECT 1 FROM attempts WHERE task_id=? AND status='running' LIMIT 1").get(taskId)) throw new Error('Boss plan cannot change during an active attempt');
+      if (!plan || typeof plan.summary !== 'string' || !plan.summary.trim() || plan.summary.length > 16000
+        || !Array.isArray(plan.acceptanceCriteria) || plan.acceptanceCriteria.length < 1 || plan.acceptanceCriteria.length > 100
+        || plan.acceptanceCriteria.some(item => typeof item !== 'string' || !item.trim() || item.length > 4000)
+        || !plan.boss || plan.boss.harness !== 'codex' || !plan.boss.model?.trim()
+        || !Number.isInteger(plan.maxRevisions) || plan.maxRevisions < 0 || plan.maxRevisions > 10) throw new Error('Invalid Boss plan');
+      validateExecutionStages({ ...task, executionStages: plan.stages });
+      if (!plan.stages?.length) throw new Error('Boss plan requires execution stages');
+      if (!Array.isArray(plan.checks) || plan.checks.length < 1 || plan.checks.length > 50
+        || new Set(plan.checks.map(check => check.id)).size !== plan.checks.length
+        || plan.checks.some(check => !check || typeof check.id !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(check.id)
+          || !Array.isArray(check.argv) || !check.argv.length || check.argv.length > 128
+          || check.argv.some(arg => typeof arg !== 'string' || arg.length > 16000 || /[\0\r\n]/.test(arg)) || !check.argv[0]?.trim())) {
+        throw new Error('Boss plan requires valid nonempty checks');
+      }
+      const prefix = task.executionStages?.slice(0, completedStages) ?? [];
+      const started = this.stages(taskId).filter(stage => stage.role === 'implement' || stage.role === 'revise');
+      if (!Number.isInteger(completedStages) || completedStages < 0 || completedStages > (task.executionStages?.length ?? 0)
+        || JSON.stringify(plan.stages.slice(0, completedStages)) !== JSON.stringify(prefix)) {
+        throw new Error('Boss plan cannot rewrite or invent an executed stage prefix');
+      }
+      const attempts = this.attempts(taskId);
+      const events = this.events(taskId);
+      let logicalStage = 0;
+      for (let index = 0; index < started.length; index++) {
+        const stage = started[index]!;
+        const expected = prefix[logicalStage];
+        const attempt = attempts.filter(item => item.stageId === stage.id).at(-1);
+        if (!expected || stage.role !== 'implement' || !stage.startedAt || !stage.finishedAt || !stage.outputFingerprint
+          || (expected.harness && stage.harness !== expected.harness) || (expected.model && stage.model !== expected.model)
+          || (expected.reasoningEffort && stage.reasoningEffort !== expected.reasoningEffort)
+          || !attempt || attempt.harness !== stage.harness || attempt.model !== stage.model) {
+          throw new Error('Boss executed stage evidence does not match the frozen prefix');
+        }
+        if (stage.status === 'succeeded' && attempt.status === 'succeeded') { logicalStage++; continue; }
+        const next = started[index + 1];
+        const finished = events.find(event => event.type === 'stage.finished' && event.payload?.stageId === stage.id && event.payload?.status === 'interrupted');
+        const successor = next && events.find(event => event.type === 'stage.created' && (event.payload?.stage as StageRecord | undefined)?.id === next.id);
+        const quota = finished && successor && events.find(event => {
+          const checkpoint = event.payload?.checkpoint as Record<string, unknown> | undefined;
+          const route = checkpoint?.finalRoute as RouteDecision | undefined;
+          return event.type === 'task.quota_waiting' && event.id > finished.id && event.id < successor.id
+            && checkpoint?.stage === 'execute' && checkpoint.revision === 0 && checkpoint.executionStageIndex === logicalStage
+            && checkpoint.worktreeFingerprint === stage.outputFingerprint && route?.harness === stage.harness && route?.model === stage.model;
+        });
+        const resumed = quota && successor && events.some(event => event.type === 'task.claimed' && event.id > quota.id && event.id < successor.id);
+        if (stage.status !== 'interrupted' || !['failed', 'interrupted'].includes(attempt.status) || !next
+          || next.predecessorStageId !== stage.id || next.inputFingerprint !== stage.outputFingerprint || !quota || !resumed) {
+          throw new Error('Boss may only continue an interrupted prefix with a proven quota checkpoint and successor');
+        }
+      }
+      if (logicalStage !== completedStages) throw new Error('Boss plan cannot invent completed logical stages');
+      const row = this.#db.prepare('SELECT payload FROM tasks WHERE id=?').get(taskId) as { payload: string };
+      const original = JSON.parse(row.payload) as TaskSubmission;
+      const normalized = structuredClone(plan);
+      const criteria = [...new Set([...(original.acceptanceCriteria ?? []), ...normalized.acceptanceCriteria])];
+      if (criteria.length > 100) throw new Error('Boss acceptance criteria exceed the retained requirement limit');
+      const next: TaskSubmission = { ...original, bossPlan: normalized, executionStages: normalized.stages,
+        checks: normalized.checks, acceptanceCriteria: criteria, maxRevisions: normalized.maxRevisions };
+      const at = new Date().toISOString();
+      this.#db.prepare('UPDATE tasks SET payload=?,updated_at=? WHERE id=?').run(JSON.stringify(next), at, taskId);
+      this.#event(taskId, 'boss.plan.saved', { plan: normalized, completedStages }, at);
+      return this.get(taskId)!;
+    });
+  }
+
   list(status?: TaskStatus): TaskRecord[] {
     const rows = (status
       ? this.#db.prepare(`SELECT t.*,(SELECT effective_base_commit FROM task_sequence_steps s WHERE s.task_id=t.id) AS sequence_base_commit
@@ -1916,7 +2031,7 @@ export class TaskStore {
       });
       if (!row) { this.#db.exec("COMMIT"); return undefined; }
       const sequenceBaseCommit = this.#resolveSequenceBaseCommit(row.id);
-      const result = this.#db.prepare(`UPDATE tasks SET status='running', updated_at=?, lease_owner=?, lease_expires_at=?, heartbeat_at=?, lease_protocol_version=2, claim_generation_id=?
+      const result = this.#db.prepare(`UPDATE tasks SET status='running', updated_at=?, lease_owner=?, lease_expires_at=?, heartbeat_at=?, lease_protocol_version=2, claim_generation_id=?, failure_reason=NULL
         WHERE id=? AND status IN ('pending','waiting')`).run(at, owner, expires, at, this.#startupGeneration.id, row.id);
       if (Number(result.changes) !== 1) { this.#db.exec("ROLLBACK"); return undefined; }
       this.#event(row.id, "task.claimed", { owner, leaseExpiresAt: expires, leaseProtocolVersion: 2, generationId: this.#startupGeneration.id,

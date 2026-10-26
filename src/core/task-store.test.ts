@@ -2322,6 +2322,8 @@ test("quota pause survives store restart and is claimable only at its persisted 
     const resumed = store.claimNext("resumed-worker", 60_000, new Date(Date.now() + 120_000));
     assert.equal(resumed?.id, task.id);
     assert.equal(resumed?.status, "running");
+    assert.equal(resumed?.failureReason, undefined, 'the historical quota reason must not appear as the active task error');
+    assert.ok(store.events(task.id).some(event => event.type === 'task.quota_waiting'));
     assert.deepEqual(resumed?.resumeCheckpoint, waiting.resumeCheckpoint);
   } finally {
     store.close();

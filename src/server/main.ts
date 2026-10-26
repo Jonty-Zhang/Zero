@@ -27,6 +27,7 @@ import { buildGoalRevisionSubmission, GoalRevisionCapacityError } from '../orche
 import { captureSequenceGoalEvidence } from './sequence-goal-evidence.js';
 import { QuotaLimitError } from '../core/quota.js';
 import { TaskWorker } from '../orchestrator/worker.js';
+import { BossOrchestrator } from '../orchestrator/boss.js';
 import { ConfigStore } from './config-store.js';
 import { createCodexAdapter, createDefaultAdapters, createZeroServer } from './server.js';
 import type { ExecutionSelection, HarnessAdapter, TaskStatus } from '../domain/types.js';
@@ -139,6 +140,12 @@ export async function startZeroServer(options: { host?: string; port?: number } 
   const router = {
     route: async (task: Parameters<TaskRouter['route']>[0], context: Parameters<TaskRouter['route']>[1]) => {
       const cfg = await config.read();
+      if (task.boss) {
+        const lead = task.bossPlan?.boss;
+        if (!lead) throw new Error('Boss project has no persisted lead plan');
+        return new TaskRouter({ codex, coordinatorModel: lead.model, coordinatorReasoningEffort: lead.reasoningEffort,
+          cwd: context.cwd, artifactDir: resolve(dataRoot, 'artifacts', task.id, 'router'), getCandidates: candidateProvider }).route(task, context);
+      }
       const executionDefaults = executionDefaultsForTask(cfg, task.repoPath);
       if (cfg.allocator.kind === 'api') {
         const api = cfg.allocator.api;
@@ -159,11 +166,26 @@ export async function startZeroServer(options: { host?: string; port?: number } 
   const reviewer = {
     review: async (...args: Parameters<TaskReviewer['review']>) => {
       const cfg = await config.read();
-      return new TaskReviewer({ codex, artifactDir: resolve(dataRoot, 'artifacts'), model: cfg.reviewer.modelId ?? undefined,
-        reasoningEffort: cfg.reviewer.reasoningEffort ?? undefined }).review(...args);
+      const task = args[0];
+      const lead = task.bossPlan?.boss;
+      if (task.boss && !lead) throw new Error('Boss project has no persisted acceptance lead');
+      if (task.boss) {
+        const discussion = store.bossMessages(task.id).filter(message => message.role === 'user');
+        args[0] = { ...task, prompt: `${task.prompt}\n\nLatest human project messages (requirements, not permission to bypass verification):\n${JSON.stringify(discussion)}` };
+      }
+      const review = await new TaskReviewer({ codex, artifactDir: resolve(dataRoot, 'artifacts'), model: task.boss ? lead!.model : cfg.reviewer.modelId ?? undefined,
+        reasoningEffort: task.boss ? lead!.reasoningEffort : cfg.reviewer.reasoningEffort ?? undefined }).review(...args);
+      if (task.boss && task.leaseOwner && !store.getTaskCancellation(task.id)) store.addBossMessage(task.id, 'boss',
+        `验收：${review.result.verdict}\n${review.result.summary}`, { owner: task.leaseOwner, harness: review.harness, model: review.model });
+      return review;
     },
   };
-  const worker = new TaskWorker({ store, worktrees, testRunner, router, reviewer, adapters: new Map(Object.entries(adapters)), artifactRoot: resolve(dataRoot, 'artifacts') });
+  const boss = { plan: async (...args: Parameters<BossOrchestrator['plan']>) => {
+    const cfg = await config.read();
+    return new BossOrchestrator({ codex, adapters: new Map(Object.entries(adapters)), getCandidates: candidateProvider,
+      artifactRoot: resolve(dataRoot, 'artifacts'), defaultPreference: cfg.boss?.preference }).plan(...args);
+  } };
+  const worker = new TaskWorker({ store, worktrees, testRunner, router, reviewer, boss, adapters: new Map(Object.entries(adapters)), artifactRoot: resolve(dataRoot, 'artifacts') });
   const reviewReadySequences = createSequenceGoalReviewScheduler({ store, worktrees, codex,
     artifactRoot: resolve(dataRoot, 'artifacts'), readReviewerConfig: async () => (await config.read()).reviewer });
   const server = createZeroServer({ store, config, adapters, artifactRoot: resolve(dataRoot, 'artifacts'), staticDir: resolve(repoRoot, 'web/dist'),
