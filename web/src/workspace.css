@@ -493,6 +493,7 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
 }
 
 .board {
+  grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));
   padding:0 22px 24px;
   gap:16px
 }

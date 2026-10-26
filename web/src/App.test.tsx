@@ -144,6 +144,74 @@ describe('polling workspace filters', () => {
   });
 });
 
+describe('nonempty workflow board columns', () => {
+  const boardColumns = () => Array.from(document.querySelectorAll<HTMLElement>('.board-column'));
+  const columnLabels = () => boardColumns().map(column => column.querySelector('.column-heading b')?.textContent);
+  const mixedTasks = (): Task[] => [
+    { ...tasks[2]!, title: '失败项目', updatedAt: '2026-10-27T04:00:00Z' },
+    { ...tasks[0]!, title: '较旧执行任务', updatedAt: '2026-10-27T01:00:00Z' },
+    { ...tasks[1]!, title: '已完成项目', updatedAt: '2026-10-27T03:00:00Z' },
+    { ...tasks[0]!, id: 'newer-running', title: '较新执行任务', updatedAt: '2026-10-27T02:00:00Z' },
+  ];
+  async function openBoard(fixture: Task[]) {
+    vi.mocked(api.tasks).mockResolvedValue(fixture);
+    render(<App />);
+    await screen.findByText(fixture[0]!.title!);
+    fireEvent.click(screen.getByRole('button', { name: '看板视图' }));
+  }
+  it('renders only the done column for completed tasks without seven empty placeholders', async () => {
+    await openBoard([{ ...tasks[1]!, title: '完成任务一' }, { ...tasks[1]!, id: 'second-done', title: '完成任务二' }]);
+    expect(columnLabels()).toEqual(['已完成']);
+    expect(boardColumns()[0]!.querySelector('.column-count')?.textContent).toBe('2');
+    expect(within(boardColumns()[0]!).getAllByRole('button')).toHaveLength(2);
+    expect(screen.getByText('完成任务一')).toBeTruthy();
+    expect(screen.getByText('完成任务二')).toBeTruthy();
+    expect(screen.queryAllByText('暂无任务')).toHaveLength(0);
+  });
+  it('preserves canonical workflow order, column counts, task status and newest-first card order', async () => {
+    const fixture = mixedTasks();
+    await openBoard(fixture);
+    expect(columnLabels()).toEqual(['执行中', '已完成', '失败']);
+    expect(boardColumns().map(column => column.querySelector('.column-count')?.textContent)).toEqual(['2', '1', '1']);
+    expect(boardColumns().map(column => Array.from(column.querySelectorAll('h3'), title => title.textContent))).toEqual([
+      ['较新执行任务', '较旧执行任务'], ['已完成项目'], ['失败项目'],
+    ]);
+    expect(Array.from(boardColumns()[0]!.querySelectorAll('.status-pill'), pill => pill.textContent)).toEqual(['执行中', '执行中']);
+    expect(fixture.map(task => task.status)).toEqual(['failed', 'running', 'done', 'running']);
+  });
+  it('shows only columns matching the status filter and restores occupied columns after clear', async () => {
+    await openBoard(mixedTasks());
+    fireEvent.change(screen.getByLabelText('状态筛选'), { target: { value: 'done' } });
+    expect(columnLabels()).toEqual(['已完成']);
+    expect(screen.getByText('已完成项目')).toBeTruthy();
+    expect(screen.queryByText('较新执行任务')).toBeNull();
+    expect(screen.queryByText('失败项目')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '清除筛选' }));
+    expect(columnLabels()).toEqual(['执行中', '已完成', '失败']);
+    expect(screen.getByText('较新执行任务')).toBeTruthy();
+    expect(screen.getByText('失败项目')).toBeTruthy();
+    expect(screen.queryAllByText('暂无任务')).toHaveLength(0);
+  });
+  it('removes the emptied running column and shows the done column after a real poll transition', async () => {
+    vi.useFakeTimers();
+    const running: Task = { ...tasks[0]!, title: '轮询迁移任务' };
+    const completed: Task = { ...running, status: 'done', updatedAt: '2026-10-27T05:00:00Z' };
+    vi.mocked(api.tasks).mockResolvedValueOnce([running]).mockResolvedValue([completed]);
+    render(<App />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: '看板视图' }));
+    expect(screen.getByText('轮询迁移任务').closest('button')?.querySelector('.status-pill')?.textContent).toBe('执行中');
+    await act(async () => { await vi.advanceTimersByTimeAsync(4500); });
+    expect(api.tasks).toHaveBeenCalledTimes(2);
+    expect(columnLabels()).toEqual(['已完成']);
+    expect(boardColumns()[0]!.querySelector('.column-count')?.textContent).toBe('1');
+    expect(screen.getByText('轮询迁移任务').closest('button')?.querySelector('.status-pill')?.textContent).toBe('已完成');
+    expect(screen.queryAllByText('暂无任务')).toHaveLength(0);
+    expect(running.status).toBe('running');
+    expect(completed.status).toBe('done');
+  });
+});
+
 describe('saved Boss lead identity in workspace', () => {
   const leadTask = (): Task => ({
     id: 'boss-delegated-project', title: '跨 Agent 实验项目', status: 'running', repoPath: 'C:/repo/project',
