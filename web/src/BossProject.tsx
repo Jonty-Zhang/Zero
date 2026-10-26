@@ -84,7 +84,7 @@ export function BossProjectModal({ capabilities, capabilityError, onClose, onAdv
     finally { submitting.current = false; setBusy(false); }
   };
   return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="交给 Boss" className="modal submit-modal boss-submit">
-    <div className="modal-heading"><div><div className="eyebrow">BOSS / 项目负责人</div><h2>你说目标，Boss 负责推进</h2><p>先设计与讨论，再分配合适的 Agent 和模型，最后检查验收。</p></div><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
+    <div className="modal-heading"><div><div className="eyebrow"><BrainCircuit size={14} />BOSS / 项目负责人</div><h2>你说目标，Boss 负责推进</h2><p>选择项目位置，写下目标，其余交给 Boss 和团队。</p></div><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
     <form onSubmit={submit} className="submit-form"><fieldset disabled={busy}>
       <div className="field"><label htmlFor="boss-project-path" className="field-label">项目文件夹 *</label><div className="boss-folder-input"><input id="boss-project-path" required value={path} onChange={e => setPath(e.target.value)} placeholder="选择已有文件夹，或输入新文件夹完整路径" /><button className="button secondary" type="button" onClick={() => void browse(path.trim() || undefined)}><Folder size={15} />浏览文件夹</button></div><span className="field-hint">可使用普通文件夹；Zero 会准备项目版本记录，方便保留和检查改动。</span></div>
       <label className="boss-create-toggle"><input type="checkbox" checked={create} onChange={e => setCreate(e.target.checked)} />这个路径还不存在，创建新文件夹</label>
