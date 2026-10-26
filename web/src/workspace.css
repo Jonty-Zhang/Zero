@@ -620,15 +620,20 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
   box-shadow:0 0 0 3px #eeebf6
 }
 .select-wrap select {
-  padding-right:32px
+  height:auto;
+  min-height:calc(1.8em + 26px);
+  padding-right:36px
 }
 .select-wrap select:disabled {
   background:#f1eee8;
   color:#766c5f
 }
 .select-wrap>svg {
-  color:#827564
+  color:#827564;
+  top:50%;
+  transform:translateY(-50%)
 }
+.lower-grid .field:first-child input { height:auto; }
 .boss-submit {
   width:min(800px,100%)
 }
