@@ -41,6 +41,7 @@ export interface TaskStorePort {
   reviews(taskId: string): ReviewResult[];
   events(taskId: string): TaskEvent[];
   addBossMessage?(taskId: string, role: 'user', content: string): unknown;
+  addBossMessageIdempotent?(taskId: string, content: string, requestKey: string): unknown;
   bossMessages?(taskId: string): unknown[];
   getWorktreeCreation?: TaskStore['getWorktreeCreation'];
   commitOperations?: TaskStore['commitOperations'];
@@ -220,7 +221,16 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
           const raw = await bodyJson(req, options.maxBodyBytes);
           if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => key !== 'content')) throw new HttpError(400, '对话请求必须只包含 content');
           const content = stringField((raw as Record<string, unknown>).content, 'content', 1, 16_000);
-          const entry = options.store.addBossMessage(id, 'user', content);
+          const header = req.headers['x-idempotency-key'];
+          let requestKey: string | undefined;
+          if (header !== undefined) {
+            try { requestKey = validateSubmissionKey(header); }
+            catch (error) { throw new HttpError(400, message(error)); }
+            if (!options.store.addBossMessageIdempotent) throw new HttpError(501, '当前任务存储不支持对话消息的可靠重试');
+          }
+          const entry = requestKey
+            ? options.store.addBossMessageIdempotent!(id, content, requestKey)
+            : options.store.addBossMessage(id, 'user', content);
           return json(res, 201, entry);
         }
         if (taskPath[2] === 'cancel' && req.method === 'POST') return await cancelTask(res, id, options);

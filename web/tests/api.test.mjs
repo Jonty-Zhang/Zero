@@ -40,6 +40,22 @@ test('Boss task retries retain submission identity and exact natural-language pr
   assert.equal(calls[1].path, '/api/tasks');
 });
 
+test('Boss message delivery retains its identity after an uncertain response and starts a fresh identity after acknowledgement', async (t) => {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (path, init) => {
+    calls.push({ path, key: init.headers['X-Idempotency-Key'], body: JSON.parse(init.body) });
+    if (calls.length === 1) throw new TypeError('message response lost after acceptance');
+    return new Response(JSON.stringify({ id: 'saved-message' }), { status: 201 });
+  });
+  await assert.rejects(api.messageTask('boss-project', 'Keep export names'), /response lost/);
+  await api.messageTask('boss-project', 'Keep export names');
+  await api.messageTask('boss-project', 'Keep export names');
+  assert.ok(calls[0].key, 'message retry needs a durable request identity');
+  assert.equal(calls[0].key, calls[1].key);
+  assert.notEqual(calls[1].key, calls[2].key, 'an acknowledged message can intentionally be sent again');
+  assert.deepEqual(calls[1].body, { content: 'Keep export names' });
+});
+
 test('goal review retry posts the exact source attempt and encoded sequence path without task submission keys', async (t) => {
   const sourceAttempt = 'attempt/source ?中文';
   const sequence = { id: 'sequence/中文 ?', status: 'blocked', goalReview: { state: 'verdict', attemptId: sourceAttempt, retryRequestedAt: '2026-10-18T00:00:00Z', result: { verdict: 'blocked' } } };

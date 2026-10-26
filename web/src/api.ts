@@ -55,7 +55,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   folders: (path?: string, options?: RequestOptions) => request<{ path: string; parent: string | null; folders: Array<{ name: string; path: string }> }>(`/api/folders${path ? `?path=${encodeURIComponent(path)}` : ''}`, options),
   prepareProject: (path: string, create = false) => request<{ path: string; repoPath: string; initialized: boolean }>('/api/projects/prepare', { method: 'POST', body: JSON.stringify({ path, create }) }),
-  messageTask: (id: string, content: string) => request<unknown>(`/api/tasks/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content }) }),
+  messageTask: (id: string, content: string) => submit<unknown>(`/api/tasks/${encodeURIComponent(id)}/messages`, { content }),
   capabilities: (options?: RequestOptions) => request<Capabilities>('/api/capabilities', options),
   tasks: (options?: RequestOptions) => request<Task[]>('/api/tasks', options),
   task: (id: string, options?: RequestOptions) => request<Task>(`/api/tasks/${encodeURIComponent(id)}`, options),

@@ -584,6 +584,9 @@ export class TaskStore {
         key TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('task','sequence')),
         request_hash TEXT NOT NULL CHECK(length(request_hash)=64), resource_id TEXT NOT NULL, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS boss_message_requests (
+        key TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), message TEXT NOT NULL, created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS task_sequence_steps (
         sequence_id TEXT NOT NULL REFERENCES task_sequences(id), task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
         position INTEGER NOT NULL CHECK(position >= 0), effective_base_commit TEXT, PRIMARY KEY(sequence_id, position)
@@ -1886,12 +1889,24 @@ export class TaskStore {
 
   /** Discussion is append-only; model-authored messages require the current live owner. */
   addBossMessage(taskId: string, role: BossMessage['role'], content: string,
-    metadata: { owner?: string; harness?: string; model?: string } = {}): BossMessage {
+    metadata: { owner?: string; harness?: string; model?: string; requestKey?: string } = {}): BossMessage {
     return this.#transaction(() => {
       const task = this.get(taskId);
       if (!task?.boss) throw new Error('Unknown Boss project task');
       if (!['user', 'boss', 'consultant'].includes(role) || typeof content !== 'string' || !content.trim() || content.trim().length > 16000) {
         throw new Error('Boss message content must contain 1 to 16000 characters');
+      }
+      if (metadata.requestKey !== undefined) {
+        if (role !== 'user') throw new Error('Only user messages support delivery request keys');
+        const key = validateSubmissionKey(metadata.requestKey);
+        const previous = this.#db.prepare('SELECT task_id,message FROM boss_message_requests WHERE key=?').get(key) as { task_id: string; message: string } | undefined;
+        if (previous) {
+          const original = JSON.parse(previous.message) as BossMessage;
+          if (previous.task_id !== taskId || original.content !== content.trim()) throw new IdempotencyConflictError();
+          // Replaying an acknowledged requirement adds no new work. Its receipt
+          // remains valid after acceptance or cancellation has closed admission.
+          return original;
+        }
       }
       if (role === 'user' && (!['pending', 'running', 'revision', 'waiting'].includes(task.status) || this.getTaskCancellation(taskId))) {
         throw new BossMessageConflictError(task.status === 'reviewing'
@@ -1909,8 +1924,16 @@ export class TaskStore {
         ...(metadata.harness ? { harness: metadata.harness } : {}), ...(metadata.model ? { model: metadata.model } : {}) };
       this.#event(taskId, 'boss.message', message, message.at);
       this.#db.prepare('UPDATE tasks SET updated_at=? WHERE id=?').run(message.at, taskId);
+      if (metadata.requestKey !== undefined) {
+        this.#db.prepare('INSERT INTO boss_message_requests(key,task_id,message,created_at) VALUES(?,?,?,?)')
+          .run(metadata.requestKey, taskId, JSON.stringify(message), message.at);
+      }
       return message;
     });
+  }
+
+  addBossMessageIdempotent(taskId: string, content: string, requestKey: string): BossMessage {
+    return this.addBossMessage(taskId, 'user', content, { requestKey: validateSubmissionKey(requestKey) });
   }
 
   bossMessages(taskId: string): BossMessage[] {
