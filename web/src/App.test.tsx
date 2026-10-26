@@ -49,10 +49,10 @@ afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 describe('polling workspace filters', () => {
   it.each([
-    { view: '列表视图', field: 'Harness 筛选', selected: 'codex', changedTask: { ...tasks[0]!, route: { harnessId: 'zcode' } } },
-    { view: '看板视图', field: 'Harness 筛选', selected: 'codex', changedTask: { ...tasks[0]!, route: { harnessId: 'zcode' } } },
-    { view: '列表视图', field: '仓库筛选', selected: 'C:/repo/zero', changedTask: { ...tasks[0]!, repoPath: 'C:/repo/other' } },
-    { view: '看板视图', field: '仓库筛选', selected: 'C:/repo/zero', changedTask: { ...tasks[0]!, repoPath: 'C:/repo/other' } },
+    { view: '列表视图', field: 'Agent 筛选', selected: 'codex', changedTask: { ...tasks[0]!, route: { harnessId: 'zcode' } } },
+    { view: '看板视图', field: 'Agent 筛选', selected: 'codex', changedTask: { ...tasks[0]!, route: { harnessId: 'zcode' } } },
+    { view: '列表视图', field: '项目筛选', selected: 'C:/repo/zero', changedTask: { ...tasks[0]!, repoPath: 'C:/repo/other' } },
+    { view: '看板视图', field: '项目筛选', selected: 'C:/repo/zero', changedTask: { ...tasks[0]!, repoPath: 'C:/repo/other' } },
   ])('retains the selected $field across missing values, reappearance and clear in $view', async scenario => {
     vi.useFakeTimers();
     const initialTasks = [tasks[0]!, tasks[1]!];
@@ -65,8 +65,8 @@ describe('polling workspace filters', () => {
     fireEvent.click(screen.getByRole('button', { name: scenario.view }));
     const search = screen.getByRole('searchbox') as HTMLInputElement;
     const status = screen.getByLabelText('状态筛选') as HTMLSelectElement;
-    const repo = screen.getByLabelText('仓库筛选') as HTMLSelectElement;
-    const harness = screen.getByLabelText('Harness 筛选') as HTMLSelectElement;
+    const repo = screen.getByLabelText('项目筛选') as HTMLSelectElement;
+    const harness = screen.getByLabelText('Agent 筛选') as HTMLSelectElement;
     fireEvent.change(search, { target: { value: '登录' } });
     fireEvent.change(status, { target: { value: 'running' } });
     fireEvent.change(repo, { target: { value: 'C:/repo/zero' } });
@@ -635,14 +635,38 @@ describe('task workspace', () => {
     expect(screen.getByText('检查归属尚未确认')).toBeTruthy();
     expect(screen.queryByRole('region', { name: '当前检查结果' })).toBeNull();
   });
+  it('clears active filters from a matching list without waiting for an empty result', async () => {
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    fireEvent.change(screen.getByLabelText('状态筛选'), { target: { value: 'running' } });
+    expect(screen.getAllByRole('row')).toHaveLength(2);
+    fireEvent.click(screen.getByRole('button', { name: '清除筛选' }));
+    expect(screen.getAllByRole('row')).toHaveLength(4);
+    expect((screen.getByLabelText('状态筛选') as HTMLSelectElement).value).toBe('');
+  });
+  it('clears only search and returns focus while preserving the status filter', async () => {
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    fireEvent.change(screen.getByLabelText('状态筛选'), { target: { value: 'running' } });
+    const input = screen.getByRole('searchbox') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '登录' } });
+    fireEvent.click(screen.getByRole('button', { name: '清除搜索' }));
+    expect(input.value).toBe(''); expect(document.activeElement).toBe(input);
+    expect((screen.getByLabelText('状态筛选') as HTMLSelectElement).value).toBe('running');
+    fireEvent.change(input, { target: { value: '登录' } });
+    fireEvent.keyDown(input, { key: 'Escape', isComposing: true });
+    expect(input.value).toBe('登录');
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(input.value).toBe('');
+  });
   it('combines list-title search, status, repository and Harness filters in the default table', async () => {
     render(<App />);
     await screen.findByText('修复登录回调');
     expect(screen.getByRole('table')).toBeTruthy();
     fireEvent.change(screen.getByRole('searchbox'), { target: { value: '登录' } });
     expect(screen.queryByText('更新文档')).toBeNull();
-    fireEvent.change(screen.getByLabelText('仓库筛选'), { target: { value: 'C:/repo/zero' } });
-    fireEvent.change(screen.getByLabelText('Harness 筛选'), { target: { value: 'codex' } });
+    fireEvent.change(screen.getByLabelText('项目筛选'), { target: { value: 'C:/repo/zero' } });
+    fireEvent.change(screen.getByLabelText('Agent 筛选'), { target: { value: 'codex' } });
     fireEvent.change(screen.getByLabelText('状态筛选'), { target: { value: 'done' } });
     expect(screen.getByText('没有符合条件的任务')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '清除筛选' }));

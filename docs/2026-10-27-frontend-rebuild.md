@@ -36,3 +36,13 @@ The implementation and styling are original. No source code from these projects 
 - This is presentation and interaction validation with synthetic data. It does not claim a live provider/model execution or deployment.
 
 Browser logs and screenshots are stored in the ignored, repository-contained `data/verification/frontend-rebuild-root/` directory. Independent static-font HTTP verification is in `data/verification/frontend-rebuild-review/`.
+
+## Round 2: filtering and long-content handling
+
+- The active-filter row now offers a reset even when results match. Clearing filters returns focus to search.
+- Search has an explicitly named clear button; clearing only search preserves status/project/Agent filters. Escape clears search without interrupting an active IME composition.
+- Visible list/filter wording uses projects and Agents, consistent with ordinary project folders. IDs remain searchable without occupying every task row.
+- A real Edge reproduction found that a long model identifier could expand a card beyond its board column while the card's own scrollWidth check still passed. Cards and flex children can now shrink, and paths/model names wrap. The browser assertion compares each card's bounds against its owning column.
+- Frontend: 121 tests pass, including two new interaction regressions that failed before implementation. Production build passes. The browser checks card boundaries at 960/1280/1440/1920, and repeats forms, details, focus, empty/offline states and font checks.
+
+Evidence for this round is in `data/verification/frontend-refinement-round2/`; it uses the same owned synthetic API/browser isolation as round 1.

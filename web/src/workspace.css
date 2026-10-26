@@ -1314,3 +1314,23 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
 .overview-card.green>div svg {
   color:#4b8063
 }
+
+/* Filtering: keep reset actions close to the controls, including matching results. */
+.task-search { position:relative; }
+.task-search input { padding-right:42px; }
+.task-search input::-webkit-search-cancel-button { appearance:none; }
+.search-clear { position:absolute; right:7px; top:6px; width:30px; height:30px; display:grid; place-items:center; border:0; border-radius:4px; background:transparent; color:#776c5c; }
+.search-clear:hover { color:#30291f; background:#eee8dd; }
+.active-filters { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:0 26px 18px; font-size:14px; color:var(--muted); }
+.active-filters .link-button { min-height:32px; }
+@media (max-width:680px) { .active-filters { padding-inline:16px; } }
+
+/* Long project paths and provider model names must stay inside their board column. */
+.cards, .task-card, .task-card-top, .task-card-bottom { min-width:0; }
+.task-card { width:100%; }
+.task-card-top { flex-wrap:wrap; gap:8px; }
+.task-card-top .task-time { font-size:13px; color:var(--muted); }
+.task-card .task-repo { white-space:normal; overflow-wrap:anywhere; align-items:flex-start; }
+.task-card .task-repo svg, .route-chip svg { flex-shrink:0; }
+.task-card-bottom { flex-wrap:wrap; gap:8px; }
+.task-card .route-chip { min-width:0; max-width:100%; white-space:normal; overflow-wrap:anywhere; align-items:flex-start; font-size:13px; line-height:1.8; }
