@@ -1097,16 +1097,32 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
 }
 .fixed-badge,.section-divider,.section-divider span+span {
   color:#74654d;
-  font-size:13px
+  font-size:14px
 }
 .settings-save-row {
-  padding:20px 0
+  padding:20px 0;
+  justify-content:flex-end
 }
 .settings-save-row>span {
   color:#78684f;
   font-size:14px;
-  max-width:650px
+  max-width:650px;
+  margin-right:auto
 }
+.boss-settings-current span, .project-preset-empty { font-size:14px; }
+.project-preset-empty { color:var(--muted); background:#f6f1e8; border-color:var(--line); }
+.stage-editor-head { margin:24px 0 16px; gap:20px; }
+.stage-editor-head b, .execution-stage-title > b { color:#51412d; font-size:15px; }
+.stage-editor-head span { color:var(--muted); font-size:14px; line-height:1.8; }
+.stage-editor-head .button { font-size:14px; }
+.execution-stage, .sequence-step-editor { padding:20px; border-color:#ded6c8; background:#fbf8f1; border-radius:6px; }
+.sequence-step-editor { margin:16px 0; }
+.sequence-step-editor .field, .sequence-step-editor .form-grid .field { margin-bottom:18px; }
+.sequence-step-editor .form-grid { gap:16px; }
+.execution-stage-title { margin-bottom:18px; gap:16px; }
+.sequence-repository-preview { padding:12px 14px; margin:0 0 18px; background:#eee7d9; border-radius:4px; color:#6a573c; line-height:1.8; }
+.sequence-repository-error { color:#a44138; }
+.inline-info { color:#5f5039; background:#f2ecdf; padding:12px 14px; }
 .toast {
   background:#393128;
   font-size:15px

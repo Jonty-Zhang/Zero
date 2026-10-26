@@ -10,6 +10,7 @@ The references include publication, blog and editor projects, rather than only a
 - [AstroPaper](https://github.com/satnaing/astro-paper) and its [blog demo](https://astro-paper.pages.dev/): compact navigation and direct content lists informed the masthead and task list.
 - [Novel](https://github.com/steven-tey/novel): a document-oriented editor reference for giving text actual reading space instead of dense administrative annotations.
 - [Cal typography](https://cal.com/font): a reference for assigning different type roles deliberately. Zero does not ship Cal's font or copy its proprietary website assets.
+- [GOV.UK Frontend](https://github.com/alphagov/govuk-frontend) and its [text input guidance](https://design-system.service.gov.uk/components/text-input/): short, direct labels and concise help informed the later form copy pass. Zero keeps its own typography and visual design.
 
 The implementation and styling are original. No source code from these projects is vendored, and their respective licenses do not replace Zero's license. Shipped font licenses are retained separately in `web/public/fonts/`.
 
@@ -76,3 +77,12 @@ Validation: all 143 frontend tests pass across ten files, including nine new del
 The remaining legacy fixed heights left only 14px inside shared selects and 10px inside the manual-task revision input, while the new text line is 27px high. This visibly clipped selected values across routing settings, manual task stages and sequence steps. Selects now size from their actual type scale and padding, matching ordinary text inputs; the revision input also grows naturally. Dropdown arrows follow the control's vertical center.
 
 Validation: a dedicated owned Edge fixture reproduced 93 clipped controls across 15 desktop/form cases before the change. After the change, all 147 controls in those cases have enough room for their text line at 960/1280/1440 window widths. A further settings pass with 1.5× control text confirms the controls grow and arrows remain centered. Keyboard ArrowDown genuinely switches the native allocator select to API settings. The production build passes; this CSS-only change uses these layout/interaction checks rather than adding tests that mirror CSS declarations. No real task or provider was called. Evidence: `data/verification/frontend-controls-round5/`.
+
+## Round 6: secondary form presentation
+
+- Removed duplicate modal eyebrow labels, the allocator's redundant “switchable” badge and the manual form's normal-capability announcement. Failure/unavailable-capability notices, validation requirements and submit restrictions remain.
+- Shortened repeated empty execution choices to “继承或自动选择”, so their selected labels fit the desktop three-column forms. Existing inheritance and routing behavior is unchanged.
+- API credential handling information is shown with the API allocator; it no longer appears in a Codex-only settings page.
+- Stage notes and empty project-default text no longer use 11–12px. Form annotations and model binding chips use 14px. Execution stages, sequence groups and repository previews now share the warm surfaces, readable spacing and restrained state colors.
+
+Validation: all 143 frontend tests pass, and the production build passes. Owned Edge checks the three desktop widths, native keyboard selection, sufficient line space in 156 control instances and visible non-code form text of at least 14px in the covered forms. The enlarged-text test waits until computed font size actually reaches 22.5px before measuring 66.5px-high controls with 40.5px content lines; this avoids reading the initial frame of the control's CSS transition. Independent source review found no change to payloads, model compatibility checks or task submission rules. Evidence: `data/verification/frontend-forms-round6/`.
