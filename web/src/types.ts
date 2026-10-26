@@ -67,6 +67,10 @@ export type Task = {
   executionStages?: ExecutionStageDefinition[];
   stages?: ExecutionStage[];
   handoffs?: Handoff[];
+  boss?: { preference: string };
+  bossPlan?: { summary: string; acceptanceCriteria: string[]; stages: Array<{ objective: string; harness?: string; model?: string; reasoningEffort?: string }>; checks: Array<{ id: string; argv: string[] }>; maxRevisions: number };
+  bossMessages?: Array<{ id: string; role: 'user' | 'boss' | 'consultant'; content: string; at: string; model?: string; harness?: string }>;
+  delivery?: { path: string; branch: string; resultCommit?: string };
 };
 export type ExecutionStage = {
   id: string; sequence: number; role: 'implement' | 'revise' | 'route' | 'review'; status: 'pending' | 'running' | 'succeeded' | 'failed' | 'interrupted'; predecessorStageId?: string;
@@ -109,6 +113,7 @@ export type TaskSequence = {
   blockedReason?: { taskId: string; status: Status; reason?: string };
 };
 export type Config = {
+  boss?: { preference: string };
   allocator: {
     kind: 'codex' | 'api';
     modelId: string | null;

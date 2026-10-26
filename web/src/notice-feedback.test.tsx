@@ -54,6 +54,7 @@ it('replaces a save notice with a different success message for a fresh full int
   vi.mocked(api.createTask).mockResolvedValue(task); vi.mocked(api.task).mockResolvedValue(task);
   fireEvent.click(screen.getByRole('button', { name: '任务工作台' }));
   fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
   fireEvent.change(screen.getByLabelText(/仓库路径/), { target: { value: 'C:/repo/zero' } });
   fireEvent.change(screen.getByLabelText('任务描述 *'), { target: { value: 'Verify the next successful operation.' } });
   fireEvent.change(screen.getByLabelText(/检查命令/), { target: { value: 'npm test' } });

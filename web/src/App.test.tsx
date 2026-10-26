@@ -149,7 +149,7 @@ describe('sequence repository authoring', () => {
     vi.mocked(api.sequence).mockResolvedValue(blockedSequence());
     render(<App />);
     await screen.findByText('修复登录回调');
-    fireEvent.click(screen.getAllByRole('button', { name: '提交目标' })[0]!);
+    fireEvent.click(screen.getAllByRole('button', { name: '高级目标序列' })[0]!);
     return screen.getByRole('dialog', { name: '提交有序任务序列' });
   }
   const rows = (dialog: HTMLElement) => Array.from(dialog.querySelectorAll<HTMLElement>('.sequence-step-editor'));
@@ -414,6 +414,7 @@ describe('task workspace', () => {
     render(<App />);
     await screen.findByText('修复登录回调');
     fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
     const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
     const [harness, model, effort] = within(dialog).getAllByRole('combobox');
     fireEvent.change(model!, { target: { value: 'shared-model' } });
@@ -432,6 +433,7 @@ describe('task workspace', () => {
     render(<App />);
     await screen.findByText('修复登录回调');
     fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
     const [harness, model, effort] = within(screen.getByRole('dialog')).getAllByRole('combobox');
     fireEvent.change(harness!, { target: { value: 'dsh' } });
     fireEvent.change(model!, { target: { value: 'shared-model' } });
@@ -453,6 +455,7 @@ describe('task workspace', () => {
     render(<App />);
     await act(async () => {});
     fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
     const [harness, model, effort] = within(screen.getByRole('dialog')).getAllByRole('combobox');
     fireEvent.change(model!, { target: { value: 'shared-model' } });
     fireEvent.change(effort!, { target: { value: 'high' } });
@@ -472,7 +475,7 @@ describe('task workspace', () => {
     vi.mocked(api.capabilities).mockResolvedValue(sharedModelCapabilities);
     render(<App />);
     await screen.findByText('修复登录回调');
-    fireEvent.click(screen.getAllByRole('button', { name: '提交目标' })[0]!);
+    fireEvent.click(screen.getAllByRole('button', { name: '高级目标序列' })[0]!);
     const dialog = screen.getByRole('dialog', { name: '提交有序任务序列' });
     const step = within(dialog).getByLabelText('步骤 1 描述 *').closest('.sequence-step-editor')!;
     const [harness, model, effort] = within(step as HTMLElement).getAllByRole('combobox');
@@ -575,6 +578,7 @@ describe('task workspace', () => {
     render(<App />);
     await screen.findByText('修复登录回调');
     fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
     const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
     fireEvent.change(within(dialog).getByLabelText(/仓库路径/), { target: { value: 'C:/repo/zero' } });
     fireEvent.change(within(dialog).getByLabelText('任务描述 *'), { target: { value: '实现登录并由另一名执行者补全检查' } });
@@ -670,6 +674,7 @@ describe('task workspace', () => {
     vi.mocked(api.createTask).mockReturnValue(new Promise(() => {}));
     render(<App />);
     fireEvent.click(screen.getByRole('button', { name: '提交任务' }));
+    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
     const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
     expect(within(dialog).getByDisplayValue('HEAD')).toBeTruthy();
     fireEvent.change(within(dialog).getByLabelText(/仓库路径/), { target: { value: 'C:/repo/zero' } });
@@ -741,7 +746,7 @@ describe('task workspace', () => {
   });
   it('requires a check command for every sequence step', async () => {
     render(<App />);
-    fireEvent.click(screen.getAllByRole('button', { name: '提交目标' })[0]!);
+    fireEvent.click(screen.getAllByRole('button', { name: '高级目标序列' })[0]!);
     const dialog = screen.getByRole('dialog', { name: '提交有序任务序列' });
     fireEvent.change(within(dialog).getByRole('textbox', { name: /^默认仓库路径/ }), { target: { value: 'C:/repo/zero' } });
     fireEvent.change(within(dialog).getByLabelText('步骤 1 描述 *'), { target: { value: '完成第一步修改并运行检查' } });
@@ -810,6 +815,7 @@ describe('task workspace', () => {
     const opener = await screen.findByRole('button', { name: '提交任务' });
     opener.focus();
     fireEvent.click(opener);
+    fireEvent.click(screen.getByRole('button', { name: '高级模式：手动执行任务' }));
     const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
     fireEvent.change(within(dialog).getByLabelText(/仓库路径/), { target: { value: 'C:/repo/zero' } });
     fireEvent.change(within(dialog).getByLabelText('任务描述 *'), { target: { value: '完成目标并检查结果' } });
@@ -832,7 +838,7 @@ describe('task workspace', () => {
     const opener = await screen.findByRole('button', { name: '提交任务' });
     opener.focus();
     fireEvent.click(opener);
-    const dialog = screen.getByRole('dialog', { name: '提交执行任务' });
+    const dialog = screen.getByRole('dialog', { name: '交给 Boss' });
     screen.getByRole('button', { name: '路由设置' }).focus();
     expect(dialog.contains(document.activeElement)).toBe(true);
     fireEvent.keyDown(document.activeElement!, { key: 'Escape' });

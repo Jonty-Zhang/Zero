@@ -3,6 +3,43 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { api } from '../src/api.ts';
 
+test('project folder APIs encode local paths and preserve preparation intent and supplementary messages', async (t) => {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (path, init) => {
+    calls.push({ path, method: init.method ?? 'GET', body: init.body && JSON.parse(init.body), signal: init.signal });
+    return new Response(JSON.stringify({ accepted: true }), { headers: { 'Content-Type': 'application/json' } });
+  });
+  const folder = 'C:\\项目\\new #folder?';
+  const controller = new AbortController();
+  await api.folders(folder, { signal: controller.signal });
+  await api.folders();
+  await api.prepareProject(folder, true);
+  await api.messageTask('task/中文 ?', '请检查接力过程');
+  assert.equal(calls[0].path, `/api/folders?path=${encodeURIComponent(folder)}`);
+  assert.equal(calls[1].path, '/api/folders');
+  assert.equal(calls[2].path, '/api/projects/prepare');
+  assert.deepEqual(calls[2].body, { path: folder, create: true });
+  assert.equal(calls[3].path, `/api/tasks/${encodeURIComponent('task/中文 ?')}/messages`);
+  assert.deepEqual(calls[3].body, { content: '请检查接力过程' });
+});
+
+test('Boss task retries retain submission identity and exact natural-language preferences', async (t) => {
+  const calls = [];
+  let fail = true;
+  t.mock.method(globalThis, 'fetch', async (path, init) => {
+    calls.push({ path, key: init.headers['X-Idempotency-Key'], body: JSON.parse(init.body) });
+    if (fail) { fail = false; throw new TypeError('request result uncertain'); }
+    return new Response(JSON.stringify({ id: 'boss-created' }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+  });
+  const payload = { repoPath: 'C:/project', prompt: '设计、实现并验收项目', boss: { preference: 'Codex gpt6.1sol high 负责设计，DSH 处理普通工作' } };
+  await assert.rejects(api.createTask(payload), /uncertain/);
+  await api.createTask(payload);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].key, calls[1].key);
+  assert.deepEqual(calls[1].body, payload);
+  assert.equal(calls[1].path, '/api/tasks');
+});
+
 test('goal review retry posts the exact source attempt and encoded sequence path without task submission keys', async (t) => {
   const sourceAttempt = 'attempt/source ?中文';
   const sequence = { id: 'sequence/中文 ?', status: 'blocked', goalReview: { state: 'verdict', attemptId: sourceAttempt, retryRequestedAt: '2026-10-18T00:00:00Z', result: { verdict: 'blocked' } } };

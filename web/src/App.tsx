@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { Activity, Search, LayoutList, Columns3, Layers3, AlertCircle, ArrowDown, ArrowRight, ArrowUp, Check, CheckCircle2, ChevronDown, CircleHelp, Clock3, Code2, FileText, FolderGit2, ListOrdered, LoaderCircle, Plus, RefreshCw, Settings2, ShieldCheck, Target, TerminalSquare, X, XCircle } from 'lucide-react';
 import { api } from './api';
+import { useDialog } from './dialog';
+import { BossProjectModal, BossProgress, ProjectDelivery } from './BossProject';
 import { usePolling } from './usePolling';
 import type { Capabilities, Choice, Config, ExecutionSelection, HarnessHealth, Status, Task, TaskSequence, TestResult } from './types';
 
@@ -52,55 +54,6 @@ function Button({ children, onClick, variant = 'secondary', disabled, type = 'bu
   return <button className={`button ${variant}`} type={type} onClick={onClick} disabled={disabled}>{children}</button>;
 }
 
-function useDialog(onClose: () => void, busy = false) {
-  const ref = useRef<HTMLElement>(null);
-  const state = useRef({ onClose, busy });
-  state.current = { onClose, busy };
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
-    const element = ref.current;
-    if (!element) return;
-    const controls = () => Array.from(element.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), a[href], summary, [tabindex="0"]')).filter(node => {
-      if (node.closest('fieldset:disabled') || node.getAttribute('tabindex') === '-1' || node.getAttribute('type') === 'hidden') return false;
-      if (node.tagName === 'SUMMARY' && (node.parentElement?.tagName !== 'DETAILS' || Array.from(node.parentElement.children).find(child => child.tagName === 'SUMMARY') !== node)) return false;
-      for (let ancestor: HTMLElement | null = node; ancestor; ancestor = ancestor.parentElement) {
-        const style = getComputedStyle(ancestor);
-        if (ancestor.hidden || ancestor.hasAttribute('inert') || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
-        if (ancestor.tagName === 'DETAILS' && !ancestor.hasAttribute('open')) {
-          const summary = Array.from(ancestor.children).find(child => child.tagName === 'SUMMARY');
-          if (!summary?.contains(node)) return false;
-        }
-        if (ancestor === element) break;
-      }
-      return true;
-    });
-    (controls()[0] ?? element).focus();
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') { event.preventDefault(); if (!state.current.busy) state.current.onClose(); }
-      if (event.key === 'Tab') {
-        const items = controls(); const first = items[0]; const last = items.at(-1);
-        if (!first) { event.preventDefault(); element.focus(); }
-        else if (event.shiftKey && (document.activeElement === first || document.activeElement === element || !element.contains(document.activeElement))) { event.preventDefault(); last?.focus(); }
-        else if (!event.shiftKey && (document.activeElement === last || document.activeElement === element || !element.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
-      }
-    };
-    const containFocus = (event: FocusEvent) => {
-      if (event.target instanceof Node && !element.contains(event.target)) (controls()[0] ?? element).focus();
-    };
-    document.addEventListener('keydown', onKey, true);
-    document.addEventListener('focusin', containFocus);
-    return () => {
-      document.removeEventListener('keydown', onKey, true);
-      document.removeEventListener('focusin', containFocus);
-      if (previous?.isConnected) previous.focus();
-    };
-  }, []);
-  useEffect(() => {
-    // Disabling the focused submit control can move native browser focus to BODY.
-    if (busy) ref.current?.focus();
-  }, [busy]);
-  return ref;
-}
 
 const loadTasks = async (_key: string, signal: AbortSignal) => asTasks(await api.tasks({ signal }));
 const loadCapabilities = (_key: string, signal: AbortSignal) => api.capabilities({ signal });
@@ -119,6 +72,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const detail = usePolling(selectedId, loadTask, 3500);
   const [showSubmit, setShowSubmit] = useState(false);
+  const [showAdvancedSubmit, setShowAdvancedSubmit] = useState(false);
   const [showSequenceSubmit, setShowSequenceSubmit] = useState(false);
   const [selectedSequenceId, setSelectedSequenceId] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ message: string } | null>(null);
@@ -139,22 +93,23 @@ export default function App() {
   return <div className="app-shell">
     <aside className="sidebar" aria-label="工作区导航"><div className="brand"><div className="brand-mark"><Layers3 size={23} /></div><div><strong>zero<span> / </span></strong><small>AGENT WORKSPACE</small></div></div><div className="sidebar-label">工作空间</div>
       <nav><button aria-label="任务工作台" aria-current={page === 'tasks' ? 'page' : undefined} className={`nav-item ${page === 'tasks' ? 'active' : ''}`} onClick={() => setPage('tasks')}><LayoutList size={18} /><span className="nav-text">任务工作台</span><span className="nav-count">{tasks.length}</span></button><button aria-label="路由设置" aria-current={page === 'settings' ? 'page' : undefined} className={`nav-item ${page === 'settings' ? 'active' : ''}`} onClick={() => setPage('settings')}><Settings2 size={18} /><span className="nav-text">路由设置</span></button></nav>
-      <div className="sidebar-note"><div className="sidebar-label">执行流程</div><p>提交任务 → Agent 执行<br />运行检查 → 独立审核<br />通过门禁 → 交付归档</p></div><div className="sidebar-bottom"><div className="node-status"><span className={`pulse-dot ${connected ? '' : 'offline'}`} /><div><b>本地执行节点</b><small>{connectionLabel}</small></div></div><div className="sidebar-version">ZERO / LOCAL FIRST</div></div>
+      <div className="sidebar-note"><div className="sidebar-label">执行流程</div><p>描述目标 → Boss 设计<br />跨 Agent 分工与讨论<br />检查验收 → 交付结果</p></div><div className="sidebar-bottom"><div className="node-status"><span className={`pulse-dot ${connected ? '' : 'offline'}`} /><div><b>本地执行节点</b><small>{connectionLabel}</small></div></div><div className="sidebar-version">ZERO / LOCAL FIRST</div></div>
     </aside>
-    <main className="main-area"><header className="topbar"><div className="breadcrumb">工作空间 <span>/</span><b>{page === 'tasks' ? '任务工作台' : '路由设置'}</b></div><div className="top-actions"><button className="icon-button" aria-label="刷新工作区" onClick={refreshAll}><RefreshCw size={17} className={taskState.refreshing ? 'spin' : ''} /></button>{page === 'tasks' && <Button onClick={() => setShowSequenceSubmit(true)}><ListOrdered size={16} />提交目标</Button>}<Button variant="primary" onClick={() => setShowSubmit(true)}><Plus size={17} />提交任务</Button></div></header>
-      {page === 'tasks' ? <><section className="page-heading"><div><div className="eyebrow">AGENT WORKSPACE</div><h1>任务工作台<span> / 每一步，都有据可查。</span></h1><p>跟踪任务执行、跨 Agent 接力与独立验收结果。</p></div><div className={`connection-state ${connected ? 'connected' : ''}`}><div><span className={`pulse-dot ${connected ? '' : 'offline'}`} /><b>{connectionLabel}</b></div><small>{taskState.lastSynced ? `上次同步 ${date(taskState.lastSynced)}` : '等待首次同步'}</small></div></section>
+    <main className="main-area"><header className="topbar"><div className="breadcrumb">工作空间 <span>/</span><b>{page === 'tasks' ? '任务工作台' : '路由设置'}</b></div><div className="top-actions"><button className="icon-button" aria-label="刷新工作区" onClick={refreshAll}><RefreshCw size={17} className={taskState.refreshing ? 'spin' : ''} /></button>{page === 'tasks' && <Button onClick={() => setShowSequenceSubmit(true)}><ListOrdered size={16} />高级目标序列</Button>}<Button variant="primary" onClick={() => setShowSubmit(true)}><Plus size={17} />提交任务</Button></div></header>
+      {page === 'tasks' ? <><section className="page-heading"><div><div className="eyebrow">AGENT WORKSPACE</div><h1>项目工作台<span> / 把目标交给 Boss。</span></h1><p>Boss 负责深入设计、跨 Agent 分工、必要的讨论与最终验收。</p></div><div className={`connection-state ${connected ? 'connected' : ''}`}><div><span className={`pulse-dot ${connected ? '' : 'offline'}`} /><b>{connectionLabel}</b></div><small>{taskState.lastSynced ? `上次同步 ${date(taskState.lastSynced)}` : '等待首次同步'}</small></div></section>
         <section className="overview" aria-label="任务概览">{[{ label: '全部任务', count: tasks.length, icon: <Layers3 size={19} />, detail: '当前节点', tone: 'slate' }, { label: '正在进行', count: counts.running + counts.reviewing + counts.revision, icon: <Activity size={19} />, detail: '执行 · 审核 · 返工', tone: 'blue' }, { label: '需要关注', count: counts.failed + counts.recovery_required, icon: <AlertCircle size={19} />, detail: '失败 · 需要恢复', tone: 'amber' }, { label: '已完成', count: counts.done, icon: <CheckCircle2 size={19} />, detail: '通过检查与审核', tone: 'green' }].map(item => <div key={item.label} className={`overview-card ${item.tone}`} aria-label={`${item.label} ${item.count}`}><div><span>{item.label}</span>{item.icon}</div><strong>{item.count}<small>{item.detail}</small></strong></div>)}</section>
         <HarnessStrip harnesses={capabilities?.harnesses ?? []} error={capState.error} />
-        <SequenceProgressSection sequences={seqState.data ?? []} error={seqState.error} onOpen={setSelectedSequenceId} onCreate={() => setShowSequenceSubmit(true)} />
+        {(seqState.data?.length || seqState.error) ? <SequenceProgressSection sequences={seqState.data ?? []} error={seqState.error} onOpen={setSelectedSequenceId} onCreate={() => setShowSequenceSubmit(true)} /> : null}
         <section className="task-workspace" aria-label="执行任务"><div className="workspace-heading"><div><h2>执行任务 <span>{tasks.length}</span></h2><p>{counts.pending + counts.waiting} 个任务待处理或等待额度恢复</p></div><div className="view-toggle" aria-label="任务视图"><button aria-label="列表视图" aria-pressed={view === 'list'} className={view === 'list' ? 'active' : ''} onClick={() => setView('list')}><LayoutList size={16} />列表</button><button aria-label="看板视图" aria-pressed={view === 'board'} className={view === 'board' ? 'active' : ''} onClick={() => setView('board')}><Columns3 size={16} />看板</button></div></div>
           <div className="task-toolbar"><label className="task-search"><Search size={17} /><input type="search" aria-label="搜索任务" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题、仓库、模型或 ID…" /></label><select aria-label="状态筛选" value={status} onChange={e => setStatus(e.target.value)}><option value="">全部状态</option>{columns.map(col => <option key={col.id} value={col.id}>{col.label} ({counts[col.id]})</option>)}</select><select aria-label="仓库筛选" value={repo} onChange={e => setRepo(e.target.value)}><option value="">全部仓库</option>{repos.map(path => <option key={path} value={path}>{path}</option>)}</select><select aria-label="Harness 筛选" value={harness} onChange={e => setHarness(e.target.value)}><option value="">全部 Harness</option>{harnesses.map(id => <option key={id} value={id}>{id}</option>)}</select></div>
           {taskState.error && <div className="alert error" role="alert"><AlertCircle size={17} /><div><b>{taskState.data ? '连接中断，当前显示上次同步的任务' : '无法连接 Zero 服务'}</b><span>{taskState.error}。请确认本地服务已启动。</span></div><button onClick={() => void taskState.refresh()}><RefreshCw size={14} />重试</button></div>}
-          {taskState.loading ? <div className="loading-state"><LoaderCircle className="spin" size={24} /><span>正在连接 Zero 服务…</span></div> : !tasks.length ? <div className="empty-state"><div className="empty-icon"><TerminalSquare size={26} /></div><h2>{taskState.error ? '等待本地服务连接' : '准备好开始第一个任务'}</h2><p>{taskState.error ? '连接恢复后，已有任务会显示在这里。' : '描述目标，设置检查命令，然后查看 Agent 的执行与审核结果。'}</p>{!taskState.error && <Button variant="primary" onClick={() => setShowSubmit(true)}><Plus size={16} />创建第一个任务</Button>}</div> : !filtered.length ? <div className="empty-state filter-empty"><Search size={27} /><h2>没有符合条件的任务</h2><p>试试其他关键词，或清除筛选查看全部任务。</p><Button onClick={clearFilters}>清除筛选</Button></div> : view === 'list' ? <TaskTable tasks={filtered} onOpen={setSelectedId} /> : <div className="board">{columns.map(col => { const items = filtered.filter(task => task.status === col.id); return <section className="board-column" key={col.id}><div className="column-heading"><span className={`column-dot ${col.tone}`} /><b>{col.label}</b><span className="column-count">{items.length}</span></div><div className="cards">{items.map(task => <TaskCard key={task.id} task={task} onClick={() => setSelectedId(task.id)} />)}{!items.length && <div className="column-empty">暂无任务</div>}</div></section>; })}</div>}
+          {taskState.loading ? <div className="loading-state"><LoaderCircle className="spin" size={24} /><span>正在连接 Zero 服务…</span></div> : !tasks.length ? <div className="empty-state"><div className="empty-icon"><TerminalSquare size={26} /></div><h2>{taskState.error ? '等待本地服务连接' : '准备好开始第一个任务'}</h2><p>{taskState.error ? '连接恢复后，已有任务会显示在这里。' : '选择项目文件夹，说明你想完成什么。Boss 负责设计、分工、检查与验收。'}</p>{!taskState.error && <Button variant="primary" onClick={() => setShowSubmit(true)}><Plus size={16} />创建第一个任务</Button>}</div> : !filtered.length ? <div className="empty-state filter-empty"><Search size={27} /><h2>没有符合条件的任务</h2><p>试试其他关键词，或清除筛选查看全部任务。</p><Button onClick={clearFilters}>清除筛选</Button></div> : view === 'list' ? <TaskTable tasks={filtered} onOpen={setSelectedId} /> : <div className="board">{columns.map(col => { const items = filtered.filter(task => task.status === col.id); return <section className="board-column" key={col.id}><div className="column-heading"><span className={`column-dot ${col.tone}`} /><b>{col.label}</b><span className="column-count">{items.length}</span></div><div className="cards">{items.map(task => <TaskCard key={task.id} task={task} onClick={() => setSelectedId(task.id)} />)}{!items.length && <div className="column-empty">暂无任务</div>}</div></section>; })}</div>}
           {!!tasks.length && <div className="table-footer">显示 {filtered.length} / {tasks.length} 个任务<span>任务状态来自本地执行节点</span></div>}
         </section></> : <SettingsPage capabilities={capabilities} onSaved={(message, kind) => { setAllocatorKind(kind); setNotice({ message }); }} onRetry={capState.refresh} />}
     </main>
-    {selectedId && <TaskDrawer key={selectedId} task={detail.data} loading={detail.loading} loadError={detail.error} onClose={() => setSelectedId(null)} onCancel={async () => { if (!detail.data || detail.data.id !== selectedId) return; await api.cancelTask(detail.data.id); setNotice({ message: '已发送取消请求' }); void detail.refresh(); void taskState.refresh(); }} />}
-    {showSubmit && <SubmitModal capabilities={capabilities} capabilityError={capState.error} allocatorKind={allocatorKind} onClose={() => setShowSubmit(false)} onCreated={task => { setShowSubmit(false); setSelectedId(task.id); setNotice({ message: '任务已加入队列' }); refreshAll(); }} />}
+    {selectedId && <TaskDrawer onMessage={() => void detail.refresh()} key={selectedId} task={detail.data} loading={detail.loading} loadError={detail.error} onClose={() => setSelectedId(null)} onCancel={async () => { if (!detail.data || detail.data.id !== selectedId) return; await api.cancelTask(detail.data.id); setNotice({ message: '已发送取消请求' }); void detail.refresh(); void taskState.refresh(); }} />}
+    {showSubmit && <BossProjectModal capabilities={capabilities} capabilityError={capState.error} onClose={() => setShowSubmit(false)} onAdvanced={() => { setShowSubmit(false); setShowAdvancedSubmit(true); }} onCreated={task => { setShowSubmit(false); setSelectedId(task.id); setNotice({ message: '项目任务已交给 Boss' }); refreshAll(); }} />}
+    {showAdvancedSubmit && <SubmitModal capabilities={capabilities} capabilityError={capState.error} allocatorKind={allocatorKind} onClose={() => setShowAdvancedSubmit(false)} onCreated={task => { setShowAdvancedSubmit(false); setSelectedId(task.id); setNotice({ message: '任务已加入队列' }); refreshAll(); }} />}
     {showSequenceSubmit && <SequenceSubmitModal capabilities={capabilities} onClose={() => setShowSequenceSubmit(false)} onCreated={sequence => { setShowSequenceSubmit(false); setSelectedSequenceId(sequence.id); refreshAll(); }} />}
     {selectedSequenceId && <SequenceDrawer key={selectedSequenceId} id={selectedSequenceId} onClose={() => setSelectedSequenceId(null)} onOpenTask={id => { setSelectedSequenceId(null); setSelectedId(id); }} />}
     {notice && <div className="toast" role="status"><CheckCircle2 size={16} />{notice.message}</div>}
@@ -347,7 +302,7 @@ function SubmitModal({ capabilities, capabilityError, allocatorKind, onClose, on
     </fieldset></form></section></div>;
 }
 
-function TaskDrawer({ task, loading, loadError, onClose, onCancel }: { task: Task | null; loading: boolean; loadError: string; onClose: () => void; onCancel: () => Promise<void> }) {
+function TaskDrawer({ task, loading, loadError, onClose, onCancel, onMessage }: { onMessage: () => void; task: Task | null; loading: boolean; loadError: string; onClose: () => void; onCancel: () => Promise<void> }) {
   const [cancelBusy, setCancelBusy] = useState(false); const [cancelError, setCancelError] = useState('');
   const dialogRef = useDialog(onClose);
   const cancel = async () => { setCancelBusy(true); setCancelError(''); try { await onCancel(); } catch (e) { setCancelError(e instanceof Error ? e.message : '取消请求失败'); } finally { setCancelBusy(false); } };
@@ -359,7 +314,7 @@ function TaskDrawer({ task, loading, loadError, onClose, onCancel }: { task: Tas
       {task.status === 'waiting' && <section className="quota-wait-panel"><div className="quota-wait-icon"><Clock3 size={17} /></div><div><b>模型额度暂时受限</b><p>Zero 会保留当前进度，并在可重试时自动继续这个任务。</p><span>{retryDate(task.retryAt) ? `下一次自动重试：${retryDate(task.retryAt)}` : '下一次重试时间暂未确定；Zero 会在额度恢复后继续。'}</span>{task.error && <small>{task.error}</small>}</div></section>}
       {task.status === 'recovery_required' && <section className="quota-wait-panel recovery-required-panel"><div className="quota-wait-icon"><AlertCircle size={17} /></div><div><b>任务需要人工检查</b><p>{task.recoveryReason || '执行租约已过期。租约过期不能证明原进程已停止，因此 Zero 未自动重试。'}</p><span>请检查旧 worker 进程和任务 worktree，再决定如何继续。</span>{task.recoveryEvidence && <small>恢复证据：{JSON.stringify(task.recoveryEvidence)}</small>}</div></section>}
       {canCancel && cancelError && <div className="alert error compact"><AlertCircle size={15} />{cancelError}</div>}
-      <div className="detail-block"><h3><FolderGit2 size={15} />仓库与任务</h3><dl className="detail-list"><div><dt>任务 ID</dt><dd><code>{task.id}</code></dd></div><div><dt>仓库</dt><dd>{task.repoPath || '—'}</dd></div><div><dt>基础 Ref</dt><dd>{task.baseRef || '—'}</dd></div><div><dt>最大返工</dt><dd>{task.maxRevisions ?? '—'} 次</dd></div></dl><p className="pre-wrap">{task.prompt || '无任务描述'}</p>{task.acceptanceCriteria && <><div className="sub-label">验收标准</div><p className="pre-wrap">{task.acceptanceCriteria}</p></>}</div>
+      <ProjectDelivery task={task} /><BossProgress task={task} onMessage={onMessage} /><div className="detail-block"><h3><FolderGit2 size={15} />仓库与任务</h3><dl className="detail-list"><div><dt>任务 ID</dt><dd><code>{task.id}</code></dd></div><div><dt>仓库</dt><dd>{task.repoPath || '—'}</dd></div><div><dt>基础 Ref</dt><dd>{task.baseRef || '—'}</dd></div><div><dt>最大返工</dt><dd>{task.maxRevisions ?? '—'} 次</dd></div></dl><p className="pre-wrap">{task.prompt || '无任务描述'}</p>{task.acceptanceCriteria && <><div className="sub-label">验收标准</div><p className="pre-wrap">{task.acceptanceCriteria}</p></>}</div>
       <div className="detail-block"><h3><Activity size={15} />路由决策</h3><div className="route-detail"><div><span>执行路线</span><b>{routeName(task.route)}</b></div><div><span>选择来源</span><b>{nice(task.route?.selectionSource)}</b></div>{task.route?.reason && <p>{task.route.reason}</p>}</div></div>
       <StageTimeline task={task} /><div className="detail-block"><h3><ArrowDown size={15} />执行记录 <span className="count-badge">{attempts.length}</span></h3>{attempts.length ? <div className="attempt-list">{attempts.map((attempt, i) => <article className="attempt" key={attempt.id ?? attempt.number ?? i}><div className="attempt-head"><b>尝试 {attempt.number ?? i + 1}{attempt.role ? ` · ${roleLabel(attempt.role)}` : ""}</b><span className={`tiny-status ${attempt.status || 'pending'}`}>{stageStatusLabel(attempt.status || '')}</span><span className="muted">{date(attempt.startedAt)}</span></div>{attempt.stageId && <div className="attempt-route">阶段：{attempt.stageId}</div>}{attempt.exitCode != null && <div className="attempt-route">退出码：{attempt.exitCode}</div>}{attempt.route && <div className="attempt-route">{routeName(attempt.route)}</div>}{attempt.sessionId && <div className="attempt-route">执行会话 ID：<code style={{ userSelect: 'all', overflowWrap: 'anywhere' }}>{attempt.sessionId}</code></div>}{attempt.summary && attempt.summary !== attempt.executorSummary && <p>{attempt.summary}</p>}{attempt.executorSummary && <section className="executor-summary" aria-label="执行者自述"><b>执行者自述，需结合检查与审查确认</b><p>{attempt.executorSummary}</p></section>}{attempt.tests && <TestList tests={attempt.tests} />}{attempt.review && <Review review={attempt.review} />}{attempt.logs && <pre className="log-box">{Array.isArray(attempt.logs) ? attempt.logs.join('\n') : attempt.logs}</pre>}</article>)}</div> : <div className="soft-empty">任务开始后，执行尝试和测试结果会显示在这里。</div>}</div>
       <CheckEvidence task={task} />
@@ -482,10 +437,10 @@ function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabi
   };
   const allocatorName = config?.allocator.kind === 'api' ? 'API 模型' : 'Codex';
   const apiAllocatorConfig = config?.allocator.api ?? emptyApiAllocatorConfig;
-  return <><section className="page-heading"><div><div className="eyebrow">执行策略</div><h1>路由设置</h1><p>可选择 Codex 订阅或 API 模型作为分配器，审核始终由 Codex Reviewer 完成。</p></div></section>
+  return <><section className="page-heading"><div><div className="eyebrow">执行策略</div><h1>路由设置</h1><p>用自己的话指定 Boss 与团队偏好，Boss 结合已连接的能力制定分工和验收方案。</p></div></section>
     <div className="settings-layout"><div className="settings-main">
       {loading ? <div className="settings-card loading-state"><LoaderCircle className="spin" size={21} />正在读取设置…</div> : error && !config ? <div className="alert error"><AlertCircle size={17} /><div><b>设置暂不可用</b><span>{error}</span></div><Button onClick={() => { setLoading(true); api.config().then(c => { setConfig(normalizeConfig(c)); setError(''); }).catch(e => setError(e instanceof Error ? e.message : '配置读取失败')).finally(() => setLoading(false)); }}>重试</Button></div> : config && <fieldset disabled={busy} className="settings-fields" aria-label="路由设置表单">
-        <section className="settings-card"><div className="settings-card-head"><div className="role-icon codex"><Activity size={18} /></div><div><h2>{allocatorName}分配器</h2><p>{config.allocator.kind === 'api' ? '使用兼容 OpenAI API 的模型决定任务执行路线。' : '使用 Codex 订阅和 Codex CLI 配置决定任务执行路线。'}</p></div><span className="fixed-badge">可切换</span></div>
+        <section className="settings-card boss-settings"><div className="settings-card-head"><div className="role-icon codex"><Activity size={18} /></div><div><h2>Boss 与团队偏好</h2><p>Boss 是项目负责人，负责设计、必要的跨模型讨论、任务分配和验收。</p></div></div><Field label="默认 Boss 偏好" hint="自由填写，模型名称不必准确。任务中的偏好优先；最终采用的模型以任务记录为准。"><textarea aria-label="默认 Boss 偏好" rows={5} value={config.boss?.preference ?? ''} onChange={e => editConfig(prev => ({ ...prev, boss: { preference: e.target.value } }))} placeholder="例如：Boss 用 Codex gpt6.1sol high；复杂部分自己设计，必要时与其他模型讨论，具体操作优先交给便宜模型或 DeepSeek Harness。" /></Field><div className="boss-settings-current" aria-label="当前已验证模型">{(capabilities?.bindings ?? []).filter(binding => binding.available && capabilities?.harnesses.some(h => h.id === binding.harnessId && h.available)).map(binding => <span key={JSON.stringify([binding.harnessId, binding.modelId])}>{binding.harnessId} · {binding.modelName || binding.modelId}</span>)}</div>{!capabilities ? <p className="boss-settings-warning">能力尚未读取，请刷新能力状态。</p> : !(capabilities.bindings.some(binding => binding.available && capabilities.harnesses.some(h => h.id === binding.harnessId && h.available))) ? <div className="boss-settings-warning"><b>尚无可用的模型绑定</b><p>保存文字偏好不会连接或验证模型。请先在服务端配置 Harness 并验证绑定，再刷新能力状态。</p><ul>{capabilities.harnesses.filter(h => !h.available).map(h => <li key={h.id}>{h.name}：{h.reason || '未检测到可用配置'}</li>)}</ul></div> : <p className="field-hint">Boss 只会使用已验证的可用组合；无法匹配的偏好会给出原因。</p>}</section><details className="advanced-settings"><summary>高级路由配置（可选）</summary><section className="settings-card"><div className="settings-card-head"><div className="role-icon codex"><Activity size={18} /></div><div><h2>{allocatorName}分配器</h2><p>{config.allocator.kind === 'api' ? '使用兼容 OpenAI API 的模型决定任务执行路线。' : '使用 Codex 订阅和 Codex CLI 配置决定任务执行路线。'}</p></div><span className="fixed-badge">可切换</span></div>
           <Field label="分配器来源"><Select value={config.allocator.kind} onChange={kind => editConfig(prev => ({ ...prev, allocator: { ...prev.allocator, kind: kind as Config['allocator']['kind'] } }))} choices={[{ id: 'codex', label: 'Codex 订阅' }, { id: 'api', label: 'API 模型' }]} placeholder="选择分配器" /></Field>
           {config.allocator.kind === 'api' ? <>
             <div className="form-grid" style={{ marginTop: 14 }}><Field label="API HTTPS 地址" hint="必须使用 HTTPS。此处仅配置服务地址。"><input type="url" inputMode="url" pattern="https://.+" title="API 地址必须以 https:// 开头" value={apiAllocatorConfig.baseUrl ?? ''} onChange={e => updateApi('baseUrl', e.target.value)} placeholder="https://api.example.com/v1" /></Field><Field label="API 模型"><input value={apiAllocatorConfig.model ?? ''} onChange={e => updateApi('model', e.target.value)} placeholder="例如 gpt-4.1" /></Field></div>
@@ -500,8 +455,8 @@ function SettingsPage({ capabilities, onSaved, onRetry }: { capabilities: Capabi
           <div className="project-preset-add"><Field label="仓库绝对路径"><input value={projectPath} onChange={e => setProjectPath(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addProjectDefault(); } }} placeholder="例如 C:\\projects\\my-app" /></Field><Button onClick={addProjectDefault}><Plus size={14} />添加项目</Button></div>
           {(config.executionDefaults?.projects ?? []).length === 0 ? <div className="project-preset-empty">尚未添加项目默认值。</div> : <div className="project-preset-list">{config.executionDefaults!.projects.map((project, index) => <div className="project-preset-row" key={`${project.repoPath}-${index}`}><div className="project-preset-heading"><b title={project.repoPath}>{project.repoPath}</b><button className="button danger" onClick={() => removeProjectDefault(index)}><X size={13} />移除</button></div><ExecutionPresetFields title={`${project.repoPath} 执行默认值`} value={project.execution} onChange={execution => updateProjectDefault(index, execution)} capabilities={capabilities} /></div>)}</div>}
         </section>
-        <div className="settings-save-row"><span><ShieldCheck size={14} />界面只保存密钥环境变量名，不读取或保存 API 密钥原文。</span><Button variant="primary" disabled={busy || saved} onClick={() => void save()}>{busy ? <><LoaderCircle size={15} className="spin" />保存中</> : saved ? <><Check size={15} />已保存</> : '保存设置'}</Button></div>{error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}
+        </details><div className="settings-save-row"><span><ShieldCheck size={14} />界面只保存密钥环境变量名，不读取或保存 API 密钥原文。</span><Button variant="primary" disabled={busy || saved} onClick={() => void save()}>{busy ? <><LoaderCircle size={15} className="spin" />保存中</> : saved ? <><Check size={15} />已保存</> : '保存设置'}</Button></div>{error && <div className="alert error compact"><AlertCircle size={16} />{error}</div>}
       </fieldset>}
-    </div><aside className="settings-aside"><div className="aside-icon"><ShieldCheck size={19} /></div><h3>选择优先级</h3><p>每个任务的手动指定优先于项目预设与全局预设；未指定字段由 {allocatorName} 补全。</p><div className="priority-stack"><div><span>1</span><b>任务指定</b></div><ArrowDown size={14} /><div><span>2</span><b>项目预设</b></div><ArrowDown size={14} /><div><span>3</span><b>全局预设</b></div><ArrowDown size={14} /><div><span>4</span><b>{allocatorName} 分配</b></div></div><button className="link-button" onClick={() => void onRetry()}><RefreshCw size={13} />刷新能力状态</button></aside></div>
+    </div><aside className="settings-aside"><div className="aside-icon"><ShieldCheck size={19} /></div><h3>把目标交给 Boss</h3><p>你负责描述目标、补充背景和收取结果。Boss 负责设计、分配合适的 Agent 与模型，再检查和验收。任务偏好优先于这里的默认偏好。</p><div className="priority-stack"><div><span>1</span><b>设计与必要的讨论</b></div><ArrowDown size={14} /><div><span>2</span><b>分配 Agent 与模型</b></div><ArrowDown size={14} /><div><span>3</span><b>执行、检查与修正</b></div><ArrowDown size={14} /><div><span>4</span><b>验收和交付结果</b></div></div><button className="link-button" onClick={() => void onRetry()}><RefreshCw size={13} />刷新能力状态</button></aside></div>
   </>;
 }
