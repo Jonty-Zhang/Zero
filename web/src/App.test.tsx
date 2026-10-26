@@ -144,6 +144,64 @@ describe('polling workspace filters', () => {
   });
 });
 
+describe('factual missing execution route copy', () => {
+  const states = [
+    { status: 'done', label: '已完成' }, { status: 'failed', label: '失败' },
+    { status: 'recovery_required', label: '需要检查恢复' }, { status: 'pending', label: '待处理' },
+  ] as const;
+  const noRoute = (status: Task['status']): Task => ({ id: `no-route-${status}`, title: `缺少执行路线 ${status}`, status, repoPath: 'C:/repo/history', attempts: [] });
+  async function openTaskView(task: Task, view: string) {
+    vi.mocked(api.tasks).mockResolvedValue([task]);
+    render(<App />);
+    await screen.findByText(task.title!);
+    fireEvent.click(screen.getByRole('button', { name: view }));
+    return screen.getByText(task.title!).closest(view === '列表视图' ? 'tr' : 'button')! as HTMLElement;
+  }
+  it.each(states.flatMap(state => ['列表视图', '看板视图'].map(view => ({ ...state, view }))))(
+    'states the missing route fact for $status in $view without promising execution', async ({ status, label, view }) => {
+      const container = await openTaskView(noRoute(status), view);
+      expect(within(container).getByText(label)).toBeTruthy();
+      expect(within(container).getByText(status === 'pending' ? '待分配执行 Agent' : '执行 Agent 未记录')).toBeTruthy();
+      expect(within(container).queryByText(/等待路由|^待分配$/)).toBeNull();
+    },
+  );
+  it.each(['列表视图', '看板视图'])('preserves a real harness without inventing a waiting model in %s', async view => {
+    const container = await openTaskView({ ...noRoute('done'), route: { harnessId: 'codex' } }, view);
+    expect(within(container).getByText('codex')).toBeTruthy();
+    expect(within(container).queryByText(/等待路由/)).toBeNull();
+    expect(within(container).queryByText('执行 Agent 未记录')).toBeNull();
+    if (view === '列表视图') expect(container.querySelector('.table-agent small')).toBeNull();
+  });
+  it.each(states)('uses the same missing route fact and neutral empty history for $status details', async ({ status, label }) => {
+    const fixture: Task = { ...noRoute(status), ...(status === 'failed' || status === 'recovery_required' ? { error: `保留原始错误 ${status}` } : {}) };
+    vi.mocked(api.tasks).mockResolvedValue([fixture]);
+    vi.mocked(api.task).mockResolvedValue(fixture);
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: fixture.title! }));
+    const dialog = await screen.findByRole('dialog', { name: '任务详情' });
+    await within(dialog).findByText(fixture.title!);
+    expect(within(dialog).getByText(label)).toBeTruthy();
+    if (fixture.error) expect(within(dialog).getByText(fixture.error)).toBeTruthy();
+    expect(within(dialog).getByText(status === 'pending' ? '待分配执行 Agent' : '执行 Agent 未记录')).toBeTruthy();
+    expect(within(dialog).getByText('尚无执行记录。')).toBeTruthy();
+    expect(within(dialog).queryByText(/任务开始后|等待路由分配/)).toBeNull();
+  });
+  it('labels an empty attempt route as unrecorded while retaining the real task route and failure evidence', async () => {
+    const fixture: Task = { ...noRoute('failed'), route: { harnessId: 'dsh', modelId: 'real-worker', reasoningEffort: 'low' },
+      error: '任务失败原始原因', attempts: [{ id: 'route-missing-attempt', status: 'failed', route: {}, summary: '尝试失败原始原因' }] };
+    vi.mocked(api.tasks).mockResolvedValue([fixture]);
+    vi.mocked(api.task).mockResolvedValue(fixture);
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: fixture.title! }));
+    const dialog = await screen.findByRole('dialog', { name: '任务详情' });
+    await within(dialog).findByText('任务失败原始原因');
+    expect(within(dialog).getByText('dsh · real-worker · low')).toBeTruthy();
+    expect(within(dialog).getByText('尝试失败原始原因')).toBeTruthy();
+    expect(within(dialog).getByText('执行路线未记录')).toBeTruthy();
+    expect(within(dialog).queryByText(/等待路由分配|任务开始后/)).toBeNull();
+  });
+});
+
 describe('nonempty workflow board columns', () => {
   const boardColumns = () => Array.from(document.querySelectorAll<HTMLElement>('.board-column'));
   const columnLabels = () => boardColumns().map(column => column.querySelector('.column-heading b')?.textContent);
