@@ -5,6 +5,7 @@ import { RichText } from './RichText';
 import { TaskLead } from './TaskLead';
 import { useDialog } from './dialog';
 import type { Capabilities, Task } from './types';
+import { createBossMessageComposer, useBossMessageComposer, type BossMessageComposer } from './boss-message-composer';
 
 const preferenceExample = 'Codex gpt6.1sol high 负责设计与验收，日常实现交给便宜模型或 DeepSeek，复杂问题先讨论。';
 type FolderListing = Awaited<ReturnType<typeof api.folders>>;
@@ -136,21 +137,20 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
   </section></div>;
 }
 
-export function BossProgress({ task, onMessage }: { task: Task; onMessage: () => void }) {
-  const [content, setContent] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [sent, setSent] = useState(false);
-  const sending = useRef(false);
+export function BossProgress({ task, onMessage, composer }: { task: Task; onMessage: (taskId: string) => void; composer?: BossMessageComposer }) {
+  const [localComposer] = useState(() => createBossMessageComposer({ send: api.messageTask }));
+  const messageComposer = composer ?? localComposer;
+  const { content, busy, error, sent } = useBossMessageComposer(messageComposer, task.id);
   const terminal = ['done', 'failed', 'recovery_required'].includes(task.status);
   const canMessage = ['pending', 'running', 'revision', 'waiting'].includes(task.status) && task.bossMessageAdmission !== 'closed';
   if (!task.boss && !task.bossPlan && !task.bossMessages?.length) return null;
   const send = async (event: FormEvent) => {
-    event.preventDefault(); if (sending.current || !canMessage || !content.trim()) return;
-    sending.current = true; setBusy(true); setError(''); setSent(false);
-    try { await api.messageTask(task.id, content.trim()); setContent(''); setSent(true); onMessage(); }
-    catch (e) { setError(e instanceof Error ? e.message : '发送失败'); }
-    finally { sending.current = false; setBusy(false); }
+    event.preventDefault();
+    if (!canMessage) return;
+    const delivered = await messageComposer.send(task.id, { allowed: canMessage });
+    if (delivered) {
+      try { onMessage(task.id); } catch { /* A refresh failure cannot revoke a confirmed receipt. */ }
+    }
   };
   return <section className="detail-block boss-progress" aria-label="Boss 项目进展">
     <div className="boss-section-heading"><h3>项目方案</h3>{task.boss?.preference && <details className="boss-preference"><summary>团队偏好</summary><p>{task.boss.preference}</p></details>}</div>
@@ -166,7 +166,7 @@ export function BossProgress({ task, onMessage }: { task: Task; onMessage: () =>
     <section className="boss-discussion" aria-label="项目讨论"><h4><MessageSquare size={15} />讨论</h4>
       <div className="boss-message-list">{(task.bossMessages ?? []).map(message => <article key={message.id} className={`boss-message ${message.role}`}><header className="boss-message-meta"><b>{message.role === 'user' ? '你' : message.role === 'consultant' ? '顾问' : 'Boss'}</b><span>{[message.harness, message.model].filter(Boolean).join(' · ')}</span><time dateTime={message.at} title={new Date(message.at).toLocaleString('zh-CN')}>{new Date(message.at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</time></header><RichText>{message.content}</RichText></article>)}</div>
       <form onSubmit={send} className="boss-message-form" aria-disabled={!canMessage}>
-        <label className="field"><span className="field-label">给 Boss 补充信息或提问</span><textarea rows={3} maxLength={16000} disabled={busy || !canMessage} value={content} onChange={e => { setContent(e.target.value); setSent(false); }} placeholder="补充要求或提问…" /></label>
+        <label className="field"><span className="field-label">给 Boss 补充信息或提问</span><textarea rows={3} maxLength={16000} disabled={busy || !canMessage} value={content} onChange={e => messageComposer.setContent(task.id, e.target.value)} placeholder="补充要求或提问…" /></label>
         <div className="boss-message-actions"><p className="boss-message-status">{terminal ? '任务已结束。继续工作请新建后续任务。' : !canMessage ? (task.status === 'waiting' ? '验收已暂停，要求已封存。新要求请新建后续任务。' : '正在验收。新要求请在验收后新建后续任务。') : '消息将在下个安全处理点读取。'}</p><button className="button secondary" type="submit" disabled={busy || !canMessage || !content.trim()}>{busy ? '发送中…' : '发送给 Boss'}<Send size={14} /></button></div>
         {sent && <p role="status" className="boss-message-receipt">已发送，等待处理。</p>}{error && <p role="alert" className="folder-error">{error}</p>}
       </form>

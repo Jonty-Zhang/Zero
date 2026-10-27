@@ -7,6 +7,7 @@ import { AgentConnections } from './AgentConnections';
 import { useDialog } from './dialog';
 import { BossProjectModal, BossProgress, ProjectDelivery, type BossProjectDraft } from './BossProject';
 import { usePolling } from './usePolling';
+import { createBossMessageComposer, type BossMessageComposer } from './boss-message-composer';
 import type { Capabilities, Choice, Config, ExecutionSelection, Status, Task, TaskSequence, TestResult } from './types';
 
 const columns: { id: Status; label: string; tone: string }[] = [
@@ -77,6 +78,9 @@ export default function App() {
   const [allocatorKind, setAllocatorKind] = useState<Config['allocator']['kind']>('codex');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const detail = usePolling(selectedId, loadTask, 3500);
+  const selectedTaskId = useRef(selectedId);
+  selectedTaskId.current = selectedId;
+  const [messageComposer] = useState(() => createBossMessageComposer({ send: api.messageTask }));
   const [showSubmit, setShowSubmit] = useState(false);
   const [showAdvancedSubmit, setShowAdvancedSubmit] = useState(false);
   const [bossDraft, setBossDraft] = useState<BossProjectDraft | null>(null);
@@ -116,7 +120,7 @@ export default function App() {
           {!!tasks.length && <div className="table-footer">{filtered.length} / {tasks.length} 个任务</div>}
         </section></> : <SettingsPage capabilities={capabilities} capabilityError={capState.error} onSaved={(message, kind) => { setAllocatorKind(kind); setNotice({ message }); }} onRetry={capState.refresh} />}
     </main>
-    {selectedId && <TaskDrawer onMessage={() => void detail.refresh()} key={selectedId} task={detail.data} loading={detail.loading} loadError={detail.error} onClose={() => setSelectedId(null)} onCancel={async () => { if (!detail.data || detail.data.id !== selectedId) return; await api.cancelTask(detail.data.id); setNotice({ message: '已发送取消请求' }); void detail.refresh(); void taskState.refresh(); }} />}
+    {selectedId && <TaskDrawer messageComposer={messageComposer} onMessage={id => { if (selectedTaskId.current === id) void detail.refresh(); void taskState.refresh(); }} key={selectedId} task={detail.data} loading={detail.loading} loadError={detail.error} onClose={() => setSelectedId(null)} onCancel={async () => { if (!detail.data || detail.data.id !== selectedId) return; await api.cancelTask(detail.data.id); setNotice({ message: '已发送取消请求' }); void detail.refresh(); void taskState.refresh(); }} />}
     {showSubmit && <BossProjectModal capabilities={capabilities} capabilityError={capState.error} initialDraft={bossDraft} onClose={() => { setShowSubmit(false); setBossDraft(null); }} onAdvanced={draft => { setBossDraft(draft); setShowSubmit(false); setShowAdvancedSubmit(true); }} onCreated={task => { setShowSubmit(false); setBossDraft(null); setSelectedId(task.id); setNotice({ message: '项目任务已交给 Boss' }); refreshAll(); }} />}
     {showAdvancedSubmit && <SubmitModal capabilities={capabilities} capabilityError={capState.error} allocatorKind={allocatorKind} initialDraft={bossDraft} onClose={() => setShowAdvancedSubmit(false)} onCreated={task => { setShowAdvancedSubmit(false); setBossDraft(null); setSelectedId(task.id); setNotice({ message: '任务已加入队列' }); refreshAll(); }} />}
     {showSequenceSubmit && <SequenceSubmitModal capabilities={capabilities} onClose={() => setShowSequenceSubmit(false)} onCreated={sequence => { setShowSequenceSubmit(false); setSelectedSequenceId(sequence.id); refreshAll(); }} />}
@@ -312,7 +316,7 @@ function SubmitModal({ capabilities, capabilityError, allocatorKind, initialDraf
     </fieldset></form></section></div>;
 }
 
-function TaskDrawer({ task, loading, loadError, onClose, onCancel, onMessage }: { onMessage: () => void; task: Task | null; loading: boolean; loadError: string; onClose: () => void; onCancel: () => Promise<void> }) {
+function TaskDrawer({ task, loading, loadError, onClose, onCancel, onMessage, messageComposer }: { onMessage: (taskId: string) => void; messageComposer: BossMessageComposer; task: Task | null; loading: boolean; loadError: string; onClose: () => void; onCancel: () => Promise<void> }) {
   const [cancelBusy, setCancelBusy] = useState(false); const [cancelError, setCancelError] = useState('');
   const dialogRef = useDialog(onClose);
   const cancel = async () => { setCancelBusy(true); setCancelError(''); try { await onCancel(); } catch (e) { setCancelError(e instanceof Error ? e.message : '取消请求失败'); } finally { setCancelBusy(false); } };
@@ -324,7 +328,7 @@ function TaskDrawer({ task, loading, loadError, onClose, onCancel, onMessage }: 
       {task.status === 'waiting' && <section className="quota-wait-panel"><div className="quota-wait-icon"><Clock3 size={17} /></div><div><b>模型额度暂时受限</b><p>Zero 会保留当前进度，并在可重试时自动继续这个任务。</p><span>{retryDate(task.retryAt) ? `下一次自动重试：${retryDate(task.retryAt)}` : '下一次重试时间暂未确定；Zero 会在额度恢复后继续。'}</span>{task.error && <small>{task.error}</small>}</div></section>}
       {task.status === 'recovery_required' && <section className="quota-wait-panel recovery-required-panel"><div className="quota-wait-icon"><AlertCircle size={17} /></div><div><b>任务需要人工检查</b><p>{task.recoveryReason || '执行租约已过期。租约过期不能证明原进程已停止，因此 Zero 未自动重试。'}</p><span>请检查旧 worker 进程和任务 worktree，再决定如何继续。</span>{task.recoveryEvidence && <small>恢复证据：{JSON.stringify(task.recoveryEvidence)}</small>}</div></section>}
       {canCancel && cancelError && <div className="alert error compact"><AlertCircle size={15} />{cancelError}</div>}
-      <ProjectDelivery task={task} /><BossProgress task={task} onMessage={onMessage} /><div className="detail-block"><h3><FolderGit2 size={15} />仓库与任务</h3><dl className="detail-list"><div><dt>任务 ID</dt><dd><code>{task.id}</code></dd></div><div><dt>仓库</dt><dd>{task.repoPath || '—'}</dd></div><div><dt>基础 Ref</dt><dd>{task.baseRef || '—'}</dd></div><div><dt>最大返工</dt><dd>{task.maxRevisions ?? '—'} 次</dd></div></dl><RichText className="task-description">{task.prompt || '无任务描述'}</RichText>{task.acceptanceCriteria && <><div className="sub-label">验收标准</div><RichText>{task.acceptanceCriteria}</RichText></>}</div>
+      <ProjectDelivery task={task} /><BossProgress task={task} onMessage={onMessage} composer={messageComposer} /><div className="detail-block"><h3><FolderGit2 size={15} />仓库与任务</h3><dl className="detail-list"><div><dt>任务 ID</dt><dd><code>{task.id}</code></dd></div><div><dt>仓库</dt><dd>{task.repoPath || '—'}</dd></div><div><dt>基础 Ref</dt><dd>{task.baseRef || '—'}</dd></div><div><dt>最大返工</dt><dd>{task.maxRevisions ?? '—'} 次</dd></div></dl><RichText className="task-description">{task.prompt || '无任务描述'}</RichText>{task.acceptanceCriteria && <><div className="sub-label">验收标准</div><RichText>{task.acceptanceCriteria}</RichText></>}</div>
       <div className="detail-block"><h3><Activity size={15} />路由决策</h3><div className="route-detail"><div><span>执行路线</span><b>{taskRouteName(task)}</b></div><div><span>选择来源</span><b>{nice(task.route?.selectionSource)}</b></div>{task.route?.reason && <p>{task.route.reason}</p>}</div></div>
       <StageTimeline task={task} /><div className="detail-block"><h3><ArrowDown size={15} />执行记录 <span className="count-badge">{attempts.length}</span></h3>{attempts.length ? <div className="attempt-list">{attempts.map((attempt, i) => <article className="attempt" key={attempt.id ?? attempt.number ?? i}><div className="attempt-head"><b>尝试 {attempt.number ?? i + 1}{attempt.role ? ` · ${roleLabel(attempt.role)}` : ""}</b><span className={`tiny-status ${attempt.status || 'pending'}`}>{stageStatusLabel(attempt.status || '')}</span><span className="muted">{date(attempt.startedAt)}</span></div>{attempt.stageId && <div className="attempt-route">阶段：{attempt.stageId}</div>}{attempt.exitCode != null && <div className="attempt-route">退出码：{attempt.exitCode}</div>}{attempt.route && <div className="attempt-route">{routeName(attempt.route)}</div>}{attempt.sessionId && <div className="attempt-route">执行会话 ID：<code style={{ userSelect: 'all', overflowWrap: 'anywhere' }}>{attempt.sessionId}</code></div>}{attempt.summary && attempt.summary !== attempt.executorSummary && <p>{attempt.summary}</p>}{attempt.executorSummary && <section className="executor-summary" aria-label="执行者自述"><b>执行者自述，需结合检查与审查确认</b><p>{attempt.executorSummary}</p></section>}{attempt.tests && <TestList tests={attempt.tests} />}{attempt.review && <Review review={attempt.review} />}{attempt.logs && <pre className="log-box">{Array.isArray(attempt.logs) ? attempt.logs.join('\n') : attempt.logs}</pre>}</article>)}</div> : <div className="soft-empty">尚无执行记录。</div>}</div>
       <CheckEvidence task={task} />
