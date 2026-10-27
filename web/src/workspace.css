@@ -1058,6 +1058,7 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
   grid-template-columns:minmax(0,1fr) 280px;
   gap:32px
 }
+.settings-layout.settings-with-connections { grid-template-columns:minmax(0,1fr); }
 .settings-card {
   padding:28px;
   border-radius:8px;
@@ -1509,3 +1510,45 @@ h4 { font-size:16px; font-weight:600; }
 .rich-text .task-list-item input { appearance:none; position:relative; vertical-align:middle; opacity:1; border:1px solid #95866e; border-radius:3px; background:#fffefa; }
 .rich-text .task-list-item input:checked { background:#527253; border-color:#527253; }
 .rich-text .task-list-item input:checked:after { content:'✓'; position:absolute; inset:-4px 0 0; color:#fff; font-family:'Zero Sans',sans-serif; font-size:14px; text-align:center; }
+.agent-connections-bar {
+  display:flex; align-items:center; flex-wrap:wrap; gap:14px 24px;
+  padding:0 0 20px; margin-bottom:24px; border-bottom:1px solid var(--line);
+  font-size:14px; line-height:1.6;
+}
+.agent-bar-title { display:inline-flex; align-items:center; gap:8px; color:var(--muted); }
+.agent-bar-statuses { display:flex; align-items:center; flex-wrap:wrap; gap:12px 24px; }
+.agent-bar-entry { display:inline-flex; align-items:center; gap:8px; color:var(--muted); }
+.agent-bar-entry b { color:var(--ink); font-weight:500; }
+.agent-bar-entry .health-indicator { width:6px; height:6px; flex:0 0 6px; }
+.agent-manage-button { margin-left:auto; display:inline-flex; align-items:center; gap:4px; border:0; background:transparent; color:var(--ink); padding:7px 0 7px 10px; min-height:36px; }
+.agent-manage-button:hover { color:var(--accent); }
+.agent-bar-error { color:#85402d; }
+.agent-connections-dialog { width:min(720px,calc(100vw - 40px)); display:flex; flex-direction:column; padding:26px 30px 0; overflow:hidden; }
+.agent-connections-dialog .modal-heading { flex-shrink:0; padding-bottom:20px; }
+.agent-connections-content { min-height:0; overflow:auto; overscroll-behavior:contain; padding-right:4px; }
+.agent-connection-card { padding:21px 0; border-bottom:1px solid var(--line); min-width:0; }
+.agent-connection-heading { display:flex; align-items:center; justify-content:space-between; gap:20px; }
+.agent-connection-heading h3 { font-size:19px; font-weight:500; line-height:1.6; margin:0; color:var(--ink); }
+.agent-status { border-radius:5px; color:#6c5740; background:#efe9df; padding:3px 9px; font-size:14px; line-height:1.6; }
+.agent-status.ready { color:#315e43; background:#e8eee7; }
+.agent-connection-hint { font-size:15px; line-height:1.8; margin:8px 0 0; color:var(--muted); }
+.agent-connection-mode { font-size:14px; line-height:1.7; margin:8px 0 0; color:var(--muted); }
+.agent-technical { margin-top:12px; }
+.agent-technical summary { display:flex; align-items:center; gap:3px; width:fit-content; cursor:pointer; color:var(--muted); font-size:14px; line-height:1.8; list-style:none; }
+.agent-technical summary::-webkit-details-marker { display:none; }
+.agent-technical[open] summary svg { transform:rotate(90deg); }
+.agent-technical p { margin:10px 0 0; padding:12px 14px; background:#f1eee8; border-radius:6px; font-size:14px; line-height:1.8; color:#5a5146; white-space:pre-wrap; overflow-wrap:anywhere; }
+.agent-version { display:block; font-size:14px; line-height:1.8; margin-top:8px; overflow-wrap:anywhere; color:var(--muted); }
+.codex-connection-note { padding:20px 0 24px; }
+.codex-connection-note b { color:var(--ink); font-weight:500; font-size:15px; }
+.codex-connection-note p { color:var(--muted); font-size:14px; line-height:1.9; margin:6px 0 8px; }
+.codex-connection-note a { color:var(--accent); display:inline-flex; align-items:center; gap:4px; font-size:14px; line-height:1.8; }
+.agent-connections-footer { flex-shrink:0; display:flex; align-items:center; justify-content:space-between; gap:14px; padding:18px 0; border-top:1px solid var(--line); }
+.agent-connection-error { margin-top:16px; background:#f4e9e1; padding:12px 14px; border-radius:6px; color:#85402d; }
+.agent-connection-error p { margin:6px 0 0; overflow-wrap:anywhere; font-size:14px; line-height:1.8; white-space:pre-wrap; }
+@media(max-height:850px) and (min-width:901px) { .agent-connections-bar { padding-bottom:14px; margin-bottom:18px; } }
+@media(max-width:700px) {
+  .agent-connections-bar { gap:10px; }
+  .agent-bar-statuses { order:3; width:100%; gap:10px 20px; }
+  .agent-connections-dialog { padding:20px 20px 0; }
+}

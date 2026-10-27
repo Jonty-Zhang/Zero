@@ -4,6 +4,8 @@
 
 Zero manages coding projects across local agents. Choose or create a folder, describe the goal, and optionally express a Boss/team preference in plain language. The Codex Boss resolves that preference against connected verified models, studies the project, consults other agents when useful, designs the work and checks, delegates across Harnesses, and accepts or requests revisions. Start the Windows local service manually; it continues while the launcher remains open, even when the browser is closed.
 
+See [Agent connection states and Codex Desktop integration limits](docs/codex-desktop-integration.md) for the current connection methods and what model readiness means.
+
 Zero is an application made of one Node.js service, a local React web UI, and a CLI. The service owns task state and execution; the UI is a client of that service. v1 targets one Windows-first, single-user machine and binds to loopback by default.
 
 ## What works today

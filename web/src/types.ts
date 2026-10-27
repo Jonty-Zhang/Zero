@@ -1,6 +1,6 @@
 export type Status = 'pending' | 'running' | 'reviewing' | 'revision' | 'waiting' | 'recovery_required' | 'done' | 'failed';
 export type Choice = { id: string; label: string };
-export type HarnessHealth = { id: string; name: string; available: boolean; reason?: string | null };
+export type HarnessHealth = { id: string; name: string; available: boolean; cliAvailable?: boolean; version?: string; reason?: string | null };
 export type Binding = {
   harnessId: string;
   modelId: string;
