@@ -56,6 +56,37 @@ test('Boss message delivery retains its identity after an uncertain response and
   assert.deepEqual(calls[1].body, { content: 'Keep export names' });
 });
 
+test('receipt confirmation reuses the failed message identity and uses an explicit read-only intent', async (t) => {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (path, init) => {
+    calls.push({ path, key: init.headers['X-Idempotency-Key'], body: JSON.parse(init.body) });
+    if (calls.length === 1) throw new TypeError('accepted but response lost');
+    if (calls.length === 2) return new Response(JSON.stringify({ error: 'Receipt not visible yet' }), { status: 409 });
+    return new Response(JSON.stringify({ id: 'original-receipt' }), { status: 200 });
+  });
+  await assert.rejects(api.messageTask('confirm-task', 'Original 中文 message'), /response lost/);
+  assert.equal(typeof api.confirmMessageTask, 'function');
+  await assert.rejects(api.confirmMessageTask('confirm-task', 'Original 中文 message'), /not visible/);
+  await api.confirmMessageTask('confirm-task', 'Original 中文 message');
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every(call => call.key === calls[0].key && call.path === calls[0].path));
+  assert.deepEqual(calls[1].body, { content: 'Original 中文 message', receiptOnly: true });
+  assert.deepEqual(calls[2].body, calls[1].body);
+  await assert.rejects(api.confirmMessageTask('confirm-task', 'Original 中文 message'), /可确认|记录/);
+  assert.equal(calls.length, 3, 'acknowledged identity was cleared; never mint a confirmation key');
+});
+
+test('receipt confirmation without an exact pending payload never starts a network request', async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { calls++; throw new TypeError('uncertain'); });
+  assert.equal(typeof api.confirmMessageTask, 'function');
+  await assert.rejects(api.confirmMessageTask('no-pending-task', 'Unsent'), /可确认|记录/);
+  await assert.rejects(api.messageTask('pending-task', 'Original'), /uncertain/);
+  await assert.rejects(api.confirmMessageTask('pending-task', 'Changed'), /可确认|记录/);
+  await assert.rejects(api.confirmMessageTask('another-task', 'Original'), /可确认|记录/);
+  assert.equal(calls, 1);
+});
+
 test('goal review retry posts the exact source attempt and encoded sequence path without task submission keys', async (t) => {
   const sourceAttempt = 'attempt/source ?中文';
   const sequence = { id: 'sequence/中文 ?', status: 'blocked', goalReview: { state: 'verdict', attemptId: sourceAttempt, retryRequestedAt: '2026-10-18T00:00:00Z', result: { verdict: 'blocked' } } };

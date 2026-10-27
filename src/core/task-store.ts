@@ -1905,6 +1905,19 @@ export class TaskStore {
     return row ? this.#task(row) : undefined;
   }
 
+  /** A confirmation must never turn into a new requirement when admission reopens. */
+  lookupBossMessageReceipt(taskId: string, content: string, requestKey: string): BossMessage | undefined {
+    const key = validateSubmissionKey(requestKey);
+    if (typeof content !== 'string' || !content.trim() || content.trim().length > 16000) {
+      throw new Error('Boss message content must contain 1 to 16000 characters');
+    }
+    const previous = this.#db.prepare('SELECT task_id,message FROM boss_message_requests WHERE key=?').get(key) as { task_id: string; message: string } | undefined;
+    if (!previous) return undefined;
+    const original = JSON.parse(previous.message) as BossMessage;
+    if (previous.task_id !== taskId || original.content !== content.trim()) throw new IdempotencyConflictError();
+    return original;
+  }
+
   /** Discussion is append-only; model-authored messages require the current live owner. */
   addBossMessage(taskId: string, role: BossMessage['role'], content: string,
     metadata: { owner?: string; harness?: string; model?: string; requestKey?: string } = {}): BossMessage {

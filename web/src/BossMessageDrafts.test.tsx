@@ -95,7 +95,7 @@ it('keeps an in-flight send busy after closing and reopening the actual task dra
   await act(async () => { delivery.resolve({}); await delivery.promise; });
   expect(messageInput(dialog).disabled).toBe(false);
   expect(messageInput(dialog).value).toBe('');
-  expect(within(dialog).getByText('已发送，等待处理。')).toBeTruthy();
+  expect(within(dialog).getByText('已送达。')).toBeTruthy();
 });
 
 it.each(['success', 'failure'])('settles task A %s while task B is being edited without changing B content or receipt state', async outcome => {
@@ -120,14 +120,14 @@ it.each(['success', 'failure'])('settles task A %s while task B is being edited 
   expect(messageInput(otherDialog).value).toBe(otherDraft);
   expect(messageInput(otherDialog).disabled).toBe(false);
   expect(within(otherDialog).queryByRole('alert')).toBeNull();
-  expect(within(otherDialog).queryByText('已发送，等待处理。')).toBeNull();
+  expect(within(otherDialog).queryByText('已送达。')).toBeNull();
   expect(api.messageTask).toHaveBeenCalledTimes(1);
   expect(vi.mocked(api.task).mock.calls).toEqual(detailCallsBeforeSettlement);
   closeTask(otherDialog);
   const reopened = await openTask(first.title!);
   expect(messageInput(reopened).value).toBe(outcome === 'success' ? '' : originalDraft);
   expect(messageInput(reopened).disabled).toBe(false);
-  if (outcome === 'success') expect(within(reopened).getByText('已发送，等待处理。')).toBeTruthy();
+  if (outcome === 'success') expect(within(reopened).getByText('已送达。')).toBeTruthy();
   else expect(within(reopened).getByRole('alert').textContent).toBe('A 的请求超时，保留原文');
   closeTask(reopened);
   expect(messageInput(await openTask(second.title!)).value).toBe(otherDraft);
@@ -146,7 +146,7 @@ it('retries an uncertain send after real navigation with the original trimmed pa
   dialog = await openTask(first.title!);
   expect(messageInput(dialog).value).toBe(originalDraft);
   fireEvent.click(within(dialog).getByRole('button', { name: '发送给 Boss' }));
-  await within(dialog).findByText('已发送，等待处理。');
+  await within(dialog).findByText('已送达。');
   expect(api.messageTask).toHaveBeenCalledTimes(2);
   expect(vi.mocked(api.messageTask).mock.calls).toEqual([[first.id, originalDraft.trim()], [first.id, originalDraft.trim()]]);
   expect(messageInput(dialog).value).toBe('');

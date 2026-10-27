@@ -80,7 +80,7 @@ export default function App() {
   const detail = usePolling(selectedId, loadTask, 3500);
   const selectedTaskId = useRef(selectedId);
   selectedTaskId.current = selectedId;
-  const [messageComposer] = useState(() => createBossMessageComposer({ send: api.messageTask }));
+  const [messageComposer] = useState(() => createBossMessageComposer({ send: api.messageTask, confirm: api.confirmMessageTask }));
   const [showSubmit, setShowSubmit] = useState(false);
   const [showAdvancedSubmit, setShowAdvancedSubmit] = useState(false);
   const [bossDraft, setBossDraft] = useState<BossProjectDraft | null>(null);

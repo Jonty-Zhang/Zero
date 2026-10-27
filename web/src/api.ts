@@ -11,16 +11,22 @@ function stableJson(value: unknown): string {
   return JSON.stringify(normalize(JSON.parse(JSON.stringify(value))));
 }
 
-async function submit<T>(path: string, payload: unknown): Promise<T> {
+async function submit<T>(path: string, payload: unknown, receiptOnly = false): Promise<T> {
   const body = stableJson(payload);
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${path}\n${body}`));
   const storageKey = `zero.pending-submission.${Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')}`;
   let key = pendingSubmissions.get(storageKey);
   try { key ??= sessionStorage.getItem(storageKey) ?? undefined; } catch { /* Storage can be disabled; in-memory retries still work. */ }
-  if (!key || !/^[A-Za-z0-9_-]{16,128}$/.test(key)) key = crypto.randomUUID();
+  if (!key || !/^[A-Za-z0-9_-]{16,128}$/.test(key)) {
+    if (receiptOnly) throw new Error('没有可确认的发送记录，请查看项目讨论。');
+    key = crypto.randomUUID();
+  }
   pendingSubmissions.set(storageKey, key);
   try { sessionStorage.setItem(storageKey, key); } catch { /* Keep the in-memory identity. */ }
-  const result = await request<T>(path, { method: 'POST', body, headers: { 'X-Idempotency-Key': key } });
+  // The identity is based on the original body. Confirmation explicitly asks
+  // the server to read an existing receipt, even if the task is writable again.
+  const requestBody = receiptOnly ? stableJson({ ...JSON.parse(body), receiptOnly: true }) : body;
+  const result = await request<T>(path, { method: 'POST', body: requestBody, headers: { 'X-Idempotency-Key': key } });
   if (pendingSubmissions.get(storageKey) === key) pendingSubmissions.delete(storageKey);
   try { if (sessionStorage.getItem(storageKey) === key) sessionStorage.removeItem(storageKey); } catch { /* Storage can be disabled. */ }
   return result;
@@ -56,6 +62,7 @@ export const api = {
   folders: (path?: string, options?: RequestOptions) => request<{ path: string; parent: string | null; folders: Array<{ name: string; path: string }> }>(`/api/folders${path ? `?path=${encodeURIComponent(path)}` : ''}`, options),
   prepareProject: (path: string, create = false) => request<{ path: string; repoPath: string; initialized: boolean }>('/api/projects/prepare', { method: 'POST', body: JSON.stringify({ path, create }) }),
   messageTask: (id: string, content: string) => submit<unknown>(`/api/tasks/${encodeURIComponent(id)}/messages`, { content }),
+  confirmMessageTask: (id: string, content: string) => submit<unknown>(`/api/tasks/${encodeURIComponent(id)}/messages`, { content }, true),
   capabilities: (options?: RequestOptions) => request<Capabilities>('/api/capabilities', options),
   tasks: (options?: RequestOptions) => request<Task[]>('/api/tasks', options),
   task: (id: string, options?: RequestOptions) => request<Task>(`/api/tasks/${encodeURIComponent(id)}`, options),

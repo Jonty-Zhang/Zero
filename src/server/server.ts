@@ -43,6 +43,7 @@ export interface TaskStorePort {
   events(taskId: string): TaskEvent[];
   addBossMessage?(taskId: string, role: 'user', content: string): unknown;
   addBossMessageIdempotent?(taskId: string, content: string, requestKey: string): unknown;
+  lookupBossMessageReceipt?(taskId: string, content: string, requestKey: string): unknown;
   bossMessages?(taskId: string): unknown[];
   getWorktreeCreation?: TaskStore['getWorktreeCreation'];
   commitOperations?: TaskStore['commitOperations'];
@@ -220,15 +221,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
           if (!task.boss) throw new HttpError(400, '此任务未启用 Boss 对话');
           if (!options.store.addBossMessage || !options.store.bossMessages) throw new HttpError(501, '当前任务存储不支持负责人对话');
           const raw = await bodyJson(req, options.maxBodyBytes);
-          if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => key !== 'content')) throw new HttpError(400, '对话请求必须只包含 content');
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => key !== 'content' && key !== 'receiptOnly')) throw new HttpError(400, '对话请求只能包含 content 和可选的 receiptOnly');
+          const receiptOnly = (raw as Record<string, unknown>).receiptOnly;
+          if (receiptOnly !== undefined && receiptOnly !== true) throw new HttpError(400, 'receiptOnly 只能设为 true');
           const content = stringField((raw as Record<string, unknown>).content, 'content', 1, 16_000);
           const header = req.headers['x-idempotency-key'];
           let requestKey: string | undefined;
           if (header !== undefined) {
             try { requestKey = validateSubmissionKey(header); }
             catch (error) { throw new HttpError(400, message(error)); }
-            if (!options.store.addBossMessageIdempotent) throw new HttpError(501, '当前任务存储不支持对话消息的可靠重试');
           }
+          if (receiptOnly) {
+            if (!requestKey) throw new HttpError(400, '确认发送结果需要原请求标识');
+            if (!options.store.lookupBossMessageReceipt) throw new HttpError(501, '当前任务存储不支持回执确认');
+            const receipt = options.store.lookupBossMessageReceipt(id, content, requestKey);
+            if (!receipt) throw new HttpError(409, '尚未找到接收回执，原文已保留。本次确认没有追加消息。');
+            return json(res, 200, receipt);
+          }
+          if (requestKey && !options.store.addBossMessageIdempotent) throw new HttpError(501, '当前任务存储不支持对话消息的可靠重试');
           const entry = requestKey
             ? options.store.addBossMessageIdempotent!(id, content, requestKey)
             : options.store.addBossMessage(id, 'user', content);

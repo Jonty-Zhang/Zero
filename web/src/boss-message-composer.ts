@@ -7,6 +7,7 @@ export interface BossMessageDraft {
   readonly error: string;
   /** The visible, unchanged draft was confirmed delivered. */
   readonly sent: boolean;
+  readonly canConfirm: boolean;
 }
 
 export interface BossMessageComposer {
@@ -15,17 +16,20 @@ export interface BossMessageComposer {
   setContent(taskId: string, content: string): void;
   /** False for denied, duplicate or failed sends; only one actual delivery returns true. */
   send(taskId: string, options?: { allowed?: boolean }): Promise<boolean>;
+  /** Read the receipt for an unchanged failed payload; never dispatch new work. */
+  confirm(taskId: string): Promise<boolean>;
 }
 
 export interface BossMessageComposerOptions {
   send: (taskId: string, content: string) => Promise<unknown>;
+  confirm?: (taskId: string, content: string) => Promise<unknown>;
   onSent?: (taskId: string) => void | Promise<void>;
 }
 
 interface PendingMessage { operationId: number; content: string; revision: number }
-interface Entry { snapshot: BossMessageDraft; pending?: PendingMessage }
+interface Entry { snapshot: BossMessageDraft; pending?: PendingMessage; unconfirmedContent?: string }
 
-const EMPTY: BossMessageDraft = Object.freeze({ content: '', revision: 0, busy: false, error: '', sent: false });
+const EMPTY: BossMessageDraft = Object.freeze({ content: '', revision: 0, busy: false, error: '', sent: false, canConfirm: false });
 
 /**
  * Create once per App instance. Drawer unmounts detach React subscribers only;
@@ -47,40 +51,47 @@ export function createBossMessageComposer(options: BossMessageComposerOptions): 
   const matches = (entry: Entry, pending: PendingMessage) => entry.pending?.operationId === pending.operationId;
   const unchanged = (entry: Entry, pending: PendingMessage) => entry.snapshot.revision === pending.revision && entry.snapshot.content === pending.content;
 
+  const deliver = async (taskId: string, allowed: boolean, confirmation: boolean): Promise<boolean> => {
+    const current = read(taskId);
+    const content = current.snapshot.content.trim();
+    const transport = confirmation ? options.confirm : options.send;
+    if (!transport || current.pending || !allowed || !content || (confirmation && current.unconfirmedContent !== content)) return false;
+    const pending: PendingMessage = { operationId: ++sequence, content: current.snapshot.content, revision: current.snapshot.revision };
+    // Sending and read-only confirmation share the per-task lock across mounts.
+    publish(taskId, { ...current, pending, snapshot: { ...current.snapshot, busy: true, error: '', sent: false } });
+    try {
+      await transport(taskId, content);
+    } catch (error) {
+      const latest = read(taskId);
+      if (matches(latest, pending)) {
+        const unconfirmedContent = confirmation ? latest.unconfirmedContent : content;
+        publish(taskId, { unconfirmedContent, snapshot: { ...latest.snapshot, busy: false, sent: false,
+          canConfirm: !!options.confirm && latest.snapshot.content.trim() === unconfirmedContent,
+          error: unchanged(latest, pending) ? (error instanceof Error && error.message ? error.message : '发送失败，请重试') : latest.snapshot.error } });
+      }
+      return false;
+    }
+    const latest = read(taskId);
+    if (!matches(latest, pending)) return false;
+    const sameDraft = unchanged(latest, pending);
+    publish(taskId, { snapshot: { ...latest.snapshot, content: sameDraft ? '' : latest.snapshot.content,
+      busy: false, error: '', sent: sameDraft, canConfirm: false } });
+    // Refresh observers cannot revoke a confirmed receipt or unlock a newer call.
+    try { void Promise.resolve(options.onSent?.(taskId)).catch(() => undefined); }
+    catch { /* Synchronous observer errors do not change delivery evidence. */ }
+    return true;
+  };
+
   return {
     getSnapshot(taskId) { return read(taskId).snapshot; },
     subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     setContent(taskId, content) {
       const current = read(taskId);
-      publish(taskId, { ...current, snapshot: { ...current.snapshot, content, revision: current.snapshot.revision + 1, error: '', sent: false } });
+      publish(taskId, { ...current, snapshot: { ...current.snapshot, content, revision: current.snapshot.revision + 1, error: '', sent: false,
+        canConfirm: !!options.confirm && current.unconfirmedContent === content.trim() } });
     },
-    async send(taskId, admission = {}) {
-      const current = read(taskId);
-      if (current.pending || admission.allowed === false || !current.snapshot.content.trim()) return false;
-      const pending: PendingMessage = { operationId: ++sequence, content: current.snapshot.content, revision: current.snapshot.revision };
-      // Install the per-task lock synchronously, before invoking user transport
-      // or awaiting anything, so remounts and repeated submit events share it.
-      publish(taskId, { pending, snapshot: { ...current.snapshot, busy: true, error: '', sent: false } });
-      try {
-        await options.send(taskId, pending.content.trim());
-      } catch (error) {
-        const latest = read(taskId);
-        if (matches(latest, pending)) {
-          publish(taskId, { snapshot: { ...latest.snapshot, busy: false, sent: false,
-            error: unchanged(latest, pending) ? (error instanceof Error && error.message ? error.message : '发送失败，请重试') : latest.snapshot.error } });
-        }
-        return false;
-      }
-      const latest = read(taskId);
-      if (!matches(latest, pending)) return false;
-      const sameDraft = unchanged(latest, pending);
-      publish(taskId, { snapshot: { ...latest.snapshot, content: sameDraft ? '' : latest.snapshot.content, busy: false, error: '', sent: sameDraft } });
-      // Delivery is already confirmed. A refresh/observer failure must not turn
-      // it into an uncertain send, and no old completion writes after observers.
-      try { void Promise.resolve(options.onSent?.(taskId)).catch(() => undefined); }
-      catch { /* A synchronous observer error cannot revoke confirmed delivery. */ }
-      return true;
-    },
+    send(taskId, admission = {}) { return deliver(taskId, admission.allowed !== false, false); },
+    confirm(taskId) { return deliver(taskId, true, true); },
   };
 }
 
