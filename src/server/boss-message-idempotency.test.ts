@@ -35,6 +35,7 @@ async function fixture(legacy = false) {
     return { status: response.status, body: await response.json() as BossMessage & { error?: string } };
   };
   return { task, post, database, get store() { return store; },
+    async detail() { return (await fetch(`${url}/api/tasks/${task.id}`)).json() as Promise<{ bossMessageAdmission: string }>; },
     async reopen() { await stop(); store = new TaskStore(database); server = serve(); url = await listen(); },
     async close() { await stop(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); },
   };
@@ -54,6 +55,23 @@ test('concurrent Boss message retries persist one exact message and replay after
     f.store.fail(f.task.id, 'reviewing', 'Fixture finished', 'owner');
     assert.deepEqual((await f.post('Please verify export too')).body, replies[0]!.body);
     assert.equal(f.store.bossMessages(f.task.id).length, 1);
+  } finally { await f.close(); }
+});
+
+test('task detail distinguishes writable quota waiting from frozen review waiting for the message composer', async () => {
+  const f = await fixture();
+  try {
+    assert.equal((await f.detail()).bossMessageAdmission, 'open');
+    f.store.claimNext('owner');
+    f.store.pauseForQuota(f.task.id, 'owner', { retryAt: new Date(Date.now() + 60_000).toISOString(),
+      reason: 'Synthetic persisted review-quota checkpoint for HTTP projection', checkpoint: { kind: 'review_quota', stage: 'review' } });
+    assert.equal((await f.detail()).bossMessageAdmission, 'closed');
+    assert.equal((await f.post('Must not enter frozen acceptance')).status, 409);
+    const other = f.store.submit({ repoPath: '.', baseRef: 'HEAD', prompt: 'Writer quota fixture', boss: { preference: '' } });
+    f.store.claimNext('other-owner');
+    f.store.pauseForQuota(other.id, 'other-owner', { retryAt: new Date(Date.now() + 60_000).toISOString(),
+      reason: 'Writer quota', checkpoint: { stage: 'execute' } });
+    assert.equal((await f.post('Read this at the next writable boundary', 'writer-quota-http-0001', other.id)).status, 201);
   } finally { await f.close(); }
 });
 

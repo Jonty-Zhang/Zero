@@ -25,6 +25,7 @@ import type {
 import { HANDOFF_V1_MAX_BYTES, parseHandoffV1 } from "../domain/handoff.js";
 import { IdempotencyConflictError, validateSubmissionKey } from "./submission-idempotency.js";
 import { buildGoalRevisionDraft, GoalRevisionCapacityError } from "../domain/goal-revision.js";
+import { assertReviewRequirements, canAcceptNewBossMessage, type ReviewRequirementsSnapshot } from "../domain/review-requirements.js";
 
 type Json = string | null;
 type TaskRow = {
@@ -106,6 +107,7 @@ export interface ReviewPackageRecord {
   checkDefinitionHash: string;
   expectedCheckIds: string[];
   createdAt: string;
+  requirements?: ReviewRequirementsSnapshot;
 }
 
 export interface PackageReviewVerdictRecord {
@@ -691,6 +693,21 @@ export class TaskStore {
       CREATE INDEX IF NOT EXISTS review_packages_task_created ON review_packages(task_id, created_at, id);
       CREATE TRIGGER IF NOT EXISTS review_packages_no_update BEFORE UPDATE ON review_packages BEGIN SELECT RAISE(ABORT,'review packages are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS review_packages_no_delete BEFORE DELETE ON review_packages BEGIN SELECT RAISE(ABORT,'review packages are immutable'); END;
+      CREATE TABLE IF NOT EXISTS review_package_requirements (
+        package_id TEXT PRIMARY KEY REFERENCES review_packages(id), payload TEXT NOT NULL
+      );
+      CREATE TRIGGER IF NOT EXISTS review_package_requirements_insert_window BEFORE INSERT ON review_package_requirements
+      WHEN NOT EXISTS (
+        SELECT 1 FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id
+        JOIN tasks t ON t.id=p.task_id WHERE p.id=NEW.package_id AND c.status='running' AND t.status='running'
+          AND t.lease_owner=c.owner AND t.claim_generation_id=c.generation_id
+          AND t.lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          AND p.id=(SELECT id FROM review_packages WHERE task_id=t.id ORDER BY rowid DESC LIMIT 1)
+      ) BEGIN SELECT RAISE(ABORT,'review requirements can only be sealed during check completion'); END;
+      CREATE TRIGGER IF NOT EXISTS review_package_requirements_no_update BEFORE UPDATE ON review_package_requirements
+        BEGIN SELECT RAISE(ABORT,'review requirements are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS review_package_requirements_no_delete BEFORE DELETE ON review_package_requirements
+        BEGIN SELECT RAISE(ABORT,'review requirements are immutable'); END;
       CREATE TABLE IF NOT EXISTS review_verdicts (
         id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), package_id TEXT NOT NULL REFERENCES review_packages(id),
         attempt_id TEXT NOT NULL REFERENCES attempts(id), generation_id TEXT NOT NULL REFERENCES startup_generations(id),
@@ -1064,6 +1081,7 @@ export class TaskStore {
       .get(verdictId, taskId, packageId, taskId, taskId) as Record<string, unknown> | undefined;
     if (!row || row.id !== verdictId || row.package_id !== packageId || row.attempt_status !== "succeeded" ||
         row.attempt_role !== "review" || row.attempt_harness !== "codex" || row.check_status !== "completed") return undefined;
+    this.requireReviewPackageRequirements(packageId);
     let result: ReviewResult;
     let metadata: Record<string, unknown>;
     let snapshot: CheckRunSnapshot;
@@ -1908,8 +1926,9 @@ export class TaskStore {
           return original;
         }
       }
-      if (role === 'user' && (!['pending', 'running', 'revision', 'waiting'].includes(task.status) || this.getTaskCancellation(taskId))) {
-        throw new BossMessageConflictError(task.status === 'reviewing'
+      const sealedReviewWaiting = task.status === 'waiting' && task.resumeCheckpoint?.kind === 'review_quota';
+      if (role === 'user' && (!canAcceptNewBossMessage(task) || this.getTaskCancellation(taskId))) {
+        throw new BossMessageConflictError(task.status === 'reviewing' || sealedReviewWaiting
           ? 'Boss 正在验收本轮结果，暂不能追加要求。请等待验收结束后新建后续任务。'
           : '任务已停止或需要恢复检查，无法继续处理消息。请新建后续任务。');
       }
@@ -2382,6 +2401,8 @@ export class TaskStore {
         FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id
         WHERE p.task_id=? ORDER BY p.rowid DESC LIMIT 1`).get(taskId) as Record<string, unknown> | undefined;
       if (!pkgRow) { reject("Review recovery requires a sealed review package"); return; }
+      try { this.requireReviewPackageRequirements(String(pkgRow.id)); }
+      catch (error) { reject(error instanceof Error ? error.message : 'Review recovery requirements snapshot is invalid', { packageId: pkgRow.id }); return; }
       let packageSnapshot: CheckRunSnapshot;
       let runSnapshot: CheckRunSnapshot;
       let expectedCheckIds: string[];
@@ -2718,6 +2739,7 @@ export class TaskStore {
         WHERE p.id=? AND p.task_id=? AND p.id=(SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1)`)
         .get(input.packageId, taskId, taskId) as { id: string; check_run_id: string; source_generation_id: string } | undefined;
       if (!pkg) throw new Error("Review quota pause must target the latest sealed review package");
+      this.requireReviewPackageRequirements(pkg.id);
       const attempt = this.#db.prepare(`SELECT id,status,role,harness,metadata FROM attempts WHERE id=? AND task_id=?`)
         .get(input.attemptId, taskId) as { id: string; status: string; role: string; harness: string | null; metadata: string | null } | undefined;
       let metadata: Record<string, unknown>;
@@ -2832,6 +2854,7 @@ export class TaskStore {
           pkg.source_generation_id !== checkpoint.sourceGenerationId || pkg.check_status !== "completed" ||
           pkg.snapshot !== pkg.run_snapshot || pkg.check_definition_hash !== pkg.run_check_definition_hash ||
           pkg.expected_check_ids !== pkg.run_expected_check_ids) return;
+      this.requireReviewPackageRequirements(String(pkg.id));
       let snapshot: CheckRunSnapshot;
       try { snapshot = JSON.parse(String(pkg.snapshot)) as CheckRunSnapshot; }
       catch { return; }
@@ -3591,6 +3614,7 @@ export class TaskStore {
       const pkg = this.#db.prepare(`SELECT p.*,c.status AS check_run_status FROM review_packages p
         JOIN check_runs c ON c.id=p.check_run_id WHERE p.id=?`).get(input.packageId) as Record<string, unknown> | undefined;
       if (!pkg || pkg.check_run_status !== "completed") throw new Error("Review requires a current package with a completed check run");
+      this.requireReviewPackageRequirements(input.packageId);
       const latest = this.#db.prepare("SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
         .get(String(pkg.task_id)) as { id: string } | undefined;
       if (!latest || latest.id !== input.packageId) throw new Error("Review package is not current for the task");
@@ -4250,6 +4274,7 @@ export class TaskStore {
         FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id WHERE p.id=?`)
         .get(input.packageId) as Record<string, unknown> | undefined;
       if (!pkg || pkg.check_status !== "completed") throw new Error("Commit intent requires a completed package check run");
+      this.requireReviewPackageRequirements(input.packageId);
       const taskId = String(pkg.task_id);
       this.#assertTaskAcceptsWork(taskId);
       if (input.branchRef !== `refs/heads/zero/${taskId}` || pkg.branch_ref !== input.branchRef) {
@@ -4346,6 +4371,7 @@ export class TaskStore {
         FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id AND c.task_id=p.task_id WHERE p.id=?`)
         .get(input.packageId) as Record<string, unknown> | undefined;
       if (!pkg || pkg.check_status !== "completed") throw new Error("Recovered commit requires a completed package check run");
+      this.requireReviewPackageRequirements(input.packageId);
       const taskId = String(pkg.task_id);
       this.#assertTaskAcceptsWork(taskId);
       const task = this.#db.prepare("SELECT status,lease_owner,lease_expires_at,claim_generation_id,payload FROM tasks WHERE id=?")
@@ -4651,6 +4677,7 @@ export class TaskStore {
       if (!report || report.status !== "complete" || !report.readback_evidence) {
         throw new Error("DONE requires a complete report operation with verified file readback");
       }
+      this.requireReviewPackageRequirements(String(report.package_id));
       if (report.claim_generation_id === input.generationId) {
         this.#assertReportOperationGuard(report, { owner: input.owner, generationId: input.generationId });
       }
@@ -4994,13 +5021,24 @@ export class TaskStore {
       if (rows.length !== expected.length || !sameStringSet(rows.map(row => row.check_id), expected)) throw new Error("Check run does not have exactly one result for every expected check");
       const results = rows.map(row => JSON.parse(row.result) as CheckResult);
       if (results.some(result => result.status !== "passed")) throw new Error("Every expected check must pass before a review package can be created");
+      // The same write transaction closes message admission below. Include every
+      // accepted human message, including requirements received during the last
+      // writer or the checks; consultant text is not promoted to user intent.
+      const userMessages = submission.boss ? this.bossMessages(String(run.task_id)).filter(message => message.role === 'user') : [];
+      const requirements: ReviewRequirementsSnapshot = {
+        version: 1, taskId: String(run.task_id), prompt: submission.prompt,
+        acceptanceCriteria: submission.acceptanceCriteria ?? [], userMessages,
+        ...(userMessages.length ? { messageCursor: userMessages.at(-1)!.id } : {}),
+      };
+      assertReviewRequirements(requirements, String(run.task_id));
       packageId = randomUUID();
-      const updated = this.#db.prepare("UPDATE check_runs SET status='completed',completed_at=? WHERE id=? AND status='running'").run(completedAt, runId);
-      if (Number(updated.changes) !== 1) throw new Error("Check run changed before completion");
       this.#db.prepare(`INSERT INTO review_packages(id,task_id,check_run_id,execution_attempt_id,execution_stage_id,route_attempt_id,
         route,branch_ref,snapshot,check_definition_hash,expected_check_ids,created_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(packageId, String(run.task_id), runId, String(run.execution_attempt_id), String(run.execution_stage_id),
         String(run.route_attempt_id), String(run.route), String(run.branch_ref), String(run.snapshot), String(run.check_definition_hash), String(run.expected_check_ids), completedAt);
+      this.#db.prepare('INSERT INTO review_package_requirements(package_id,payload) VALUES(?,?)').run(packageId, JSON.stringify(requirements));
+      const updated = this.#db.prepare("UPDATE check_runs SET status='completed',completed_at=? WHERE id=? AND status='running'").run(completedAt, runId);
+      if (Number(updated.changes) !== 1) throw new Error("Check run changed before completion");
       const changed = this.#db.prepare(`UPDATE tasks SET status='reviewing',updated_at=?
         WHERE id=? AND status='running' AND lease_owner=? AND claim_generation_id=? AND lease_expires_at>?`)
         .run(completedAt, run.task_id, guard.owner, guard.generationId, completedAt);
@@ -5035,6 +5073,23 @@ export class TaskStore {
   reviewPackages(taskId: string): ReviewPackageRecord[] {
     return (this.#db.prepare("SELECT * FROM review_packages WHERE task_id=? ORDER BY rowid").all(taskId) as Record<string, unknown>[])
       .map(row => this.#reviewPackage(row));
+  }
+
+  /** Required at every active review/commit boundary; historical reads remain compatible. */
+  requireReviewPackageRequirements(packageId: string): ReviewRequirementsSnapshot | undefined {
+    const pkg = this.#db.prepare('SELECT task_id FROM review_packages WHERE id=?').get(packageId) as { task_id: string } | undefined;
+    if (!pkg) throw new Error('Review requirements require an existing sealed package');
+    const row = this.#db.prepare('SELECT payload FROM review_package_requirements WHERE package_id=?').get(packageId) as { payload: string } | undefined;
+    if (!row) {
+      const task = this.#db.prepare('SELECT payload FROM tasks WHERE id=?').get(pkg.task_id) as { payload: string } | undefined;
+      if (task && (JSON.parse(task.payload) as TaskSubmission).boss) {
+        throw new Error('Boss review package has no immutable requirements snapshot; legacy evidence cannot authorize review, rework or commit. Create a fresh task.');
+      }
+      return undefined;
+    }
+    const requirements: unknown = JSON.parse(row.payload);
+    assertReviewRequirements(requirements, pkg.task_id);
+    return requirements;
   }
 
   #validateReviewEvidence(snapshot: CheckRunSnapshot, route: RouteDecision, expectedCheckIds: string[], checkDefinitionHash: string): void {
@@ -5079,6 +5134,7 @@ export class TaskStore {
   }
 
   #assertCommitOperationGuard(operation: Record<string, unknown>, guard: CheckRunGuard): void {
+    this.requireReviewPackageRequirements(String(operation.package_id));
     if (!guard?.owner || !guard.generationId || operation.claim_owner !== guard.owner || operation.claim_generation_id !== guard.generationId) {
       throw new Error("Commit operation guard does not match its owner and generation");
     }
@@ -5095,11 +5151,13 @@ export class TaskStore {
   }
 
   #reviewPackage(row: Record<string, unknown>): ReviewPackageRecord {
+    const annex = this.#db.prepare('SELECT payload FROM review_package_requirements WHERE package_id=?').get(String(row.id)) as { payload: string } | undefined;
     return { id: String(row.id), taskId: String(row.task_id), checkRunId: String(row.check_run_id),
       executionAttemptId: String(row.execution_attempt_id), executionStageId: String(row.execution_stage_id), routeAttemptId: String(row.route_attempt_id),
       route: JSON.parse(String(row.route)) as RouteDecision, branchRef: String(row.branch_ref),
       snapshot: JSON.parse(String(row.snapshot)) as CheckRunSnapshot, checkDefinitionHash: String(row.check_definition_hash),
-      expectedCheckIds: JSON.parse(String(row.expected_check_ids)) as string[], createdAt: String(row.created_at) };
+      expectedCheckIds: JSON.parse(String(row.expected_check_ids)) as string[], createdAt: String(row.created_at),
+      ...(annex ? { requirements: JSON.parse(annex.payload) as ReviewRequirementsSnapshot } : {}) };
   }
 
   #packageReviewVerdict(row: Record<string, unknown>): PackageReviewVerdictRecord {
@@ -5138,6 +5196,7 @@ export class TaskStore {
   }
 
   #assertReportOperationGuard(operation: Record<string, unknown>, guard: CheckRunGuard): void {
+    this.requireReviewPackageRequirements(String(operation.package_id));
     if (!guard?.owner || !guard.generationId || operation.claim_owner !== guard.owner || operation.claim_generation_id !== guard.generationId) {
       throw new Error("Report operation guard does not match its current owner and generation");
     }

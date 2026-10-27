@@ -31,6 +31,7 @@ import { TestRunner } from "../core/test-runner.js";
 import { QuotaLimitError, quotaRetryAt } from "../core/quota.js";
 import { boundExecutorSummary, HANDOFF_V1_MAX_BYTES, renderHandoffContext } from "../domain/handoff.js";
 import type { BossOrchestrator } from './boss.js';
+import type { ReviewRequirementsSnapshot } from '../domain/review-requirements.js';
 
 type ResumeStage = "route" | "execute" | "review";
 interface ReviewReworkRunContext {
@@ -96,7 +97,8 @@ export interface ReviewExecution {
 
 export interface TaskReviewer {
   /** Must run a new read-only Codex session and return a schema-validated verdict. */
-  review(task: TaskRecord, worktree: WorktreeInfo, route: RouteDecision, checks: CheckResult[], diff: string, context: { attemptId: string }): Promise<ReviewExecution>;
+  review(task: TaskRecord, worktree: WorktreeInfo, route: RouteDecision, checks: CheckResult[], diff: string,
+    context: { attemptId: string; requirements?: ReviewRequirementsSnapshot }): Promise<ReviewExecution>;
 }
 
 export interface TaskWorkerOptions {
@@ -1109,6 +1111,10 @@ export class TaskWorker {
         if (!reviewPackage && !legacyReviewCheckpoint) {
           throw new Error("Current review has no sealed package; refusing to persist a passing verdict");
         }
+        if (task.boss && !reviewPackage) {
+          throw new Error("Boss review requires a sealed review requirements snapshot; legacy checkpoints cannot authorize review");
+        }
+        const requirements = reviewPackage ? this.#options.store.requireReviewPackageRequirements(reviewPackage.id) : undefined;
         const reviewAttempt = this.#options.store.createAttempt(taskId, "review", {
           owner, harness: "codex",
           ...(reviewPackage ? { metadata: { packageId: reviewPackage.id, generationId } } : {}),
@@ -1118,7 +1124,8 @@ export class TaskWorker {
         active.attempt = reviewAttempt;
         let packageVerdictId: string | undefined;
         this.#assertNotCancelled(active);
-        const review = await this.#options.reviewer.review(task, worktree, route, finalChecks, reviewSnapshot.diff, { attemptId: reviewAttempt.id });
+        const review = await this.#options.reviewer.review(task, worktree, route, finalChecks, reviewSnapshot.diff,
+          { attemptId: reviewAttempt.id, requirements });
         const reviewAfter = await this.#options.worktrees.captureReviewSnapshot(worktree);
         const branchAfterReview = await this.#options.worktrees.readTaskBranchHead(worktree);
         if (!sameFullReviewSnapshot(reviewSnapshot, reviewAfter)
@@ -1550,6 +1557,9 @@ export class TaskWorker {
       this.#assertLease(taskId, owner, () => leaseLost);
       const latestPackage = this.#options.store.reviewPackages(taskId).at(-1);
       if (!latestPackage || latestPackage.id !== reviewPackage.id) throw new Error("Review recovery package is no longer the latest sealed package");
+      // This also gates saved PASS and existing commit-operation recovery, which
+      // intentionally skip a new model call but must retain the same contract.
+      const requirements = this.#options.store.requireReviewPackageRequirements(reviewPackage.id);
       const checks = this.#options.store.checkRunResults(reviewPackage.checkRunId);
       const savedVerdict = this.#options.store.packageReviewVerdicts(taskId).at(-1);
       if (savedVerdict?.packageId === reviewPackage.id && savedVerdict.result.verdict === "blocked") {
@@ -1576,7 +1586,8 @@ export class TaskWorker {
         activeWithAttempt.adapter = this.#options.adapters.get("codex");
         activeWithAttempt.attempt = reviewAttempt;
         this.#assertNotCancelled(active);
-        const review = await this.#options.reviewer.review(task, worktree, reviewPackage.route, checks, before.diff, { attemptId: reviewAttempt.id });
+        const review = await this.#options.reviewer.review(task, worktree, reviewPackage.route, checks, before.diff,
+          { attemptId: reviewAttempt.id, requirements });
         this.#assertNotCancelled(active);
         this.#assertLease(taskId, owner, () => leaseLost);
         const after = await this.#options.worktrees.captureReviewSnapshot(worktree);
@@ -1846,6 +1857,7 @@ export class TaskWorker {
     if (!samePackageSnapshot(pkg.snapshot, current)) {
       throw new Error("Current Git snapshot does not match the sealed review package");
     }
+    this.#options.store.requireReviewPackageRequirements(pkg.id);
     return pkg;
   }
 

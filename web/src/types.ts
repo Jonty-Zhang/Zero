@@ -68,6 +68,7 @@ export type Task = {
   stages?: ExecutionStage[];
   handoffs?: Handoff[];
   boss?: { preference: string };
+  bossMessageAdmission?: 'open' | 'closed';
   bossPlan?: { summary: string; acceptanceCriteria: string[]; stages: Array<{ objective: string; harness?: string; model?: string; reasoningEffort?: string }>; checks: Array<{ id: string; argv: string[] }>; maxRevisions: number; boss?: { harness: string; model: string; reasoningEffort?: string } };
   bossMessages?: Array<{ id: string; role: 'user' | 'boss' | 'consultant'; content: string; at: string; model?: string; harness?: string }>;
   delivery?: { path: string; branch: string; resultCommit?: string };

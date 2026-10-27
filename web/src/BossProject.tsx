@@ -143,7 +143,7 @@ export function BossProgress({ task, onMessage }: { task: Task; onMessage: () =>
   const [sent, setSent] = useState(false);
   const sending = useRef(false);
   const terminal = ['done', 'failed', 'recovery_required'].includes(task.status);
-  const canMessage = ['pending', 'running', 'revision', 'waiting'].includes(task.status);
+  const canMessage = ['pending', 'running', 'revision', 'waiting'].includes(task.status) && task.bossMessageAdmission !== 'closed';
   if (!task.boss && !task.bossPlan && !task.bossMessages?.length) return null;
   const send = async (event: FormEvent) => {
     event.preventDefault(); if (sending.current || !canMessage || !content.trim()) return;
@@ -167,7 +167,7 @@ export function BossProgress({ task, onMessage }: { task: Task; onMessage: () =>
       <div className="boss-message-list">{(task.bossMessages ?? []).map(message => <article key={message.id} className={`boss-message ${message.role}`}><header className="boss-message-meta"><b>{message.role === 'user' ? '你' : message.role === 'consultant' ? '顾问' : 'Boss'}</b><span>{[message.harness, message.model].filter(Boolean).join(' · ')}</span><time dateTime={message.at} title={new Date(message.at).toLocaleString('zh-CN')}>{new Date(message.at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</time></header><RichText>{message.content}</RichText></article>)}</div>
       <form onSubmit={send} className="boss-message-form" aria-disabled={!canMessage}>
         <label className="field"><span className="field-label">给 Boss 补充信息或提问</span><textarea rows={3} maxLength={16000} disabled={busy || !canMessage} value={content} onChange={e => { setContent(e.target.value); setSent(false); }} placeholder="补充要求或提问…" /></label>
-        <div className="boss-message-actions"><p className="boss-message-status">{terminal ? '任务已结束。继续工作请新建后续任务。' : !canMessage ? '正在验收。新要求请在验收后新建后续任务。' : '消息将在下个安全处理点读取。'}</p><button className="button secondary" type="submit" disabled={busy || !canMessage || !content.trim()}>{busy ? '发送中…' : '发送给 Boss'}<Send size={14} /></button></div>
+        <div className="boss-message-actions"><p className="boss-message-status">{terminal ? '任务已结束。继续工作请新建后续任务。' : !canMessage ? (task.status === 'waiting' ? '验收已暂停，要求已封存。新要求请新建后续任务。' : '正在验收。新要求请在验收后新建后续任务。') : '消息将在下个安全处理点读取。'}</p><button className="button secondary" type="submit" disabled={busy || !canMessage || !content.trim()}>{busy ? '发送中…' : '发送给 Boss'}<Send size={14} /></button></div>
         {sent && <p role="status" className="boss-message-receipt">已发送，等待处理。</p>}{error && <p role="alert" className="folder-error">{error}</p>}
       </form>
     </section>

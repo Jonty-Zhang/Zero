@@ -15,6 +15,7 @@ import { DshAdapter } from '../adapters/dsh.js';
 import { ZCodeCompositeAdapter } from '../adapters/zcode-composite.js';
 import type { ModelBinding } from '../adapters/types.js';
 import type { Attempt, CheckDefinition, CheckResult, ExecutionSelection, HandoffRecord, HarnessAdapter, ReviewResult, RouteDecision, SequenceGoalReview, StageRecord, TaskEvent, TaskRecord, TaskSequenceMetadata, TaskSequenceRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
+import { canAcceptNewBossMessage } from '../domain/review-requirements.js';
 
 type HarnessName = 'codex' | 'dsh' | 'zcode';
 export type AdapterMap = Partial<Record<HarnessName, HarnessAdapter>>;
@@ -680,6 +681,7 @@ function mapTaskList(task: TaskRecord) {
   return { id: task.id, title: task.prompt.split(/\r?\n/, 1)[0]?.slice(0, 100), status: task.status,
     repoPath: task.repoPath, baseRef: task.baseRef, createdAt: task.createdAt, updatedAt: task.updatedAt,
     boss: task.boss, bossPlan: task.bossPlan,
+    bossMessageAdmission: task.boss ? (canAcceptNewBossMessage(task) ? 'open' : 'closed') : undefined,
     maxRevisions: task.maxRevisions, route: route ? mapRoute(route as unknown as Record<string, unknown>) : undefined,
     retryAt: task.status === 'waiting' ? task.retryAt : undefined, error: task.failureReason,
     recoveryReason: task.recoveryReason, recoveryEvidence: task.recoveryEvidence };
