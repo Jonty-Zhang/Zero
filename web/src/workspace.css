@@ -297,6 +297,32 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
   font-size:14px;
   line-height:1.65
 }
+.harness-health-copy { min-width:0; flex:1; }
+.harness-diagnostic summary {
+  display:flex;
+  align-items:center;
+  gap:6px;
+  margin-top:2px;
+  color:var(--muted);
+  font-size:14px;
+  line-height:1.65;
+  list-style:none;
+  cursor:pointer;
+}
+.harness-diagnostic summary::-webkit-details-marker { display:none; }
+.harness-diagnostic summary svg { flex-shrink:0; }
+.harness-diagnostic[open] summary svg { transform:rotate(180deg); }
+.harness-diagnostic p {
+  margin:10px 0 0;
+  color:var(--muted);
+  font-size:14px;
+  line-height:1.8;
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+}
+.harness-strip:has(.harness-diagnostic[open]) { align-items:start; }
+.harness-health:has(.harness-diagnostic[open]) { align-items:flex-start; }
+.harness-health:has(.harness-diagnostic[open]) > .health-indicator { margin-top:8px; }
 .health-check {
   color:#407154
 }

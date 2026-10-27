@@ -47,6 +47,97 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
+describe('expandable Agent readiness diagnostics', () => {
+  const unavailableAgents = [
+    { id: 'codex', name: 'Codex', available: false, reason: 'CLI 可运行，但没有完成真实调用验证的模型绑定' },
+    { id: 'dsh', name: 'DSH', available: false, reason: 'Could not start process: spawn dsh ENOENT' },
+    { id: 'zcode', name: 'ZCode', available: false, reason: 'Could not start process: spawn zcode ENOENT; ZCode app-server requires an absolute JavaScript CLI entry' },
+  ];
+  const readiness = (harnesses = unavailableAgents) => ({ ...capability, harnesses });
+  it.each(unavailableAgents)('lets the user expand the entire original $name diagnostic without invoking an Agent', async agent => {
+    vi.mocked(api.capabilities).mockResolvedValue(readiness());
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    const summary = screen.getByLabelText(`查看 ${agent.name} 未就绪原因`);
+    expect(summary.tagName).toBe('SUMMARY');
+    expect(summary.textContent).toContain('未就绪 · 查看原因');
+    const details = summary.closest('details')!;
+    expect(details.classList.contains('harness-diagnostic')).toBe(true);
+    expect(details.open).toBe(false);
+    fireEvent.click(summary);
+    expect(details.open).toBe(true);
+    expect(within(details).getByText(agent.reason, { selector: 'p' }).textContent).toBe(agent.reason);
+    expect(api.capabilities).toHaveBeenCalledTimes(1);
+    expect(api.task).not.toHaveBeenCalled();
+    expect(api.createTask).not.toHaveBeenCalled();
+    expect(api.saveConfig).not.toHaveBeenCalled();
+  });
+  it('provides a complete fallback diagnostic when no Harness configuration was recorded', async () => {
+    vi.mocked(api.capabilities).mockResolvedValue({ ...capability, harnesses: [] });
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    for (const name of ['Codex', 'DSH', 'ZCode']) {
+      const summary = screen.getByLabelText(`查看 ${name} 未就绪原因`);
+      fireEvent.click(summary);
+      expect(within(summary.closest('details')!).getByText('未检测到可用配置', { selector: 'p' })).toBeTruthy();
+    }
+    expect(api.capabilities).toHaveBeenCalledTimes(1);
+    expect(api.createTask).not.toHaveBeenCalled();
+  });
+  it('keeps an available Agent marked usable without a failure diagnostic entry', async () => {
+    vi.mocked(api.capabilities).mockResolvedValue(capability);
+    render(<App />);
+    await screen.findByText('修复登录回调');
+    const card = screen.getByText('Codex').closest('.harness-health')! as HTMLElement;
+    expect(within(card).getByText('可用')).toBeTruthy();
+    expect(within(card).queryByLabelText('查看 Codex 未就绪原因')).toBeNull();
+    expect(card.querySelector('details')).toBeNull();
+  });
+  it('preserves the expanded native details across polling while replacing the full original reason', async () => {
+    vi.useFakeTimers();
+    const updatedReason = '新的完整诊断：已发现 CLI，但 verified lead 缺少当前版本证明；请保留本句末尾原因。';
+    vi.mocked(api.capabilities).mockResolvedValueOnce(readiness()).mockResolvedValue(readiness(unavailableAgents.map(agent => agent.id === 'codex' ? { ...agent, reason: updatedReason } : agent)));
+    render(<App />);
+    await act(async () => {});
+    const summary = screen.getByLabelText('查看 Codex 未就绪原因');
+    const details = summary.closest('details')!;
+    fireEvent.click(summary);
+    expect(details.open).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+    expect(api.capabilities).toHaveBeenCalledTimes(2);
+    expect(screen.getByLabelText('查看 Codex 未就绪原因').closest('details')).toBe(details);
+    expect(details.open).toBe(true);
+    expect(within(details).getByText(updatedReason, { selector: 'p' }).textContent).toBe(updatedReason);
+    expect(within(details).queryByText(unavailableAgents[0]!.reason)).toBeNull();
+    expect(api.createTask).not.toHaveBeenCalled();
+  });
+  it('removes the prior failure reason when the same Agent becomes available', async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.capabilities).mockResolvedValueOnce(readiness()).mockResolvedValue({ ...capability, harnesses: [{ id: 'codex', name: 'Codex', available: true }] });
+    render(<App />);
+    await act(async () => {});
+    const summary = screen.getByLabelText('查看 Codex 未就绪原因');
+    fireEvent.click(summary);
+    expect(summary.closest('details')!.open).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+    expect(api.capabilities).toHaveBeenCalledTimes(2);
+    const card = screen.getByText('Codex').closest('.harness-health')! as HTMLElement;
+    expect(within(card).getByText('可用')).toBeTruthy();
+    expect(within(card).queryByLabelText('查看 Codex 未就绪原因')).toBeNull();
+    expect(within(card).queryByText(unavailableAgents[0]!.reason)).toBeNull();
+  });
+  it('retains a capability API failure as one global error without inventing per-Agent configuration failures', async () => {
+    vi.mocked(api.capabilities).mockRejectedValue(new Error('capabilities-503-observed'));
+    render(<App />);
+    expect(await screen.findByText(/能力检查失败：capabilities-503-observed/)).toBeTruthy();
+    const strip = screen.getByRole('region', { name: 'Agent 连接状态' });
+    expect(within(strip).queryAllByText('未检测到可用配置')).toHaveLength(0);
+    expect(strip.querySelectorAll('details')).toHaveLength(0);
+    expect(strip.querySelectorAll('.harness-health')).toHaveLength(0);
+    expect(api.createTask).not.toHaveBeenCalled();
+  });
+});
+
 describe('task drawer focus after workspace polling', () => {
   it.each([
     { label: 'replaces the opener task with another task', nextTasks: [tasks[1]!] },

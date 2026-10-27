@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { Activity, Search, LayoutList, Columns3, Layers3, AlertCircle, ArrowDown, ArrowRight, ArrowUp, Check, CheckCircle2, ChevronDown, CircleHelp, Clock3, Code2, FileText, FolderGit2, ListOrdered, LoaderCircle, Plus, RefreshCw, Settings2, ShieldCheck, Target, TerminalSquare, X, XCircle } from 'lucide-react';
+import { Activity, Search, LayoutList, Columns3, Layers3, AlertCircle, ArrowDown, ArrowRight, ArrowUp, Check, CheckCircle2, ChevronDown, Clock3, Code2, FileText, FolderGit2, ListOrdered, LoaderCircle, Plus, RefreshCw, Settings2, ShieldCheck, Target, TerminalSquare, X, XCircle } from 'lucide-react';
 import { api } from './api';
 import { RichText } from './RichText';
 import { TaskLead } from './TaskLead';
@@ -138,7 +138,13 @@ function TaskTable({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: string) => v
 function HarnessStrip({ harnesses, error }: { harnesses: HarnessHealth[]; error: string }) {
   const order = ['codex', 'dsh', 'zcode'];
   return <section className="harness-strip" aria-label="Agent 连接状态"><div className="strip-title"><div className="strip-icon"><Code2 size={16} /></div><div><b>Agent 连接</b></div></div>
-    {error ? <div className="strip-error"><AlertCircle size={15} />能力检查失败：{error}</div> : order.map(id => { const item = harnesses.find(h => h.id.toLowerCase() === id); const name = item?.name || ({ codex: 'Codex', dsh: 'DSH', zcode: 'ZCode' }[id]); return <div className="harness-health" key={id}><span className={`health-indicator ${item?.available ? 'ok' : 'off'}`} /><div><b>{name}</b><small>{item?.available ? '可用' : item?.reason || '未检测到可用配置'}</small></div>{item?.available ? <Check size={14} className="health-check" /> : <CircleHelp size={14} className="health-help" />}</div>; })}
+    {error ? <div className="strip-error"><AlertCircle size={15} />能力检查失败：{error}</div> : order.map(id => {
+      const item = harnesses.find(h => h.id.toLowerCase() === id);
+      const name = item?.name || ({ codex: 'Codex', dsh: 'DSH', zcode: 'ZCode' }[id]);
+      return <div className="harness-health" key={id}><span className={`health-indicator ${item?.available ? 'ok' : 'off'}`} /><div className="harness-health-copy"><b>{name}</b>
+        {item?.available ? <small>可用</small> : <details className="harness-diagnostic"><summary aria-label={`查看 ${name} 未就绪原因`}>未就绪 · 查看原因<ChevronDown size={14} aria-hidden="true" /></summary><p>{item?.reason || '未检测到可用配置'}</p></details>}
+      </div>{item?.available && <Check size={14} className="health-check" />}</div>;
+    })}
   </section>;
 }
 
