@@ -164,6 +164,9 @@ export interface CreateCommitOperationInput {
   diffHash: string;
   message: string;
   timestamp: string;
+  /** Selection hint only; Store independently verifies the latest durable quota claim. */
+  sameGenerationReviewQuota?: { kind: 'quota'; packageId: string; owner: string; generationId: string; claimId?: string };
+  preCommitInspection?: { checkedAt: string; branchRef: string; head: string; snapshot: CheckRunSnapshot };
 }
 
 export interface CreateRecoveredCommitOperationInput extends CreateCommitOperationInput {
@@ -4282,7 +4285,7 @@ export class TaskStore {
     }
     const createdAt = new Date().toISOString();
     this.#transaction(() => {
-      const pkg = this.#db.prepare(`SELECT p.*,c.status AS check_status,c.expected_check_ids AS run_expected_check_ids,
+      const pkg = this.#db.prepare(`SELECT p.*,c.status AS check_status,c.generation_id AS source_generation_id,c.owner AS source_owner,c.expected_check_ids AS run_expected_check_ids,
         c.check_definition_hash AS run_check_definition_hash,c.snapshot AS run_snapshot
         FROM review_packages p JOIN check_runs c ON c.id=p.check_run_id WHERE p.id=?`)
         .get(input.packageId) as Record<string, unknown> | undefined;
@@ -4317,7 +4320,7 @@ export class TaskStore {
           !sameStringSet(submittedChecks.map(check => check.id), packageCheckIds)) {
         throw new Error("Commit intent check definitions do not match the submitted task checks");
       }
-      const verdictRow = this.#db.prepare(`SELECT v.*,a.status AS attempt_status,a.role AS attempt_role,a.harness AS attempt_harness,
+      const verdictRow = this.#db.prepare(`SELECT v.*,a.status AS attempt_status,a.role AS attempt_role,a.harness AS attempt_harness,a.exit_code AS attempt_exit_code,a.error AS attempt_error,
         a.metadata AS attempt_metadata FROM review_verdicts v JOIN attempts a ON a.id=v.attempt_id WHERE v.id=? AND v.package_id=?`)
         .get(input.verdictId, input.packageId) as Record<string, unknown> | undefined;
       if (!verdictRow || verdictRow.task_id !== taskId || verdictRow.generation_id !== input.generationId ||
@@ -4344,6 +4347,7 @@ export class TaskStore {
           expectedCheckIds.some(id => !checkResults.some(check => check.id === id && check.status === "passed" && check.exitCode === 0))) {
         throw new Error("Commit intent requires the complete passing check result set");
       }
+      this.#authorizeNormalQuotaCommit(input, pkg, verdictRow);
       this.#db.prepare(`INSERT INTO commit_operations(id,task_id,package_id,verdict_id,generation_id,owner,claim_owner,claim_generation_id,branch_ref,pre_head,tree_id,diff_hash,
         message,timestamp,author_name,author_email,committer_name,committer_email,encoding,status,created_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'intent',?)`).run(operationId, taskId, input.packageId, input.verdictId,
@@ -4354,6 +4358,96 @@ export class TaskStore {
         branchRef: input.branchRef, preHead: input.preHead.toLowerCase(), treeId: input.treeId.toLowerCase(), diffHash: input.diffHash }, createdAt);
     });
     return this.getCommitOperation(operationId)!;
+  }
+
+  /** Runs inside normal intent insertion's transaction; caller proof never grants authority. */
+  #authorizeNormalQuotaCommit(input: CreateCommitOperationInput, pkg: Record<string, unknown>, verdict: Record<string, unknown>): void {
+    const taskId = String(pkg.task_id);
+    const events = this.events(taskId);
+    const claim = events.filter(event => event.type === 'task.claimed').at(-1);
+    const resume = events.filter(event => event.type === 'task.review_quota_resumed').at(-1);
+    const proof = input.sameGenerationReviewQuota;
+    const quotaClaim = ['review_quota', 'review_quota_resume'].includes(String(claim?.payload?.recovery));
+    if (!proof && !resume && !quotaClaim) return;
+
+    // A bounded reviewer revision can create a later package under the same
+    // claim. Its actual sealed/check/rework events, not an ID mismatch alone,
+    // establish a new normal execution epoch after quota recovery.
+    if (!proof && resume && resume.payload?.packageId !== pkg.id
+        && this.#isPostQuotaReworkPackage(input, pkg, resume, events)) return;
+
+    const fail = (detail: string): never => { throw new Error(`Same-generation review quota commit ${detail}`); };
+    if (!proof || proof.kind !== 'quota' || proof.packageId !== pkg.id || proof.owner !== input.owner
+        || proof.generationId !== input.generationId || proof.claimId !== undefined) fail('requires its exact full quota proof');
+    if (input.generationId !== this.#startupGeneration.id || pkg.source_generation_id !== input.generationId
+        || this.reviewRecoveryClaims(taskId).length !== 0) fail('cannot replace historical or cross-generation recovery authorization');
+    if (!claim || !resume || claim.id >= resume.id || claim.payload?.recovery !== 'review_quota_resume'
+        || claim.payload.owner !== input.owner || claim.payload.generationId !== input.generationId
+        || claim.payload.leaseProtocolVersion !== 2) fail('does not match the latest live quota claim');
+    const resumed = resume!.payload;
+    if (!resumed || resumed.packageId !== pkg.id || resumed.checkRunId !== pkg.check_run_id
+        || resumed.owner !== input.owner || resumed.generationId !== input.generationId
+        || resumed.priorGenerationId !== input.generationId || resumed.recoveredGeneration !== false
+        || resumed.reviewRecoveryClaimId !== undefined) fail('does not match the latest original-generation quota resume event');
+    const latestVerdict = this.packageReviewVerdicts(taskId).at(-1);
+    const starts = events.filter(event => event.type === 'attempt.started'
+      && (event.payload?.attempt as Record<string, unknown> | undefined)?.id === verdict.attempt_id);
+    const finished = events.filter(event => event.type === 'review.finished' && event.payload?.attemptId === verdict.attempt_id);
+    if (!latestVerdict || latestVerdict.id !== input.verdictId || verdict.generation_id !== input.generationId
+        || verdict.attempt_exit_code !== 0 || (typeof verdict.attempt_error === 'string' && verdict.attempt_error.trim())
+        || starts.length !== 1 || finished.length !== 1 || starts[0]!.id <= resume!.id || finished[0]!.id <= starts[0]!.id
+        || this.#reviewVerdictOwner(taskId, String(verdict.attempt_id), input.packageId, input.generationId) !== input.owner) {
+      fail('requires a fresh successful atomic PASS from the current resumed owner');
+    }
+    const started = starts[0]!.payload?.attempt as Record<string, unknown>;
+    const metadata = started?.metadata as Record<string, unknown> | undefined;
+    const ended = finished[0]!.payload;
+    if (started.role !== 'review' || started.harness !== 'codex' || metadata?.packageId !== pkg.id
+        || metadata?.generationId !== input.generationId || ended?.packageId !== pkg.id
+        || ended?.generationId !== input.generationId || ended?.owner !== input.owner
+        || JSON.stringify(ended?.result) !== String(verdict.result)) fail('has inconsistent review attempt or completion evidence');
+    const inspection = input.preCommitInspection;
+    if (!inspection || !inspection.snapshot || inspection.branchRef !== pkg.branch_ref
+        || inspection.head?.toLowerCase() !== input.preHead.toLowerCase()
+        || !sameReviewRecoverySnapshot(inspection.snapshot, JSON.parse(String(pkg.snapshot)) as CheckRunSnapshot)) {
+      fail('requires a fresh full exact pre-commit inspection');
+    }
+    this.#assertFreshRecoveryCheck(inspection!.checkedAt, new Date());
+    if (this.commitOperations(taskId).length || this.reportOperations(taskId).length) fail('cannot create another commit or report operation');
+  }
+
+  #isPostQuotaReworkPackage(input: CreateCommitOperationInput, pkg: Record<string, unknown>, resume: TaskEvent, events: TaskEvent[]): boolean {
+    const taskId = String(pkg.task_id);
+    const claim = events.filter(event => event.type === 'task.claimed').at(-1);
+    const continuation = this.getReviewReworkContinuation(taskId);
+    const verdict = continuation && this.getPackageReviewVerdict(continuation.verdictId);
+    const begun = continuation && events.find(event => event.type === 'task.review_rework_begun'
+      && event.payload?.id === continuation.id && JSON.stringify(event.payload) === JSON.stringify(continuation));
+    const completed = events.filter(event => event.type === 'check_run.completed'
+      && event.payload?.checkRunId === pkg.check_run_id && event.payload?.reviewPackageId === pkg.id);
+    const created = events.filter(event => event.type === 'review_package.created'
+      && event.payload?.reviewPackageId === pkg.id && event.payload?.checkRunId === pkg.check_run_id);
+    const reworkResume = events.filter(event => event.type === 'task.review_rework_quota_resumed').at(-1);
+    const hasRecoveryClaims = continuation && Boolean(this.#db.prepare('SELECT 1 FROM rework_continuation_claims WHERE continuation_id=? LIMIT 1').get(continuation.id));
+    const continuationOwned = continuation && (hasRecoveryClaims
+      ? this.#verifiedReworkClaimChain(continuation, input.generationId, input.owner)
+      : continuation.beginGenerationId === input.generationId
+        && this.#taskClaimOwnersForGeneration(taskId, input.generationId).has(continuation.owner)
+        && (continuation.owner === input.owner || (claim?.payload?.recovery === 'review_rework_quota_resume'
+          && reworkResume && reworkResume.id > claim.id && reworkResume.payload?.continuationId === continuation.id
+          && reworkResume.payload.packageId === continuation.packageId && reworkResume.payload.verdictId === continuation.verdictId
+          && reworkResume.payload.owner === input.owner && reworkResume.payload.generationId === input.generationId
+          && reworkResume.payload.priorGenerationId === input.generationId && reworkResume.payload.recoveredGeneration === false
+          && reworkResume.payload.claimId === undefined)));
+    const passingVerdict = this.getPackageReviewVerdict(input.verdictId);
+    return Boolean(claim && claim.payload?.owner === input.owner && claim.payload.generationId === input.generationId
+      && pkg.source_generation_id === input.generationId && pkg.source_owner === input.owner
+      && continuation && verdict?.result.verdict === 'changes_requested' && verdict.packageId === continuation.packageId
+      && continuationOwned && passingVerdict
+      && this.#reviewVerdictOwner(taskId, passingVerdict.attemptId, input.packageId, input.generationId) === input.owner
+      && begun && begun.id > resume.id && completed.length === 1 && created.length === 1
+      && completed[0]!.id > begun.id && completed[0]!.id > claim.id
+      && (!reworkResume || completed[0]!.id > reworkResume.id) && created[0]!.id > completed[0]!.id);
   }
 
   /** Explicitly resumes commit intent from a pass verdict made in this task's verified recovery chain. */

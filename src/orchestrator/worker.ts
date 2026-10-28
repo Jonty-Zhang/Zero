@@ -385,7 +385,7 @@ export class TaskWorker {
 
   async #resumeReviewAndContinue(taskId: string, owner: string, recoveryClaimId: string | undefined,
     worktree: WorktreeInfo, reviewPackage: ReviewPackageRecord, reviewRecoveryProof: NonNullable<ReviewReworkRunContext["reviewRecoveryProof"]>): Promise<TaskRecord> {
-    const result = await this.#resumeReviewRecovery(taskId, owner, recoveryClaimId, worktree, reviewPackage);
+    const result = await this.#resumeReviewRecovery(taskId, owner, recoveryClaimId, worktree, reviewPackage, reviewRecoveryProof);
     if (result.status !== "running" || result.leaseOwner !== owner) return result;
     if (this.#options.store.getTaskCancellation(taskId)) {
       return (await this.#finishSettledCancellation(taskId, owner, result.claimGenerationId!, false)) ?? this.#requireTask(taskId);
@@ -1528,7 +1528,7 @@ export class TaskWorker {
 
   /** Resume only the immutable review/commit/report boundaries after a proven-drained reviewing claim. */
   async #resumeReviewRecovery(taskId: string, owner: string, recoveryClaimId: string | undefined, worktree: WorktreeInfo,
-    reviewPackage: ReviewPackageRecord): Promise<TaskRecord> {
+    reviewPackage: ReviewPackageRecord, reviewRecoveryProof: NonNullable<ReviewReworkRunContext['reviewRecoveryProof']>): Promise<TaskRecord> {
     const task = this.#requireTask(taskId);
     const generationId = task.claimGenerationId;
     if (task.status !== "reviewing" || task.leaseOwner !== owner || !generationId) return task;
@@ -1569,6 +1569,7 @@ export class TaskWorker {
       }
       let verdictId = savedVerdict?.packageId === reviewPackage.id && savedVerdict.result.verdict === "pass"
         ? savedVerdict.id : undefined;
+      let freshPassVerdictId: string | undefined;
       if (!verdictId) {
         this.#assertNotCancelled(active);
         this.#assertAllowedPaths(task, await this.#options.worktrees.changedPaths(worktree));
@@ -1624,6 +1625,7 @@ export class TaskWorker {
         if (review.result.verdict !== "pass") {
           return this.#options.store.fail(taskId, "reviewing", "Recovered review returned an unsupported verdict", owner);
         }
+        freshPassVerdictId = persistedVerdict.id;
       }
 
       let operation = this.#options.store.commitOperations(taskId).at(-1);
@@ -1639,13 +1641,27 @@ export class TaskWorker {
           || preBranch.head.toLowerCase() !== reviewPackage.snapshot.preHead.toLowerCase()) {
           throw new Error("Fresh pre-commit inspection no longer matches the reviewed package");
         }
-        operation = this.#options.store.createCommitOperationFromRecoveredVerdict({
+        const commitInput = {
           operationId: randomUUID(), packageId: reviewPackage.id, verdictId: verdictId!, owner, generationId,
           branchRef: preBranch.ref, preHead: preBranch.head, treeId: preCommit.treeId, diffHash: preCommit.diffHash,
           message: `Zero task ${taskId}`, timestamp: new Date().toISOString(),
           preCommitInspection: { checkedAt: new Date().toISOString(), branchRef: preBranch.ref, head: preBranch.head,
             snapshot: { baseCommit: worktree.baseCommit, preHead: preBranch.head, ...preCommit } },
-        });
+        };
+        const checkRun = this.#options.store.getCheckRun(reviewPackage.checkRunId);
+        const sameGenerationQuota = reviewRecoveryProof.kind === 'quota'
+          && reviewRecoveryProof.packageId === reviewPackage.id && reviewRecoveryProof.owner === owner
+          && reviewRecoveryProof.generationId === generationId && reviewRecoveryProof.claimId === undefined
+          && checkRun?.generationId === generationId && this.#options.store.reviewRecoveryClaims(taskId).length === 0
+          && freshPassVerdictId === verdictId;
+        // Selection is deliberately narrower than a current-generation verdict:
+        // saved PASS and historical packages keep the verified recovery chain.
+        // The normal Store insertion independently rechecks the complete quota
+        // claim, event ordering, current-owner review and filesystem evidence.
+        operation = sameGenerationQuota ? this.#options.store.createCommitOperation({ ...commitInput,
+          sameGenerationReviewQuota: { kind: 'quota', packageId: reviewRecoveryProof.packageId, owner: reviewRecoveryProof.owner,
+            generationId: reviewRecoveryProof.generationId },
+        }) : this.#options.store.createCommitOperationFromRecoveredVerdict(commitInput);
       }
 
       candidate = { branchRef: operation.branchRef, preHead: operation.preHead, commit: operation.candidateSha ?? "",

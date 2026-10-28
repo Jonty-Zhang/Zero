@@ -1913,7 +1913,8 @@ test("Codex allocation and review quota pauses resume at their exact stages", as
   } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
-test("normal sealed-package review quota resumes after guardian reboot without repeating writer or checks", async () => {
+for (const mode of ['same-owner', 'changed-owner', 'repeated-quota', 'guardian-reboot', 'guardian-then-quota'] as const) {
+test(`normal sealed-package review quota resumes ${mode} without repeating writer or checks`, async () => {
   const root = await mkdtemp(join(process.cwd(), ".zero-worker-normal-review-quota-reboot-"));
   const repo = join(root, "repo");
   const db = join(root, "tasks.sqlite");
@@ -1929,9 +1930,11 @@ test("normal sealed-package review quota resumes after guardian reboot without r
     let routeCalls = 0;
     let writeCalls = 0;
     let reviewCalls = 0;
+    const quotas = mode === 'repeated-quota' || mode === 'guardian-then-quota' ? 2 : 1;
+    const reboot = mode === 'guardian-reboot' || mode === 'guardian-then-quota';
     const reviewer: TaskReviewer = { async review() {
       reviewCalls++;
-      if (reviewCalls === 1) throw new QuotaLimitError("normal review quota");
+      if (reviewCalls <= quotas) throw new QuotaLimitError("normal review quota");
       return { harness: "codex", model: "review", exitCode: 0,
         result: { verdict: "pass", summary: "approved", findings: [] } };
     } };
@@ -1948,29 +1951,39 @@ test("normal sealed-package review quota resumes after guardian reboot without r
     assert.equal(store.reviewPackages(task.id).length, 1);
     assert.equal(store.checkRuns(task.id).length, 1);
     assert.deepEqual(store.attempts(task.id).filter(attempt => attempt.role === "review").map(attempt => attempt.status), ["interrupted"]);
-    store.close();
-
-    store = new TaskStore(db, guardianGeneration("2".repeat(32)));
-    const quotaDb = new DatabaseSync(db);
-    quotaDb.prepare("UPDATE quota_pauses SET retry_at=? WHERE task_id=?").run(new Date(Date.now() - 1_000).toISOString(), task.id);
-    quotaDb.close();
-    const resumed = await new TaskWorker({ ...options, store, worktrees: new GitWorktreeManager(worktreeRoot) })
-      .runNext("normal-review-quota-guardian-resume");
+    const requirements = JSON.stringify(store.reviewPackages(task.id)[0]?.requirements);
+    let resumed: TaskRecord | undefined = waiting;
+    for (let retry = 0; retry < quotas; retry++) {
+      assert.equal(resumed?.status, "waiting");
+      assert.equal(store.commitOperations(task.id).length, 0);
+      if (reboot && retry === 0) {
+        store.close();
+        store = new TaskStore(db, guardianGeneration("2".repeat(32)));
+      }
+      const quotaDb = new DatabaseSync(db);
+      try {
+        quotaDb.prepare("UPDATE quota_pauses SET retry_at=? WHERE task_id=?").run(new Date(Date.now() - 1_000).toISOString(), task.id);
+      } finally { quotaDb.close(); }
+      resumed = await new TaskWorker({ ...options, store, worktrees: new GitWorktreeManager(worktreeRoot) })
+        .runNext(mode === 'same-owner' || mode === 'repeated-quota' ? owner : "normal-review-quota-resume");
+    }
     assert.equal(resumed?.id, task.id);
     assert.equal(resumed?.status, "done");
     assert.equal(routeCalls, 1);
     assert.equal(writeCalls, 1);
-    assert.equal(reviewCalls, 2);
+    assert.equal(reviewCalls, quotas + 1);
     assert.equal(store.reviewPackages(task.id).length, 1);
     assert.equal(store.checkRuns(task.id).length, 1);
     assert.equal(store.packageReviewVerdicts(task.id).length, 1);
     assert.deepEqual(store.attempts(task.id).filter(attempt => attempt.role === "review").map(attempt => attempt.status),
-      ["interrupted", "succeeded"]);
+      [...Array(quotas).fill("interrupted"), "succeeded"]);
     assert.equal(store.commitOperations(task.id).length, 1);
     assert.equal(store.reportOperations(task.id).length, 1);
-    assert.equal(store.reviewRecoveryClaims(task.id).length, 1);
+    assert.equal(store.reviewRecoveryClaims(task.id).length, reboot ? 1 : 0);
+    assert.equal(JSON.stringify(store.reviewPackages(task.id)[0]?.requirements), requirements);
   } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
+}
 
 test("failed validation stage is handed off before a linked revision stage starts", async () => {
   const root = await mkdtemp(join(process.cwd(), ".zero-worker-stage-revision-test-"));

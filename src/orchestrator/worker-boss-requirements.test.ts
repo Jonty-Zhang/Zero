@@ -14,8 +14,11 @@ import { TaskWorker } from './worker.js';
 
 const complete = (final: string): RunResult => ({ status: 'completed', exitCode: 0, durationMs: 1, final });
 
-for (const window of ['initial', 'writer', 'checks', 'review-quota'] as const) {
+for (const window of ['initial', 'writer', 'checks', 'review-quota', 'review-rework-quota', 'review-rework-quota-reboot'] as const) {
   test(`Boss ${window} requirements reach real acceptance, bounded rework and exact delivery receipts`, { timeout: 180_000 }, async () => {
+    const reworkQuota = window === 'review-rework-quota' || window === 'review-rework-quota-reboot';
+    const reviewQuota = window === 'review-quota' || reworkQuota;
+    const guardian = (id: string) => ({ id, lockId: 'b'.repeat(64), predecessorDrained: true, evidenceKind: 'guardian_startup_verified' as const });
     const fixtures = resolve('data/verification/boss-requirements-worker-tests');
     await mkdir(fixtures, { recursive: true });
     const root = await mkdtemp(join(fixtures, `${window}-`));
@@ -24,14 +27,14 @@ for (const window of ['initial', 'writer', 'checks', 'review-quota'] as const) {
     await writeFile(join(repo, 'README.md'), 'Synthetic acceptance project.\n');
     await prepareProjectFolder(repo);
     const database = join(root, 'queue.sqlite');
-    const store = new TaskStore(database);
+    let store = new TaskStore(database, window === 'review-rework-quota-reboot' ? guardian('1'.repeat(32)) : undefined);
     try {
       const task = store.submit({ repoPath: repo, baseRef: 'HEAD', prompt: 'Implement an export feature', boss: { preference: 'Independent lead' } });
       const original = store.addBossMessageIdempotent(task.id, 'Keep the existing public export API. [original-human]', `original-human-${window}-123`);
       const requirement = `导出必须保留原始中文名称 / Preserve export names. [${window}-human]`;
       let receipt: BossMessage | undefined;
       const key = `accepted-late-${window}-123`;
-      if (window === 'initial' || window === 'review-quota') receipt = store.addBossMessageIdempotent(task.id, requirement, key);
+      if (window === 'initial' || reviewQuota) receipt = store.addBossMessageIdempotent(task.id, requirement, key);
       const expectedReceipt = () => { assert.ok(receipt); return receipt; };
       const accept = () => {
         assert.equal(store.get(task.id)?.status, 'running');
@@ -55,6 +58,10 @@ for (const window of ['initial', 'writer', 'checks', 'review-quota'] as const) {
           writerRoles.push(request.role);
           if (request.role === 'implement' && window === 'writer') accept();
           if (request.role === 'revise') assert.ok(request.prompt.includes(requirement), 'the revision must preserve the human requirement');
+          if (reworkQuota && writerRoles.length === 2) return {
+            status: 'failed', exitCode: 1, durationMs: 1,
+            quota: { source: 'provider_message', retryAt: new Date(Date.now() + 60_000).toISOString() },
+          };
           await writeFile(join(request.cwd, 'export.txt'), request.role === 'revise' ? 'original-names-preserved' : 'initial-export');
           return complete('Synthetic writer result.');
         },
@@ -72,7 +79,7 @@ for (const window of ['initial', 'writer', 'checks', 'review-quota'] as const) {
           assert.deepEqual(store.addBossMessageIdempotent(task.id, requirement, key), expectedReceipt(), 'an accepted message receipt is replayable after admission closes');
           assert.throws(() => store.addBossMessageIdempotent(task.id, 'New requirement after admission closed', `fresh-review-${window}-${reviewCalls}-123`), /验收|review|任务/);
           assert.equal(store.bossMessages(task.id).filter(message => message.role === 'user').length, 2);
-          if (window === 'review-quota' && reviewCalls === 1) return { status: 'failed', exitCode: 1, durationMs: 1,
+          if (reviewQuota && reviewCalls === 1) return { status: 'failed', exitCode: 1, durationMs: 1,
             quota: { source: 'provider_message', retryAt: new Date(Date.now() + 60_000).toISOString() } };
           finishedReviews++;
           assert.equal(await readFile(join(request.cwd, 'review-context/project/export.txt'), 'utf8'), finishedReviews === 1 ? 'initial-export' : 'original-names-preserved');
@@ -87,13 +94,14 @@ for (const window of ['initial', 'writer', 'checks', 'review-quota'] as const) {
         messageCursor: original.id, maxRevisions: 1, stages: [{ harness: 'dsh', model: 'cheap', objective: 'Implement export' }],
         checks: [{ id: 'export-file', argv: [process.execPath, '-e', "require('node:assert/strict').ok(require('node:fs').existsSync('export.txt'))"] }] };
       const actualReviewer = new TaskReviewer({ codex, model: 'lead', reasoningEffort: 'high', artifactDir: artifacts });
-      const worker = new TaskWorker({ store, artifactRoot: artifacts, worktrees: new GitWorktreeManager(join(root, 'worktrees')), testRunner: new ObservedChecks(),
+      const makeWorker = () => new TaskWorker({ store, artifactRoot: artifacts, worktrees: new GitWorktreeManager(join(root, 'worktrees')), testRunner: new ObservedChecks(),
         adapters: new Map([['dsh', writer], ['codex', codex]]), boss: { async plan() { return plan; } },
         router: { async route(current) { return { taskId: current.id, harness: 'dsh', model: 'cheap', reason: 'Synthetic route', selectionSource: 'task', decidedAt: new Date().toISOString() }; } },
         reviewer: { async review(...args) { snapshots.push(structuredClone(args[5].requirements)); return actualReviewer.review(...args); } },
       });
+      const worker = makeWorker();
       let result = await worker.runNext(`before-${window}`);
-      if (window === 'review-quota') {
+      if (reviewQuota) {
         assert.equal(result?.status, 'waiting', result?.failureReason);
         assert.equal(result.resumeCheckpoint?.kind, 'review_quota');
         const sealed = store.reviewPackages(task.id)[0]; assert.ok(sealed?.requirements);
@@ -107,10 +115,23 @@ for (const window of ['initial', 'writer', 'checks', 'review-quota'] as const) {
         assert.deepEqual(snapshots[0], snapshots[1], 'quota recovery reuses the original sealed human requirements');
         assert.deepEqual(store.reviewPackages(task.id)[0]?.requirements, sealed.requirements, 'resume does not rewrite its first package');
       }
+      if (reworkQuota) {
+        assert.equal(result?.status, 'waiting', result?.failureReason);
+        assert.equal(result.resumeCheckpoint?.kind, 'rework_quota');
+        assert.equal(result.revisionCount, 1);
+        assert.equal(checkRuns, 1);
+        if (window === 'review-rework-quota-reboot') {
+          store.close();
+          store = new TaskStore(database, guardian('2'.repeat(32)));
+        }
+        const sql = new DatabaseSync(database);
+        try { sql.prepare('UPDATE quota_pauses SET retry_at=? WHERE task_id=?').run(new Date(Date.now() - 1000).toISOString(), task.id); } finally { sql.close(); }
+        result = await makeWorker().runNext('changed-rework-owner');
+      }
       assert.equal(result?.status, 'done', result?.failureReason);
-      assert.deepEqual(writerRoles, ['implement', 'revise']);
+      assert.deepEqual(writerRoles, reworkQuota ? ['implement', 'revise', 'revise'] : ['implement', 'revise']);
       assert.equal(checkRuns, 2); assert.equal(finishedReviews, 2);
-      assert.equal(reviewCalls, window === 'review-quota' ? 3 : 2);
+      assert.equal(reviewCalls, reviewQuota ? 3 : 2);
       for (const prompt of prompts) {
         assert.ok(prompt.includes(original.content), 'actual reviewer sees the original accepted human wording');
         assert.ok(prompt.includes(requirement), `actual reviewer sees accepted ${window} wording`);
