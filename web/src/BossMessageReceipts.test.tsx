@@ -53,6 +53,14 @@ async function open(task: Task) {
   await act(async () => {});
   return screen.getByRole('dialog', { name: '任务详情' });
 }
+async function clickAndWaitForRequest(button: HTMLElement, requests: unknown[], count: number) {
+  await act(async () => {
+    fireEvent.click(button);
+    // Native WebCrypto can settle after React's microtask flush, including when
+    // fake timers drive App polling. Wait for the actual transport boundary.
+    await vi.waitFor(() => expect(requests).toHaveLength(count));
+  });
+}
 it.each(['reviewing', 'waiting'] as const)('can confirm an exact accepted-but-timed-out request after real App polling closes %s admission', async status => {
   vi.useFakeTimers();
   const f = fixture(status);
@@ -60,7 +68,7 @@ it.each(['reviewing', 'waiting'] as const)('can confirm an exact accepted-but-ti
   const dialog = await open(f.task);
   const input = within(dialog).getByLabelText('给 Boss 补充信息或提问') as HTMLTextAreaElement;
   fireEvent.change(input, { target: { value: draft } });
-  await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '发送给 Boss' })); });
+  await clickAndWaitForRequest(within(dialog).getByRole('button', { name: '发送给 Boss' }), f.requests, 1);
   expect(f.receipts.size).toBe(1);
   expect(f.requests).toHaveLength(1);
   expect(within(dialog).getByRole('alert').textContent).toBe('请求超时，请检查 Zero 服务后重试');
@@ -68,10 +76,9 @@ it.each(['reviewing', 'waiting'] as const)('can confirm an exact accepted-but-ti
   expect(input.value).toBe(draft);
   expect(input.disabled).toBe(true);
   expect((within(dialog).getByRole('button', { name: '发送给 Boss' }) as HTMLButtonElement).disabled).toBe(true);
-  console.log(JSON.stringify({ status, accepted: f.receipts.size, original: f.requests[0], draftPreserved: input.value === draft, buttons: within(dialog).getAllByRole('button').map(button => ({ text: button.textContent, disabled: (button as HTMLButtonElement).disabled })) }));
   const confirm = within(dialog).getByRole('button', { name: '确认发送结果' }) as HTMLButtonElement;
   expect(confirm.disabled).toBe(false);
-  await act(async () => { fireEvent.click(confirm); });
+  await clickAndWaitForRequest(confirm, f.requests, 2);
   expect(f.requests).toHaveLength(2);
   expect(f.requests[1]!.path).toBe(f.requests[0]!.path);
   expect(f.requests[1]!.key).toBe(f.requests[0]!.key);
@@ -98,14 +105,14 @@ it('uses receipt-only confirmation after a task returns to running and does not 
   const dialog = await open(f.task);
   const input = within(dialog).getByLabelText('给 Boss 补充信息或提问') as HTMLTextAreaElement;
   fireEvent.change(input, { target: { value: draft } });
-  await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '发送给 Boss' })); });
+  await clickAndWaitForRequest(within(dialog).getByRole('button', { name: '发送给 Boss' }), f.requests, 1);
   expect(f.requests).toHaveLength(1);
   expect(f.receipts.size).toBe(0);
   await act(async () => { await vi.advanceTimersByTimeAsync(3500); });
   expect(input.value).toBe(draft);
   const confirm = within(dialog).getByRole('button', { name: '确认发送结果' }) as HTMLButtonElement;
   expect(confirm.disabled).toBe(false);
-  await act(async () => { fireEvent.click(confirm); });
+  await clickAndWaitForRequest(confirm, f.requests, 2);
   expect(f.requests).toHaveLength(2);
   expect(f.requests[1]!.path).toBe(f.requests[0]!.path);
   expect(f.requests[1]!.key).toBe(f.requests[0]!.key);
