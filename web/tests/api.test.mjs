@@ -234,6 +234,24 @@ test('changed submission payloads and endpoints receive independent identities',
   assert.equal(new Set(keys).size, 3);
 });
 
+test('continuation submission identities include the effective baseRef and reuse only the same accepted commit', async (t) => {
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (_path, init) => {
+    requests.push({ key: init.headers['X-Idempotency-Key'], body: JSON.parse(init.body) });
+    throw new TypeError('uncertain continuation receipt');
+  });
+  const common = { repoPath: '/continuation-project', prompt: 'Continue the project', boss: { preference: 'User preference' } };
+  const first = { ...common, baseRef: 'a'.repeat(40) };
+  await assert.rejects(api.createTask(first));
+  await assert.rejects(api.createTask({ ...common, baseRef: 'b'.repeat(40) }));
+  await assert.rejects(api.createTask(common));
+  await assert.rejects(api.createTask(first));
+  assert.equal(new Set(requests.slice(0, 3).map(item => item.key)).size, 3);
+  assert.equal(requests[3].key, requests[0].key);
+  assert.equal(requests[0].body.baseRef, first.baseRef);
+  assert.equal(Object.hasOwn(requests[2].body, 'baseRef'), false);
+});
+
 test('uncertain submission identity survives reloading the client module in the same tab', async (t) => {
   const values = new Map();
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');

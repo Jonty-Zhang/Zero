@@ -182,7 +182,7 @@ describe('Boss draft handoff', () => {
     fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
     await screen.findByText('Response uncertain');
     fireEvent.click(screen.getByRole('button', { name: '手动配置' }));
-    expect(onAdvanced).toHaveBeenCalledWith({ path: 'C:/projects/plain', prompt: '设计并实现这个项目，自己验证', preference: '', create: false, pendingSubmission: { draftKey: JSON.stringify(['C:/projects/plain', false, '设计并实现这个项目，自己验证', '']), payload: { repoPath: 'C:/projects/plain', prompt: '设计并实现这个项目，自己验证', boss: { preference: '' } } } });
+    expect(onAdvanced).toHaveBeenCalledWith({ path: 'C:/projects/plain', prompt: '设计并实现这个项目，自己验证', preference: '', create: false, pendingSubmission: { draftKey: JSON.stringify(['C:/projects/plain', false, '设计并实现这个项目，自己验证', '', null]), payload: { repoPath: 'C:/projects/plain', prompt: '设计并实现这个项目，自己验证', boss: { preference: '' } } } });
     const draft = onAdvanced.mock.calls[0]![0];
     const onCreated = vi.fn();
     view.unmount();

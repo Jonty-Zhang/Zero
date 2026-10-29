@@ -11,10 +11,15 @@ import type { ConnectionVerification } from './connection-verification';
 
 const preferenceExample = 'Codex gpt6.1sol high 负责设计与验收，日常实现交给便宜模型或 DeepSeek，复杂问题先讨论。';
 type FolderListing = Awaited<ReturnType<typeof api.folders>>;
-type BossSubmission = { draftKey: string; payload: { repoPath: string; prompt: string; boss: { preference: string } } };
-export type BossProjectDraft = { path: string; prompt: string; preference: string; create: boolean; pendingSubmission: BossSubmission | null };
+type BossSubmission = { draftKey: string; payload: { repoPath: string; baseRef?: string; prompt: string; boss: { preference: string } } };
+export type BossProjectDraft = { path: string; prompt: string; preference: string; create: boolean; pendingSubmission: BossSubmission | null; continuation?: { repoPath: string; baseRef: string } };
 
-export function ProjectDelivery({ task }: { task: Task }) {
+export function continuationBaseRef(draft: Pick<BossProjectDraft, 'path' | 'create' | 'continuation'>): string | null {
+  const source = draft.continuation;
+  return source && !draft.create && draft.path.trim() === source.repoPath.trim() && /^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(source.baseRef) ? source.baseRef : null;
+}
+
+export function ProjectDelivery({ task, onContinue }: { task: Task; onContinue?: (draft: BossProjectDraft) => void }) {
   const scope = JSON.stringify([task.id, task.delivery?.path ?? null]);
   const currentScope = useRef(scope);
   currentScope.current = scope;
@@ -29,6 +34,8 @@ export function ProjectDelivery({ task }: { task: Task }) {
   const copied = feedback?.scope === scope && feedback.status === 'copied';
   const copyFailed = feedback?.scope === scope && feedback.status === 'failed';
   const completed = task.status === 'done';
+  const resultCommit = task.delivery?.resultCommit;
+  const canContinue = completed && !!task.boss && !!task.repoPath?.trim() && !!resultCommit && /^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(resultCommit) && !!onContinue;
   if (!task.delivery?.path && (!completed || !task.boss)) return null;
   const copyPath = async () => {
     if (!task.delivery?.path || pendingCopy.current?.scope === scope) return;
@@ -57,6 +64,7 @@ export function ProjectDelivery({ task }: { task: Task }) {
       {copied && <span className="sr-only" role="status">成果文件夹路径已复制</span>}
       {copyFailed && <p role="alert" className="folder-error">复制未成功，请选中下方路径手动复制。</p>}
     </> : <p className="folder-error">成果目录尚未确认，请查看执行报告。</p>}
+    {canContinue && <button type="button" className="button primary" onClick={() => onContinue!({ path: task.repoPath!, prompt: '', preference: task.boss!.preference, create: false, pendingSubmission: null, continuation: { repoPath: task.repoPath!, baseRef: resultCommit! } })}>继续这个项目</button>}
   </section>;
 }
 
@@ -65,6 +73,8 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
   const [prompt, setPrompt] = useState(initialDraft?.prompt ?? '');
   const [preference, setPreference] = useState(initialDraft?.preference ?? '');
   const [create, setCreate] = useState(initialDraft?.create ?? false);
+  const continuation = initialDraft?.continuation;
+  const baseRef = continuationBaseRef({ path, create, continuation });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [browsing, setBrowsing] = useState(false);
@@ -89,7 +99,7 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
   }, [connecting]);
   const codex = capabilities?.harnesses.find(harness => harness.id === 'codex');
   const leadReady = !capabilityError && !!codex?.available && !!capabilities?.bindings.some(binding => binding.harnessId === 'codex' && binding.available);
-  const draftKey = JSON.stringify([path.trim(), create, prompt.trim(), preference.trim()]);
+  const draftKey = JSON.stringify([path.trim(), create, prompt.trim(), preference.trim(), baseRef]);
   const retrySubmission = pendingSubmission?.draftKey === draftKey ? pendingSubmission : null;
   const submissionReady = leadReady || !!retrySubmission;
   useEffect(() => () => folderRequest.current?.abort(), []);
@@ -121,7 +131,7 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
       let submission = retrySubmission;
       if (!submission) {
         const project = await api.prepareProject(path.trim(), create);
-        submission = { draftKey, payload: { repoPath: project.repoPath, prompt: prompt.trim(), boss: { preference: preference.trim() } } };
+        submission = { draftKey, payload: { repoPath: project.repoPath, ...(baseRef ? { baseRef } : {}), prompt: prompt.trim(), boss: { preference: preference.trim() } } };
         setPendingSubmission(submission);
       }
       const task = await api.createTask(submission.payload);
@@ -135,6 +145,7 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
     {connecting && verification ? <div className="submit-form"><button ref={connectionBack} type="button" className="button secondary" onClick={() => setConnecting(false)}>返回项目</button><ConnectionVerificationForm store={verification} /></div> : <form onSubmit={submit} className="submit-form"><fieldset disabled={busy}>
       <div className="field"><label htmlFor="boss-project-path" className="field-label">项目文件夹 *</label><div className="boss-folder-input"><input id="boss-project-path" required value={path} onChange={e => setPath(e.target.value)} placeholder="选择文件夹或输入完整路径" /><button className="button secondary" type="button" onClick={() => void browse(path.trim() || undefined)}><Folder size={15} />浏览文件夹</button></div><span className="field-hint">支持普通文件夹，无需预先配置 Git。</span></div>
       <label className="boss-create-toggle"><input type="checkbox" checked={create} onChange={e => setCreate(e.target.checked)} />这个路径还不存在，创建新文件夹</label>
+      {baseRef && <p className="field-hint">从上次验收的成果继续</p>}
       {browsing && <section className="folder-browser" aria-label="本机文件夹浏览"><div className="folder-browser-head"><b>选择本机文件夹</b><button type="button" className="icon-button" aria-label="关闭文件夹浏览" onClick={closeBrowser}><X size={15} /></button></div><div className="boss-folder-input"><label className="field"><span className="field-label">浏览路径</span><input value={browsePath} onChange={e => setBrowsePath(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); void browse(browsePath.trim() || undefined); } }} /></label><button type="button" className="button secondary" disabled={folderBusy} onClick={() => void browse(browsePath.trim() || undefined)}>打开路径</button></div>
         {folderBusy ? <p role="status"><LoaderCircle size={15} className="spin" />正在读取文件夹…</p> : <>{listing?.parent && <button type="button" className="link-button" onClick={() => void browse(listing.parent!)}><ArrowUp size={14} />上一级</button>}{listing && <><p className="folder-current">{listing.path}</p><div className="folder-list">{listing.folders.map(folder => <button type="button" key={folder.path} onClick={() => void browse(folder.path)}><Folder size={15} />{folder.name}</button>)}{!listing.folders.length && <p>没有子文件夹</p>}</div><div className="folder-browser-actions"><button type="button" className="button primary" onClick={() => selectFolder()}>选择此文件夹</button><label className="field"><span className="field-label">新文件夹名称</span><input value={newName} onChange={e => setNewName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); selectFolder(true); } }} placeholder="例如 my-project" /></label><button type="button" className="button secondary" disabled={!newName.trim()} onClick={() => selectFolder(true)}><FolderPlus size={15} />使用新文件夹</button></div></>}</>}
         {folderError && <p role="alert" className="folder-error">{folderError}</p>}
@@ -145,7 +156,7 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
       {verification && <button ref={connectionTrigger} type="button" className="button secondary" disabled={busy} onClick={() => { closeBrowser(); setConnecting(true); }}>{leadReady ? '管理模型连接' : '接通 Codex 模型'}</button>}
       {retrySubmission && !busy && <p className="field-hint">上次提交结果未确认。重试不会重复创建任务。</p>}
       {error && <div className="alert error compact" role="alert"><AlertCircle size={16} />{error}</div>}
-      <div className="modal-footer"><button type="button" className="link-button" disabled={busy} onClick={() => onAdvanced({ path, prompt, preference, create, pendingSubmission })}>手动配置</button><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || browsing || !submissionReady || !path.trim() || !prompt.trim()}>{busy ? <><LoaderCircle size={15} className="spin" />正在交给 Boss</> : <><Send size={15} />{retrySubmission ? '确认上次提交' : '交给 Boss'}</>}</button></div>
+      <div className="modal-footer"><button type="button" className="link-button" disabled={busy} onClick={() => onAdvanced({ path, prompt, preference, create, pendingSubmission, ...(continuation ? { continuation } : {}) })}>手动配置</button><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || browsing || !submissionReady || !path.trim() || !prompt.trim()}>{busy ? <><LoaderCircle size={15} className="spin" />正在交给 Boss</> : <><Send size={15} />{retrySubmission ? '确认上次提交' : '交给 Boss'}</>}</button></div>
     </fieldset></form>}
   </section></div>;
 }
