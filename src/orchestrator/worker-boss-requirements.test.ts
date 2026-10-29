@@ -9,7 +9,7 @@ import { TaskStore } from '../core/task-store.js';
 import { GitWorktreeManager } from '../core/git-worktree.js';
 import { TestRunner } from '../core/test-runner.js';
 import { prepareProjectFolder } from '../server/project-folders.js';
-import { TaskReviewer } from './reviewer.js';
+import { createConfiguredTaskReviewer } from '../server/task-reviewer.js';
 import { TaskWorker } from './worker.js';
 
 const complete = (final: string): RunResult => ({ status: 'completed', exitCode: 0, durationMs: 1, final });
@@ -83,21 +83,32 @@ for (const window of ['initial', 'writer', 'checks', 'review-quota', 'review-rew
             quota: { source: 'provider_message', retryAt: new Date(Date.now() + 60_000).toISOString() } };
           finishedReviews++;
           assert.equal(await readFile(join(request.cwd, 'review-context/project/export.txt'), 'utf8'), finishedReviews === 1 ? 'initial-export' : 'original-names-preserved');
-          return complete(JSON.stringify(finishedReviews === 1 ? {
+          const requirements = JSON.parse(request.prompt.split('\n\n').at(-1)!).requirements as ReviewRequirementsSnapshot;
+          assert.deepEqual(requirements.replyMessageIds, finishedReviews === 1 ? [original.id, expectedReceipt().id] : []);
+          const result = finishedReviews === 1 ? {
             verdict: 'changes_requested', summary: 'The accepted name-preservation requirement still needs implementation.',
             findings: [{ file: 'export.txt', line: 1, severity: 'high', evidence: 'The initial export does not preserve the original names.', requestedChange: 'Preserve original Chinese export names.' }],
-          } : { verdict: 'pass', summary: 'The bounded revision satisfies the accepted human requirement.', findings: [] }));
+          } : { verdict: 'pass', summary: 'The bounded revision satisfies the accepted human requirement.', findings: [] };
+          return complete(JSON.stringify({ ...result, userMessageReplies: requirements.replyMessageIds!.map(messageId => ({ messageId,
+            content: 'The export artifact does not preserve the original names yet. A revision must satisfy this requirement before acceptance.' })) }));
         },
       };
       const artifacts = join(root, 'artifacts');
       const plan: BossPlan = { summary: 'Implement and independently accept export', acceptanceCriteria: ['Export exists'], boss: { harness: 'codex', model: 'lead', reasoningEffort: 'high' },
         messageCursor: original.id, maxRevisions: 1, stages: [{ harness: 'dsh', model: 'cheap', objective: 'Implement export' }],
         checks: [{ id: 'export-file', argv: [process.execPath, '-e', "require('node:assert/strict').ok(require('node:fs').existsSync('export.txt'))"] }] };
-      const actualReviewer = new TaskReviewer({ codex, model: 'lead', reasoningEffort: 'high', artifactDir: artifacts });
+      const actualReviewer = createConfiguredTaskReviewer({ codex, artifactRoot: artifacts,
+        readReviewerConfig: async () => ({ modelId: 'global-default', reasoningEffort: 'low' }) });
       const makeWorker = () => new TaskWorker({ store, artifactRoot: artifacts, worktrees: new GitWorktreeManager(join(root, 'worktrees')), testRunner: new ObservedChecks(),
         adapters: new Map([['dsh', writer], ['codex', codex]]), boss: { async plan() { return plan; } },
         router: { async route(current) { return { taskId: current.id, harness: 'dsh', model: 'cheap', reason: 'Synthetic route', selectionSource: 'task', decidedAt: new Date().toISOString() }; } },
-        reviewer: { async review(...args) { snapshots.push(structuredClone(args[5].requirements)); return actualReviewer.review(...args); } },
+        reviewer: { async review(...args) {
+          snapshots.push(structuredClone(args[5].requirements));
+          const before = store.bossMessages(task.id);
+          const proposal = await actualReviewer.review(...args);
+          assert.deepEqual(store.bossMessages(task.id), before, 'the production reviewer must not publish a verdict before Worker validates its snapshot');
+          return proposal;
+        } },
       });
       const worker = makeWorker();
       let result = await worker.runNext(`before-${window}`);
@@ -132,6 +143,14 @@ for (const window of ['initial', 'writer', 'checks', 'review-quota', 'review-rew
       assert.deepEqual(writerRoles, reworkQuota ? ['implement', 'revise', 'revise'] : ['implement', 'revise']);
       assert.equal(checkRuns, 2); assert.equal(finishedReviews, 2);
       assert.equal(reviewCalls, reviewQuota ? 3 : 2);
+      const replies = store.bossMessages(task.id).filter(message => message.inReplyTo);
+      assert.deepEqual(replies.map(message => message.inReplyTo), [original.id, expectedReceipt().id]);
+      for (const reply of replies) assert.ok(store.packageReviewVerdicts(task.id).some(verdict =>
+        verdict.attemptId === reply.reviewAttemptId && verdict.packageId === reply.reviewPackageId));
+      const summaries = store.bossMessages(task.id).filter(message => message.role === 'boss' && !message.inReplyTo && message.reviewAttemptId);
+      assert.deepEqual(summaries.map(message => message.content.split('\n')[0]), ['需要修改', '验收通过']);
+      for (const summary of summaries) assert.ok(store.packageReviewVerdicts(task.id).some(verdict =>
+        verdict.attemptId === summary.reviewAttemptId && verdict.packageId === summary.reviewPackageId));
       for (const prompt of prompts) {
         assert.ok(prompt.includes(original.content), 'actual reviewer sees the original accepted human wording');
         assert.ok(prompt.includes(requirement), `actual reviewer sees accepted ${window} wording`);

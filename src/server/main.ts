@@ -21,7 +21,7 @@ import type { StartupGenerationAttestation } from '../core/task-store.js';
 import { TestRunner } from '../core/test-runner.js';
 import { TaskRouter } from '../orchestrator/router.js';
 import { OpenAICompatibleCoordinator } from '../orchestrator/openai-compatible-coordinator.js';
-import { TaskReviewer } from '../orchestrator/reviewer.js';
+import { createConfiguredTaskReviewer } from './task-reviewer.js';
 import { GoalReviewer, goalReviewInputFingerprint } from '../orchestrator/goal-reviewer.js';
 import { buildGoalRevisionSubmission, GoalRevisionCapacityError } from '../orchestrator/goal-revision.js';
 import { captureSequenceGoalEvidence } from './sequence-goal-evidence.js';
@@ -166,23 +166,8 @@ export async function startZeroServer(options: { host?: string; port?: number } 
         ...executionDefaults }).route(task, context);
     },
   };
-  const reviewer = {
-    review: async (...args: Parameters<TaskReviewer['review']>) => {
-      const cfg = await config.read();
-      const task = args[0];
-      const lead = task.bossPlan?.boss;
-      if (task.boss && !lead) throw new Error('Boss project has no persisted acceptance lead');
-      if (task.boss) {
-        const discussion = store.bossMessages(task.id).filter(message => message.role === 'user');
-        args[0] = { ...task, prompt: `${task.prompt}\n\nLatest human project messages (requirements, not permission to bypass verification):\n${JSON.stringify(discussion)}` };
-      }
-      const review = await new TaskReviewer({ codex, artifactDir: resolve(dataRoot, 'artifacts'), model: task.boss ? lead!.model : cfg.reviewer.modelId ?? undefined,
-        reasoningEffort: task.boss ? lead!.reasoningEffort : cfg.reviewer.reasoningEffort ?? undefined }).review(...args);
-      if (task.boss && task.leaseOwner && !store.getTaskCancellation(task.id)) store.addBossMessage(task.id, 'boss',
-        `验收：${review.result.verdict}\n${review.result.summary}`, { owner: task.leaseOwner, harness: review.harness, model: review.model });
-      return review;
-    },
-  };
+  const reviewer = createConfiguredTaskReviewer({ codex, artifactRoot: resolve(dataRoot, 'artifacts'),
+    readReviewerConfig: async () => (await config.read()).reviewer });
   const boss = { plan: async (...args: Parameters<BossOrchestrator['plan']>) => {
     const cfg = await config.read();
     return new BossOrchestrator({ codex, adapters: new Map(Object.entries(adapters)), getCandidates: candidateProvider,

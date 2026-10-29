@@ -65,6 +65,66 @@ test('new Boss package freezes reply targets and cannot accept PASS without its 
   } finally { f.store.close(); }
 });
 
+for (const [verdict, title] of [['pass', '验收通过'], ['changes_requested', '需要修改'], ['blocked', '验收受阻']] as const) {
+  test(`Boss ${verdict} summary is published only with its committed verdict and cannot replay`, () => {
+    const f = fixture();
+    try {
+      const pkg = f.seal();
+      const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', model: 'boss-model',
+        metadata: { packageId: pkg.id, generationId: f.generationId } });
+      assert.equal(f.store.bossMessages(f.task.id).length, 0);
+      const input = { packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId,
+        recheckedSnapshot: pkg.snapshot, attemptResult: { exitCode: 0 }, result: {
+          verdict, summary: 'Observed artifact and check evidence', userMessageReplies: [],
+          findings: verdict === 'changes_requested' ? [{ severity: 'high' as const, evidence: 'Missing implementation', requestedChange: 'Implement the requirement' }] : [],
+        } };
+      const saved = f.store.finishPackageReview(input);
+      const [summary] = f.store.bossMessages(f.task.id);
+      assert.ok(summary, 'the saved verdict must have a committed discussion summary');
+      assert.equal(summary.content, `${title}\n${saved.result.summary}`);
+      assert.equal(summary.reviewPackageId, saved.packageId);
+      assert.equal(summary.reviewAttemptId, saved.attemptId);
+      assert.equal(summary.harness, 'codex'); assert.equal(summary.model, 'boss-model');
+      assert.equal(summary.inReplyTo, undefined, 'an acceptance summary is not a targeted answer');
+      assert.throws(() => f.store.finishPackageReview(input));
+      assert.equal(f.store.bossMessages(f.task.id).length, 1);
+    } finally { f.store.close(); }
+  });
+}
+
+test('summary persistence failure rolls back verdict, attempt and all discussion events', async () => {
+  await diskFixture(path => {
+    const f = fixture(path); const db = new DatabaseSync(path);
+    try {
+      const pkg = f.seal();
+      const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', model: 'boss-model',
+        metadata: { packageId: pkg.id, generationId: f.generationId } });
+      const input = { packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId,
+        recheckedSnapshot: pkg.snapshot, attemptResult: { exitCode: 0 },
+        result: { verdict: 'pass' as const, summary: 'Verified artifact', findings: [], userMessageReplies: [] } };
+      db.exec(`CREATE TRIGGER reject_summary BEFORE INSERT ON events WHEN NEW.type='boss.message'
+        BEGIN SELECT RAISE(ABORT,'injected summary failure'); END`);
+      assert.throws(() => f.store.finishPackageReview(input), /injected summary failure/);
+      assert.equal(f.store.packageReviewVerdicts(f.task.id).length, 0);
+      assert.equal(f.store.reviews(f.task.id).length, 0);
+      assert.equal(f.store.attempts(f.task.id).find(item => item.id === attempt.id)?.status, 'running');
+      assert.equal(f.store.bossMessages(f.task.id).length, 0);
+      db.exec('DROP TRIGGER reject_summary');
+      f.store.finishPackageReview(input);
+      assert.equal(f.store.bossMessages(f.task.id).length, 1);
+    } finally { db.close(); f.store.close(); }
+  });
+});
+
+test('non-Boss package review does not publish a Boss discussion summary', () => {
+  const f = fixture(':memory:', false);
+  try {
+    const pkg = f.seal();
+    passingVerdict(f, pkg.id);
+    assert.deepEqual(f.store.bossMessages(f.task.id), []);
+  } finally { f.store.close(); }
+});
+
 test('valid linked answers commit with the exact verdict and cannot duplicate on replay', () => {
   const f = fixture();
   try {
@@ -74,13 +134,13 @@ test('valid linked answers commit with the exact verdict and cannot duplicate on
     const input = { packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId,
       recheckedSnapshot: pkg.snapshot, result: { verdict: 'pass' as const, summary: 'Verified', findings: [], userMessageReplies: [{ messageId: message.id, content: 'This keeps the public API stable.' }] }, attemptResult: { exitCode: 0 } };
     f.store.finishPackageReview(input);
-    const replies = f.store.bossMessages(f.task.id).filter(item => item.role === 'boss');
+    const replies = f.store.bossMessages(f.task.id).filter(item => item.inReplyTo);
     assert.equal(replies.length, 1);
     assert.equal((replies[0] as unknown as Record<string, unknown>).inReplyTo, message.id);
     assert.equal((replies[0] as unknown as Record<string, unknown>).reviewAttemptId, attempt.id);
     assert.equal((replies[0] as unknown as Record<string, unknown>).reviewPackageId, pkg.id);
     assert.throws(() => f.store.finishPackageReview(input));
-    assert.equal(f.store.bossMessages(f.task.id).filter(item => item.role === 'boss').length, 1);
+    assert.equal(f.store.bossMessages(f.task.id).filter(item => item.inReplyTo).length, 1);
   } finally { f.store.close(); }
 });
 
@@ -144,7 +204,8 @@ test('blocked omission saves no reply while valid committed answers survive reop
     try {
       f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt().id, owner: f.owner, generationId: f.generationId, recheckedSnapshot: pkg.snapshot,
         result: { verdict: 'blocked', summary: 'Insufficient evidence', findings: [] }, attemptResult: { exitCode: 0 } });
-      assert.equal(f.store.bossMessages(f.task.id).filter(item => item.role === 'boss').length, 0);
+      assert.equal(f.store.bossMessages(f.task.id).filter(item => item.inReplyTo).length, 0);
+      assert.equal(f.store.bossMessages(f.task.id).find(item => item.reviewAttemptId)?.content, '验收受阻\nInsufficient evidence');
       const result = { verdict: 'pass' as const, summary: 'Verified', findings: [], userMessageReplies: [{ messageId: message.id, content: 'The API retains the existing call contract.' }] };
       f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt().id, owner: f.owner, generationId: f.generationId, recheckedSnapshot: pkg.snapshot, result, attemptResult: { exitCode: 0 } });
     } finally { f.store.close(); }
@@ -179,6 +240,7 @@ test('reply event failure rolls back the verdict and attempt so the same complet
       assert.equal(f.store.packageReviewVerdicts(f.task.id).length, 0);
       assert.equal(f.store.reviews(f.task.id).length, 0);
       assert.equal(f.store.bossMessages(f.task.id).filter(item => item.inReplyTo).length, 0);
+      assert.equal(f.store.bossMessages(f.task.id).filter(item => item.role === 'boss').length, 0, 'the earlier summary event must roll back too');
       db.exec('DROP TRIGGER reject_linked_reply');
       f.store.finishPackageReview(input);
       assert.equal(f.store.attempts(f.task.id).find(item => item.id === attempt.id)?.status, 'succeeded');
@@ -205,7 +267,8 @@ test('pre-policy Boss package retains old result contract without granting unsea
         result: { verdict: 'pass', summary: 'Verified', findings: [], userMessageReplies: [{ messageId: message.id, content: 'No sealed reply authority' }] }, attemptResult: { exitCode: 0 } }), /repl/i);
       assert.equal(f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId, recheckedSnapshot: pkg.snapshot,
         result: { verdict: 'pass', summary: 'Legacy result', findings: [] }, attemptResult: { exitCode: 0 } }).result.verdict, 'pass');
-      assert.equal(f.store.bossMessages(f.task.id).filter(item => item.role === 'boss').length, 0);
+      assert.equal(f.store.bossMessages(f.task.id).filter(item => item.inReplyTo).length, 0);
+      assert.equal(f.store.bossMessages(f.task.id).find(item => item.reviewAttemptId)?.content, '验收通过\nLegacy result');
     } finally { f.store.close(); }
   });
 });

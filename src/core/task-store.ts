@@ -3709,6 +3709,13 @@ export class TaskStore {
       this.#db.prepare(`INSERT INTO review_verdicts(id,task_id,package_id,attempt_id,generation_id,snapshot,result,created_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(verdictId, String(pkg.task_id), input.packageId, input.attemptId, input.generationId,
         JSON.stringify(snapshot), JSON.stringify(input.result), createdAt);
+      if (this.get(String(pkg.task_id))?.boss) {
+        const title = input.result.verdict === 'pass' ? '验收通过' : input.result.verdict === 'changes_requested' ? '需要修改' : '验收受阻';
+        const summary: BossMessage = { id: randomUUID(), role: 'boss', content: `${title}\n${input.result.summary}`, at: createdAt,
+          harness: 'codex', ...(typeof completedAttempt.model === 'string' ? { model: completedAttempt.model } : {}),
+          reviewPackageId: input.packageId, reviewAttemptId: input.attemptId };
+        this.#event(String(pkg.task_id), 'boss.message', summary, createdAt);
+      }
       for (const reply of input.result.userMessageReplies ?? []) {
         const message: BossMessage = { id: randomUUID(), role: 'boss', content: reply.content, at: createdAt,
           harness: 'codex', ...(typeof completedAttempt.model === 'string' ? { model: completedAttempt.model } : {}),
