@@ -2,6 +2,47 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { api } from '../src/api.ts';
+import { HttpError } from '../src/http-error.ts';
+
+test('verification rejection preserves typed status and only an explicit boolean admission marker', async (t) => {
+  const responses = [
+    [400, { error: '模型无效', verificationNotStarted: true }, true],
+    [409, { error: '模型身份不唯一', verificationNotStarted: true }, true],
+    [409, { error: 'proxy conflict' }, false],
+    [503, { error: '服务关闭' }, false],
+    [400, { error: 'invalid marker', verificationNotStarted: 'true' }, false],
+  ];
+  for (const [status, body, flag] of responses) {
+    t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify(body), { status }));
+    await assert.rejects(api.verifyConnection('lead', 'high', 'retained-connection-key'), error => {
+      assert.ok(error instanceof HttpError); assert.equal(error.status, status);
+      assert.equal(error.message, body.error); assert.equal(error.verificationNotStarted, flag); return true;
+    });
+    t.mock.restoreAll();
+  }
+});
+
+test('connection verification keeps the caller request identity and reads jobs without invoking another model', async (t) => {
+  const calls = [];
+  const job = { id: 'job/中文?', modelId: 'canonical', requestedModelIds: ['upstream-alias'], reasoningEffort: 'high', state: 'running', createdAt: '2026-10-29T00:00:00Z' };
+  t.mock.method(globalThis, 'fetch', async (path, init) => {
+    calls.push({ path, method: init.method ?? 'GET', key: init.headers['X-Idempotency-Key'], body: init.body && JSON.parse(init.body) });
+    return new Response(JSON.stringify(job), { status: init.method === 'POST' ? 202 : 200 });
+  });
+  await api.connectionSetup();
+  const accepted = await api.verifyConnection('upstream-alias', 'high', 'retained-connection-key');
+  await api.verifyConnection('upstream-alias', 'high', 'retained-connection-key');
+  assert.deepEqual(accepted, job);
+  assert.equal(calls[0].path, '/api/connections/setup');
+  assert.equal(calls[1].path, '/api/connections/codex/verify');
+  assert.equal(calls[1].key, 'retained-connection-key');
+  assert.deepEqual(calls[1], calls[2]);
+  assert.deepEqual(calls[1].body, { modelId: 'upstream-alias', reasoningEffort: 'high' });
+  await api.connectionVerification(job.id);
+  assert.equal(calls[3].path, `/api/connections/verifications/${encodeURIComponent(job.id)}`);
+  assert.equal(calls[3].method, 'GET');
+  assert.equal(calls[3].body, undefined);
+});
 
 test('project folder APIs encode local paths and preserve preparation intent and supplementary messages', async (t) => {
   const calls = [];

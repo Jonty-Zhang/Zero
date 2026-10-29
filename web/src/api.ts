@@ -1,4 +1,6 @@
 import type { Capabilities, Config, Task, TaskSequence } from './types';
+import type { ConnectionSetup, VerificationJob } from './connection-verification';
+import { HttpError } from './http-error.ts';
 
 export type RequestOptions = { signal?: AbortSignal };
 
@@ -44,11 +46,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     if (!response.ok) {
       const body = await response.text();
       let message = body;
+      let verificationNotStarted = false;
       try {
         const parsed: unknown = JSON.parse(body);
         if (parsed && typeof parsed === 'object' && 'error' in parsed && typeof parsed.error === 'string') message = parsed.error;
+        if (parsed && typeof parsed === 'object' && 'verificationNotStarted' in parsed) verificationNotStarted = parsed.verificationNotStarted === true;
       } catch { /* Local proxies can return plain-text diagnostics. */ }
-      throw new Error(message || `请求失败（${response.status}）`);
+      throw new HttpError(message || `请求失败（${response.status}）`, response.status, verificationNotStarted);
     }
     if (response.status === 204) return undefined as T;
     return await response.json() as T;
@@ -59,6 +63,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  connectionSetup: (options?: RequestOptions) => request<ConnectionSetup>('/api/connections/setup', options),
+  verifyConnection: (modelId: string, reasoningEffort: string, key: string) => request<VerificationJob>('/api/connections/codex/verify', { method: 'POST', body: JSON.stringify({ modelId, reasoningEffort }), headers: { 'X-Idempotency-Key': key } }),
+  connectionVerification: (id: string) => request<VerificationJob>(`/api/connections/verifications/${encodeURIComponent(id)}`),
   folders: (path?: string, options?: RequestOptions) => request<{ path: string; parent: string | null; folders: Array<{ name: string; path: string }> }>(`/api/folders${path ? `?path=${encodeURIComponent(path)}` : ''}`, options),
   prepareProject: (path: string, create = false) => request<{ path: string; repoPath: string; initialized: boolean }>('/api/projects/prepare', { method: 'POST', body: JSON.stringify({ path, create }) }),
   messageTask: (id: string, content: string) => submit<unknown>(`/api/tasks/${encodeURIComponent(id)}/messages`, { content }),

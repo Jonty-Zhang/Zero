@@ -28,6 +28,12 @@ export interface ZCodeAppServerVerificationEvidence {
   reasoningEffort: ReasoningEffort;
 }
 
+/** Captured inside the same write lock that persisted the successful proof. */
+export interface CodexVerificationReceipt {
+  binding: ModelBinding;
+  verification: LocalZeroConfig['verifications'][string];
+}
+
 export interface ZCodeAppServerNonceProof {
   nonce: string;
   echoedNonce: string;
@@ -130,6 +136,20 @@ export class ConfigStore {
     });
   }
 
+  /** Adds a user-selected Codex tuple to Zero's model registry only. */
+  async registerCodexModel(modelId: string): Promise<ModelConfig> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(modelId)) throw new Error('模型标识无效');
+    return this.update(async (config, path) => {
+      const existing = resolveModelIdentity(config.models, modelId, item => item);
+      if (existing) return { ...existing };
+      if (config.models.some(item => item.id === modelId || item.modelId === modelId)) throw new Error('模型身份不唯一，无法验证');
+      const model = { id: modelId, provider: 'openai', modelId };
+      config.models = [...config.models, model];
+      await this.persist(config, path);
+      return model;
+    });
+  }
+
   /** Adds a user-selected ZCode desktop tuple to Zero's model registry only. */
   async registerZCodeDesktopModel(model: ModelConfig): Promise<'registered' | 'already_registered'> {
     if (!isValidLocalModel(model)) throw new Error('ZCode desktop model requires a safe local ID and exact provider/model IDs');
@@ -153,7 +173,7 @@ export class ConfigStore {
     });
   }
 
-  async markVerified(harness: 'codex', modelId: string, evidence: Omit<LocalZeroConfig['verifications'][string], 'reasoningEfforts'> & { reasoningEfforts?: ReasoningEffort[] }, expectedModel?: ModelConfig): Promise<void> {
+  async markVerified(harness: 'codex', modelId: string, evidence: Omit<LocalZeroConfig['verifications'][string], 'reasoningEfforts'> & { reasoningEfforts?: ReasoningEffort[] }, expectedModel?: ModelConfig): Promise<CodexVerificationReceipt> {
     return this.update(async (config, path) => {
       const model = resolveModelIdentity(config.models, modelId, item => item);
       if (!model) throw new Error(`Unknown or ambiguous model ID: ${modelId}`);
@@ -187,6 +207,7 @@ export class ConfigStore {
       config.bindings = [...config.bindings.filter(item => !(item.harness === harness && item.model.id === model.id)), binding];
       config.verifications[key] = { ...verificationEvidence, reasoningEfforts, ...(Object.keys(effortEvidence).length ? { effortEvidence } : {}) };
       await this.persist(config, path);
+      return structuredClone({ binding, verification: config.verifications[key]! });
     });
   }
 

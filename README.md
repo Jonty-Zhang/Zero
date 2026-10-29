@@ -6,6 +6,8 @@ Zero manages coding projects across local agents. Choose or create a folder, des
 
 See [Agent connection states and Codex Desktop integration limits](docs/codex-desktop-integration.md) for the current connection methods and what model readiness means.
 
+Use **Manage connections** to enter a Codex model and reasoning effort, then explicitly verify it. Verification makes one model call using Zero's already-authorized Codex environment; a successful binding becomes available to the Boss without a restart. Progress survives closing the dialog, and retries retain the original request. Account login and desktop-chat control are not part of this flow.
+
 Zero is an application made of one Node.js service, a local React web UI, and a CLI. The service owns task state and execution; the UI is a client of that service. v1 targets one Windows-first, single-user machine and binds to loopback by default.
 
 ## What works today

@@ -16,6 +16,8 @@ import { ZCodeCompositeAdapter } from '../adapters/zcode-composite.js';
 import type { ModelBinding } from '../adapters/types.js';
 import type { Attempt, CheckDefinition, CheckResult, ExecutionSelection, HandoffRecord, HarnessAdapter, ReviewResult, RouteDecision, SequenceGoalReview, StageRecord, TaskEvent, TaskRecord, TaskSequenceMetadata, TaskSequenceRecord, TaskSubmission, TaskStatus } from '../domain/types.js';
 import { canAcceptNewBossMessage } from '../domain/review-requirements.js';
+import { ConnectionSetupError, type ConnectionSetupService } from './connection-setup.js';
+import { LiveRuntimeAdapter } from './live-runtime-adapter.js';
 
 type HarnessName = 'codex' | 'dsh' | 'zcode';
 export type AdapterMap = Partial<Record<HarnessName, HarnessAdapter>>;
@@ -56,6 +58,7 @@ export interface ZeroServerOptions {
   store: TaskStorePort;
   config: ConfigPort;
   adapters?: AdapterMap;
+  connections?: Pick<ConnectionSetupService, 'setup' | 'submit' | 'get'>;
   /** Nudge the scheduler after a successful task insert. */
   enqueue?: (taskId: string) => void | Promise<void>;
   /** Nudge aggregate review after its explicit retry request has been persisted. */
@@ -78,11 +81,11 @@ const JSON_HEADERS = { ...SECURITY_HEADERS, 'Content-Type': 'application/json; c
 export function createDefaultAdapters(bindings: ModelBinding[], config?: Pick<ConfigPort, 'read'>): AdapterMap {
   const snapshot = structuredClone(bindings);
   const adapters: AdapterMap = {
-    codex: createCodexAdapter(snapshot),
+    codex: config ? new LiveRuntimeAdapter({ id:'codex',startupBindings:snapshot,readConfig:()=>config.read(),createDelegate:bindings=>createCodexAdapter(bindings) }) : createCodexAdapter(snapshot),
     dsh: new DshAdapter({ bindings: snapshot, dshHome: resolve(zeroDataRoot(), 'dsh-home') }),
     zcode: new ZCodeCompositeAdapter({ bindings: snapshot }),
   };
-  if (config) for (const id of KNOWN_HARNESSES) adapters[id] = guardRuntimeBindings(adapters[id]!, snapshot, () => config.read());
+  if (config) for (const id of KNOWN_HARNESSES) if(id!=='codex') adapters[id] = guardRuntimeBindings(adapters[id]!, snapshot, () => config.read());
   return adapters;
 }
 
@@ -134,6 +137,21 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     if (req.method === 'GET' && url.pathname === '/api/health') return json(res, 200, { status: 'ok' });
     if (url.pathname.startsWith('/api/')) {
       if (req.method === 'GET' && url.pathname === '/api/capabilities') return json(res, 200, await readCapabilities());
+      if (req.method === 'GET' && url.pathname === '/api/connections/setup') {
+        if(!options.connections)throw new HttpError(501,'此服务未启用网页连接设置');
+        return json(res,200,await options.connections.setup());
+      }
+      if (req.method === 'POST' && url.pathname === '/api/connections/codex/verify') {
+        if(!options.connections)throw new HttpError(501,'此服务未启用网页模型验证');
+        return json(res,202,await options.connections.submit(await bodyJson(req,options.maxBodyBytes),req.headers['x-idempotency-key']));
+      }
+      const verificationMatch=/^\/api\/connections\/verifications\/([A-Za-z0-9-]{1,128})$/.exec(url.pathname);
+      if(req.method==='GET'&&verificationMatch) {
+        if(!options.connections)throw new HttpError(501,'此服务未启用网页模型验证');
+        const job=options.connections.get(verificationMatch[1]!);
+        if(!job)throw new HttpError(404,'未找到这次验证');
+        return json(res,200,job);
+      }
       if (req.method === 'GET' && url.pathname === '/api/folders') {
         validateMutationOrigin(req);
         if (req.headers['sec-fetch-site'] === 'cross-site') throw new HttpError(403, '跨站读取文件夹请求已拒绝');
@@ -252,8 +270,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     }
     await staticFile(res, url.pathname, options.staticDir);
   } catch (error) {
-    const code = error instanceof HttpError || error instanceof ProjectFolderError ? error.status : error instanceof IdempotencyConflictError || error instanceof GoalReviewRetryConflictError || error instanceof BossMessageConflictError ? 409 : 500;
-    json(res, code, { error: message(error) });
+    const code = error instanceof HttpError || error instanceof ProjectFolderError || error instanceof ConnectionSetupError ? error.status : error instanceof IdempotencyConflictError || error instanceof GoalReviewRetryConflictError || error instanceof BossMessageConflictError ? 409 : 500;
+    // This marks rejection of this payload only; a conflicting key may still
+    // identify an earlier admitted job. Unknown/503 failures retain custody.
+    json(res, code, { error: message(error), ...(error instanceof ConnectionSetupError && (error.status === 400 || error.status === 409) ? { verificationNotStarted: true } : {}) });
   }
 }
 

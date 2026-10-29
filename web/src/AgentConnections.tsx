@@ -1,7 +1,16 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { ArrowUpRight, ChevronRight, Plug, RefreshCw, X } from 'lucide-react';
 import { useDialog } from './dialog';
 import type { HarnessHealth } from './types';
+import { api } from './api';
+import { createConnectionVerification, type ConnectionVerification } from './connection-verification';
+import { ConnectionVerificationForm } from './ConnectionVerificationForm';
+
+export function newConnectionVerification() {
+  let storage: Storage | undefined;
+  try { storage = sessionStorage; } catch { /* Browser storage can be disabled. */ }
+  return createConnectionVerification({ start: (...args) => api.verifyConnection(...args), read: id => api.connectionVerification(id) }, storage);
+}
 
 const agents = [{ id: 'codex', name: 'Codex' }, { id: 'dsh', name: 'DSH' }, { id: 'zcode', name: 'ZCode' }];
 
@@ -12,17 +21,28 @@ function readiness(item: HarnessHealth | undefined, error: string, loading?: boo
   const unverified = item.reason?.includes('没有完成真实调用验证的模型绑定');
   if (item.cliAvailable || (item.cliAvailable === undefined && unverified)) return {
     label: unverified ? '待验证模型' : '模型未就绪',
-    hint: '运行组件已检测到。请完成模型绑定验证；配置有改动时需重启 Zero。', ready: false,
+    hint: '运行组件已检测到。接通模型后即可交给 Boss 使用。', ready: false,
   };
   if (/\bENOENT\b/.test(item.reason ?? '')) return { label: '运行入口不可用', hint: '检查运行入口路径及工作目录，确认 Zero 能启动这个 Agent。', ready: false };
   if (item.cliAvailable === false) return { label: '运行入口不可用', hint: '运行组件未能启动，具体原因见技术详情。', ready: false };
   return { label: '连接异常', hint: '这个 Agent 暂时不能接收任务，具体原因见技术详情。', ready: false };
 }
 
-export function AgentConnections({ harnesses, error, loading, onRefresh }: {
-  harnesses: HarnessHealth[]; error: string; loading?: boolean; onRefresh: () => void;
+export function AgentConnections({ harnesses, error, loading, onRefresh, verification }: {
+  harnesses: HarnessHealth[]; error: string; loading?: boolean; onRefresh: () => void; verification?: ConnectionVerification;
 }) {
   const [open, setOpen] = useState(false);
+  const [local] = useState(() => verification ?? newConnectionVerification());
+  const store = verification ?? local;
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  const refreshed = useRef('');
+  const refresh = useRef(onRefresh); refresh.current = onRefresh;
+  useEffect(() => {
+    if (state.job?.state === 'succeeded' && refreshed.current !== state.job.id) {
+      refreshed.current = state.job.id;
+      refresh.current();
+    }
+  }, [state.job]);
   const entries = agents.map(agent => {
     const item = harnesses.find(h => h.id.toLowerCase() === agent.id);
     return { ...agent, name: item?.name || agent.name, item, state: readiness(item, error, loading) };
@@ -37,13 +57,13 @@ export function AgentConnections({ harnesses, error, loading, onRefresh }: {
       {error && <span className="agent-bar-error" role="status">连接状态暂不可用</span>}
       <button type="button" className="agent-manage-button" aria-label="管理 Agent 连接" onClick={() => setOpen(true)}>管理连接<ChevronRight size={16} aria-hidden="true" /></button>
     </section>
-    {open && <ConnectionDialog entries={entries} error={error} onClose={() => setOpen(false)} onRefresh={onRefresh} />}
+    {open && <ConnectionDialog entries={entries} error={error} onClose={() => setOpen(false)} onRefresh={onRefresh} verification={store} />}
   </>;
 }
 
-function ConnectionDialog({ entries, error, onClose, onRefresh }: {
+function ConnectionDialog({ entries, error, onClose, onRefresh, verification }: {
   entries: Array<{ id: string; name: string; item?: HarnessHealth; state: ReturnType<typeof readiness> }>;
-  error: string; onClose: () => void; onRefresh: () => void;
+  error: string; onClose: () => void; onRefresh: () => void; verification: ConnectionVerification;
 }) {
   const ref = useDialog(onClose);
   return <div className="overlay" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
@@ -55,6 +75,7 @@ function ConnectionDialog({ entries, error, onClose, onRefresh }: {
           <div className="agent-connection-heading"><h3>{name}</h3><span className={`agent-status ${state.ready ? 'ready' : ''}`}>{state.label}</span></div>
           <p className="agent-connection-hint">{state.hint}</p>
           {id === 'codex' && item && <p className="agent-connection-mode">当前接入：本机运行组件（CLI）</p>}
+          {id === 'codex' && <ConnectionVerificationForm store={verification} />}
           {!error && item && !state.ready && <details className="agent-technical"><summary aria-label={`查看 ${name} 技术详情`}>技术详情<ChevronRight size={14} aria-hidden="true" /></summary><p>{item.reason || '服务未提供具体原因。'}</p>{item.version && <span className="agent-version">版本：{item.version}</span>}</details>}
         </article>)}
         <aside className="codex-connection-note"><b>Codex 桌面版</b><p>当前版本通过本机运行组件调用 Codex，暂不能接管桌面窗口。App Server 是官方程序化接入协议，尚未在 Zero 启用。</p><a href="https://developers.openai.com/codex/app-server" target="_blank" rel="noreferrer">Codex App Server 文档<ArrowUpRight size={14} aria-hidden="true" /></a></aside>

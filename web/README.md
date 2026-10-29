@@ -15,6 +15,8 @@ npm run build
 
 Boss 偏好原样交给服务端解释，不在前端猜测或硬编码模型名称。设置页可编辑全局 `boss.preference`，任务偏好可覆盖它；保存偏好不代表已经连接对应模型，能力不足时显示可操作原因。任务详情优先展示 Boss 方案、真实分工与咨询消息，并允许继续补充说明或提问。活跃任务在安全处理点读取消息；验收中和已停止的任务不能追加消息，需要新建后续任务，不会自动重新开始。
 
+“管理连接”支持主动验证 Codex 模型和思考强度，成功后刷新能力，Boss 提交即可解禁，无须重启。验证按钮会说明真实模型调用和额度；打开页面、刷新状态或恢复已知作业只读取结果。App 持有作业状态，关闭弹窗和切换设置页不会丢失请求；会话存储仅保留模型、强度、请求标识和作业 ID，不保存任务内容或账户凭据。验证失败不能替代账号登录，也不表示桌面聊天已接入。
+
 任务详情顶部展示服务端确认的实际工作目录；完成时标记为成果文件夹，支持复制路径，并显示任务分支和成果提交。数据来自 `delivery`，不会将原项目 `repoPath` 当成输出目录。成果保存在独立工作区，不自动回写、覆盖原目录、合并或推送 GitHub。历史任务缺少成果定位数据时显示明确提示。
 
 旧任务表单在“高级模式：手动执行任务”中，旧目标序列通过“高级目标序列”进入，旧模型/执行预设在设置页“高级路由配置”中保留。
@@ -52,6 +54,9 @@ Boss 偏好原样交给服务端解释，不在前端猜测或硬编码模型名
 - `tests[].output` 保留检查错误，并附上可安全读取的 stdout/stderr。日志仅从配置的 artifact 根目录读取，每文件最多 256 KiB；缺失或目录外文件不返回。
 - `checkEvidence` 指明 `current`、`historical` 或 `unattributed`，并在可归属时返回 `runId`、`stageId`、`attemptId` 与批次 `status`。`tests` 只展示当前批次结果；过期批次放在 `historicalTests`。旧记录无法确认归属时保留可见，但不作为当前改动已通过的结论。完整性失败独立显示，即使所有用户命令退出 0。
 - `POST /api/tasks`：接收 `{ repoPath, baseRef, prompt, acceptanceCriteria, maxRevisions, checkCommands, execution: { harnessId, modelId, reasoningEffort }, executionStages: [{ harnessId, modelId, reasoningEffort }] }`。手动项可为 `null`；`executionStages` 可省略，若提供则需包含 1 到 16 个阶段。`execution` 是任务级默认值，阶段字段会覆盖默认值；服务端会验证每个最终组合均对应当前可用且已验证的绑定，并保留阶段顺序。
+- `GET /api/connections/setup`：模型选项、思考强度和 Codex 运行入口状态；入口可用不等于账号或模型已就绪。
+- `POST /api/connections/codex/verify`：接收 `{ modelId, reasoningEffort }` 和 `X-Idempotency-Key`，返回持久化验证作业。同一请求标识不能更换载荷。
+- `GET /api/connections/verifications/:id`：读取原验证结果，不启动调用。网络断线后重试已知作业只用此接口；尚无作业 ID 时显式重试原 POST，沿用原键。
 - `POST /api/tasks/:id/cancel`：取消 pending 或活跃任务。
 - `GET /api/sequences` 与 `GET /api/sequences/:id`：目标及其有序任务步骤，`goalReview` 包含最新验收状态、判定和发现，新的服务还返回 `attemptId`；存在待处理的显式重试时返回 `retryRequestedAt`。
 - `POST /api/sequences/:id/goal-review/retry`：JSON 为 `{ "attemptId": "最新 blocked 判定的 ID" }`。202 表示请求已持久化；同一仍有效的 ID 重复提交只排队一次。400 为无效输入，404 为序列不存在，409 为 ID 过期或状态不允许，501 为兼容存储不支持持久请求。失败后刷新目标状态再决定下一步。
