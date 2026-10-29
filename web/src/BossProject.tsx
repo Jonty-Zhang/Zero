@@ -130,8 +130,8 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
     try {
       let submission = retrySubmission;
       if (!submission) {
-        const project = await api.prepareProject(path.trim(), create);
-        submission = { draftKey, payload: { repoPath: project.repoPath, ...(baseRef ? { baseRef } : {}), prompt: prompt.trim(), boss: { preference: preference.trim() } } };
+        const repoPath = baseRef ? path.trim() : (await api.prepareProject(path.trim(), create)).repoPath;
+        submission = { draftKey, payload: { repoPath, ...(baseRef ? { baseRef } : {}), prompt: prompt.trim(), boss: { preference: preference.trim() } } };
         setPendingSubmission(submission);
       }
       const task = await api.createTask(submission.payload);

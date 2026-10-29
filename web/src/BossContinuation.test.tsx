@@ -38,7 +38,18 @@ it('opens one empty-goal Boss dialog with the original project and preference, t
   expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled();
   goal(); fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
   await vi.waitFor(() => expect(api.createTask).toHaveBeenCalledWith({ repoPath: repo, baseRef: sha, prompt: '请完成下一阶段目标', boss: { preference: done.boss!.preference } }));
-  expect(api.prepareProject).toHaveBeenCalledWith(repo, false);
+  expect(api.prepareProject).not.toHaveBeenCalled();
+});
+it('submits the fixed accepted commit even when current-folder preparation is unavailable', async () => {
+  vi.mocked(api.prepareProject).mockRejectedValue(new Error('Current folder contains an oversized local file'));
+  const initialDraft = draft();
+  initialDraft.path = `  ${repo}  `;
+  const onCreated = vi.fn();
+  render(<BossProjectModal capabilities={caps} capabilityError="" initialDraft={initialDraft} onClose={vi.fn()} onAdvanced={vi.fn()} onCreated={onCreated} />);
+  goal(); fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
+  await vi.waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: 'next', status: 'pending' }));
+  expect(api.createTask).toHaveBeenCalledWith({ repoPath: repo, baseRef: sha, prompt: '请完成下一阶段目标', boss: { preference: done.boss!.preference } });
+  expect(api.prepareProject).not.toHaveBeenCalled();
 });
 it.each([
   { status: 'running' }, { status: 'failed' }, { boss: undefined }, { repoPath: '' }, { repoPath: '  ' },
@@ -74,6 +85,7 @@ it('keeps the baseline through connection settings and advanced configuration, a
   expect(api.createTask).not.toHaveBeenCalled();
 });
 it('retries the exact fixed-baseline payload after an advanced round trip', async () => {
+  vi.mocked(api.prepareProject).mockRejectedValue(new Error('Current folder preparation unavailable'));
   vi.mocked(api.createTask).mockRejectedValueOnce(new Error('unknown receipt'));
   await openContinuation(); goal(); fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
   await screen.findByText('unknown receipt');
@@ -84,7 +96,29 @@ it('retries the exact fixed-baseline payload after an advanced round trip', asyn
   fireEvent.click(screen.getByRole('button', { name: '确认上次提交' }));
   await vi.waitFor(() => expect(api.createTask).toHaveBeenCalledTimes(2));
   expect(vi.mocked(api.createTask).mock.calls[1]![0]).toBe(payload);
-  expect(api.prepareProject).toHaveBeenCalledTimes(1);
+  expect(api.prepareProject).not.toHaveBeenCalled();
+});
+it.each([
+  { name: 'ordinary folder', continuation: undefined, path: repo, create: false },
+  { name: 'different folder', continuation: { repoPath: repo, baseRef: sha }, path: 'C:/other', create: false },
+  { name: 'new folder', continuation: { repoPath: repo, baseRef: sha }, path: repo, create: true },
+  { name: 'invalid source commit', continuation: { repoPath: repo, baseRef: 'HEAD' }, path: repo, create: false },
+])('prepares the $name and submits its prepared path without a fixed baseline', async ({ continuation, path, create }) => {
+  vi.mocked(api.prepareProject).mockResolvedValue({ path, repoPath: 'C:/prepared-project', initialized: true });
+  const onCreated = vi.fn();
+  render(<BossProjectModal capabilities={caps} capabilityError="" initialDraft={{ ...draft(), path: ` ${path} `, create, continuation }} onClose={vi.fn()} onAdvanced={vi.fn()} onCreated={onCreated} />);
+  goal(); fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
+  await vi.waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: 'next', status: 'pending' }));
+  expect(api.prepareProject).toHaveBeenCalledExactlyOnceWith(path, create);
+  expect(api.createTask).toHaveBeenCalledWith({ repoPath: 'C:/prepared-project', prompt: '请完成下一阶段目标', boss: { preference: done.boss!.preference } });
+});
+it('keeps ordinary submission blocked when folder preparation fails', async () => {
+  vi.mocked(api.prepareProject).mockRejectedValue(new Error('Folder preparation failed'));
+  render(<BossProjectModal capabilities={caps} capabilityError="" initialDraft={{ ...draft(), continuation: undefined }} onClose={vi.fn()} onAdvanced={vi.fn()} onCreated={vi.fn()} />);
+  goal(); fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
+  await screen.findByText('Folder preparation failed');
+  expect(api.prepareProject).toHaveBeenCalledExactlyOnceWith(repo, false);
+  expect(api.createTask).not.toHaveBeenCalled();
 });
 it('separates pending identities by the effective baseline and drops the source commit for a different folder', async () => {
   const onAdvanced = vi.fn();

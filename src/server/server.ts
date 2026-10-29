@@ -7,7 +7,7 @@ import { ConfigStore, type LocalZeroConfig } from './config-store.js';
 import { guardRuntimeBindings, matchesRuntimeBinding, RUNTIME_BINDING_RESTART_REQUIRED } from './runtime-binding-guard.js';
 import { TaskStore, BossMessageConflictError, GoalReviewRetryConflictError, type SequenceGoalReviewRetryRequest, type CheckRunRecord, type CheckRunIntegrityFailureRecord } from '../core/task-store.js';
 import { selectTaskCheckEvidence } from './task-check-evidence.js';
-import { listProjectFolders, prepareProjectFolder, ProjectFolderError } from './project-folders.js';
+import { listProjectFolders, prepareProjectFolder, validateProjectBaseline, ProjectFolderError } from './project-folders.js';
 import { CodexAdapter } from '../adapters/codex.js';
 import { IdempotencyConflictError, submissionRequestHash, validateSubmissionKey } from '../core/submission-idempotency.js';
 import type { AdapterConfig } from '../adapters/base.js';
@@ -503,11 +503,10 @@ async function parseSubmission(raw: unknown, options: ZeroServerOptions, capabil
     if (!capability.harnesses.some(harness => harness.id === 'codex' && harness.available)) {
       throw new HttpError(503, 'Boss 项目负责人暂不可用：请先连接并验证至少一个 Codex 模型，再重试。');
     }
-    const project = await prepareProjectFolder(input.repoPath);
-    const baseRef = typeof input.baseRef === 'string' && input.baseRef.trim() ? input.baseRef.trim() : project.baseRef ?? 'HEAD';
-    if (baseRef.length > 255 || baseRef.startsWith('-') || /[\0\r\n]/.test(baseRef)) throw new HttpError(400, 'baseRef 格式无效');
-    const baseCheck = spawnSync('git', ['-C', project.repoPath, 'rev-parse', '--verify', '--end-of-options', `${baseRef}^{commit}`], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
-    if (baseCheck.error || baseCheck.status !== 0) throw new HttpError(400, 'baseRef 必须指向项目中存在的提交');
+    const requestedBaseRef = typeof input.baseRef === 'string' && input.baseRef.trim() ? input.baseRef.trim() : undefined;
+    const project = requestedBaseRef ? await validateProjectBaseline(input.repoPath, requestedBaseRef) : await prepareProjectFolder(input.repoPath);
+    const baseRef = requestedBaseRef ?? project.baseRef ?? 'HEAD';
+    if (!requestedBaseRef) await validateProjectBaseline(project.repoPath, baseRef);
     return { repoPath: project.repoPath, baseRef, prompt, boss, acceptanceCriteria: [], checks: [], maxRevisions: 2 };
   }
   const repoInput = stringField(input.repoPath, 'repoPath', 1, 4096);

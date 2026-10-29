@@ -77,6 +77,19 @@ export async function listProjectFolders(value: unknown = process.cwd()) {
   return { path, parent: parent === path ? null : parent, folders };
 }
 
+/** An explicit baseline selects existing history, never the folder's current files. */
+export async function validateProjectBaseline(value: unknown, baseRef: string): Promise<{ repoPath: string; baseRef: string }> {
+  if (!baseRef || baseRef.length > 255 || baseRef.startsWith('-') || /[\0\r\n]/.test(baseRef)) throw new ProjectFolderError('baseRef 格式无效');
+  const path = await directory(pathInput(value));
+  const metadata = await lstat(join(path, '.git')).catch(() => undefined);
+  if (metadata?.isSymbolicLink()) throw new ProjectFolderError('项目 .git 不能是符号链接');
+  const top = await git(path, ['rev-parse', '--show-toplevel']).catch(() => undefined);
+  if (!top || await realpath(top.stdout.trim()).catch(() => '') !== path) throw new ProjectFolderError('所选文件夹必须是有效的 Git 仓库根目录');
+  const commit = await git(path, ['rev-parse', '--verify', '--end-of-options', `${baseRef}^{commit}`]).catch(() => undefined);
+  if (!commit) throw new ProjectFolderError('baseRef 必须指向项目中存在的提交');
+  return { repoPath: path, baseRef };
+}
+
 /** User-selected folders receive local history only; no remote is created or contacted. */
 export async function prepareProjectFolder(value: unknown, create = false): Promise<PreparedProject> {
   const requested = pathInput(value);

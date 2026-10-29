@@ -86,6 +86,7 @@ test('continuing a Boss project starts from its delivered commit despite later o
     await git('add', 'head-only.txt');
     await git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'Later original project work');
     const advancedHead = await git('rev-parse', 'HEAD'); assert.notEqual(advancedHead, acceptedCommit);
+    await writeFile(join(repo, 'later-local-export.bin'), Buffer.alloc(10 * 1024 * 1024 + 1));
     const payload = { repoPath: detail.repoPath, baseRef: acceptedCommit, prompt: nextPrompt, boss: detail.boss };
     const next = await post(payload, 'continue-project-request-1234'); assert.equal(next.status, 201, next.body.error);
     const retry = await post(payload, 'continue-project-request-1234'); assert.equal(retry.status, 201); assert.equal(retry.body.id, next.body.id);
