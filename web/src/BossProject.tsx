@@ -6,6 +6,8 @@ import { TaskLead } from './TaskLead';
 import { useDialog } from './dialog';
 import type { Capabilities, Task } from './types';
 import { createBossMessageComposer, useBossMessageComposer, type BossMessageComposer } from './boss-message-composer';
+import { ConnectionVerificationForm } from './ConnectionVerificationForm';
+import type { ConnectionVerification } from './connection-verification';
 
 const preferenceExample = 'Codex gpt6.1sol high 负责设计与验收，日常实现交给便宜模型或 DeepSeek，复杂问题先讨论。';
 type FolderListing = Awaited<ReturnType<typeof api.folders>>;
@@ -58,7 +60,7 @@ export function ProjectDelivery({ task }: { task: Task }) {
   </section>;
 }
 
-export function BossProjectModal({ capabilities, capabilityError, initialDraft, onClose, onAdvanced, onCreated }: { capabilities: Capabilities | null; capabilityError: string; initialDraft?: BossProjectDraft | null; onClose: () => void; onAdvanced: (draft: BossProjectDraft) => void; onCreated: (task: Task) => void }) {
+export function BossProjectModal({ capabilities, capabilityError, initialDraft, onClose, onAdvanced, onCreated, verification }: { capabilities: Capabilities | null; capabilityError: string; initialDraft?: BossProjectDraft | null; onClose: () => void; onAdvanced: (draft: BossProjectDraft) => void; onCreated: (task: Task) => void; verification?: ConnectionVerification }) {
   const [path, setPath] = useState(initialDraft?.path ?? '');
   const [prompt, setPrompt] = useState(initialDraft?.prompt ?? '');
   const [preference, setPreference] = useState(initialDraft?.preference ?? '');
@@ -74,7 +76,17 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
   const [pendingSubmission, setPendingSubmission] = useState<BossSubmission | null>(initialDraft?.pendingSubmission ?? null);
   const folderRequest = useRef<AbortController | null>(null);
   const submitting = useRef(false);
-  const dialogRef = useDialog(onClose, busy);
+  const [connecting, setConnecting] = useState(false);
+  const connectionTrigger = useRef<HTMLButtonElement>(null);
+  const connectionBack = useRef<HTMLButtonElement>(null);
+  const previousView = useRef(false);
+  const closeView = () => { if (connecting) setConnecting(false); else onClose(); };
+  const dialogRef = useDialog(closeView, busy);
+  useEffect(() => {
+    if (connecting) connectionBack.current?.focus();
+    else if (previousView.current) connectionTrigger.current?.focus();
+    previousView.current = connecting;
+  }, [connecting]);
   const codex = capabilities?.harnesses.find(harness => harness.id === 'codex');
   const leadReady = !capabilityError && !!codex?.available && !!capabilities?.bindings.some(binding => binding.harnessId === 'codex' && binding.available);
   const draftKey = JSON.stringify([path.trim(), create, prompt.trim(), preference.trim()]);
@@ -118,9 +130,9 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
     } catch (e) { setError(e instanceof Error ? e.message : '提交失败，请重试'); }
     finally { submitting.current = false; setBusy(false); }
   };
-  return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="交给 Boss" className="modal submit-modal boss-submit">
-    <div className="modal-heading boss-project-heading"><h2>新建项目</h2><button className="icon-button" aria-label="关闭对话框" disabled={busy} onClick={onClose}><X size={18} /></button></div>
-    <form onSubmit={submit} className="submit-form"><fieldset disabled={busy}>
+  return <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget && !busy) closeView(); }}><section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="交给 Boss" className="modal submit-modal boss-submit">
+    <div className="modal-heading boss-project-heading"><h2>{connecting ? '接通 Codex' : '新建项目'}</h2><button className="icon-button" aria-label={connecting ? '关闭连接设置' : '关闭对话框'} disabled={busy} onClick={closeView}><X size={18} /></button></div>
+    {connecting && verification ? <div className="submit-form"><button ref={connectionBack} type="button" className="button secondary" onClick={() => setConnecting(false)}>返回项目</button><ConnectionVerificationForm store={verification} /></div> : <form onSubmit={submit} className="submit-form"><fieldset disabled={busy}>
       <div className="field"><label htmlFor="boss-project-path" className="field-label">项目文件夹 *</label><div className="boss-folder-input"><input id="boss-project-path" required value={path} onChange={e => setPath(e.target.value)} placeholder="选择文件夹或输入完整路径" /><button className="button secondary" type="button" onClick={() => void browse(path.trim() || undefined)}><Folder size={15} />浏览文件夹</button></div><span className="field-hint">支持普通文件夹，无需预先配置 Git。</span></div>
       <label className="boss-create-toggle"><input type="checkbox" checked={create} onChange={e => setCreate(e.target.checked)} />这个路径还不存在，创建新文件夹</label>
       {browsing && <section className="folder-browser" aria-label="本机文件夹浏览"><div className="folder-browser-head"><b>选择本机文件夹</b><button type="button" className="icon-button" aria-label="关闭文件夹浏览" onClick={closeBrowser}><X size={15} /></button></div><div className="boss-folder-input"><label className="field"><span className="field-label">浏览路径</span><input value={browsePath} onChange={e => setBrowsePath(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); void browse(browsePath.trim() || undefined); } }} /></label><button type="button" className="button secondary" disabled={folderBusy} onClick={() => void browse(browsePath.trim() || undefined)}>打开路径</button></div>
@@ -130,10 +142,11 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
       <label className="field"><span className="field-label">你想完成什么 *</span><textarea aria-label="你想完成什么 *" required rows={5} value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="描述目标、背景和约束。方案、分工与验收由负责人处理。" /></label>
       <label className="field"><span className="field-label">Boss 与团队偏好（可选）</span><textarea aria-label="Boss 与团队偏好（可选）" rows={3} value={preference} onChange={e => setPreference(e.target.value)} placeholder={preferenceExample} /><span className="field-hint">模型名称不必准确；留空使用默认偏好。</span></label>
       {capabilityError ? <div className="inline-warning"><AlertCircle size={15} />无法读取可用模型：{capabilityError}。请重试，草稿已保留。</div> : !capabilities ? <p className="field-hint" role="status">正在确认 Codex 是否可用…</p> : !leadReady ? <div className="inline-warning"><AlertCircle size={15} /><div>尚无可用的 Codex 项目负责人。请先连接并验证 Codex 模型，再刷新。{codex?.reason && <p>Codex：{codex.reason}</p>}</div></div> : null}
+      {verification && <button ref={connectionTrigger} type="button" className="button secondary" disabled={busy} onClick={() => { closeBrowser(); setConnecting(true); }}>{leadReady ? '管理模型连接' : '接通 Codex 模型'}</button>}
       {retrySubmission && !busy && <p className="field-hint">上次提交结果未确认。重试不会重复创建任务。</p>}
       {error && <div className="alert error compact" role="alert"><AlertCircle size={16} />{error}</div>}
       <div className="modal-footer"><button type="button" className="link-button" disabled={busy} onClick={() => onAdvanced({ path, prompt, preference, create, pendingSubmission })}>手动配置</button><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || browsing || !submissionReady || !path.trim() || !prompt.trim()}>{busy ? <><LoaderCircle size={15} className="spin" />正在交给 Boss</> : <><Send size={15} />{retrySubmission ? '确认上次提交' : '交给 Boss'}</>}</button></div>
-    </fieldset></form>
+    </fieldset></form>}
   </section></div>;
 }
 
