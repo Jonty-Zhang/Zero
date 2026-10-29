@@ -237,6 +237,72 @@ for (const revisionCause of ['checks', 'review'] as const) test(`human requireme
   } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
+test('a requirement accepted during the last writer reaches actual sealed review and a verified revision', async () => {
+  const { root, repo, store, worktrees } = await fixture();
+  try {
+    const task = store.submit({ repoPath: repo, baseRef: 'HEAD', prompt: 'Create result.txt with an export label', boss: { preference: 'lead' } });
+    const requirement = 'The delivered label must be bilingual: Export / 导出';
+    let messageId = '';
+    let writes = 0;
+    let reviews = 0;
+    const codex: HarnessAdapter = {
+      id: 'codex',
+      async probe() { return { harness: 'codex', available: true, models: ['lead'], reasoningEfforts: ['high'], roles: ['review'] }; },
+      async run(request) {
+        assert.equal(request.role, 'review');
+        const payload = JSON.parse(request.prompt.split('\n\n').at(-1)!) as { requirements: { userMessages: Array<{ id: string; content: string }>; messageCursor: string } };
+        assert.deepEqual(payload.requirements.userMessages.map(message => ({ id: message.id, content: message.content })), [{ id: messageId, content: requirement }]);
+        assert.equal(payload.requirements.messageCursor, messageId);
+        assert.match(request.prompt, /immutable acceptance contract sealed with this review package/);
+        const label = await readFile(join(request.cwd, 'review-context/project/result.txt'), 'utf8');
+        if (++reviews === 1) {
+          assert.equal(label, 'Export');
+          return complete(JSON.stringify({ verdict: 'changes_requested', summary: 'Accepted late bilingual requirement is missing',
+            findings: [{ severity: 'medium', file: 'result.txt', line: 1, evidence: 'The file contains Export only', requestedChange: requirement }] }));
+        }
+        assert.equal(label, 'Export / 导出');
+        return complete(JSON.stringify({ verdict: 'pass', summary: 'Confirmed late bilingual requirement against artifact', findings: [] }));
+      },
+    };
+    const executor: HarnessAdapter = {
+      id: 'dsh', async probe() { return { harness: 'dsh', available: true, models: ['cheap'] }; },
+      async run(request) {
+        if (++writes === 1) {
+          assert.equal(request.role, 'implement');
+          assert.ok(!request.prompt.includes(requirement), 'the message arrives after this last writer has already started');
+          messageId = store.addBossMessage(task.id, 'user', requirement).id;
+          await writeFile(join(request.cwd, 'result.txt'), 'Export');
+        } else {
+          assert.equal(request.role, 'revise');
+          assert.ok(request.prompt.includes(requirement));
+          assert.match(request.prompt, /Accepted late bilingual requirement is missing/);
+          await writeFile(join(request.cwd, 'result.txt'), 'Export / 导出');
+        }
+        return complete(writes === 1 ? 'Initial export label' : 'Applied the late bilingual requirement');
+      },
+    };
+    const artifactRoot = join(root, 'artifacts');
+    const plan: BossPlan = { summary: 'Create export label', acceptanceCriteria: ['result.txt exists'],
+      boss: { harness: 'codex', model: 'lead', reasoningEffort: 'high' }, maxRevisions: 1,
+      stages: [{ harness: 'dsh', model: 'cheap', objective: 'Create export label' }],
+      checks: [{ id: 'exists', argv: [process.execPath, '-e', "require('node:assert/strict').ok(require('node:fs').existsSync('result.txt'))"] }] };
+    const worker = new TaskWorker({ store, worktrees, testRunner: new TestRunner(), artifactRoot,
+      adapters: new Map([['codex', codex], ['dsh', executor]]), boss: { async plan() { return plan; } },
+      router: { async route(current) { return { taskId: current.id, harness: 'dsh', model: 'cheap', reason: 'Execute assigned last stage', selectionSource: 'task', decidedAt: new Date().toISOString() }; } },
+      reviewer: new TaskReviewer({ codex, model: 'lead', reasoningEffort: 'high', artifactDir: artifactRoot }),
+    });
+    const done = await worker.runNext('last-writer-requirement');
+    assert.equal(done?.status, 'done', done?.failureReason);
+    assert.equal(writes, 2); assert.equal(reviews, 2);
+    assert.deepEqual(done.checks, plan.checks, 'late requirements do not rewrite checks which already started');
+    const report = await worker.readReport(task.id);
+    assert.deepEqual(report?.reviews.map(review => review.verdict), ['changes_requested', 'pass']);
+    assert.equal(report?.reviews.at(-1)?.summary, 'Confirmed late bilingual requirement against artifact');
+    assert.ok(report?.resultCommit);
+    assert.equal(await readFile(join(root, 'worktrees', task.id, 'result.txt'), 'utf8'), 'Export / 导出');
+  } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
 test('quota during the first Boss consultation persists a route checkpoint without starting a project writer', async () => {
   const { root, repo, store, worktrees } = await fixture();
   try {
