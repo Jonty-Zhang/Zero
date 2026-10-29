@@ -24,6 +24,9 @@ async function setup(path: string, quota: boolean) {
   const checks = [{ id: 'unit', argv: ['node', 'fixture.js'] }];
   const task = store.submit({ repoPath: '.', baseRef: 'HEAD', prompt: 'Quota commit authorization', checks, maxRevisions: 2, boss: { preference: 'lead' } });
   const owner = 'original'; const generationId = store.claimNext(owner)!.claimGenerationId!;
+  store.saveBossPlan(task.id, owner, { summary: 'Quota commit fixture', acceptanceCriteria: ['The result is reviewed'],
+    stages: [{ harness: 'dsh', model: 'fixture', objective: 'Produce the result' }], checks, maxRevisions: 2,
+    boss: { harness: 'codex', model: 'fixture-boss' } });
   const plan = { taskId: task.id, repoPath: join(process.cwd(), 'data/verification/boss-recovery-round20/project'), commonGitDir: join(process.cwd(), 'data/verification/boss-recovery-round20/project/.git'), worktreeRoot: join(process.cwd(), 'data/verification/boss-recovery-round20/worktrees'), path: join(process.cwd(), 'data/verification/boss-recovery-round20/worktrees', task.id), branch: `zero/${task.id}`, baseCommit: 'a'.repeat(40) };
   const info = { taskId: task.id, repoPath: plan.repoPath, path: plan.path, branch: plan.branch, baseCommit: plan.baseCommit };
   const observed = { info, commonGitDir: plan.commonGitDir, head: plan.baseCommit, fingerprint: 'd'.repeat(64) };
@@ -57,7 +60,7 @@ function resume(f: Awaited<ReturnType<typeof setup>>, owner: string) {
 }
 
 function pass(f: Awaited<ReturnType<typeof setup>>) {
-  const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', metadata: { packageId: f.pkg.id, generationId: f.generationId } });
+  const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', model: 'fixture-boss', metadata: { packageId: f.pkg.id, generationId: f.generationId } });
   const verdict = f.store.finishPackageReview({ packageId: f.pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId, recheckedSnapshot: f.snapshot, result: { verdict: 'pass', summary: 'all requirements', findings: [] }, attemptResult: { exitCode: 0 } });
   const input: QuotaInput = { operationId: 'quota-commit', packageId: f.pkg.id, verdictId: verdict.id, owner: f.owner, generationId: f.generationId, branchRef: f.pkg.branchRef, preHead: f.snapshot.preHead, treeId: f.snapshot.treeId, diffHash: f.snapshot.diffHash, message: 'Approved', timestamp: new Date().toISOString(),
     sameGenerationReviewQuota: { kind: 'quota', packageId: f.pkg.id, owner: f.owner, generationId: f.generationId },

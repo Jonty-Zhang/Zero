@@ -52,7 +52,9 @@ test('one objective drives Boss consultation, cross-harness work, adaptive deleg
           reviews++;
           assert.equal(await readFile(join(request.cwd, 'review-context/project/result.txt'), 'utf8'), 'integrated-export');
           assert.match(request.prompt, /final product includes export/);
-          return complete(JSON.stringify({ verdict: 'pass', summary: 'Observed final result and real automated check satisfy the objective', findings: [] }));
+          const frozen = JSON.parse(request.prompt.split('\n\n').at(-1)!).requirements as { replyMessageIds: string[] };
+          return complete(JSON.stringify({ verdict: 'pass', summary: 'Observed final result and real automated check satisfy the objective', findings: [],
+            userMessageReplies: frozen.replyMessageIds.map(messageId => ({ messageId, content: 'The final export preserves names; the artifact and automated check confirm the integration.' })) }));
         }
         const schema = JSON.parse(await readFile(request.outputSchemaPath!, 'utf8'));
         if (schema.properties.bindingId && !schema.properties.taskType) return complete(JSON.stringify({ bindingId: 'codex:lead', reasoningEffort: 'high', reason: 'Matched the requested available lead' }));
@@ -170,7 +172,10 @@ for (const pause of ['plan', 'writer'] as const) test(`quota in ${pause} resumes
     const worker = new TaskWorker({ store, worktrees, testRunner: new TestRunner(), artifactRoot: join(root, 'artifacts'), adapters: new Map([['dsh', dsh], ['zcode', zcode]]),
       boss: { async plan(_current, context) { plans++; if (pause === 'plan' && plans === 2) throw new QuotaLimitError('Boss planning limit', new Date(Date.now() + 60000).toISOString()); return { ...definitions, stages: context.completedStages ? definitions.stages.slice(1) : definitions.stages }; } },
       router: { async route(current) { return { taskId: current.id, harness: current.selection!.harness!, model: current.selection!.model!, reason: 'Boss chosen worker', selectionSource: 'task', decidedAt: new Date().toISOString() }; } },
-      reviewer: { async review() { return { harness: 'codex', model: 'lead', exitCode: 0, result: { verdict: 'pass', summary: 'Verified export', findings: [] } }; } } });
+      reviewer: { async review(_task, _worktree, _route, _checks, _diff, context) {
+        const userMessageReplies = context?.requirements?.replyMessageIds?.map(messageId => ({ messageId, content: 'Confirmed the export retains its original names against the artifact and checks.' })) ?? [];
+        return { harness: 'codex', model: 'lead', exitCode: 0, result: { verdict: 'pass', summary: 'Verified export', findings: [], userMessageReplies } };
+      } } });
     const waiting = await worker.runNext('before-quota');
     assert.equal(waiting?.status, 'waiting', waiting?.failureReason);
     assert.equal(waiting.resumeCheckpoint?.executionStageIndex, pause === 'writer' ? 0 : 1);
@@ -224,10 +229,11 @@ for (const revisionCause of ['checks', 'review'] as const) test(`human requireme
         if (++routes === 1) store.addBossMessage(task.id, 'user', 'Keep the existing public API during implementation');
         return { taskId: current.id, harness: 'dsh', model: 'cheap', reason: 'Boss chosen worker', selectionSource: 'task', decidedAt: new Date().toISOString() };
       } },
-      reviewer: { async review() {
+      reviewer: { async review(_task, _worktree, _route, _checks, _diff, context) {
+        const userMessageReplies = context?.requirements?.replyMessageIds?.map(messageId => ({ messageId, content: 'Reviewed the complete artifact against this accepted requirement.' })) ?? [];
         if (revisionCause === 'review' && ++reviews === 1) return { harness: 'codex', model: 'lead', exitCode: 0,
-          result: { verdict: 'changes_requested', summary: 'Finish the implementation against every accepted user update', findings: [{ severity: 'medium', file: 'result.txt', evidence: 'The artifact is still initial', requestedChange: 'Complete the product' }] } };
-        return { harness: 'codex', model: 'lead', exitCode: 0, result: { verdict: 'pass', summary: 'Verified the final product', findings: [] } };
+          result: { verdict: 'changes_requested', summary: 'Finish the implementation against every accepted user update', findings: [{ severity: 'medium', file: 'result.txt', evidence: 'The artifact is still initial', requestedChange: 'Complete the product' }], userMessageReplies } };
+        return { harness: 'codex', model: 'lead', exitCode: 0, result: { verdict: 'pass', summary: 'Verified the final product', findings: [], userMessageReplies } };
       } } });
     const done = await worker.runNext('human-context');
     assert.equal(done?.status, 'done', done?.failureReason);
@@ -237,7 +243,7 @@ for (const revisionCause of ['checks', 'review'] as const) test(`human requireme
   } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
-test('a requirement accepted during the last writer reaches actual sealed review and a verified revision', async () => {
+for (const pauseReview of [false, true]) test(`a requirement accepted during the last writer reaches actual sealed review, linked answer and a verified revision${pauseReview ? ' after review quota' : ''}`, async () => {
   const { root, repo, store, worktrees } = await fixture();
   try {
     const task = store.submit({ repoPath: repo, baseRef: 'HEAD', prompt: 'Create result.txt with an export label', boss: { preference: 'lead' } });
@@ -245,23 +251,32 @@ test('a requirement accepted during the last writer reaches actual sealed review
     let messageId = '';
     let writes = 0;
     let reviews = 0;
+    let quotaIssued = false;
+    let reviewPackageId = '';
     const codex: HarnessAdapter = {
       id: 'codex',
       async probe() { return { harness: 'codex', available: true, models: ['lead'], reasoningEfforts: ['high'], roles: ['review'] }; },
       async run(request) {
         assert.equal(request.role, 'review');
-        const payload = JSON.parse(request.prompt.split('\n\n').at(-1)!) as { requirements: { userMessages: Array<{ id: string; content: string }>; messageCursor: string } };
+        const payload = JSON.parse(request.prompt.split('\n\n').at(-1)!) as { requirements: { userMessages: Array<{ id: string; content: string }>; messageCursor: string; replyMessageIds: string[] } };
         assert.deepEqual(payload.requirements.userMessages.map(message => ({ id: message.id, content: message.content })), [{ id: messageId, content: requirement }]);
         assert.equal(payload.requirements.messageCursor, messageId);
         assert.match(request.prompt, /immutable acceptance contract sealed with this review package/);
+        assert.deepEqual(payload.requirements.replyMessageIds, reviews === 0 ? [messageId] : []);
+        if (pauseReview && !quotaIssued) {
+          quotaIssued = true; reviewPackageId = store.reviewPackages(task.id).at(-1)!.id;
+          return { status: 'failed', exitCode: 1, durationMs: 1, quota: { source: 'provider_message', retryAt: new Date(Date.now() + 60_000).toISOString() } };
+        }
+        if (pauseReview && reviews === 0) assert.equal(store.reviewPackages(task.id).at(-1)!.id, reviewPackageId, 'quota resumes the original frozen package');
         const label = await readFile(join(request.cwd, 'review-context/project/result.txt'), 'utf8');
         if (++reviews === 1) {
           assert.equal(label, 'Export');
           return complete(JSON.stringify({ verdict: 'changes_requested', summary: 'Accepted late bilingual requirement is missing',
-            findings: [{ severity: 'medium', file: 'result.txt', line: 1, evidence: 'The file contains Export only', requestedChange: requirement }] }));
+            findings: [{ severity: 'medium', file: 'result.txt', line: 1, evidence: 'The file contains Export only', requestedChange: requirement }],
+            userMessageReplies: [{ messageId, content: 'The artifact currently contains Export only. I requested a revision to add 导出 before accepting it.' }] }));
         }
         assert.equal(label, 'Export / 导出');
-        return complete(JSON.stringify({ verdict: 'pass', summary: 'Confirmed late bilingual requirement against artifact', findings: [] }));
+        return complete(JSON.stringify({ verdict: 'pass', summary: 'Confirmed late bilingual requirement against artifact', findings: [], userMessageReplies: [] }));
       },
     };
     const executor: HarnessAdapter = {
@@ -291,13 +306,28 @@ test('a requirement accepted during the last writer reaches actual sealed review
       router: { async route(current) { return { taskId: current.id, harness: 'dsh', model: 'cheap', reason: 'Execute assigned last stage', selectionSource: 'task', decidedAt: new Date().toISOString() }; } },
       reviewer: new TaskReviewer({ codex, model: 'lead', reasoningEffort: 'high', artifactDir: artifactRoot }),
     });
-    const done = await worker.runNext('last-writer-requirement');
+    let done = await worker.runNext('last-writer-requirement');
+    if (pauseReview) {
+      assert.equal(done?.status, 'waiting', done?.failureReason);
+      assert.equal(done.resumeCheckpoint?.kind, 'review_quota');
+      assert.equal(writes, 1); assert.equal(reviews, 0);
+      assert.equal(store.bossMessages(task.id).filter(message => message.inReplyTo).length, 0);
+      const db = new DatabaseSync(join(root, 'queue.sqlite'));
+      try { db.prepare('UPDATE quota_pauses SET retry_at=? WHERE task_id=?').run(new Date(Date.now() - 1000).toISOString(), task.id); } finally { db.close(); }
+      done = await worker.runNext('last-writer-requirement-resumed');
+    }
     assert.equal(done?.status, 'done', done?.failureReason);
     assert.equal(writes, 2); assert.equal(reviews, 2);
     assert.deepEqual(done.checks, plan.checks, 'late requirements do not rewrite checks which already started');
     const report = await worker.readReport(task.id);
     assert.deepEqual(report?.reviews.map(review => review.verdict), ['changes_requested', 'pass']);
     assert.equal(report?.reviews.at(-1)?.summary, 'Confirmed late bilingual requirement against artifact');
+    const answers = store.bossMessages(task.id).filter(message => message.inReplyTo === messageId);
+    assert.equal(answers.length, 1);
+    const verdict = store.packageReviewVerdicts(task.id).find(item => item.packageId === answers[0]!.reviewPackageId)!;
+    assert.equal(answers[0]!.reviewAttemptId, verdict.attemptId);
+    assert.equal(answers[0]!.content, verdict.result.userMessageReplies![0]!.content);
+    assert.deepEqual(report?.reviews[0]?.userMessageReplies, verdict.result.userMessageReplies);
     assert.ok(report?.resultCommit);
     assert.equal(await readFile(join(root, 'worktrees', task.id, 'result.txt'), 'utf8'), 'Export / 导出');
   } finally { store.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }

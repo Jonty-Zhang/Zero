@@ -25,6 +25,44 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+describe('persisted Boss replies', () => {
+  const user = { id: 'question-1', role: 'user' as const, content: '为什么选择这个方案？', at: '2026-10-29T10:00:00Z' };
+  const reply = { id: 'answer-1', role: 'boss' as const, content: '它减少了组件间的耦合；检查仍有两项未通过。', at: '2026-10-29T10:01:00Z', inReplyTo: user.id, reviewPackageId: 'package-1', reviewAttemptId: 'attempt-1' };
+  it('shows the exact question and answered receipt only for a complete persisted reply', () => {
+    render(<BossProgress task={{ ...task, bossMessages: [user, reply] }} onMessage={vi.fn()} />);
+    const answer = screen.getByText(reply.content).closest('article')!;
+    expect(within(answer).getByText('回复')).toBeTruthy();
+    expect(within(answer).getByLabelText('回复的原消息').textContent).toContain(user.content);
+    const original = screen.getAllByText(user.content).find(item => !answer.contains(item))!.closest('article')!;
+    expect(within(original).getByText('已答复')).toBeTruthy();
+    expect(screen.queryByText('已实现')).toBeNull(); expect(screen.queryByText('已验收')).toBeNull();
+    expect(screen.queryByText('package-1')).toBeNull(); expect(screen.queryByText('attempt-1')).toBeNull();
+    expect(screen.getByText(/回答在验收时产生/)).toBeTruthy();
+    expect(api.messageTask).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['historical summary', { inReplyTo: undefined, reviewPackageId: undefined, reviewAttemptId: undefined }],
+    ['missing package', { reviewPackageId: undefined }], ['missing attempt', { reviewAttemptId: undefined }],
+    ['empty package', { reviewPackageId: '  ' }], ['foreign message', { inReplyTo: 'other-task-question' }],
+    ['consultant target', { inReplyTo: 'consultant-1' }], ['not Boss', { role: 'consultant' as const }], ['empty answer', { content: '  ' }],
+  ])('does not infer a reply from %s', (_name, override) => {
+    render(<BossProgress task={{ ...task, bossMessages: [user, { ...user, id: 'consultant-1', role: 'consultant' }, { ...reply, ...override }] }} onMessage={vi.fn()} />);
+    expect(screen.queryByText('已答复')).toBeNull(); expect(screen.queryByText('回复')).toBeNull();
+    expect(screen.queryByLabelText('回复的原消息')).toBeNull();
+  });
+  it('preserves exact context across refresh order, waits for the original page and never carries it into another task', () => {
+    const view = render(<BossProgress task={{ ...task, bossMessages: [reply] }} onMessage={vi.fn()} />);
+    expect(screen.queryByText('已答复')).toBeNull();
+    view.rerender(<BossProgress task={{ ...task, bossMessages: [reply, user] }} onMessage={vi.fn()} />);
+    expect(screen.getByLabelText('回复的原消息').textContent).toContain(user.content);
+    view.rerender(<BossProgress task={{ ...task, bossMessages: [user, { ...user, id: 'later-question', content: '另一个问题' }, reply] }} onMessage={vi.fn()} />);
+    expect(screen.getByLabelText('回复的原消息').textContent).toContain(user.content);
+    expect(screen.getByText('另一个问题').closest('article')!.textContent).not.toContain('已答复');
+    view.rerender(<BossProgress task={{ ...task, id: 'another-task', bossMessages: [reply] }} onMessage={vi.fn()} />);
+    expect(screen.queryByLabelText('回复的原消息')).toBeNull(); expect(screen.queryByText(user.content)).toBeNull();
+  });
+});
+
 describe('recorded project lead', () => {
   it('shows the saved Boss identity separately from the executor and preference', () => {
     const bossPlan = { summary: '已保存的项目方案', acceptanceCriteria: [], stages: [], checks: [], maxRevisions: 2, boss: { harness: 'codex', model: 'actual-lead', reasoningEffort: 'high' } };

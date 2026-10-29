@@ -8,14 +8,14 @@ import { BossMessageConflictError, TaskStore } from './task-store.js';
 import type { BossMessage, RouteDecision } from '../domain/types.js';
 import { assertReviewRequirements } from '../domain/review-requirements.js';
 
-function fixture(path = ':memory:', boss = true) {
+function fixture(path = ':memory:', boss = true, reasoningEffort?: string) {
   const store = new TaskStore(path);
   const checks = [{ id: 'unit', argv: ['node', 'test.js'] }];
   const task = store.submit({ repoPath: '.', baseRef: 'main', prompt: 'Original human goal', ...(boss ? { boss: { preference: 'Codex lead' } } : { checks, acceptanceCriteria: ['Original acceptance'] }) }, 'requirements');
   const owner = 'worker';
   const claimed = store.claimNext(owner, 60_000)!;
   const generationId = claimed.claimGenerationId!;
-  if (boss) store.saveBossPlan(task.id, owner, { summary: 'Plan', acceptanceCriteria: ['Original acceptance'], stages: [{}], checks, maxRevisions: 1, boss: { harness: 'codex', model: 'boss-model' } });
+  if (boss) store.saveBossPlan(task.id, owner, { summary: 'Plan', acceptanceCriteria: ['Original acceptance'], stages: [{}], checks, maxRevisions: 1, boss: { harness: 'codex', model: 'boss-model', ...(reasoningEffort ? { reasoningEffort } : {}) } });
   const route: RouteDecision = { taskId: task.id, harness: 'zcode', model: 'writer', selectionSource: 'codex', reason: 'test', decidedAt: new Date().toISOString() };
   const routing = store.createAttempt(task.id, 'route', { owner, harness: 'codex' });
   store.finishAttempt(routing.id, { status: 'succeeded', metadata: { decision: route } });
@@ -53,6 +53,163 @@ test('review package freezes all accepted human requirements at check completion
   } finally { f.store.close(); }
 });
 
+test('new Boss package freezes reply targets and cannot accept PASS without its answers', () => {
+  const f = fixture();
+  try {
+    const message = f.store.addBossMessage(f.task.id, 'user', 'Why this design?');
+    const pkg = f.seal();
+    assert.equal((pkg.requirements as unknown as Record<string, unknown>).replyPolicy, 'per_message_v1');
+    assert.deepEqual((pkg.requirements as unknown as Record<string, unknown>).replyMessageIds, [message.id]);
+    assert.throws(() => passingVerdict(f, pkg.id), /repl|answer|回答/i);
+    assert.equal(f.store.packageReviewVerdicts(f.task.id).length, 0);
+  } finally { f.store.close(); }
+});
+
+test('valid linked answers commit with the exact verdict and cannot duplicate on replay', () => {
+  const f = fixture();
+  try {
+    const message = f.store.addBossMessage(f.task.id, 'user', 'Why this design?');
+    const pkg = f.seal();
+    const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', model: 'boss-model', metadata: { packageId: pkg.id, generationId: f.generationId } });
+    const input = { packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId,
+      recheckedSnapshot: pkg.snapshot, result: { verdict: 'pass' as const, summary: 'Verified', findings: [], userMessageReplies: [{ messageId: message.id, content: 'This keeps the public API stable.' }] }, attemptResult: { exitCode: 0 } };
+    f.store.finishPackageReview(input);
+    const replies = f.store.bossMessages(f.task.id).filter(item => item.role === 'boss');
+    assert.equal(replies.length, 1);
+    assert.equal((replies[0] as unknown as Record<string, unknown>).inReplyTo, message.id);
+    assert.equal((replies[0] as unknown as Record<string, unknown>).reviewAttemptId, attempt.id);
+    assert.equal((replies[0] as unknown as Record<string, unknown>).reviewPackageId, pkg.id);
+    assert.throws(() => f.store.finishPackageReview(input));
+    assert.equal(f.store.bossMessages(f.task.id).filter(item => item.role === 'boss').length, 1);
+  } finally { f.store.close(); }
+});
+
+for (const actual of [{ model: 'other', reasoningEffort: 'high' }, { model: 'boss-model', reasoningEffort: 'low' }]) test(`linked answers reject an ungranted actual Boss ${JSON.stringify(actual)}`, () => {
+  const f = fixture(':memory:', true, 'high');
+  try {
+    const message = f.store.addBossMessage(f.task.id, 'user', 'Why this design?'); const pkg = f.seal();
+    const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', metadata: { packageId: pkg.id, generationId: f.generationId } });
+    assert.throws(() => f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId,
+      recheckedSnapshot: pkg.snapshot, result: { verdict: 'pass', summary: 'Verified', findings: [], userMessageReplies: [{ messageId: message.id, content: 'Evidence-based answer' }] }, attemptResult: { exitCode: 0, ...actual } }), /Boss.*binding|Boss.*model|Boss.*effort/i);
+    assert.equal(f.store.attempts(f.task.id).find(a => a.id === attempt.id)?.status, 'running');
+    assert.equal(f.store.packageReviewVerdicts(f.task.id).length, 0);
+    assert.equal(f.store.bossMessages(f.task.id).filter(item => item.role === 'boss').length, 0);
+  } finally { f.store.close(); }
+});
+
+for (const actual of [{ model: 'other', reasoningEffort: 'high' }, { model: 'boss-model', reasoningEffort: 'low' }]) test(`empty reply target package cannot grant another Boss ${JSON.stringify(actual)}`, () => {
+  const f = fixture(':memory:', true, 'high');
+  try {
+    const pkg = f.seal(); assert.deepEqual(pkg.requirements?.replyMessageIds, []);
+    const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', metadata: { packageId: pkg.id, generationId: f.generationId } });
+    assert.throws(() => f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId,
+      recheckedSnapshot: pkg.snapshot, result: { verdict: 'pass', summary: 'Verified', findings: [], userMessageReplies: [] }, attemptResult: { exitCode: 0, ...actual } }), /Boss.*binding/i);
+    assert.equal(f.store.packageReviewVerdicts(f.task.id).length, 0);
+  } finally { f.store.close(); }
+});
+
+test('forged reply source fields without a committed verdict do not consume a reply target', async () => {
+  await diskFixture(path => {
+    const f = fixture(path);
+    try {
+      const message = f.store.addBossMessage(f.task.id, 'user', 'Explain this choice');
+      const db = new DatabaseSync(path);
+      try { db.prepare('INSERT INTO events(task_id,type,at,payload) VALUES(?,?,?,?)').run(f.task.id, 'boss.message', new Date().toISOString(), JSON.stringify({ id: 'forged', role: 'boss', content: 'Not a review receipt', at: new Date().toISOString(), inReplyTo: message.id, reviewPackageId: 'unknown', reviewAttemptId: 'unknown' })); }
+      finally { db.close(); }
+      assert.deepEqual(f.seal().requirements?.replyMessageIds, [message.id]);
+    } finally { f.store.close(); }
+  });
+});
+
+for (const boundary of ['cancelled', 'snapshot', 'forged-id'] as const) test(`linked answers are not published when ${boundary} invalidates completion`, () => {
+  const f = fixture();
+  try {
+    const message = f.store.addBossMessage(f.task.id, 'user', 'Explain the decision'); const pkg = f.seal();
+    const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', model: 'boss-model', metadata: { packageId: pkg.id, generationId: f.generationId } });
+    if (boundary === 'cancelled') f.store.requestTaskCancellation(f.task.id, f.owner, f.generationId);
+    assert.throws(() => f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId,
+      recheckedSnapshot: boundary === 'snapshot' ? { ...pkg.snapshot, fingerprint: 'changed' } : pkg.snapshot,
+      result: { verdict: 'pass', summary: 'Verified', findings: [], userMessageReplies: [{ messageId: boundary === 'forged-id' ? 'other-task-message' : message.id, content: 'An actual answer' }] }, attemptResult: { exitCode: 0 } }));
+    assert.equal(f.store.packageReviewVerdicts(f.task.id).length, 0);
+    assert.equal(f.store.attempts(f.task.id).find(item => item.id === attempt.id)?.status, 'running');
+    assert.equal(f.store.bossMessages(f.task.id).filter(item => item.role === 'boss').length, 0);
+  } finally { f.store.close(); }
+});
+
+test('blocked omission saves no reply while valid committed answers survive reopen', async () => {
+  await diskFixture(path => {
+    const f = fixture(path);
+    const message = f.store.addBossMessage(f.task.id, 'user', 'Why choose this API?'); const pkg = f.seal();
+    const attempt = () => f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', model: 'boss-model', metadata: { packageId: pkg.id, generationId: f.generationId } });
+    try {
+      f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt().id, owner: f.owner, generationId: f.generationId, recheckedSnapshot: pkg.snapshot,
+        result: { verdict: 'blocked', summary: 'Insufficient evidence', findings: [] }, attemptResult: { exitCode: 0 } });
+      assert.equal(f.store.bossMessages(f.task.id).filter(item => item.role === 'boss').length, 0);
+      const result = { verdict: 'pass' as const, summary: 'Verified', findings: [], userMessageReplies: [{ messageId: message.id, content: 'The API retains the existing call contract.' }] };
+      f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt().id, owner: f.owner, generationId: f.generationId, recheckedSnapshot: pkg.snapshot, result, attemptResult: { exitCode: 0 } });
+    } finally { f.store.close(); }
+    const reopened = new TaskStore(path);
+    try {
+      const answer = reopened.bossMessages(f.task.id).find(item => item.inReplyTo === message.id)!;
+      const verdict = reopened.packageReviewVerdicts(f.task.id).find(item => item.attemptId === answer.reviewAttemptId)!;
+      assert.equal(answer.reviewPackageId, verdict.packageId);
+      assert.equal(answer.content, verdict.result.userMessageReplies![0]!.content);
+    } finally { reopened.close(); }
+  });
+});
+
+test('reply event failure rolls back the verdict and attempt so the same completion can retry', async () => {
+  await diskFixture(path => {
+    const f = fixture(path);
+    const db = new DatabaseSync(path);
+    try {
+      const message = f.store.addBossMessage(f.task.id, 'user', 'Why preserve this API?');
+      const pkg = f.seal();
+      const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', model: 'boss-model',
+        metadata: { packageId: pkg.id, generationId: f.generationId } });
+      const input = { packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId,
+        recheckedSnapshot: pkg.snapshot, attemptResult: { exitCode: 0 },
+        result: { verdict: 'pass' as const, summary: 'Verified', findings: [],
+          userMessageReplies: [{ messageId: message.id, content: 'The existing callers depend on this API, and the artifact preserves it.' }] } };
+      db.exec(`CREATE TRIGGER reject_linked_reply BEFORE INSERT ON events
+        WHEN NEW.type='boss.message' AND json_extract(NEW.payload,'$.inReplyTo') IS NOT NULL
+        BEGIN SELECT RAISE(ABORT,'injected reply event failure'); END`);
+      assert.throws(() => f.store.finishPackageReview(input), /injected reply event failure/);
+      assert.equal(f.store.attempts(f.task.id).find(item => item.id === attempt.id)?.status, 'running');
+      assert.equal(f.store.packageReviewVerdicts(f.task.id).length, 0);
+      assert.equal(f.store.reviews(f.task.id).length, 0);
+      assert.equal(f.store.bossMessages(f.task.id).filter(item => item.inReplyTo).length, 0);
+      db.exec('DROP TRIGGER reject_linked_reply');
+      f.store.finishPackageReview(input);
+      assert.equal(f.store.attempts(f.task.id).find(item => item.id === attempt.id)?.status, 'succeeded');
+      assert.equal(f.store.packageReviewVerdicts(f.task.id).length, 1);
+      assert.equal(f.store.bossMessages(f.task.id).filter(item => item.inReplyTo === message.id).length, 1);
+    } finally { db.close(); f.store.close(); }
+  });
+});
+
+test('pre-policy Boss package retains old result contract without granting unsealed replies', async () => {
+  await diskFixture(path => {
+    const f = fixture(path);
+    try {
+      const message = f.store.addBossMessage(f.task.id, 'user', 'Legacy question'); const pkg = f.seal();
+      const oldRequirements = { ...pkg.requirements }; delete oldRequirements.replyPolicy; delete oldRequirements.replyMessageIds;
+      const db = new DatabaseSync(path);
+      try {
+        db.exec('DROP TRIGGER review_package_requirements_no_update');
+        db.prepare('UPDATE review_package_requirements SET payload=? WHERE package_id=?').run(JSON.stringify(oldRequirements), pkg.id);
+        db.exec("CREATE TRIGGER review_package_requirements_no_update BEFORE UPDATE ON review_package_requirements BEGIN SELECT RAISE(ABORT,'review requirements are immutable'); END");
+      } finally { db.close(); }
+      const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', model: 'boss-model', metadata: { packageId: pkg.id, generationId: f.generationId } });
+      assert.throws(() => f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId, recheckedSnapshot: pkg.snapshot,
+        result: { verdict: 'pass', summary: 'Verified', findings: [], userMessageReplies: [{ messageId: message.id, content: 'No sealed reply authority' }] }, attemptResult: { exitCode: 0 } }), /repl/i);
+      assert.equal(f.store.finishPackageReview({ packageId: pkg.id, attemptId: attempt.id, owner: f.owner, generationId: f.generationId, recheckedSnapshot: pkg.snapshot,
+        result: { verdict: 'pass', summary: 'Legacy result', findings: [] }, attemptResult: { exitCode: 0 } }).result.verdict, 'pass');
+      assert.equal(f.store.bossMessages(f.task.id).filter(item => item.role === 'boss').length, 0);
+    } finally { f.store.close(); }
+  });
+});
+
 async function diskFixture(run: (path: string) => Promise<void> | void) {
   const parent = join(process.cwd(), 'data', 'verification', 'boss-flow-round17');
   await mkdir(parent, { recursive: true });
@@ -61,7 +218,7 @@ async function diskFixture(run: (path: string) => Promise<void> | void) {
 }
 
 function passingVerdict(f: ReturnType<typeof fixture>, packageId: string) {
-  const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', metadata: { packageId, generationId: f.generationId } });
+  const attempt = f.store.createAttempt(f.task.id, 'review', { owner: f.owner, harness: 'codex', model: 'boss-model', metadata: { packageId, generationId: f.generationId } });
   return f.store.finishPackageReview({ packageId, attemptId: attempt.id, owner: f.owner, generationId: f.generationId,
     recheckedSnapshot: f.store.getReviewPackage(packageId)!.snapshot,
     result: { verdict: 'pass', summary: 'All requirements checked', findings: [] }, attemptResult: { exitCode: 0 } });

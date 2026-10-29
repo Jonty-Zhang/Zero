@@ -34,6 +34,9 @@ export interface BossMessage {
   at: string;
   model?: string;
   harness?: string;
+  inReplyTo?: string;
+  reviewPackageId?: string;
+  reviewAttemptId?: string;
 }
 
 /** An executable, persisted contract produced by the project lead. */
@@ -345,6 +348,7 @@ export interface ReviewResult {
   summary: string;
   findings: ReviewFinding[];
   rawPath?: string;
+  userMessageReplies?: Array<{ messageId: string; content: string }>;
 }
 
 /** Aggregate review may select the current tip of one repository for remediation. */

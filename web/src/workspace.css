@@ -944,6 +944,22 @@ code,pre,.task-id,.boss-stage-route,.attempt-route {
 .boss-message.boss {
   background:#efecf5
 }
+.boss-message-answered {
+  color:var(--ink);
+  font-size:15px
+}
+.boss-reply-context {
+  margin:16px 0;
+  padding:4px 0 4px 16px;
+  border-left:3px solid var(--line);
+  font-size:15px
+}
+.boss-reply-context > span {
+  font-weight:600
+}
+.boss-message .boss-reply-context p {
+  margin-top:6px
+}
 .boss-message-meta {
   display:flex;
   gap:12px;

@@ -25,7 +25,7 @@ import type {
 import { HANDOFF_V1_MAX_BYTES, parseHandoffV1 } from "../domain/handoff.js";
 import { IdempotencyConflictError, validateSubmissionKey } from "./submission-idempotency.js";
 import { buildGoalRevisionDraft, GoalRevisionCapacityError } from "../domain/goal-revision.js";
-import { assertReviewRequirements, canAcceptNewBossMessage, type ReviewRequirementsSnapshot } from "../domain/review-requirements.js";
+import { assertReviewRequirements, assertUserMessageReplies, canAcceptNewBossMessage, type ReviewRequirementsSnapshot } from "../domain/review-requirements.js";
 
 type Json = string | null;
 type TaskRow = {
@@ -3630,7 +3630,9 @@ export class TaskStore {
       const pkg = this.#db.prepare(`SELECT p.*,c.status AS check_run_status FROM review_packages p
         JOIN check_runs c ON c.id=p.check_run_id WHERE p.id=?`).get(input.packageId) as Record<string, unknown> | undefined;
       if (!pkg || pkg.check_run_status !== "completed") throw new Error("Review requires a current package with a completed check run");
-      this.requireReviewPackageRequirements(input.packageId);
+      const replyRequirements = this.requireReviewPackageRequirements(input.packageId);
+      assertUserMessageReplies(input.result, replyRequirements);
+      this.#assertTaskAcceptsWork(String(pkg.task_id));
       const latest = this.#db.prepare("SELECT id FROM review_packages WHERE task_id=? ORDER BY rowid DESC LIMIT 1")
         .get(String(pkg.task_id)) as { id: string } | undefined;
       if (!latest || latest.id !== input.packageId) throw new Error("Review package is not current for the task");
@@ -3658,6 +3660,16 @@ export class TaskStore {
       ] as Array<[string, unknown, string | undefined]>) {
         if (supplied !== undefined && existing !== null && existing !== supplied) {
           throw new Error(`Attempt result ${label} conflicts with the created review attempt`);
+        }
+      }
+      if (replyRequirements?.replyPolicy === 'per_message_v1'
+          && (input.result.verdict !== 'blocked' || input.result.userMessageReplies?.length)) {
+        const lead = this.get(String(pkg.task_id))?.bossPlan?.boss;
+        const actualModel = input.attemptResult?.model ?? attempt.model;
+        const actualEffort = input.attemptResult?.reasoningEffort ?? attempt.reasoning_effort;
+        if (!lead || lead.harness !== 'codex' || actualModel !== lead.model
+            || (lead.reasoningEffort !== undefined && actualEffort !== lead.reasoningEffort)) {
+          throw new Error('Linked answers require the persisted Boss model and reasoning effort binding');
         }
       }
       const metadata = attempt.metadata ? JSON.parse(String(attempt.metadata)) as Record<string, unknown> : {};
@@ -3697,6 +3709,12 @@ export class TaskStore {
       this.#db.prepare(`INSERT INTO review_verdicts(id,task_id,package_id,attempt_id,generation_id,snapshot,result,created_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(verdictId, String(pkg.task_id), input.packageId, input.attemptId, input.generationId,
         JSON.stringify(snapshot), JSON.stringify(input.result), createdAt);
+      for (const reply of input.result.userMessageReplies ?? []) {
+        const message: BossMessage = { id: randomUUID(), role: 'boss', content: reply.content, at: createdAt,
+          harness: 'codex', ...(typeof completedAttempt.model === 'string' ? { model: completedAttempt.model } : {}),
+          inReplyTo: reply.messageId, reviewPackageId: input.packageId, reviewAttemptId: input.attemptId };
+        this.#event(String(pkg.task_id), 'boss.message', message, createdAt);
+      }
       this.#event(String(pkg.task_id), "review.finished", { attemptId: input.attemptId, packageId: input.packageId, owner: input.owner,
         generationId: input.generationId, result: input.result }, createdAt);
       this.#event(String(pkg.task_id), "attempt.finished", { attempt: completedAttempt }, createdAt);
@@ -3712,6 +3730,36 @@ export class TaskStore {
   packageReviewVerdicts(taskId: string): PackageReviewVerdictRecord[] {
     return (this.#db.prepare("SELECT * FROM review_verdicts WHERE task_id=? ORDER BY created_at,id").all(taskId) as Record<string, unknown>[])
       .map(row => this.#packageReviewVerdict(row));
+  }
+
+  /** An event is an answer receipt only when its exact source committed successfully. */
+  #answeredBossMessageIds(taskId: string): Set<string> {
+    const answered = new Set<string>();
+    const rows = this.#db.prepare(`SELECT v.package_id,v.attempt_id,v.generation_id,v.result,v.snapshot,
+        a.status,a.role,a.harness,a.model,a.metadata,p.snapshot AS package_snapshot,r.payload AS requirements
+      FROM review_verdicts v JOIN attempts a ON a.id=v.attempt_id AND a.task_id=v.task_id
+      JOIN review_packages p ON p.id=v.package_id AND p.task_id=v.task_id
+      JOIN review_package_requirements r ON r.package_id=p.id WHERE v.task_id=?`).all(taskId) as Record<string, unknown>[];
+    const messages = this.bossMessages(taskId);
+    for (const row of rows) {
+      try {
+        const metadata = JSON.parse(String(row.metadata)) as Record<string, unknown>;
+        const requirements: unknown = JSON.parse(String(row.requirements));
+        assertReviewRequirements(requirements, taskId);
+        const result = JSON.parse(String(row.result)) as ReviewResult;
+        if (requirements.replyPolicy !== 'per_message_v1' || row.status !== 'succeeded' || row.role !== 'review'
+            || row.harness !== 'codex' || metadata.packageId !== row.package_id || metadata.generationId !== row.generation_id
+            || !isValidReviewResult(result) || !sameSnapshot(JSON.parse(String(row.snapshot)) as CheckRunSnapshot,
+              JSON.parse(String(row.package_snapshot)) as CheckRunSnapshot)) continue;
+        assertUserMessageReplies(result, requirements);
+        for (const reply of result.userMessageReplies ?? []) {
+          if (messages.some(message => message.role === 'boss' && message.inReplyTo === reply.messageId
+              && message.reviewPackageId === row.package_id && message.reviewAttemptId === row.attempt_id
+              && message.harness === row.harness && message.model === row.model && message.content === reply.content)) answered.add(reply.messageId);
+        }
+      } catch { /* Unverifiable history cannot consume a sealed reply target. */ }
+    }
+    return answered;
   }
 
   /** Atomically consumes the latest changes-requested verdict and enters the next revision exactly once. */
@@ -5132,10 +5180,13 @@ export class TaskStore {
       // accepted human message, including requirements received during the last
       // writer or the checks; consultant text is not promoted to user intent.
       const userMessages = submission.boss ? this.bossMessages(String(run.task_id)).filter(message => message.role === 'user') : [];
+      const answeredMessageIds = submission.boss ? this.#answeredBossMessageIds(String(run.task_id)) : new Set<string>();
       const requirements: ReviewRequirementsSnapshot = {
         version: 1, taskId: String(run.task_id), prompt: submission.prompt,
         acceptanceCriteria: submission.acceptanceCriteria ?? [], userMessages,
         ...(userMessages.length ? { messageCursor: userMessages.at(-1)!.id } : {}),
+        ...(submission.boss ? { replyPolicy: 'per_message_v1' as const,
+          replyMessageIds: userMessages.filter(message => !answeredMessageIds.has(message.id)).map(message => message.id) } : {}),
       };
       assertReviewRequirements(requirements, String(run.task_id));
       packageId = randomUUID();
