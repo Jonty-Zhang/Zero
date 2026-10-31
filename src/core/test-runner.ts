@@ -5,6 +5,7 @@ import { basename, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { CheckDefinition, CheckResult } from "../domain/types.js";
 import { resolveCheckInvocation } from "./check-invocation.js";
+import { DiagnosticCapture } from "./check-diagnostics.js";
 
 export interface TestRunnerOptions {
   timeoutMs?: number;
@@ -78,8 +79,11 @@ export class TestRunner {
       return { id: check.id, argv: [...check.argv], status: 'spawn_error', exitCode: null, durationMs: Date.now() - started,
         stdoutPath, stderrPath, error: error instanceof Error ? error.message : String(error) };
     }
-    const tee = (stream: NodeJS.ReadableStream, file: ReturnType<typeof createWriteStream> | undefined, size: () => number, setSize: (n: number) => void) => {
+    const stdoutCapture = new DiagnosticCapture();
+    const stderrCapture = new DiagnosticCapture();
+    const tee = (stream: NodeJS.ReadableStream, capture: DiagnosticCapture, file: ReturnType<typeof createWriteStream> | undefined, size: () => number, setSize: (n: number) => void) => {
       stream.on("data", (chunk: Buffer) => {
+        capture.write(chunk);
         const next = size() + chunk.length;
         if (file && size() < this.#maxLogBytes) {
           const allowed = Math.max(0, this.#maxLogBytes - size());
@@ -89,8 +93,8 @@ export class TestRunner {
         setSize(next);
       });
     };
-    tee(child.stdout!, stdoutFile, () => stdoutSize, n => { stdoutSize = n; });
-    tee(child.stderr!, stderrFile, () => stderrSize, n => { stderrSize = n; });
+    tee(child.stdout!, stdoutCapture, stdoutFile, () => stdoutSize, n => { stdoutSize = n; });
+    tee(child.stderr!, stderrCapture, stderrFile, () => stderrSize, n => { stderrSize = n; });
 
     let cancelled = options.signal?.aborted ?? false;
     const exitCode = await new Promise<number | null>(resolveExit => {
@@ -144,6 +148,8 @@ export class TestRunner {
       stdoutPath,
       stderrPath,
       logTruncated,
+      diagnostics: spawnError && stdoutSize === 0 && stderrSize === 0 ? undefined
+        : { stdout: stdoutCapture.snapshot(), stderr: stderrCapture.snapshot() },
       error: spawnError ?? (cancelled ? "Check cancelled" : undefined),
     };
   }

@@ -34,10 +34,12 @@
 - [x] Wire form edits/default initialization/remount to that draft; preserve existing validation, request and status behavior.
 - [x] Test the five Review Focus cases plus store existing retry/reload lifecycle tests with fake transport.
 - [x] Run complete web suite, `node --test web/tests/api.test.mjs`, and web build once; no duplicate root core build/full suite while round31 is running.
-- [ ] Independent whole-diff review, root documents exact results, commit/push main and verify remote SHA.
+- [x] Independent whole-diff review, root documents exact results, commit/push main and verify remote SHA.
 
 ## Execution record
 
 One producer/consumer task on the existing user-authorized codex checkout. Core round31 files belong to a separate frozen change and must remain untouched. Root stages the two rounds separately.
 
 Initial whole-diff review found one P2 incomplete per-field default initialization. Implementer fixed it; final scoped review six cases passed and no actionable finding remained. Final complete web suite: 360/360, API: 19/19, build: exit 0. Initial loopback sandbox failures retained separately; final source hashes match independent review. Publish this independently verified frontend change before the longer core regression finishes; no core files belong to this commit.
+
+Published commit: `107408469fe52e0d7a7ad193ac4c3cc38ffa860b`, remote main exact readback confirmed. Local HTTP 200 serves the exact verified web build without restarting the older core process. GitHub CI `41225586592` was still in progress at publication; no CI success claimed at that point.

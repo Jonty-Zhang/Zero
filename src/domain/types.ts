@@ -331,6 +331,14 @@ export interface CheckResult {
   stderrPath?: string;
   logTruncated?: boolean;
   error?: string;
+  /** Runner-observed UTF-8 head/tail snapshots; absent on legacy or unobserved results. */
+  diagnostics?: { stdout: CheckStreamDiagnostic; stderr: CheckStreamDiagnostic };
+}
+
+export interface CheckStreamDiagnostic {
+  /** At most 4096 UTF-8 bytes, with a visible gap marker when truncated. */
+  text: string;
+  truncated: boolean;
 }
 
 export type ReviewVerdict = "pass" | "changes_requested" | "blocked";

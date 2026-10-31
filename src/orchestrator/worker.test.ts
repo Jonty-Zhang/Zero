@@ -592,7 +592,9 @@ test("guardian review rework recovery restarts route and validation from the reg
     try {
       const failedCheckBoundary = boundary.startsWith("failed-check-");
       const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create approved result.txt", maxRevisions: failedCheckBoundary ? 2 : 1,
-        allowedPaths: ["result.txt"], checks: [{ id: "always-pass", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+        allowedPaths: ["result.txt"], checks: [
+          ...Array.from({ length: failedCheckBoundary ? 10 : 0 }, (_, index) => ({ id: `loud-pass-${index}`, argv: [process.execPath, "-e", "process.exit(0)"] })),
+          { id: "always-pass", argv: [process.execPath, "-e", "process.exit(0)"] }] });
       const oldOwner = `rework-old-${boundary}`;
       assert.equal(store.claimNext(oldOwner, 120_000)?.id, task.id);
       const worktrees = new GitWorktreeManager(worktreeRoot);
@@ -619,9 +621,9 @@ test("guardian review rework recovery restarts route and validation from the reg
         executionStageId: originalStage.id, routeAttemptId: originalRouteAttempt.id, route: originalRoute,
         branchRef: originalBranch.ref, snapshot: { baseCommit: created.info.baseCommit, preHead: originalBranch.head, ...originalSnapshot },
         checkDefinitionHash: (await import("node:crypto")).createHash("sha256").update(JSON.stringify(task.checks)).digest("hex"),
-        expectedCheckIds: ["always-pass"] });
-      store.recordCheckResult(originalChecks.id, { owner: oldOwner, generationId: store.get(task.id)!.claimGenerationId! },
-        { id: "always-pass", argv: [], status: "passed", exitCode: 0, durationMs: 1 });
+        expectedCheckIds: task.checks!.map(check => check.id) });
+      for (const check of task.checks!) store.recordCheckResult(originalChecks.id, { owner: oldOwner, generationId: store.get(task.id)!.claimGenerationId! },
+        { id: check.id, argv: check.argv, status: "passed", exitCode: 0, durationMs: 1 });
       store.finishStage(originalStage.id, oldOwner, `original-${boundary}`, "succeeded", await worktrees.fingerprint(created.info));
       const originalPackage = store.completeCheckRun(originalChecks.id,
         { owner: oldOwner, generationId: store.get(task.id)!.claimGenerationId! },
@@ -676,9 +678,13 @@ test("guardian review rework recovery restarts route and validation from the reg
             route: reworkRoute, branchRef: branch.ref,
             snapshot: { baseCommit: created.info.baseCommit, preHead: branch.head, ...await worktrees.captureReviewSnapshot(created.info) },
             checkDefinitionHash: (await import("node:crypto")).createHash("sha256").update(JSON.stringify(task.checks)).digest("hex"),
-            expectedCheckIds: ["always-pass"] });
+            expectedCheckIds: task.checks!.map(check => check.id) });
+          for (const check of task.checks!.slice(0, -1)) store.recordCheckResult(failedRun.id, { owner: oldOwner, generationId: originalGeneration },
+            { id: check.id, argv: check.argv, status: "passed", exitCode: 0, durationMs: 1,
+              diagnostics: { stdout: { text: 'PASS_OUTPUT'.repeat(400), truncated: false }, stderr: { text: 'PASS_OUTPUT'.repeat(400), truncated: false } } });
           store.recordCheckResult(failedRun.id, { owner: oldOwner, generationId: originalGeneration },
-            { id: "always-pass", argv: [], status: "failed", exitCode: 1, durationMs: 1, error: "simulated failed rework validation" });
+            { id: "always-pass", argv: [], status: "failed", exitCode: 1, durationMs: 1, error: "simulated failed rework validation",
+              diagnostics: { stdout: { text: 'PERSISTED_ROUND31_STDOUT', truncated: false }, stderr: { text: 'PERSISTED_ROUND31_STDERR', truncated: false } } });
           store.finishCheckRun(failedRun.id, { owner: oldOwner, generationId: originalGeneration }, "failed", "simulated failed rework validation");
           store.finishStage(stage.id, oldOwner, processStartId, "failed", await worktrees.fingerprint(created.info));
           if (boundary === "failed-check-after-retry") {
@@ -712,7 +718,13 @@ test("guardian review rework recovery restarts route and validation from the reg
         async run(request) {
           writerCalls++;
           assert.equal(request.cwd, plan.path);
-          if (failedCheckBoundary) assert.match(request.prompt, /Failed checks:/);
+          if (failedCheckBoundary) {
+            assert.match(request.prompt, /Failed checks:/);
+            assert.match(request.prompt, /PERSISTED_ROUND31_STDOUT/);
+            assert.match(request.prompt, /PERSISTED_ROUND31_STDERR/);
+            assert.doesNotMatch(request.prompt, /PASS_OUTPUT/);
+            assert.doesNotMatch(request.prompt, /loud-pass-0: status=passed/);
+          }
           assert.match(request.prompt, /Reviewer verdict: changes_requested/);
           assert.match(request.prompt, /Rewrite result.txt with the approved marker\./);
           if (["mid-writer", "post-writer", "failed-check-before-retry", "failed-check-after-retry"].includes(boundary)) {
@@ -725,7 +737,7 @@ test("guardian review rework recovery restarts route and validation from the reg
         router: { async route(current) { routeCalls++; assert.equal(current.revisionCount, failedCheckBoundary ? 2 : 1); return routeFor(current); } },
         reviewer: { async review(_current, _worktree, _route, checks) {
           reviewCalls++;
-          assert.ok(checks.length === 1 && checks[0]?.status === "passed");
+          assert.ok(checks.length === task.checks!.length && checks.every(check => check.status === "passed"));
           return { harness: "codex", model: "review", exitCode: 0,
             result: boundary === "fresh-blocked"
               ? { verdict: "blocked", summary: "Review requires operator input.", findings: [] }
@@ -796,7 +808,7 @@ test("reviewer-requested revision consumes failed checks once and retries within
   try {
     const task = store.submit({ repoPath: repo, baseRef: "main", prompt: "Create approved result.txt", maxRevisions: 2,
       allowedPaths: ["result.txt"], checks: [{ id: "approved", argv: [process.execPath,
-        "-e", "process.exit(require('node:fs').readFileSync('result.txt','utf8').includes('valid') ? 0 : 1)"] }] });
+        "-e", "if(!require('node:fs').readFileSync('result.txt','utf8').includes('valid')){process.stdout.write(['REWORK31','OUT'].join('_'));process.stderr.write(['REWORK31','ERR'].join('_'));process.exitCode=1}"] }] });
     const owner = "rework-check-retry-owner";
     assert.equal(store.claimNext(owner)?.id, task.id);
     let routeCalls = 0;
@@ -805,7 +817,11 @@ test("reviewer-requested revision consumes failed checks once and retries within
     const adapter: HarnessAdapter = { id: "fake", async probe() { return { harness: "fake", available: true, models: ["model"] }; },
       async run(request) {
         writerCalls++;
-        if (writerCalls === 3) assert.match(request.prompt, /Failed checks:/);
+        if (writerCalls === 3) {
+          assert.match(request.prompt, /Failed checks:/);
+          assert.match(request.prompt, /REWORK31_OUT/);
+          assert.match(request.prompt, /REWORK31_ERR/);
+        }
         await writeFile(join(request.cwd, "result.txt"), writerCalls === 1 ? "valid initial\n"
           : writerCalls === 2 ? "bad revision\n" : "valid approved\n");
         return { status: "completed", exitCode: 0, durationMs: 1 };
@@ -1999,7 +2015,7 @@ test("failed validation stage is handed off before a linked revision stage start
     await exec("git", ["commit", "-m", "seed"], { cwd: repo });
     const task = store.submit({ repoPath: repo, baseRef: "main", prompt: `Write an approved result. ${"Objective detail ".repeat(600)}`,
       acceptanceCriteria: Array.from({ length: 22 }, (_, index) => `Criterion ${index + 1}: ${"detailed requirement ".repeat(100)}`), maxRevisions: 1,
-      checks: [{ id: "approved-result", argv: [process.execPath, "-e", "process.exit(require('fs').readFileSync('result.txt','utf8') === 'approved\\n' ? 0 : 1)"] }] });
+      checks: [{ id: "approved-result", argv: [process.execPath, "-e", "if(require('fs').readFileSync('result.txt','utf8') !== 'approved\\n'){process.stdout.write(['ROUND31','STDOUT','REPAIR'].join('_'));process.stderr.write(['ROUND31','STDERR','CAUSE'].join('_'));process.exitCode=23}"] }] });
     store.claimNext("stage-revision-worker");
     let runs = 0;
     const prompts: string[] = [];
@@ -2013,6 +2029,8 @@ test("failed validation stage is handed off before a linked revision stage start
     const result = await worker.runClaimed(task.id, "stage-revision-worker");
     assert.equal(result.status, "done");
     assert.equal(runs, 2);
+    assert.match(prompts[1]!, /ROUND31_STDOUT_REPAIR/);
+    assert.match(prompts[1]!, /ROUND31_STDERR_CAUSE/);
     const stages = store.stages(task.id);
     assert.deepEqual(stages.map(item => item.role), ["implement", "revise"]);
     assert.deepEqual(stages.map(item => item.status), ["failed", "succeeded"]);

@@ -108,6 +108,26 @@ function completeReviewPackage(f: ReturnType<typeof reviewFixture>) {
   return f.store.completeCheckRun(run.id, { owner: f.owner, generationId: f.generationId }, f.snapshot).reviewPackage;
 }
 
+test("check diagnostic snapshots survive SQLite close and reopen in both result stores", async () => {
+  const root = await mkdtemp(join(process.cwd(), '.zero-check-diagnostics-store-'));
+  const path = join(root, 'tasks.sqlite');
+  const f = reviewFixture(undefined, 60_000, path);
+  const diagnostics = { stdout: { text: 'original 原因😀\u0000\n', truncated: true }, stderr: { text: '', truncated: false } };
+  let runId = '';
+  try {
+    const run = f.store.startCheckRun(f.input);
+    runId = run.id;
+    const result = { ...f.result('unit', 'failed'), diagnostics };
+    f.store.recordCheckResult(run.id, { owner: f.owner, generationId: f.generationId }, result);
+    f.store.saveCheck(f.task.id, result);
+  } finally { f.store.close(); }
+  const reopened = new TaskStore(path);
+  try {
+    assert.deepEqual(reopened.checkRunResults(runId)[0]?.diagnostics, diagnostics);
+    assert.deepEqual(reopened.checks(f.task.id)[0]?.diagnostics, diagnostics);
+  } finally { reopened.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 function startBoundReviewAttempt(f: ReturnType<typeof reviewFixture>, packageId: string) {
   const task = f.store.get(f.task.id)!;
   return f.store.createAttempt(f.task.id, "review", { owner: task.leaseOwner ?? f.owner, harness: "codex",
