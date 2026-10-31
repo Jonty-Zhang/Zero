@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { BossMessage, HarnessAdapter, HarnessCapabilities, RunRequest, RunResult, TaskRecord } from '../domain/types.js';
+import type { BossMessage, HandoffV1, HarnessAdapter, HarnessCapabilities, RunRequest, RunResult, TaskRecord } from '../domain/types.js';
 import { BossOrchestrator, type BossPlanContext } from './boss.js';
 import type { RouteCandidate } from './router.js';
 import { QuotaLimitError } from '../core/quota.js';
@@ -53,6 +53,76 @@ async function fixture(run: (request: Omit<RunRequest, 'taskId' | 'attemptId'>, 
   return { root, workspace, boss, task, context, messages, dispose: () => rm(root, { recursive: true, force: true }) };
 }
 const result = (final: string): RunResult => ({ status: 'completed', exitCode: 0, durationMs: 1, final });
+
+function budgetHandoff(index: number, prose = 'executor account'): HandoffV1 {
+  return { schemaVersion: 1, taskId: 'task', stageId: `stage-${index}`, createdAt: '2026-10-31T00:00:00Z',
+    source: { attemptId: `attempt-${index}`, harness: 'dsh', model: 'cheap', processStartId: 'process' },
+    workspace: { state: 'dirty', baseCommit: 'base', fingerprint: `historical-${index}`, changedFiles: [] },
+    task: { objective: 'DO_NOT_REPEAT_HANDOFF_OBJECTIVE', acceptanceCriteria: ['DO_NOT_REPEAT_HANDOFF_CRITERION'] },
+    currentState: prose.slice(0, 1000), executorSummary: prose.slice(0, 1600), completed: [], decisions: [], rejectedOptions: [], keyFiles: [], checks: [], blockers: [], risks: [], nextSteps: ['Inspect the current worktree'] };
+}
+
+test('planning and consultation share independently bounded handoff projections and retain full real requirements', async () => {
+  let decisions = 0;
+  const projections: unknown[] = [];
+  const f = await fixture(async (request, purpose) => {
+    if (purpose === 'boss_selection') return result(selection());
+    const input = JSON.parse(request.prompt.split('\n').find(line => line.startsWith('{"objective":'))!);
+    assert.equal(input.objective, f.task.prompt);
+    assert.deepEqual(input.acceptanceCriteria, f.task.acceptanceCriteria);
+    const evidence = input.handoffContext;
+    assert.ok(evidence, 'machine evidence must be a separate field');
+    assert.ok(Buffer.byteLength(JSON.stringify(evidence), 'utf8') <= 128 * 1024);
+    assert.ok(evidence.projections.length <= 16);
+    assert.equal(evidence.projections.length + evidence.omittedCount, 20);
+    assert.ok(evidence.omittedCount > 4, 'outer JSON escaping must evict older projections');
+    assert.match(evidence.projections.at(-1), /stage-19/);
+    assert.ok(!JSON.stringify(evidence).includes('DO_NOT_REPEAT_HANDOFF'));
+    for (const projection of evidence.projections) {
+      assert.match(projection, /UNTRUSTED/); assert.match(projection, /authoritative/);
+      assert.match(projection, /historical-/); assert.match(projection, /executorSummary/);
+    }
+    projections.push(evidence);
+    if (purpose === 'boss_consult') return result('Independent advice');
+    return result(decisions++ === 0 ? consult() : plan());
+  });
+  Object.assign(f.context, { handoffs: Array.from({ length: 20 }, (_, i) => budgetHandoff(i, '"'.repeat(1600))) });
+  f.task.prompt = '完整原任务😀'.repeat(1000);
+  f.task.acceptanceCriteria = Array.from({ length: 20 }, (_, i) => `criterion ${i}: 界`.repeat(100));
+  try {
+    await f.boss.plan(f.task, f.context);
+    assert.equal(projections.length, 3);
+    assert.deepEqual(projections[0], projections[1]); assert.deepEqual(projections[1], projections[2]);
+  } finally { await f.dispose(); }
+});
+
+test('handoff projections bound dense Unicode while absent handoffs produce explicit empty evidence', async () => {
+  let expected = 0;
+  const f = await fixture(async (request, purpose) => {
+    if (purpose === 'boss_selection') return result(selection());
+    const input = JSON.parse(request.prompt.split('\n').find(line => line.startsWith('{"objective":'))!);
+    assert.equal(input.handoffContext.projections.length, expected);
+    assert.equal(input.handoffContext.omittedCount, 0);
+    assert.ok(Buffer.byteLength(JSON.stringify(input.handoffContext), 'utf8') <= 128 * 1024);
+    if (expected) assert.match(input.handoffContext.projections[0], /😀/);
+    assert.equal(input.latestUserMessages[0].content, 'Include runnable tests.');
+    return result(plan());
+  });
+  try {
+    await f.boss.plan(f.task, f.context);
+    expected = 16;
+    Object.assign(f.context, { handoffs: Array.from({ length: 16 }, (_, i) => budgetHandoff(i, '😀界'.repeat(400))) });
+    await f.boss.plan(f.task, f.context);
+  } finally { await f.dispose(); }
+});
+
+test('machine handoffs cannot hide an oversized real conversation', async () => {
+  const f = await fixture(async (_request, purpose) => result(purpose === 'boss_selection' ? selection() : plan()));
+  f.context.messages = Array.from({ length: 18 }, (_, i) => ({ id: `user-${i}`, role: 'user', at: new Date().toISOString(), content: 'X'.repeat(16000) }));
+  Object.assign(f.context, { handoffs: [budgetHandoff(1)] });
+  try { await assert.rejects(f.boss.plan(f.task, f.context), /conversation exceeds the 256 KiB/); }
+  finally { await f.dispose(); }
+});
 
 test('Boss resolves a natural preference, consults a different harness in a disposable snapshot, and delegates affordable stages', async () => {
   const calls: Array<{ purpose: string; request: Omit<RunRequest, 'taskId' | 'attemptId'> }> = [];
