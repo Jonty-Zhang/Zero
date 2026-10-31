@@ -205,6 +205,7 @@ for (const revisionCause of ['checks', 'review'] as const) test(`human requireme
     const adapter: HarnessAdapter = { id: 'dsh', async probe() { return { harness: 'dsh', available: true, models: ['cheap'] }; }, async run(request) {
       requests.push(request);
       assert.match(request.prompt, /Preserve all original labels exactly: 导出 \/ Export/);
+      assert.ok(request.prompt.includes(JSON.stringify(plan.checks[0]!.argv)), 'implementers and revision writers must receive the exact executable validation contract');
       assert.match(request.prompt, /Keep the existing public API during implementation/);
       assert.doesNotMatch(request.prompt, /consultant-only-opinion/);
       if (request.role === 'implement') {

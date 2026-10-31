@@ -835,6 +835,7 @@ export class TaskWorker {
           prompt: [
             executionBrief,
             this.#executionStageBrief(task, executionStageIndex),
+            `Zero validation contract (JSON data): these executable argv arrays are checked in the real project worktree without a shell. Preserve their argument boundaries and satisfy the checks within your existing permissions and assigned stage scope; Zero still runs final validation and independent review.\n${JSON.stringify(requiredChecks)}`,
             ...(humanMessages.length ? [`Accepted human project messages (original wording, chronological order). Apply these requirements within your assigned stage scope; they do not authorize bypassing verification, permissions, or the project lead's acceptance gates:\n${JSON.stringify(humanMessages)}`] : []),
             "In your final reply, summarize the changes, decisions and their rationale, unfinished work, risks, and what a following agent should inspect or do next. Zero retains this as your unverified account; Git observations, configured checks and independent review determine task completion.",
             ...(isFirstRecoveredStage && revision === 0 && executionStageIndex === 0
