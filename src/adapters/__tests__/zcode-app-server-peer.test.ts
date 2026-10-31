@@ -279,6 +279,7 @@ async function withFakeServer<T>(
   run: (peer: ZCodeAppServerPeer, dirs: { root: string; worktree: string; dataBaseDir: string }) => Promise<T>,
   onDiagnostic?: (event: ZCodeAppServerDiagnosticEvent) => void,
   profileMode: 'isolated' | 'existing-desktop' = 'isolated',
+  options: { requestTimeoutMs?: number } = {},
 ): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), 'zero-zcode-peer-'));
   const worktree = join(root, 'task-worktree');
@@ -291,7 +292,7 @@ async function withFakeServer<T>(
     taskWorktree: worktree,
     profileMode,
     ...(profileMode === 'isolated' ? { zeroDataRoot: root, dataBaseDir } : {}),
-    requestTimeoutMs: 1_000,
+    requestTimeoutMs: options.requestTimeoutMs ?? 1_000,
     initialFrameTimeoutMs: 150,
     onDiagnostic,
   });
@@ -518,12 +519,30 @@ test('preference RPC failures expose only fixed JSON-RPC numeric-code categories
     await withFakeServer(async peer => {
       await debugRequest(peer, 'test/set-mode', { mode });
       await assert.rejects(createSession(peer));
-    }, event => events.push(event));
+    }, event => events.push(event), 'isolated', { requestTimeoutMs: 10_000 });
 
     const event = events.find(candidate => candidate.stage === 'preference_ack' && candidate.outcome === 'failed');
     assert.equal(event?.code, 'rpc_failed');
     assert.equal(event?.rpcErrorCategory, category);
-    const serialized = JSON.stringify(events);
+    const nonTimingEvents = events.map(({ elapsedMs, ...diagnostic }) => {
+      assert.equal(Number.isFinite(elapsedMs), true);
+      assert.equal(Number.isInteger(elapsedMs), true);
+      assert.ok(elapsedMs >= 0 && elapsedMs <= 86_400_000);
+      assert.deepEqual(Object.keys(diagnostic).sort(), [
+        ...(diagnostic.code === undefined ? [] : ['code']),
+        ...(diagnostic.rpcErrorCategory === undefined ? [] : ['rpcErrorCategory']),
+        ...(diagnostic.transportFailureCategory === undefined ? [] : ['transportFailureCategory']),
+        'outcome', 'stage',
+      ].sort());
+      assert.ok(['launch', 'preference_ack', 'session_create_rpc', 'subscribe_ack', 'initial_frame_timeout', 'child_exit'].includes(diagnostic.stage));
+      assert.ok(['started', 'acknowledged', 'failed', 'timeout', 'exited'].includes(diagnostic.outcome));
+      if (diagnostic.code !== undefined) assert.ok(['launch_failed', 'rpc_failed', 'ack_invalid', 'response_invalid', 'initial_frame_timeout', 'child_exit_unexpected', 'child_exit_during_close'].includes(diagnostic.code));
+      if (diagnostic.rpcErrorCategory !== undefined) assert.ok(['method_not_found', 'invalid_params', 'other_protocol_error', 'no_code'].includes(diagnostic.rpcErrorCategory));
+      if (diagnostic.transportFailureCategory !== undefined) assert.ok(['child_exit', 'timeout', 'malformed_frame', 'stream_failure', 'write_failure', 'other'].includes(diagnostic.transportFailureCategory));
+      return diagnostic;
+    });
+    // A legitimate duration may contain the numeric protocol-code canary.
+    const serialized = JSON.stringify(nonTimingEvents);
     for (const canary of ['CANARY_PROMPT', 'CANARY_TOKEN', 'CANARY_CONFIG', 'C:/private/profile', 'private-proxy.invalid', '-32601', '-32602', '777']) {
       assert.equal(serialized.includes(canary), false);
     }
