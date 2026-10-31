@@ -113,6 +113,10 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
     finally { if (!controller.signal.aborted) setFolderBusy(false); }
   };
   const closeBrowser = () => { folderRequest.current?.abort(); setBrowsing(false); setFolderBusy(false); };
+  const editBrowsePath = (value: string) => {
+    folderRequest.current?.abort();
+    setFolderBusy(false); setListing(null); setFolderError(''); setNewName(''); setBrowsePath(value);
+  };
   const selectFolder = (newFolder = false) => {
     if (!listing) return;
     if (newFolder && (!newName.trim() || /[\\/]/.test(newName) || ['.', '..'].includes(newName.trim()))) { setFolderError('请输入一个文件夹名称，不能包含路径分隔符。'); return; }
@@ -145,7 +149,7 @@ export function BossProjectModal({ capabilities, capabilityError, initialDraft, 
       {baseRef && <p className="field-hint">从上次验收的成果继续</p>}
       {project.resolving && <p role="status" className="field-hint">正在确认项目目录…</p>}
       {project.error && <div role="alert" className="folder-error">{project.error}<button type="button" className="button secondary" onClick={project.retry}>重试目录检查</button></div>}
-      {browsing && <section className="folder-browser" aria-label="本机文件夹浏览"><div className="folder-browser-head"><b>选择本机文件夹</b><button type="button" className="icon-button" aria-label="关闭文件夹浏览" onClick={closeBrowser}><X size={15} /></button></div><div className="boss-folder-input"><label className="field"><span className="field-label">浏览路径</span><input value={browsePath} onChange={e => setBrowsePath(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); void browse(browsePath.trim() || undefined); } }} /></label><button type="button" className="button secondary" disabled={folderBusy} onClick={() => void browse(browsePath.trim() || undefined)}>打开路径</button></div>
+      {browsing && <section className="folder-browser" aria-label="本机文件夹浏览"><div className="folder-browser-head"><b>选择本机文件夹</b><button type="button" className="icon-button" aria-label="关闭文件夹浏览" onClick={closeBrowser}><X size={15} /></button></div><div className="boss-folder-input"><label className="field"><span className="field-label">浏览路径</span><input value={browsePath} onChange={e => editBrowsePath(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); void browse(browsePath.trim() || undefined); } }} /></label><button type="button" className="button secondary" disabled={folderBusy} onClick={() => void browse(browsePath.trim() || undefined)}>打开路径</button></div>
         {folderBusy ? <p role="status"><LoaderCircle size={15} className="spin" />正在读取文件夹…</p> : <>{listing?.parent && <button type="button" className="link-button" onClick={() => void browse(listing.parent!)}><ArrowUp size={14} />上一级</button>}{listing && <><p className="folder-current">{listing.path}</p><div className="folder-list">{listing.folders.map(folder => <button type="button" key={folder.path} onClick={() => void browse(folder.path)}><Folder size={15} />{folder.name}</button>)}{!listing.folders.length && <p>没有子文件夹</p>}</div><div className="folder-browser-actions"><button type="button" className="button primary" onClick={() => selectFolder()}>选择此文件夹</button><label className="field"><span className="field-label">新文件夹名称</span><input value={newName} onChange={e => setNewName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); selectFolder(true); } }} placeholder="例如 my-project" /></label><button type="button" className="button secondary" disabled={!newName.trim()} onClick={() => selectFolder(true)}><FolderPlus size={15} />使用新文件夹</button></div></>}</>}
         {folderError && <p role="alert" className="folder-error">{folderError}</p>}
       </section>}
