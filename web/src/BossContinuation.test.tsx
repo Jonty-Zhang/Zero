@@ -5,7 +5,7 @@ import { BossProjectModal, ProjectDelivery, type BossProjectDraft } from './Boss
 import { api } from './api';
 import type { Capabilities, Task } from './types';
 
-vi.mock('./api', () => ({ api: { tasks: vi.fn(), task: vi.fn(), sequences: vi.fn(), capabilities: vi.fn(), config: vi.fn(), prepareProject: vi.fn(), createTask: vi.fn(), connectionSetup: vi.fn() } }));
+vi.mock('./api', () => ({ api: { tasks: vi.fn(), task: vi.fn(), sequences: vi.fn(), capabilities: vi.fn(), config: vi.fn(), prepareProject: vi.fn(), createTask: vi.fn(), connectionSetup: vi.fn(), folders: vi.fn() } }));
 const sha = 'a'.repeat(40);
 const repo = 'C:/projects/original';
 const done: Task = { id: 'source', title: '上一项目', status: 'done', repoPath: repo, prompt: '旧目标不要继承', boss: { preference: '用户的团队偏好' }, delivery: { path: 'C:/old-worktree', branch: 'boss/source', resultCommit: sha } };
@@ -16,6 +16,7 @@ beforeEach(() => {
   vi.mocked(api.tasks).mockResolvedValue([done]); vi.mocked(api.task).mockResolvedValue(done);
   vi.mocked(api.sequences).mockResolvedValue([]); vi.mocked(api.capabilities).mockResolvedValue(caps);
   vi.mocked(api.config).mockResolvedValue({ allocator: { kind: 'codex', modelId: null, reasoningEffort: null }, reviewer: { modelId: null, reasoningEffort: null } });
+  vi.mocked(api.folders).mockImplementation(async path => ({ path: path!, parent: null, folders: [] }));
   vi.mocked(api.prepareProject).mockImplementation(async path => ({ path, repoPath: path, initialized: false }));
   vi.mocked(api.createTask).mockResolvedValue({ id: 'next', status: 'pending' });
   vi.mocked(api.connectionSetup).mockResolvedValue({ codex: { available: true, models: [{ id: 'lead', label: 'Lead' }], reasoningEfforts: [] } });
@@ -73,7 +74,7 @@ it('keeps the baseline through connection settings and advanced configuration, a
   expect((screen.getByLabelText('基础分支 / Ref') as HTMLInputElement).value).toBe(sha);
   expect((screen.getByLabelText('基础分支 / Ref') as HTMLInputElement).readOnly).toBe(true);
   fireEvent.change(screen.getByLabelText(/仓库路径/), { target: { value: 'C:/other' } });
-  expect((screen.getByLabelText('基础分支 / Ref') as HTMLInputElement).value).toBe('HEAD');
+  await vi.waitFor(() => expect((screen.getByLabelText('基础分支 / Ref') as HTMLInputElement).value).toBe('HEAD'));
   fireEvent.change(screen.getByLabelText(/仓库路径/), { target: { value: repo } });
   expect((screen.getByLabelText('基础分支 / Ref') as HTMLInputElement).value).toBe(sha);
   fireEvent.click(screen.getByRole('button', { name: '返回 Boss' }));
@@ -107,7 +108,9 @@ it.each([
   vi.mocked(api.prepareProject).mockResolvedValue({ path, repoPath: 'C:/prepared-project', initialized: true });
   const onCreated = vi.fn();
   render(<BossProjectModal capabilities={caps} capabilityError="" initialDraft={{ ...draft(), path: ` ${path} `, create, continuation }} onClose={vi.fn()} onAdvanced={vi.fn()} onCreated={onCreated} />);
-  goal(); fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
+  goal();
+  await vi.waitFor(() => expect((screen.getByRole('button', { name: '交给 Boss' }) as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
   await vi.waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: 'next', status: 'pending' }));
   expect(api.prepareProject).toHaveBeenCalledExactlyOnceWith(path, create);
   expect(api.createTask).toHaveBeenCalledWith({ repoPath: 'C:/prepared-project', prompt: '请完成下一阶段目标', boss: { preference: done.boss!.preference } });
@@ -131,6 +134,7 @@ it('separates pending identities by the effective baseline and drops the source 
   fireEvent.change(screen.getByLabelText('项目文件夹 *'), { target: { value: 'C:/other' } });
   expect(screen.queryByText('从上次验收的成果继续')).toBeNull();
   expect(screen.queryByRole('button', { name: '确认上次提交' })).toBeNull();
+  await vi.waitFor(() => expect((screen.getByRole('button', { name: '交给 Boss' }) as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
   await vi.waitFor(() => expect(api.createTask).toHaveBeenCalledTimes(2));
   expect(vi.mocked(api.createTask).mock.calls[1]![0]).not.toHaveProperty('baseRef');
@@ -157,6 +161,7 @@ it('returns the latest manual goal and folder to Boss with a consistent effectiv
   expect((screen.getByLabelText('项目文件夹 *') as HTMLInputElement).value).toBe('C:/other');
   expect((screen.getByLabelText('你想完成什么 *') as HTMLTextAreaElement).value).toBe('高级表单中的最新目标');
   expect(screen.queryByText('从上次验收的成果继续')).toBeNull();
+  await vi.waitFor(() => expect((screen.getByRole('button', { name: '交给 Boss' }) as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(screen.getByRole('button', { name: '交给 Boss' }));
   await vi.waitFor(() => expect(api.createTask).toHaveBeenCalledWith({ repoPath: 'C:/other', prompt: '高级表单中的最新目标', boss: { preference: done.boss!.preference } }));
 });
