@@ -195,3 +195,158 @@ it('recovers a lost result by GET when reopened and refreshes Boss readiness wit
   expect(api.connectionVerification).toHaveBeenCalledTimes(2);
   await vi.waitFor(() => expect(api.capabilities).toHaveBeenCalledTimes(2));
 });
+it('preserves the unsubmitted connection model and effort when returning from the Boss project', async () => {
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: '提交任务' }));
+  const dialog = screen.getByRole('dialog', { name: '交给 Boss' });
+  fireEvent.change(within(dialog).getByLabelText('项目文件夹 *'), { target: { value: 'C:/projects/draft' } });
+  fireEvent.change(within(dialog).getByLabelText('你想完成什么 *'), { target: { value: 'Keep my project draft' } });
+  const openConnection = async () => {
+    fireEvent.click(within(dialog).getByRole('button', { name: '接通 Codex 模型' }));
+    await vi.waitFor(() => expect((within(dialog).getByLabelText('Codex 模型') as HTMLInputElement).value).toBe('lead-model'));
+  };
+  await openConnection();
+  fireEvent.change(within(dialog).getByLabelText('Codex 模型'), { target: { value: 'chosen-custom-model' } });
+  fireEvent.change(within(dialog).getByLabelText('Codex 思考强度'), { target: { value: 'low' } });
+  expect((within(dialog).getByLabelText('Codex 模型') as HTMLInputElement).value).toBe('chosen-custom-model');
+  expect((within(dialog).getByLabelText('Codex 思考强度') as HTMLSelectElement).value).toBe('low');
+  fireEvent.click(within(dialog).getByRole('button', { name: '返回项目' }));
+  expect((within(dialog).getByLabelText('项目文件夹 *') as HTMLInputElement).value).toBe('C:/projects/draft');
+  expect((within(dialog).getByLabelText('你想完成什么 *') as HTMLTextAreaElement).value).toBe('Keep my project draft');
+  fireEvent.click(within(dialog).getByRole('button', { name: '接通 Codex 模型' }));
+  await vi.waitFor(() => expect(api.connectionSetup).toHaveBeenCalledTimes(2));
+  await vi.waitFor(() => expect((within(dialog).getByLabelText('Codex 模型') as HTMLInputElement).value).not.toBe(''));
+  const actual = {
+    model: (within(dialog).getByLabelText('Codex 模型') as HTMLInputElement).value,
+    effort: (within(dialog).getByLabelText('Codex 思考强度') as HTMLSelectElement).value,
+  };
+  console.log('ROUND32_CONNECTION_DRAFT', JSON.stringify(actual));
+  expect(api.verifyConnection).not.toHaveBeenCalled();
+  expect(api.connectionVerification).not.toHaveBeenCalled();
+  expect(api.prepareProject).not.toHaveBeenCalled();
+  expect(api.createTask).not.toHaveBeenCalled();
+  expect(actual).toEqual({ model: 'chosen-custom-model', effort: 'low' });
+});
+
+it('shares an unsubmitted draft across connection settings entry points', async () => {
+  render(<App />); let dialog = await open();
+  fireEvent.change(within(dialog).getByLabelText('Codex 模型'), { target: { value: 'custom-model' } });
+  fireEvent.change(within(dialog).getByLabelText('Codex 思考强度'), { target: { value: 'low' } });
+  close(dialog);
+  fireEvent.click(screen.getByRole('button', { name: '路由设置' }));
+  await screen.findByText('Boss 与团队偏好');
+  fireEvent.click(screen.getByRole('button', { name: '管理 Agent 连接' }));
+  dialog = screen.getByRole('dialog', { name: 'Agent 连接' });
+  await vi.waitFor(() => expect(api.connectionSetup).toHaveBeenCalledTimes(2));
+  expect((within(dialog).getByLabelText('Codex 模型') as HTMLInputElement).value).toBe('custom-model');
+  expect((within(dialog).getByLabelText('Codex 思考强度') as HTMLSelectElement).value).toBe('low');
+  expect(api.verifyConnection).not.toHaveBeenCalled();
+  expect(api.prepareProject).not.toHaveBeenCalled(); expect(api.createTask).not.toHaveBeenCalled();
+});
+
+for (const model of ['typed-before-options', '']) it(`keeps a manually edited model ${JSON.stringify(model)} when setup arrives late`, async () => {
+  let finish!: (setup: Awaited<ReturnType<typeof api.connectionSetup>>) => void;
+  vi.mocked(api.connectionSetup).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: '管理 Agent 连接' }));
+  const dialog = screen.getByRole('dialog', { name: 'Agent 连接' });
+  const input = within(dialog).getByLabelText('Codex 模型') as HTMLInputElement;
+  fireEvent.change(input, { target: { value: 'temporary' } });
+  fireEvent.change(input, { target: { value: model } });
+  await act(async () => { finish({ codex: { available: true, models: [{ id: 'late-default', label: 'Late' }], reasoningEfforts: ['low'] } }); });
+  expect(input.value).toBe(model);
+  expect((within(dialog).getByLabelText('Codex 思考强度') as HTMLSelectElement).value).toBe('low');
+  close(dialog);
+  fireEvent.click(screen.getByRole('button', { name: '管理 Agent 连接' }));
+  await vi.waitFor(() => expect(api.connectionSetup).toHaveBeenCalledTimes(2));
+  expect((screen.getByLabelText('Codex 模型') as HTMLInputElement).value).toBe(model);
+  expect(api.verifyConnection).not.toHaveBeenCalled();
+});
+
+it('keeps a newer draft on remount after a successful verification', async () => {
+  vi.mocked(api.verifyConnection).mockResolvedValue({ ...running, state: 'succeeded' });
+  render(<App />); const dialog = await open();
+  fireEvent.click(within(dialog).getByRole('button', { name: '验证并接通' }));
+  await within(dialog).findByText(/lead-model 已通过验证/);
+  fireEvent.change(within(dialog).getByLabelText('Codex 模型'), { target: { value: 'next-model' } });
+  fireEvent.change(within(dialog).getByLabelText('Codex 思考强度'), { target: { value: 'low' } });
+  close(dialog);
+  fireEvent.click(screen.getByRole('button', { name: '管理 Agent 连接' }));
+  await vi.waitFor(() => expect(api.connectionSetup).toHaveBeenCalledTimes(2));
+  expect((screen.getByLabelText('Codex 模型') as HTMLInputElement).value).toBe('next-model');
+  expect((screen.getByLabelText('Codex 思考强度') as HTMLSelectElement).value).toBe('low');
+  expect(api.verifyConnection).toHaveBeenCalledTimes(1);
+});
+
+it('locks the original custom identity across uncertain retries and changed setup options', async () => {
+  vi.mocked(api.verifyConnection).mockRejectedValueOnce(new Error('unknown custom request'))
+    .mockResolvedValue({ ...running, modelId: 'custom-model', reasoningEffort: 'low', state: 'failed', error: 'original request completed' });
+  render(<App />); let dialog = await open();
+  fireEvent.change(within(dialog).getByLabelText('Codex 模型'), { target: { value: 'custom-model' } });
+  fireEvent.change(within(dialog).getByLabelText('Codex 思考强度'), { target: { value: 'low' } });
+  fireEvent.click(within(dialog).getByRole('button', { name: '验证并接通' }));
+  await within(dialog).findByText('unknown custom request');
+  const original = vi.mocked(api.verifyConnection).mock.calls[0];
+  expect(original?.slice(0, 2)).toEqual(['custom-model', 'low']);
+  close(dialog);
+  vi.mocked(api.connectionSetup).mockResolvedValue({ codex: { available: true, models: [{ id: 'new-default', label: 'New' }], reasoningEfforts: ['high'] } });
+  fireEvent.click(screen.getByRole('button', { name: '管理 Agent 连接' }));
+  dialog = screen.getByRole('dialog', { name: 'Agent 连接' });
+  await vi.waitFor(() => expect(api.connectionSetup).toHaveBeenCalledTimes(2));
+  const model = within(dialog).getByLabelText('Codex 模型') as HTMLInputElement;
+  const effort = within(dialog).getByLabelText('Codex 思考强度') as HTMLSelectElement;
+  expect(model.disabled).toBe(true); expect(effort.disabled).toBe(true);
+  expect(model.value).toBe('custom-model'); expect(effort.value).toBe('low');
+  // Even a synthetic change cannot alter the pending identity or the draft.
+  fireEvent.change(model, { target: { value: 'different-model' } });
+  fireEvent.change(effort, { target: { value: 'high' } });
+  expect(model.value).toBe('custom-model'); expect(effort.value).toBe('low');
+  fireEvent.click(within(dialog).getByRole('button', { name: '重试原请求' }));
+  await within(dialog).findByText('original request completed');
+  expect(vi.mocked(api.verifyConnection).mock.calls[1]).toEqual(original);
+  expect(model.value).toBe('custom-model'); expect(effort.value).toBe('low');
+});
+
+it('restores an accepted job with its original model and effort and retries only its GET', async () => {
+  const pending = { modelId: 'restored-model', reasoningEffort: 'low', key: 'original-request-key-1234', jobId: 'original-job' };
+  sessionStorage.setItem('zero.connection-verification', JSON.stringify(pending));
+  vi.mocked(api.connectionVerification).mockRejectedValueOnce(new Error('read interrupted'))
+    .mockResolvedValue({ ...running, id: pending.jobId, modelId: pending.modelId, reasoningEffort: pending.reasoningEffort, state: 'succeeded' });
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: '管理 Agent 连接' }));
+  const dialog = screen.getByRole('dialog', { name: 'Agent 连接' });
+  await within(dialog).findByText('read interrupted');
+  expect((within(dialog).getByLabelText('Codex 模型') as HTMLInputElement).value).toBe(pending.modelId);
+  expect((within(dialog).getByLabelText('Codex 思考强度') as HTMLSelectElement).value).toBe('low');
+  expect((within(dialog).getByLabelText('Codex 模型') as HTMLInputElement).disabled).toBe(true);
+  fireEvent.click(within(dialog).getByRole('button', { name: '重新读取结果' }));
+  await within(dialog).findByText(/restored-model 已通过验证/);
+  expect(api.connectionVerification).toHaveBeenNthCalledWith(1, pending.jobId);
+  expect(api.connectionVerification).toHaveBeenNthCalledWith(2, pending.jobId);
+  expect(api.verifyConnection).not.toHaveBeenCalled();
+});
+
+it('initializes untouched effort from late setup after only model was edited', async () => {
+  let finish!: (setup: Awaited<ReturnType<typeof api.connectionSetup>>) => void;
+  vi.mocked(api.connectionSetup).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+  vi.mocked(api.verifyConnection).mockRejectedValue(new Error('fake transport only'));
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: '管理 Agent 连接' }));
+  fireEvent.change(screen.getByLabelText('Codex 模型'), { target: { value: 'custom-before-setup' } });
+  await act(async () => { finish({ codex: { available: true, models: [{ id: 'server-default', label: 'Default' }], reasoningEfforts: ['low'] } }); });
+  fireEvent.click(screen.getByRole('button', { name: '验证并接通' }));
+  await screen.findByText('fake transport only');
+  expect(vi.mocked(api.verifyConnection).mock.calls[0]?.slice(0, 2)).toEqual(['custom-before-setup', 'low']);
+});
+
+it('initializes untouched model from late setup after only effort was edited', async () => {
+  let finish!: (setup: Awaited<ReturnType<typeof api.connectionSetup>>) => void;
+  vi.mocked(api.connectionSetup).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: '管理 Agent 连接' }));
+  fireEvent.change(screen.getByLabelText('Codex 思考强度'), { target: { value: 'high' } });
+  await act(async () => { finish({ codex: { available: true, models: [{ id: 'server-default', label: 'Default' }], reasoningEfforts: ['low'] } }); });
+  expect((screen.getByLabelText('Codex 模型') as HTMLInputElement).value).toBe('server-default');
+  expect((screen.getByLabelText('Codex 思考强度') as HTMLSelectElement).value).toBe('high');
+  expect(api.verifyConnection).not.toHaveBeenCalled();
+});

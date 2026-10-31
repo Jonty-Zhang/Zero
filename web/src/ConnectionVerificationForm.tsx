@@ -6,15 +6,14 @@ export function ConnectionVerificationForm({ store }: { store: ConnectionVerific
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
   const [setup, setSetup] = useState<ConnectionSetup | null>(null);
   const [setupError, setSetupError] = useState('');
-  const [model, setModel] = useState(state.pending?.modelId ?? state.job?.modelId ?? '');
-  const [effort, setEffort] = useState(state.pending?.reasoningEffort ?? state.job?.reasoningEffort ?? 'high');
+  const model = state.pending?.modelId ?? state.draft.modelId;
+  const effort = state.pending?.reasoningEffort ?? state.draft.reasoningEffort;
   useEffect(() => {
     const controller = new AbortController();
     void Promise.resolve().then(() => api.connectionSetup({ signal: controller.signal })).then(result => {
       if (!controller.signal.aborted) {
         setSetup(result);
-        setModel(current => current || result.codex.models[0]?.id || '');
-        setEffort(current => result.codex.reasoningEfforts.includes(current) ? current : result.codex.reasoningEfforts[0] ?? 'high');
+        store.initializeDraft(result);
       }
     }).catch(error => { if (!controller.signal.aborted) setSetupError(error instanceof Error ? error.message : '无法读取连接选项'); });
     store.resume();
@@ -30,9 +29,9 @@ export function ConnectionVerificationForm({ store }: { store: ConnectionVerific
     {setup && !setup.codex.available && <p role="status">{setup.codex.reason || 'Codex 运行入口尚不可用，请先安装或配置运行组件。'}</p>}
     <form onSubmit={event => { event.preventDefault(); if (setup?.codex.available && !locked && modelValid) void store.start(model.trim(), effort); }}>
       <div className="connection-model-fields">
-        <label>模型<input aria-label="Codex 模型" list="codex-connection-models" value={model} disabled={locked} onChange={event => setModel(event.target.value)} placeholder="输入 Codex 支持的模型标识" required /></label>
+        <label>模型<input aria-label="Codex 模型" list="codex-connection-models" value={model} disabled={locked} onChange={event => store.editDraft({ modelId: event.target.value })} placeholder="输入 Codex 支持的模型标识" required /></label>
         <datalist id="codex-connection-models">{setup?.codex.models.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</datalist>
-        <label>思考强度<select aria-label="Codex 思考强度" value={effort} disabled={locked} onChange={event => setEffort(event.target.value)}>{(setup?.codex.reasoningEfforts ?? ['high']).map(item => <option key={item} value={item}>{item}</option>)}</select></label>
+        <label>思考强度<select aria-label="Codex 思考强度" value={effort} disabled={locked} onChange={event => store.editDraft({ reasoningEffort: event.target.value })}>{[...new Set([effort, ...(setup?.codex.reasoningEfforts ?? [])])].map(item => <option key={item} value={item}>{item}</option>)}</select></label>
       </div>
       <p>点击将发起一次真实模型验证并使用额度。通过后，Boss 即可使用这个模型。</p>
       {status === 'interrupted' && <p role="status">上次验证的监控已中断，模型可能已执行。再次点击将另外发起调用并使用额度。</p>}

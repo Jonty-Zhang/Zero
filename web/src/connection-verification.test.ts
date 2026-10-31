@@ -105,3 +105,17 @@ it('ignores late responses after disposal and refuses a different job on result 
   expect(store.getSnapshot().pending?.jobId).toBe(job.id);
   store.dispose();
 });
+
+it('initializes defaults once and keeps edited or blank drafts in memory only', () => {
+  const storage = { getItem: vi.fn().mockReturnValue(null), setItem: vi.fn(), removeItem: vi.fn() };
+  const store = createConnectionVerification({ start: vi.fn(), read: vi.fn() }, storage);
+  store.initializeDraft({ codex: { available: true, models: [{ id: 'first-model', label: 'First' }], reasoningEfforts: ['low'] } });
+  expect(store.getSnapshot().draft).toEqual({ modelId: 'first-model', reasoningEffort: 'low' });
+  store.initializeDraft({ codex: { available: true, models: [{ id: 'later-model', label: 'Later' }], reasoningEfforts: ['high'] } });
+  expect(store.getSnapshot().draft).toEqual({ modelId: 'first-model', reasoningEffort: 'low' });
+  store.editDraft({ modelId: '' });
+  store.initializeDraft({ codex: { available: true, models: [{ id: 'later-model', label: 'Later' }], reasoningEfforts: ['high'] } });
+  expect(store.getSnapshot().draft).toEqual({ modelId: '', reasoningEffort: 'low' });
+  expect(storage.setItem).not.toHaveBeenCalled();
+  store.dispose();
+});

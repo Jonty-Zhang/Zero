@@ -11,8 +11,9 @@ export interface VerificationJob {
   finishedAt?: string;
 }
 export interface ConnectionSetup { codex: { available: boolean; reason?: string; models: Array<{ id: string; label: string }>; reasoningEfforts: string[] } }
-type Pending = { modelId: string; reasoningEffort: string; key: string; jobId?: string };
-interface Snapshot { job: VerificationJob | null; pending: Pending | null; busy: boolean; uncertain: boolean; error: string }
+type Draft = { modelId: string; reasoningEffort: string };
+type Pending = Readonly<Draft & { key: string; jobId?: string }>;
+interface Snapshot { draft: Draft; job: VerificationJob | null; pending: Pending | null; busy: boolean; uncertain: boolean; error: string }
 interface Transport {
   start(modelId: string, effort: string, key: string): Promise<VerificationJob>;
   read(id: string): Promise<VerificationJob>;
@@ -29,7 +30,8 @@ export function createConnectionVerification(transport: Transport, storage?: Pic
         && ['minimal', 'low', 'medium', 'high', 'xhigh'].includes(value.reasoningEffort)
         && /^[A-Za-z0-9_-]{16,128}$/.test(value.key) && (value.jobId === undefined || typeof value.jobId === 'string')) restored = value;
   } catch { /* Storage is optional; never read authentication or task content. */ }
-  let snapshot: Snapshot = { job: null, pending: restored, busy: false, uncertain: !!restored && !restored.jobId, error: '' };
+  const draftInitialized = { modelId: !!restored, reasoningEffort: !!restored };
+  let snapshot: Snapshot = { draft: { modelId: restored?.modelId ?? '', reasoningEffort: restored?.reasoningEffort ?? 'high' }, job: null, pending: restored, busy: false, uncertain: !!restored && !restored.jobId, error: '' };
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
   const listeners = new Set<() => void>();
@@ -45,7 +47,7 @@ export function createConnectionVerification(transport: Transport, storage?: Pic
         || job.reasoningEffort !== pending.reasoningEffort
         || !['queued', 'running', 'succeeded', 'failed', 'interrupted'].includes(job.state)
         || (pending.jobId && job.id !== pending.jobId)) throw new Error('验证结果与原连接请求不匹配，请重试读取原结果');
-    publish({ job, pending: active(job) ? { ...pending, jobId: job.id } : null, busy: false, uncertain: false, error: '' });
+    publish({ ...snapshot, job, pending: active(job) ? { ...pending, jobId: job.id } : null, busy: false, uncertain: false, error: '' });
     if (!disposed && active(job)) timer = setTimeout(() => { void read(); }, 1000);
   };
   const read = async () => {
@@ -58,7 +60,7 @@ export function createConnectionVerification(transport: Transport, storage?: Pic
     catch (e) { publish({ ...snapshot, busy: false, error: e instanceof Error ? e.message : '无法读取验证结果' }); }
   };
   const submit = async (pending: Pending) => {
-    publish({ job: null, pending, busy: true, uncertain: false, error: '' });
+    publish({ ...snapshot, job: null, pending, busy: true, uncertain: false, error: '' });
     try { accept(await transport.start(pending.modelId, pending.reasoningEffort, pending.key), pending); }
     catch (e) {
       const rejected = e instanceof HttpError && [400, 409].includes(e.status) && e.verificationNotStarted;
@@ -68,6 +70,21 @@ export function createConnectionVerification(transport: Transport, storage?: Pic
   return {
     getSnapshot: () => snapshot,
     subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    initializeDraft(setup: ConnectionSetup) {
+      if (disposed || snapshot.pending || snapshot.busy || (draftInitialized.modelId && draftInitialized.reasoningEffort)) return;
+      const draft = {
+        modelId: draftInitialized.modelId ? snapshot.draft.modelId : setup.codex.models[0]?.id ?? '',
+        reasoningEffort: draftInitialized.reasoningEffort ? snapshot.draft.reasoningEffort : setup.codex.reasoningEfforts.includes('high') ? 'high' : setup.codex.reasoningEfforts[0] ?? 'high',
+      };
+      draftInitialized.modelId = draftInitialized.reasoningEffort = true;
+      publish({ ...snapshot, draft });
+    },
+    editDraft(change: Partial<Draft>) {
+      if (disposed || snapshot.pending || snapshot.busy) return;
+      if (change.modelId !== undefined) draftInitialized.modelId = true;
+      if (change.reasoningEffort !== undefined) draftInitialized.reasoningEffort = true;
+      publish({ ...snapshot, draft: { ...snapshot.draft, ...change } });
+    },
     async start(modelId: string, reasoningEffort: string) {
       if (disposed || snapshot.busy || snapshot.pending) return;
       await submit({ modelId: modelId.trim(), reasoningEffort, key: crypto.randomUUID() });
